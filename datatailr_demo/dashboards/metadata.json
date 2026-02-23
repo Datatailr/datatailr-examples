@@ -1,0 +1,11 @@
+{
+    "name": "Datatailr Demo",
+    "description": "A demo of the Datatailr platform",
+    "author": "Datatailr Inc.",
+    "version": "1.0.0",
+    "url": "https://github.com/Datatailr/datatailr-examples/tree/main/datatailr_demo",
+    "tags": ["demo", "datatailr", "platform",
+             "dashboard", "streamlit", "dash",
+             "flask", "panel", "fastapi", "service",
+             "workflow", "excel", "dag", "data", "pipeline", "data-processing"]
+}
