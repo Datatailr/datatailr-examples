@@ -3,6 +3,9 @@
 This folder is a deployment-ready demo package that showcases multiple job types on the Datatailr platform.
 Each component can be deployed independently and used as a starting point for real projects.
 
+![Demo screenshot](screenshot.png)
+
+
 ## What this demo includes
 
 1. **Simple Service**  
