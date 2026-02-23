@@ -36,7 +36,7 @@ def get_number() -> int:
 def get_number_from_service(min_val: int, max_val: int) -> int:
     import requests
 
-    data_service_url = "http://simple-service-<>USERNAME<>"
+    data_service_url = "http://simple-service"
     try:
         r = requests.get(
             f"{data_service_url}/random",

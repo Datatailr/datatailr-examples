@@ -17,7 +17,7 @@ import time
 def _data_service_url() -> str:
     if os.getenv("DATATAILR_JOB_TYPE") == "workspace":
         return "http://localhost:1024"
-    return "http://simple-service-<>USERNAME<>"
+    return "http://simple-service"
 
 
 def _health_check(url: str) -> str:

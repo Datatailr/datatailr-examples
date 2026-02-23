@@ -14,7 +14,7 @@ from datatailr import workflow, App, Service, ExcelAddin, Resources
 from data_pipelines.data_processing import func_no_args
 
 
-@workflow(name="Simple Data Pipeline with One Task - <>USERNAME<>")
+@workflow(name="Simple Data Pipeline with One Task")
 def data_pipeline_with_one_task():
     func_no_args()
 
@@ -29,9 +29,7 @@ def simple_workflow():
         get_number_from_service,
     )
 
-    @workflow(
-        name="Simple Data Pipeline - <>USERNAME<>", python_requirements=["requests"]
-    )
+    @workflow(name="Simple Data Pipeline", python_requirements=["requests"])
     def simple_data_pipeline():
         data = get_data()
         process_data(data)
@@ -50,7 +48,7 @@ def simple_workflow():
 
 
 def simple_app(framework: str = "streamlit"):
-    name = f"Simple {framework.capitalize()} App - <>USERNAME<>"
+    name = f"Simple {framework.capitalize()} App"
     resources = Resources(memory="2g", cpu=1)
 
     if framework == "streamlit":
@@ -89,7 +87,7 @@ def simple_service():
     from services.flask_service import main
 
     service = Service(
-        name="Simple Service - <>USERNAME<>",
+        name="Simple Service",
         entrypoint=main,
         python_requirements=["flask"],
     )
@@ -100,7 +98,7 @@ def simple_excel_addin():
     from excel_addins.addin import main as addin_main
 
     addin = ExcelAddin(
-        name="Simple Excel Addin - <>USERNAME<>",
+        name="Simple Excel Addin",
         entrypoint=addin_main,
         resources=Resources(memory="4g", cpu=1),
         python_version="3.10",
@@ -125,7 +123,7 @@ def deploy_app(framework: str = "streamlit"):
 
 def deploy_service():
     """
-    The service will be deployed and accessible at curl dev.simple-service-<>USERNAME<>/job/dev/simple-service-<>USERNAME<>/
+    The service will be deployed and accessible at curl dev.simple-service/job/dev/simple-service/
     """
     service = simple_service()
     print(CYAN("Deploying service..."))

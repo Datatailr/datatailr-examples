@@ -150,7 +150,7 @@ def generate_dag(num_tasks: int):
     """
     layer_sizes = _build_layer_sizes(num_tasks)
 
-    @workflow(name=f"Generated DAG ({num_tasks} tasks) - <>USERNAME<>")
+    @workflow(name=f"Generated DAG ({num_tasks} tasks)")
     def generated_dag():
         prev_layer_outputs: List[Any] = []
 

@@ -31,7 +31,7 @@ def sub(a: float, b: float) -> float:
     help="Provide min and max values",
 )
 def random(min_val: int, max_val: int) -> int:
-    data_service_url = "http://simple-service-<>USERNAME<>"
+    data_service_url = "http://simple-service"
     r = requests.get(
         f"{data_service_url}/random",
         params={"min": int(min_val), "max": int(max_val)},
