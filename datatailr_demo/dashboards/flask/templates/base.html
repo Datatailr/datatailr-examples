@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Flask Showcase{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="{{ prefix }}/static/style.css">
+  <script>var PREFIX = {{ prefix | tojson }};</script>
+</head>
+<body>
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <h2>Flask Showcase</h2>
+      <span class="sidebar-subtitle">Interactive demo</span>
+    </div>
+    <nav class="sidebar-nav">
+      <a href="{{ prefix }}/" class="nav-link {% if page == 'overview' %}active{% endif %}">
+        <span class="nav-icon">&#9632;</span> Overview
+      </a>
+      <a href="{{ prefix }}/time-series" class="nav-link {% if page == 'time_series' %}active{% endif %}">
+        <span class="nav-icon">&#9650;</span> Time Series
+      </a>
+      <a href="{{ prefix }}/explorer" class="nav-link {% if page == 'explorer' %}active{% endif %}">
+        <span class="nav-icon">&#9673;</span> Data Explorer
+      </a>
+      <a href="{{ prefix }}/distributions" class="nav-link {% if page == 'distributions' %}active{% endif %}">
+        <span class="nav-icon">&#9660;</span> Distributions
+      </a>
+      <a href="{{ prefix }}/data-table" class="nav-link {% if page == 'data_table' %}active{% endif %}">
+        <span class="nav-icon">&#9776;</span> Data Table
+      </a>
+    </nav>
+    <div class="sidebar-footer">
+      <span>Flask&nbsp;&bull;&nbsp;Chart.js</span>
+    </div>
+  </aside>
+
+  <!-- Main content -->
+  <main class="content">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="{{ prefix }}/static/app.js"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Time Series — Flask Showcase{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Time Series</h1>
+  <p class="page-subtitle">Explore trends with interactive controls</p>
+</div>
+
+<div class="panel-layout">
+  <!-- Controls sidebar -->
+  <div class="card controls-panel">
+    <label class="control-label">Metric</label>
+    <select id="ts-metric" class="control-select">
+      <option value="revenue">Revenue</option>
+      <option value="users">Users</option>
+      <option value="sessions">Sessions</option>
+    </select>
+
+    <label class="control-label">Transform</label>
+    <div class="radio-group">
+      <label class="radio-item"><input type="radio" name="ts-transform" value="raw" checked> Raw data</label>
+      <label class="radio-item"><input type="radio" name="ts-transform" value="rolling"> Rolling average</label>
+      <label class="radio-item"><input type="radio" name="ts-transform" value="diff"> Daily change</label>
+    </div>
+
+    <label class="control-label">Rolling window</label>
+    <input type="range" id="ts-window" min="1" max="60" value="7" class="control-range">
+    <span id="ts-window-val" class="range-value">7 days</span>
+
+    <label class="control-label">Chart type</label>
+    <select id="ts-chart-type" class="control-select">
+      <option value="line">Line</option>
+      <option value="bar">Bar</option>
+    </select>
+
+    <button id="ts-update" class="btn-primary">Update chart</button>
+  </div>
+
+  <!-- Chart area -->
+  <div class="card chart-panel">
+    <div class="chart-box chart-box-tall"><canvas id="tsChart"></canvas></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  const ACCENT = '#0072B5';
+  let tsChartInstance = null;
+
+  function loadTS() {
+    const metric = document.getElementById('ts-metric').value;
+    const transform = document.querySelector('input[name="ts-transform"]:checked').value;
+    const window = document.getElementById('ts-window').value;
+    const chartType = document.getElementById('ts-chart-type').value;
+
+    fetch(`${PREFIX}/api/time-series?metric=${metric}&window=${window}&transform=${transform}`)
+      .then(r => r.json())
+      .then(d => {
+        if (tsChartInstance) tsChartInstance.destroy();
+        const fill = chartType === 'line';
+        tsChartInstance = new Chart(document.getElementById('tsChart'), {
+          type: chartType,
+          data: {
+            labels: d.labels,
+            datasets: [{
+              label: metric.charAt(0).toUpperCase() + metric.slice(1) + ' (' + transform + ')',
+              data: d.values,
+              borderColor: ACCENT,
+              backgroundColor: fill ? ACCENT + '22' : ACCENT + 'aa',
+              fill: fill,
+              tension: 0.3,
+              pointRadius: chartType === 'line' ? 0 : undefined,
+              borderWidth: 2,
+              borderRadius: chartType === 'bar' ? 4 : 0
+            }]
+          },
+          options: chartOpts()
+        });
+      });
+  }
+
+  document.getElementById('ts-update').addEventListener('click', loadTS);
+  document.getElementById('ts-window').addEventListener('input', function() {
+    document.getElementById('ts-window-val').textContent = this.value + ' days';
+  });
+
+  loadTS();
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}Data Table — Flask Showcase{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Data Table</h1>
+  <p class="page-subtitle">Browse, filter, and sort the dataset</p>
+</div>
+
+<div class="card">
+  <!-- Filters -->
+  <div class="table-filters">
+    <div class="filter-group">
+      <label class="control-label">Category</label>
+      <select id="filter-cat" class="control-select">
+        <option value="">All</option>
+        {% for c in categories %}
+        <option value="{{ c }}">{{ c }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-group">
+      <label class="control-label">Region</label>
+      <select id="filter-reg" class="control-select">
+        <option value="">All</option>
+        {% for r in regions %}
+        <option value="{{ r }}">{{ r }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-group">
+      <label class="control-label">Search</label>
+      <input type="text" id="filter-search" class="control-input" placeholder="Filter values...">
+    </div>
+    <div class="filter-group filter-stats">
+      <span id="row-count" class="badge">{{ rows|length }} rows</span>
+    </div>
+  </div>
+
+  <!-- Table -->
+  <div class="table-wrapper">
+    <table id="data-table" class="data-table">
+      <thead>
+        <tr>
+          <th data-sort="idx">#</th>
+          <th data-sort="category">Category <span class="sort-icon">&#8597;</span></th>
+          <th data-sort="region">Region <span class="sort-icon">&#8597;</span></th>
+          <th data-sort="sales">Sales <span class="sort-icon">&#8597;</span></th>
+          <th data-sort="profit">Profit <span class="sort-icon">&#8597;</span></th>
+          <th data-sort="units">Units <span class="sort-icon">&#8597;</span></th>
+        </tr>
+      </thead>
+      <tbody id="table-body">
+        {% for row in rows %}
+        <tr data-cat="{{ row.category }}" data-reg="{{ row.region }}">
+          <td class="cell-num">{{ loop.index }}</td>
+          <td><span class="badge badge-cat">{{ row.category }}</span></td>
+          <td><span class="badge badge-reg">{{ row.region }}</span></td>
+          <td class="cell-num">${{ "%.2f" | format(row.sales) }}</td>
+          <td class="cell-num {% if row.profit < 0 %}cell-negative{% endif %}">${{ "%.2f" | format(row.profit) }}</td>
+          <td class="cell-num">{{ row.units }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Summary cards -->
+<div class="kpi-row" style="margin-top:20px">
+  <div class="kpi-card">
+    <span class="kpi-label">Total Sales</span>
+    <span class="kpi-value" id="sum-sales">—</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-label">Total Profit</span>
+    <span class="kpi-value" id="sum-profit">—</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-label">Total Units</span>
+    <span class="kpi-value" id="sum-units">—</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-label">Avg Profit Margin</span>
+    <span class="kpi-value" id="avg-margin">—</span>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  const tbody = document.getElementById('table-body');
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+
+  function applyFilters() {
+    const cat = document.getElementById('filter-cat').value;
+    const reg = document.getElementById('filter-reg').value;
+    const search = document.getElementById('filter-search').value.toLowerCase();
+    let visible = 0;
+    let totalSales = 0, totalProfit = 0, totalUnits = 0;
+
+    rows.forEach(tr => {
+      const matchCat = !cat || tr.dataset.cat === cat;
+      const matchReg = !reg || tr.dataset.reg === reg;
+      const matchSearch = !search || tr.textContent.toLowerCase().includes(search);
+      const show = matchCat && matchReg && matchSearch;
+      tr.style.display = show ? '' : 'none';
+      if (show) {
+        visible++;
+        const cells = tr.querySelectorAll('td');
+        totalSales += parseFloat(cells[3].textContent.replace(/[$,]/g, '')) || 0;
+        totalProfit += parseFloat(cells[4].textContent.replace(/[$,]/g, '')) || 0;
+        totalUnits += parseInt(cells[5].textContent) || 0;
+      }
+    });
+
+    document.getElementById('row-count').textContent = visible + ' rows';
+    document.getElementById('sum-sales').textContent = '$' + totalSales.toLocaleString(undefined, {maximumFractionDigits: 0});
+    document.getElementById('sum-profit').textContent = '$' + totalProfit.toLocaleString(undefined, {maximumFractionDigits: 0});
+    document.getElementById('sum-units').textContent = totalUnits.toLocaleString();
+    const margin = totalSales ? ((totalProfit / totalSales) * 100).toFixed(1) + '%' : '—';
+    document.getElementById('avg-margin').textContent = margin;
+  }
+
+  document.getElementById('filter-cat').addEventListener('change', applyFilters);
+  document.getElementById('filter-reg').addEventListener('change', applyFilters);
+  document.getElementById('filter-search').addEventListener('input', applyFilters);
+
+  // Sortable headers
+  let sortCol = null, sortAsc = true;
+  document.querySelectorAll('th[data-sort]').forEach(th => {
+    th.style.cursor = 'pointer';
+    th.addEventListener('click', () => {
+      const col = th.dataset.sort;
+      if (sortCol === col) sortAsc = !sortAsc; else { sortCol = col; sortAsc = true; }
+      const idx = Array.from(th.parentNode.children).indexOf(th);
+      rows.sort((a, b) => {
+        let va = a.children[idx].textContent.replace(/[$,]/g, '');
+        let vb = b.children[idx].textContent.replace(/[$,]/g, '');
+        const na = parseFloat(va), nb = parseFloat(vb);
+        if (!isNaN(na) && !isNaN(nb)) return sortAsc ? na - nb : nb - na;
+        return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+      });
+      rows.forEach(tr => tbody.appendChild(tr));
+    });
+  });
+
+  applyFilters();
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block title %}Data Explorer — Flask Showcase{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Data Explorer</h1>
+  <p class="page-subtitle">Scatter plots, heatmaps, and cross-filtering</p>
+</div>
+
+<!-- Tab bar -->
+<div class="tab-bar">
+  <button class="tab-btn active" data-tab="scatter">Scatter Plot</button>
+  <button class="tab-btn" data-tab="heatmap">Heatmap</button>
+  <button class="tab-btn" data-tab="radar">Radar</button>
+</div>
+
+<!-- Scatter tab -->
+<div id="tab-scatter" class="tab-content active">
+  <div class="panel-layout">
+    <div class="card controls-panel">
+      <label class="control-label">X axis</label>
+      <select id="scatter-x" class="control-select">
+        <option value="sales" selected>Sales</option>
+        <option value="profit">Profit</option>
+        <option value="units">Units</option>
+      </select>
+      <label class="control-label">Y axis</label>
+      <select id="scatter-y" class="control-select">
+        <option value="sales">Sales</option>
+        <option value="profit" selected>Profit</option>
+        <option value="units">Units</option>
+      </select>
+      <label class="control-label">Color by</label>
+      <select id="scatter-color" class="control-select">
+        <option value="category" selected>Category</option>
+        <option value="region">Region</option>
+      </select>
+      <button id="scatter-update" class="btn-primary">Update</button>
+    </div>
+    <div class="card chart-panel">
+      <div class="chart-box chart-box-tall"><canvas id="scatterChart"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<!-- Heatmap tab -->
+<div id="tab-heatmap" class="tab-content">
+  <div class="card">
+    <h3 class="card-title">Activity Heatmap (Month &times; Day)</h3>
+    <div id="heatmap-grid" class="heatmap-container"></div>
+  </div>
+</div>
+
+<!-- Radar tab -->
+<div id="tab-radar" class="tab-content">
+  <div class="card" style="max-width:640px;margin:0 auto;">
+    <h3 class="card-title">Category Performance Radar</h3>
+    <div class="chart-box chart-box-tall"><canvas id="radarChart"></canvas></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  const PALETTE = ['#0072B5','#00b894','#6c5ce7','#fdcb6e','#e17055','#00cec9','#d63031','#636e72'];
+
+  // --- Tabs ---
+  initTabs();
+
+  // --- Scatter ---
+  let scatterInstance = null;
+  function loadScatter() {
+    const x = document.getElementById('scatter-x').value;
+    const y = document.getElementById('scatter-y').value;
+    const color = document.getElementById('scatter-color').value;
+    fetch(`${PREFIX}/api/scatter?x=${x}&y=${y}&color=${color}`)
+      .then(r => r.json())
+      .then(d => {
+        if (scatterInstance) scatterInstance.destroy();
+        const datasets = Object.entries(d.groups).map(([key, pts], i) => ({
+          label: key,
+          data: pts,
+          backgroundColor: PALETTE[i % PALETTE.length] + 'bb',
+          borderColor: PALETTE[i % PALETTE.length],
+          borderWidth: 1
+        }));
+        scatterInstance = new Chart(document.getElementById('scatterChart'), {
+          type: 'bubble',
+          data: {datasets},
+          options: chartOpts({
+            x: {title: {display: true, text: x.charAt(0).toUpperCase() + x.slice(1), font: {family: 'Inter'}}},
+            y: {title: {display: true, text: y.charAt(0).toUpperCase() + y.slice(1), font: {family: 'Inter'}}}
+          })
+        });
+      });
+  }
+  document.getElementById('scatter-update').addEventListener('click', loadScatter);
+  loadScatter();
+
+  // --- Heatmap (HTML/CSS) ---
+  fetch(PREFIX + '/api/heatmap')
+    .then(r => r.json())
+    .then(d => {
+      const container = document.getElementById('heatmap-grid');
+      const flat = d.data.flat();
+      const absMax = Math.max(...flat.map(Math.abs)) || 1;
+
+      let html = '<div class="hm-grid" style="grid-template-columns: 60px repeat(' + d.weekdays.length + ', 1fr)">';
+      html += '<div class="hm-corner"></div>';
+      d.weekdays.forEach(w => { html += '<div class="hm-header">' + w + '</div>'; });
+      d.data.forEach((row, mi) => {
+        html += '<div class="hm-label">' + d.months[mi] + '</div>';
+        row.forEach(v => {
+          const norm = v / absMax;
+          const bg = norm >= 0
+            ? `rgba(0,114,181,${norm * 0.8})`
+            : `rgba(225,112,85,${Math.abs(norm) * 0.8})`;
+          html += `<div class="hm-cell" style="background:${bg}" title="${v.toFixed(2)}">${v.toFixed(1)}</div>`;
+        });
+      });
+      html += '</div>';
+      container.innerHTML = html;
+    });
+
+  // --- Radar ---
+  const categories = {{ categories | tojson }};
+  fetch(PREFIX + '/api/scatter?color=category')
+    .then(r => r.json())
+    .then(d => {
+      const avgSales = categories.map(c => {
+        const pts = d.groups[c] || [];
+        return pts.length ? Math.round(pts.reduce((s, p) => s + p.x, 0) / pts.length) : 0;
+      });
+      const avgProfit = categories.map(c => {
+        const pts = d.groups[c] || [];
+        return pts.length ? Math.round(pts.reduce((s, p) => s + p.y, 0) / pts.length) : 0;
+      });
+      new Chart(document.getElementById('radarChart'), {
+        type: 'radar',
+        data: {
+          labels: categories,
+          datasets: [
+            {label: 'Avg Sales', data: avgSales, borderColor: '#0072B5', backgroundColor: '#0072B533', pointBackgroundColor: '#0072B5'},
+            {label: 'Avg Profit', data: avgProfit, borderColor: '#00b894', backgroundColor: '#00b89433', pointBackgroundColor: '#00b894'}
+          ]
+        },
+        options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {position: 'bottom', labels: {font: {family: 'Inter'}}}}, scales: {r: {beginAtZero: true, grid: {color: '#e9ecef'}, ticks: {font: {family: 'Inter'}}}}}
+      });
+    });
+})();
+</script>
+{% endblock %}

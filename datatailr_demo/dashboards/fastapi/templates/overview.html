@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block title %}Overview — FastAPI Showcase{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Overview</h1>
+  <p class="page-subtitle">Key metrics and summary charts</p>
+</div>
+
+<!-- KPI cards -->
+<div class="kpi-row">
+  <div class="kpi-card">
+    <span class="kpi-icon kpi-icon-blue">
+      <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><path d="M11 1v20M6 6l5-5 5 5M3 11h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </span>
+    <span class="kpi-label">Revenue</span>
+    <span class="kpi-value">{{ revenue }}</span>
+    <span class="kpi-change positive">&#9650; 12.4%</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-icon kpi-icon-purple">
+      <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><circle cx="11" cy="8" r="4" stroke="currentColor" stroke-width="2"/><path d="M3 20c0-4.4 3.6-8 8-8s8 3.6 8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </span>
+    <span class="kpi-label">Users</span>
+    <span class="kpi-value">{{ users }}</span>
+    <span class="kpi-change positive">&#9650; 8.1%</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-icon kpi-icon-teal">
+      <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><rect x="3" y="3" width="16" height="16" rx="3" stroke="currentColor" stroke-width="2"/><path d="M7 11h8M11 7v8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </span>
+    <span class="kpi-label">Sessions</span>
+    <span class="kpi-value">{{ sessions }}</span>
+    <span class="kpi-change positive">&#9650; 15.3%</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-icon kpi-icon-orange">
+      <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><path d="M3 17l5-5 3 3 8-8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 7h5v5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </span>
+    <span class="kpi-label">Avg Order</span>
+    <span class="kpi-value">{{ avg_order }}</span>
+    <span class="kpi-change negative">&#9660; 2.1%</span>
+  </div>
+</div>
+
+<!-- Charts row -->
+<div class="chart-row">
+  <div class="card card-wide">
+    <h3 class="card-title">Cumulative Revenue</h3>
+    <div class="chart-box"><canvas id="revenueChart"></canvas></div>
+  </div>
+  <div class="card card-narrow">
+    <h3 class="card-title">Sales by Category</h3>
+    <div class="chart-box"><canvas id="categoryChart"></canvas></div>
+  </div>
+</div>
+
+<!-- Second row -->
+<div class="chart-row">
+  <div class="card card-narrow">
+    <h3 class="card-title">Sales by Region</h3>
+    <div class="chart-box"><canvas id="regionChart"></canvas></div>
+  </div>
+  <div class="card card-wide">
+    <h3 class="card-title">User Growth</h3>
+    <div class="chart-box"><canvas id="usersChart"></canvas></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  const ACCENT = '#0072B5';
+  const PALETTE = ['#0072B5','#00b894','#6c5ce7','#fdcb6e','#e17055','#00cec9','#d63031','#636e72'];
+
+  fetch('api/time-series?metric=revenue')
+    .then(r => r.json())
+    .then(d => {
+      new Chart(document.getElementById('revenueChart'), {
+        type: 'line',
+        data: {
+          labels: d.labels,
+          datasets: [{
+            label: 'Revenue',
+            data: d.values,
+            borderColor: ACCENT,
+            backgroundColor: ACCENT + '22',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 0,
+            borderWidth: 2
+          }]
+        },
+        options: chartOpts({y: {ticks: {callback: v => '$' + v.toLocaleString()}}})
+      });
+    });
+
+  const catLabels = {{ cat_labels | tojson }};
+  const catValues = {{ cat_values | tojson }};
+  new Chart(document.getElementById('categoryChart'), {
+    type: 'doughnut',
+    data: {
+      labels: catLabels,
+      datasets: [{data: catValues, backgroundColor: PALETTE.slice(0, catLabels.length), borderWidth: 0}]
+    },
+    options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {position: 'bottom', labels: {padding: 14, font: {family: 'Inter'}}}}}
+  });
+
+  const regLabels = {{ reg_labels | tojson }};
+  const regValues = {{ reg_values | tojson }};
+  new Chart(document.getElementById('regionChart'), {
+    type: 'bar',
+    data: {
+      labels: regLabels,
+      datasets: [{label: 'Sales', data: regValues, backgroundColor: PALETTE.slice(0, regLabels.length), borderRadius: 6, borderSkipped: false}]
+    },
+    options: chartOpts({y: {ticks: {callback: v => '$' + v.toLocaleString()}}}, false)
+  });
+
+  fetch('api/time-series?metric=users')
+    .then(r => r.json())
+    .then(d => {
+      new Chart(document.getElementById('usersChart'), {
+        type: 'line',
+        data: {
+          labels: d.labels,
+          datasets: [{
+            label: 'Users',
+            data: d.values,
+            borderColor: '#6c5ce7',
+            backgroundColor: '#6c5ce722',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 0,
+            borderWidth: 2
+          }]
+        },
+        options: chartOpts()
+      });
+    });
+})();
+</script>
+{% endblock %}

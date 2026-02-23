@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block title %}Distributions — Flask Showcase{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Distributions</h1>
+  <p class="page-subtitle">Histograms, box plots, and statistical views</p>
+</div>
+
+<!-- Tab bar -->
+<div class="tab-bar">
+  <button class="tab-btn active" data-tab="histogram">Histogram</button>
+  <button class="tab-btn" data-tab="boxplot">Box Plot</button>
+</div>
+
+<!-- Shared controls -->
+<div class="panel-layout">
+  <div class="card controls-panel">
+    <label class="control-label">Variable</label>
+    <select id="dist-var" class="control-select">
+      <option value="sales" selected>Sales</option>
+      <option value="profit">Profit</option>
+      <option value="units">Units</option>
+    </select>
+
+    <label class="control-label">Group by</label>
+    <select id="dist-group" class="control-select">
+      <option value="none" selected>None</option>
+      <option value="category">Category</option>
+      <option value="region">Region</option>
+    </select>
+
+    <div id="bins-control">
+      <label class="control-label">Bins</label>
+      <input type="range" id="dist-bins" min="5" max="60" value="20" class="control-range">
+      <span id="dist-bins-val" class="range-value">20</span>
+    </div>
+
+    <button id="dist-update" class="btn-primary">Update</button>
+  </div>
+
+  <div class="chart-panel">
+    <div id="tab-histogram" class="tab-content active">
+      <div class="card">
+        <div class="chart-box chart-box-tall"><canvas id="histChart"></canvas></div>
+      </div>
+    </div>
+    <div id="tab-boxplot" class="tab-content">
+      <div class="card">
+        <div id="box-container" class="box-plot-container"></div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  const PALETTE = ['#0072B5','#00b894','#6c5ce7','#fdcb6e','#e17055','#00cec9','#d63031','#636e72'];
+  let histInstance = null;
+
+  initTabs();
+
+  document.getElementById('dist-bins').addEventListener('input', function() {
+    document.getElementById('dist-bins-val').textContent = this.value;
+  });
+
+  function loadHistogram() {
+    const v = document.getElementById('dist-var').value;
+    const g = document.getElementById('dist-group').value;
+    const b = document.getElementById('dist-bins').value;
+    fetch(`${PREFIX}/api/distribution?var=${v}&group=${g}&bins=${b}`)
+      .then(r => r.json())
+      .then(d => {
+        if (histInstance) histInstance.destroy();
+        const datasets = d.datasets.map((ds, i) => ({
+          label: ds.label,
+          data: ds.data,
+          backgroundColor: PALETTE[i % PALETTE.length] + 'aa',
+          borderColor: PALETTE[i % PALETTE.length],
+          borderWidth: 1,
+          borderRadius: 2
+        }));
+        histInstance = new Chart(document.getElementById('histChart'), {
+          type: 'bar',
+          data: {labels: d.labels, datasets},
+          options: chartOpts({
+            x: {title: {display: true, text: v.charAt(0).toUpperCase() + v.slice(1), font: {family: 'Inter'}}},
+            y: {title: {display: true, text: 'Count', font: {family: 'Inter'}}}
+          })
+        });
+      });
+  }
+
+  function loadBoxPlot() {
+    const v = document.getElementById('dist-var').value;
+    const g = document.getElementById('dist-group').value;
+    fetch(`${PREFIX}/api/box?var=${v}&group=${g}`)
+      .then(r => r.json())
+      .then(d => {
+        const container = document.getElementById('box-container');
+        let html = '<div class="box-row-header"><span class="box-label-col">Group</span><span class="box-viz-col">Distribution</span><span class="box-stats-col">Min / Q1 / Median / Q3 / Max</span></div>';
+        const allMax = Math.max(...d.stats.map(s => s.max));
+        const allMin = Math.min(...d.stats.map(s => s.min));
+        const range = allMax - allMin || 1;
+
+        d.stats.forEach((s, i) => {
+          const pct = v => ((v - allMin) / range * 100).toFixed(1);
+          const left = pct(s.q1);
+          const right = 100 - parseFloat(pct(s.q3));
+          const medPos = pct(s.median);
+          const whiskerL = pct(s.min);
+          const whiskerR = pct(s.max);
+          const color = PALETTE[i % PALETTE.length];
+
+          html += `<div class="box-row">
+            <span class="box-label-col">${d.labels[i]}</span>
+            <span class="box-viz-col">
+              <div class="box-track">
+                <div class="box-whisker" style="left:${whiskerL}%;width:${left - whiskerL}%;border-color:${color}"></div>
+                <div class="box-iqr" style="left:${left}%;right:${right}%;background:${color}33;border-color:${color}">
+                  <div class="box-median" style="left:${((medPos - left) / (100 - right - parseFloat(left)) * 100).toFixed(1)}%;background:${color}"></div>
+                </div>
+                <div class="box-whisker" style="left:${100 - right}%;width:${parseFloat(whiskerR) - (100 - right)}%;border-color:${color}"></div>
+              </div>
+            </span>
+            <span class="box-stats-col">${s.min} / ${s.q1} / ${s.median} / ${s.q3} / ${s.max}</span>
+          </div>`;
+        });
+        container.innerHTML = html;
+      });
+  }
+
+  function update() {
+    loadHistogram();
+    loadBoxPlot();
+  }
+
+  document.getElementById('dist-update').addEventListener('click', update);
+  update();
+})();
+</script>
+{% endblock %}

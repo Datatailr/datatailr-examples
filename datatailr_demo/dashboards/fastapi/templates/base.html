@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}FastAPI Showcase{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <svg class="brand-icon" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect width="28" height="28" rx="7" fill="#0072B5"/>
+        <path d="M7 19V9l7 5-7 5zm7-5l7-5v10l-7-5z" fill="#fff" fill-opacity=".9"/>
+      </svg>
+      <div>
+        <h2>FastAPI Showcase</h2>
+        <span class="sidebar-subtitle">Interactive analytics demo</span>
+      </div>
+    </div>
+    <nav class="sidebar-nav">
+      <a href="./" class="nav-link {% if page == 'overview' %}active{% endif %}">
+        <span class="nav-icon">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="1" width="6" height="6" rx="1.5"/><rect x="9" y="1" width="6" height="6" rx="1.5"/><rect x="1" y="9" width="6" height="6" rx="1.5"/><rect x="9" y="9" width="6" height="6" rx="1.5"/></svg>
+        </span> Overview
+      </a>
+      <a href="time-series" class="nav-link {% if page == 'time_series' %}active{% endif %}">
+        <span class="nav-icon">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M1 14h14M2 10l3-4 3 2 4-6 2 3"/></svg>
+        </span> Time Series
+      </a>
+      <a href="explorer" class="nav-link {% if page == 'explorer' %}active{% endif %}">
+        <span class="nav-icon">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><circle cx="5" cy="11" r="2"/><circle cx="8" cy="5" r="2.5"/><circle cx="12" cy="9" r="1.5"/><circle cx="3" cy="6" r="1"/></svg>
+        </span> Data Explorer
+      </a>
+      <a href="distributions" class="nav-link {% if page == 'distributions' %}active{% endif %}">
+        <span class="nav-icon">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="10" width="3" height="5" rx="0.5"/><rect x="5" y="6" width="3" height="9" rx="0.5"/><rect x="9" y="3" width="3" height="12" rx="0.5"/><rect x="13" y="8" width="2" height="7" rx="0.5"/></svg>
+        </span> Distributions
+      </a>
+      <a href="data-table" class="nav-link {% if page == 'data_table' %}active{% endif %}">
+        <span class="nav-icon">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 3h12v2H2zm0 4h12v2H2zm0 4h12v2H2z"/></svg>
+        </span> Data Table
+      </a>
+    </nav>
+    <div class="sidebar-footer">
+      <span>FastAPI&nbsp;&bull;&nbsp;Jinja2&nbsp;&bull;&nbsp;Chart.js</span>
+    </div>
+  </aside>
+
+  <!-- Main content -->
+  <main class="content">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="static/app.js"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>
