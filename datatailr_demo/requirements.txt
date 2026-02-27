@@ -1,0 +1,13 @@
+streamlit
+dash
+flask
+fastapi
+pandas
+requests
+numpy
+uvicorn
+jinja2
+python-multipart
+gunicorn
+plotly
+panel
