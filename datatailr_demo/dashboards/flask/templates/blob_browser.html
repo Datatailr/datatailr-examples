@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Blob Storage Browser — Flask Showcase{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Blob Storage Browser</h1>
+  <p class="page-subtitle">Browse and inspect files in Datatailr blob storage</p>
+</div>
+<div id="blob-tree" class="card" style="padding: 1.5em; min-height: 400px;">
+  <!-- File tree will be rendered here -->
+</div>
+<script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+<script>
+async function fetchBlobTree() {
+  const resp = await axios.get("{{ prefix }}/api/blob-tree");
+  renderTree(resp.data, document.getElementById('blob-tree'));
+}
+
+function renderTree(node, container) {
+  container.innerHTML = '';
+  const ul = document.createElement('ul');
+  ul.className = 'blob-tree-root';
+  buildTree(node, ul);
+  container.appendChild(ul);
+}
+
+function buildTree(node, parent) {
+  if (node.type === 'dir') {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class='blob-dir'>📁 ${node.name}</span>`;
+    const ul = document.createElement('ul');
+    ul.style.display = 'none';
+    li.appendChild(ul);
+    li.querySelector('span').onclick = () => {
+      ul.style.display = ul.style.display === 'none' ? 'block' : 'none';
+    };
+    parent.appendChild(li);
+    (node.children || []).forEach(child => buildTree(child, ul));
+  } else {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class='blob-file'>📄 ${node.name}</span>`;
+    parent.appendChild(li);
+  }
+}
+
+document.addEventListener('DOMContentLoaded', fetchBlobTree);
+</script>
+<style>
+.blob-tree-root, .blob-tree-root ul {
+  list-style: none;
+  margin-left: 1em;
+  padding-left: 0.5em;
+}
+.blob-dir { cursor: pointer; font-weight: bold; }
+.blob-file { color: #4a90e2; }
+</style>
+{% endblock %}

@@ -20,7 +20,6 @@ Features demonstrated:
 """
 
 from __future__ import annotations
-
 import os
 import random
 from datetime import datetime, timedelta
@@ -192,6 +191,64 @@ def data_table():
         categories=_CATEGORIES,
         regions=_REGIONS,
     )
+
+
+# ---------------------------------------------------------------------------
+# Blob Storage Browser Page and API
+# ---------------------------------------------------------------------------
+
+import json
+try:
+    from datatailr import Blob
+    blob_storage = Blob()
+except ImportError:
+    blob_storage = None
+
+
+def _build_blob_tree(prefix="/"):
+    """
+    Build a nested file tree from flat blob paths using Blob.ls().
+    """
+    if not blob_storage:
+        return {"name": "Blob API not available", "type": "dir", "children": []}
+    try:
+        blobs = blob_storage.ls(prefix, recursive=True)
+    except Exception as e:
+        return {"name": "Blob API error", "type": "dir", "children": [{"name": str(e), "type": "file"}]}
+
+    # Build tree from flat paths
+    root = {"name": prefix or "root", "type": "dir", "children": []}
+    tree = {}
+    for blob in blobs:
+        rel_path = blob["name"]
+        parts = rel_path.split("/")
+        node = tree
+        for i, part in enumerate(parts):
+            if part == "":
+                continue
+            if part not in node:
+                node[part] = {} if i < len(parts) - 1 else None
+            if i < len(parts) - 1:
+                node = node[part]
+
+    def build_subtree(name, subtree):
+        if subtree is None:
+            return {"name": name, "type": "file"}
+        return {"name": name, "type": "dir", "children": [build_subtree(k, v) for k, v in sorted(subtree.items())]}
+
+    root["children"] = [build_subtree(k, v) for k, v in sorted(tree.items())]
+    return root
+
+
+@app.route("/blob-browser")
+def blob_browser():
+    return render_template("blob_browser.html", page="blob_browser")
+
+
+@app.route("/api/blob-tree")
+def api_blob_tree():
+    tree = _build_blob_tree()
+    return jsonify(tree)
 
 
 # ---------------------------------------------------------------------------
