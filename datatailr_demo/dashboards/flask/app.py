@@ -29,13 +29,18 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
-_PKG = files(__package__) if __package__ else Path(__file__).parent
-_STATIC_DIR = str(Path(str(_PKG.joinpath("static"))))
-_TEMPLATES_DIR = str(Path(str(_PKG.joinpath("templates"))))
+_STATIC_DIR = Path(__file__).parent / 'static'
+_TEMPLATES_DIR = Path(__file__).parent / 'templates'
 
 _env = os.environ.get("DATATAILR_JOB_ENVIRONMENT", "")
 _job = os.environ.get("DATATAILR_JOB_NAME", "")
-_PREFIX = f"/job/{_env}/{_job}" if _env and _job else ""
+_job_type = os.environ.get("DATATAILR_JOB_TYPE", "")
+_job_type = 'job' if _job_type != 'workstation' else 'workstation'
+
+_PREFIX = f'/{_job_type}/{_env}/{_job}' if _env and _job else ""
+
+if _job_type == 'workstation':
+    _PREFIX += '/ide/proxy/5000/'
 
 app = Flask(
     __name__,

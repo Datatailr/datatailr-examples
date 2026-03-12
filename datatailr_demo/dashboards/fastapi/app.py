@@ -31,9 +31,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-_PKG = files(__package__)
-_STATIC_DIR = Path(str(_PKG.joinpath("static")))
-_TEMPLATES_DIR = Path(str(_PKG.joinpath("templates")))
+_STATIC_DIR = Path(__file__).parent / 'static'
+_TEMPLATES_DIR = Path(__file__).parent / 'templates'
 
 app = FastAPI(title="FastAPI Showcase")
 
@@ -318,4 +317,4 @@ async def api_box(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
