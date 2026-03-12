@@ -20,11 +20,11 @@ function renderTree(node, container) {
   container.innerHTML = '';
   const ul = document.createElement('ul');
   ul.className = 'blob-tree-root';
-  buildTree(node, ul);
+  buildTree(node, ul, '');
   container.appendChild(ul);
 }
 
-function buildTree(node, parent) {
+function buildTree(node, parent, prefix = '') {
   if (node.type === 'dir') {
     const li = document.createElement('li');
     li.innerHTML = `<span class='blob-dir'>📁 ${node.name}</span>`;
@@ -35,10 +35,25 @@ function buildTree(node, parent) {
       ul.style.display = ul.style.display === 'none' ? 'block' : 'none';
     };
     parent.appendChild(li);
-    (node.children || []).forEach(child => buildTree(child, ul));
+    (node.children || []).forEach(child => buildTree(child, ul, (prefix ? prefix + '/' : '') + node.name));
   } else {
     const li = document.createElement('li');
-    li.innerHTML = `<span class='blob-file'>📄 ${node.name}</span>`;
+    const fullPath = (prefix ? prefix + '/' : '') + node.name;
+    li.innerHTML = `<span class='blob-file' title='Click to copy path'>📄 ${node.name}</span>`;
+    li.querySelector('span').onclick = async (e) => {
+      e.stopPropagation();
+      try {
+        await navigator.clipboard.writeText(fullPath);
+        li.querySelector('span').classList.add('copied');
+        li.querySelector('span').textContent = `📄 ${node.name} (copied!)`;
+        setTimeout(() => {
+          li.querySelector('span').classList.remove('copied');
+          li.querySelector('span').textContent = `📄 ${node.name}`;
+        }, 1200);
+      } catch (err) {
+        alert('Failed to copy path');
+      }
+    };
     parent.appendChild(li);
   }
 }
