@@ -205,39 +205,60 @@ except ImportError:
     blob_storage = None
 
 
-def _build_blob_tree(prefix="/"):
-    """
-    Build a nested file tree from flat blob paths using Blob.ls().
-    """
+
+def _list_blob_dir_with_size(prefix=""):
     if not blob_storage:
-        return {"name": "Blob API not available", "type": "dir", "children": []}
+        return {"name": prefix or "blob:/", "type": "dir", "children": [], "size": 0, "last_modified": None}
     try:
         blobs = blob_storage.ls(prefix, recursive=True)
     except Exception as e:
-        return {"name": "Blob API error", "type": "dir", "children": [{"name": str(e), "type": "file"}]}
+        return {"name": prefix or "blob:/", "type": "dir", "children": [{"name": str(e), "type": "file", "size": 0, "last_modified": None}], "size": 0, "last_modified": None}
 
-    # Build tree from flat paths
-    root = {"name": prefix or "root", "type": "dir", "children": []}
+    # Build a tree with size and last_modified aggregation
     tree = {}
     for blob in blobs:
-        rel_path = blob["name"]
+        # blob is a dict with 'name', 'size', 'last_modified'
+        if isinstance(blob, dict):
+            path = blob.get("name")
+            size = blob.get("size", 0)
+            last_modified = blob.get("last_modified")
+        else:
+            path = blob
+            try:
+                stat = blob_storage.stat(path)
+                size = stat.get('size', 0)
+                last_modified = stat.get('last_modified')
+            except Exception:
+                size = 0
+                last_modified = None
+        rel_path = path[len(prefix):].lstrip("/") if prefix else path
         parts = rel_path.split("/")
         node = tree
         for i, part in enumerate(parts):
-            if part == "":
+            if not part:
                 continue
             if part not in node:
-                node[part] = {} if i < len(parts) - 1 else None
-            if i < len(parts) - 1:
-                node = node[part]
+                node[part] = {"_children": {}, "_size": 0, "_is_file": i == len(parts) - 1, "_last_modified": None}
+            if i == len(parts) - 1:
+                node[part]["_size"] = size
+                node[part]["_last_modified"] = last_modified
+            node = node[part]["_children"]
 
-    def build_subtree(name, subtree):
-        if subtree is None:
-            return {"name": name, "type": "file"}
-        return {"name": name, "type": "dir", "children": [build_subtree(k, v) for k, v in sorted(subtree.items())]}
+    def build_subtree(name, node):
+        if node["_is_file"]:
+            return {"name": name, "type": "file", "size": node["_size"], "last_modified": node["_last_modified"]}
+        children = [build_subtree(k, v) for k, v in node["_children"].items()]
+        total_size = sum(child["size"] for child in children)
+        # For last_modified, use the most recent among children
+        last_mods = [child["last_modified"] for child in children if child["last_modified"]]
+        last_modified = max(last_mods) if last_mods else None
+        return {"name": name, "type": "dir", "children": children, "size": total_size, "last_modified": last_modified}
 
-    root["children"] = [build_subtree(k, v) for k, v in sorted(tree.items())]
-    return root
+    children = [build_subtree(k, v) for k, v in tree.items()]
+    total_size = sum(child["size"] for child in children)
+    last_mods = [child["last_modified"] for child in children if child["last_modified"]]
+    last_modified = max(last_mods) if last_mods else None
+    return {"name": prefix or "blob:/", "type": "dir", "children": children, "size": total_size, "last_modified": last_modified}
 
 
 @app.route("/blob-browser")
@@ -247,7 +268,7 @@ def blob_browser():
 
 @app.route("/api/blob-tree")
 def api_blob_tree():
-    tree = _build_blob_tree()
+    tree = _list_blob_dir_with_size()
     return jsonify(tree)
 
 
