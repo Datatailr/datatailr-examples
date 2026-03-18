@@ -14,6 +14,14 @@ import websockets
 
 logger = logging.getLogger(__name__)
 
+# Global registry of all adapter manager instances so services can query connection stats
+_adapter_managers: list["WebSocketAdapterManagerImpl"] = []
+
+
+def get_ws_stats() -> list[dict]:
+    """Return connection stats for all active WebSocket adapter managers."""
+    return [mgr.get_stats() for mgr in _adapter_managers]
+
 
 class WebSocketAdapterManager:
     """Graph-time representation of a WebSocket data source that feeds multiple symbol streams."""
@@ -39,6 +47,34 @@ class WebSocketAdapterManagerImpl(AdapterManagerImpl):
         self._adapters: dict[str, list] = {}
         self._running = False
         self._thread: threading.Thread | None = None
+
+        self._msgs_received = 0
+        self._msgs_dispatched = 0
+        self._connected_at: float | None = None
+        self._last_msg_at: float | None = None
+        self._reconnect_count = 0
+        self._connected = False
+
+        _adapter_managers.append(self)
+
+    def get_stats(self) -> dict:
+        now = time.time()
+        uptime = None
+        if self._connected and self._connected_at is not None:
+            uptime = round(now - self._connected_at, 1)
+        last_msg_ago = None
+        if self._last_msg_at is not None:
+            last_msg_ago = round(now - self._last_msg_at, 1)
+        return {
+            "source": self._ws_url,
+            "connected": self._connected,
+            "uptime_seconds": uptime,
+            "messages_received": self._msgs_received,
+            "messages_dispatched": self._msgs_dispatched,
+            "last_message_seconds_ago": last_msg_ago,
+            "reconnect_count": self._reconnect_count,
+            "symbols_subscribed": len(self._adapters),
+        }
 
     def start(self, starttime, endtime):
         self._running = True
@@ -67,18 +103,23 @@ class WebSocketAdapterManagerImpl(AdapterManagerImpl):
         while self._running:
             try:
                 async with websockets.connect(self._ws_url) as ws:
+                    self._connected = True
+                    self._connected_at = time.time()
                     logger.info(f"WebSocketAdapter: connected to {self._ws_url}")
                     while self._running:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
                         except asyncio.TimeoutError:
                             continue
+
+                        self._msgs_received += 1
+                        self._last_msg_at = time.time()
+
                         try:
                             data = json.loads(raw)
                         except json.JSONDecodeError:
                             continue
 
-                        # Handle envelope messages from price engine: {"type": "...", "data": {...}}
                         if "type" in data and "data" in data:
                             data = data["data"]
 
@@ -86,8 +127,11 @@ class WebSocketAdapterManagerImpl(AdapterManagerImpl):
                         if symbol and symbol in self._adapters:
                             for adapter in self._adapters[symbol]:
                                 adapter.push_tick(data)
+                            self._msgs_dispatched += 1
             except Exception as e:
+                self._connected = False
                 if self._running:
+                    self._reconnect_count += 1
                     logger.warning(f"WebSocketAdapter: connection lost ({e}), reconnecting in {self._reconnect_interval}s")
                     time.sleep(self._reconnect_interval)
 

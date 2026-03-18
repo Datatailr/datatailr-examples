@@ -1,5 +1,4 @@
 import csp
-from datetime import datetime
 
 
 class Tick(csp.Struct):
@@ -82,5 +81,4 @@ VOLATILITIES = {
     "GOLD": 0.01, "SILVER": 0.018, "OIL": 0.025,
 }
 
-WS_PORT_MARKET_DATA = 8765
-WS_PORT_PRICE_ENGINE = 8766
+WS_PATH = "/ws"

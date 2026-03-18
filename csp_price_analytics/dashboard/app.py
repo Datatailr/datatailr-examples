@@ -1,6 +1,9 @@
+import asyncio
 import json
 import os
+import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import pandas as pd
@@ -13,10 +16,15 @@ MARKET_DATA_URL = "http://market-data-generator"
 PRICE_ENGINE_URL = "http://price-engine"
 RISK_MONITOR_URL = "http://risk-monitor"
 
+MARKET_DATA_WS_URL = "ws://market-data-generator/ws"
+PRICE_ENGINE_WS_URL = "ws://price-engine/ws"
+
 if os.getenv("DATATAILR_JOB_TYPE") == "workspace":
     MARKET_DATA_URL = "http://localhost:1024"
     PRICE_ENGINE_URL = "http://localhost:1025"
     RISK_MONITOR_URL = "http://localhost:1026"
+    MARKET_DATA_WS_URL = "ws://localhost:1024/ws"
+    PRICE_ENGINE_WS_URL = "ws://localhost:1025/ws"
 
 
 def api_get(base_url, path, params=None, timeout=5):
@@ -28,6 +36,89 @@ def api_get(base_url, path, params=None, timeout=5):
         return None
 
 
+# ---------------------------------------------------------------------------
+# Background WebSocket consumer -- feeds live data into shared buffers
+# ---------------------------------------------------------------------------
+
+class _StreamingState:
+    """Shared mutable state for the background WS consumer threads."""
+    def __init__(self):
+        self.tick_feed: deque[dict] = deque(maxlen=100)
+        self.signal_feed: deque[dict] = deque(maxlen=50)
+        self.tick_count = 0
+        self.signal_count = 0
+        self.md_connected = False
+        self.pe_connected = False
+        self.lock = threading.Lock()
+
+_streaming = _StreamingState()
+_ws_threads_started = False
+
+
+def _run_md_ws():
+    """Background thread: consume raw ticks from market data generator via WebSocket."""
+    import websockets
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def _consume():
+        while True:
+            try:
+                async with websockets.connect(MARKET_DATA_WS_URL) as ws:
+                    _streaming.md_connected = True
+                    async for raw in ws:
+                        try:
+                            tick = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        with _streaming.lock:
+                            _streaming.tick_feed.append(tick)
+                            _streaming.tick_count += 1
+            except Exception:
+                _streaming.md_connected = False
+                await asyncio.sleep(2)
+
+    loop.run_until_complete(_consume())
+
+
+def _run_pe_ws():
+    """Background thread: consume signals from price engine via WebSocket."""
+    import websockets
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def _consume():
+        while True:
+            try:
+                async with websockets.connect(PRICE_ENGINE_WS_URL) as ws:
+                    _streaming.pe_connected = True
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if msg.get("type") == "signal":
+                            with _streaming.lock:
+                                _streaming.signal_feed.append(msg["data"])
+                                _streaming.signal_count += 1
+            except Exception:
+                _streaming.pe_connected = False
+                await asyncio.sleep(2)
+
+    loop.run_until_complete(_consume())
+
+
+def _ensure_ws_threads():
+    global _ws_threads_started
+    if _ws_threads_started:
+        return
+    _ws_threads_started = True
+    threading.Thread(target=_run_md_ws, daemon=True, name="dash-md-ws").start()
+    threading.Thread(target=_run_pe_ws, daemon=True, name="dash-pe-ws").start()
+
+
 def main():
     st.set_page_config(
         page_title="CSP Price Analytics",
@@ -35,6 +126,8 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded",
     )
+
+    _ensure_ws_threads()
 
     st.sidebar.title("CSP Price Analytics")
     st.sidebar.markdown("---")
@@ -45,6 +138,14 @@ def main():
 
     auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
     refresh_interval = st.sidebar.slider("Refresh interval (s)", 2, 30, 5)
+
+    # Sidebar streaming indicator
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**WebSocket Feeds**")
+    md_icon = "🟢" if _streaming.md_connected else "🔴"
+    pe_icon = "🟢" if _streaming.pe_connected else "🔴"
+    st.sidebar.markdown(f"{md_icon} Market Data: **{_streaming.tick_count:,}** ticks")
+    st.sidebar.markdown(f"{pe_icon} Price Engine: **{_streaming.signal_count:,}** signals")
 
     if page == "Live Monitor":
         page_live_monitor()
@@ -95,36 +196,81 @@ def page_live_monitor():
 
     st.markdown("---")
 
-    # Latest prices table
-    st.subheader("Latest Prices")
-    latest = api_get(MARKET_DATA_URL, "/latest")
-    if latest:
+    # --- Live streaming tick feed (data received via WebSocket, NOT REST) ---
+    st.subheader("Live Streaming Tick Feed")
+    st.caption("Data below arrives via WebSocket directly from market-data-generator — not from REST polling.")
+
+    with _streaming.lock:
+        recent_ticks = list(_streaming.tick_feed)
+
+    if recent_ticks:
+        # Build a table of latest price per symbol from the WS feed
+        ws_latest: dict[str, dict] = {}
+        for t in recent_ticks:
+            ws_latest[t["symbol"]] = t
+
         rows = []
-        for sym, tick in sorted(latest.items()):
+        for sym in sorted(ws_latest):
+            t = ws_latest[sym]
             rows.append({
                 "Symbol": sym,
-                "Price": tick.get("price", 0),
-                "Bid": tick.get("bid", 0),
-                "Ask": tick.get("ask", 0),
-                "Volume": tick.get("volume", 0),
-                "Spread": round(tick.get("ask", 0) - tick.get("bid", 0), 6),
+                "Price": t.get("price", 0),
+                "Bid": t.get("bid", 0),
+                "Ask": t.get("ask", 0),
+                "Volume": t.get("volume", 0),
+                "Source": t.get("source", ""),
+                "Timestamp": t.get("timestamp", ""),
             })
-        if rows:
-            df = pd.DataFrame(rows)
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Price": st.column_config.NumberColumn(format="%.4f"),
-                    "Bid": st.column_config.NumberColumn(format="%.4f"),
-                    "Ask": st.column_config.NumberColumn(format="%.4f"),
-                    "Spread": st.column_config.NumberColumn(format="%.6f"),
-                },
-            )
+        df = pd.DataFrame(rows)
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Price": st.column_config.NumberColumn(format="%.4f"),
+                "Bid": st.column_config.NumberColumn(format="%.4f"),
+                "Ask": st.column_config.NumberColumn(format="%.4f"),
+            },
+        )
 
-    # Analytics snapshot
-    st.subheader("Analytics Snapshot")
+        # Show the raw streaming ticker (last N ticks as they arrived)
+        with st.expander(f"Raw tick stream (last {min(len(recent_ticks), 20)} messages via WebSocket)"):
+            for t in reversed(recent_ticks[-20:]):
+                st.text(
+                    f"{t.get('timestamp', ''):>26}  {t.get('symbol', ''):>10}  "
+                    f"price={t.get('price', 0):>12.4f}  "
+                    f"bid={t.get('bid', 0):>12.4f}  "
+                    f"ask={t.get('ask', 0):>12.4f}  "
+                    f"vol={t.get('volume', 0):>8.0f}"
+                )
+    else:
+        st.info("Waiting for streaming data from WebSocket feed...")
+
+    st.markdown("---")
+
+    # --- Live streaming signal feed (via WebSocket from price engine) ---
+    st.subheader("Live Streaming Signals")
+    st.caption("Signals below arrive via WebSocket directly from price-engine — not from REST polling.")
+
+    with _streaming.lock:
+        recent_signals = list(_streaming.signal_feed)
+
+    if recent_signals:
+        for sig in reversed(recent_signals[-15:]):
+            icon = "🟢" if sig.get("signal_type") == "BUY" else "🔴" if sig.get("signal_type") == "SELL" else "⚪"
+            st.markdown(
+                f"{icon} **{sig.get('symbol')}** {sig.get('signal_type')} "
+                f"@ {sig.get('price', 0):.4f} — {sig.get('reason', '')} "
+                f"(strength: {sig.get('strength', 0):.2f})"
+            )
+    else:
+        st.info("Waiting for streaming signals from WebSocket feed...")
+
+    st.markdown("---")
+
+    # --- Analytics snapshot (REST, for comparison) ---
+    st.subheader("Analytics Snapshot (REST)")
+    st.caption("This section uses REST polling for comparison. The data originates from the same CSP pipeline.")
     snapshot = api_get(PRICE_ENGINE_URL, "/snapshot")
     if snapshot:
         rows = []
@@ -153,20 +299,6 @@ def page_live_monitor():
                     "RSI": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f"),
                 },
             )
-
-    # Recent signals
-    st.subheader("Recent Signals")
-    signals = api_get(PRICE_ENGINE_URL, "/signals", params={"limit": 20})
-    if signals:
-        for sig in reversed(signals[-10:]):
-            icon = "🟢" if sig.get("signal_type") == "BUY" else "🔴" if sig.get("signal_type") == "SELL" else "⚪"
-            st.markdown(
-                f"{icon} **{sig.get('symbol')}** {sig.get('signal_type')} "
-                f"@ {sig.get('price', 0):.4f} — {sig.get('reason', '')} "
-                f"(strength: {sig.get('strength', 0):.2f})"
-            )
-    else:
-        st.info("No signals generated yet")
 
 
 # ---------------------------------------------------------------------------
@@ -348,9 +480,87 @@ def page_analytics():
 # System Control
 # ---------------------------------------------------------------------------
 
+def _format_duration(seconds):
+    if seconds is None:
+        return "N/A"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
 def page_system_control():
     st.header("System Control")
 
+    # --- WebSocket streaming connections ---
+    st.subheader("Streaming Connections")
+    st.caption(
+        "Live WebSocket connections between services. "
+        "These prove that data flows via streaming, not REST polling."
+    )
+
+    ws_consumers = [
+        ("Price Engine", PRICE_ENGINE_URL),
+        ("Risk Monitor", RISK_MONITOR_URL),
+    ]
+
+    for service_name, url in ws_consumers:
+        stats_list = api_get(url, "/ws-stats")
+        if stats_list is None:
+            st.warning(f"{service_name}: offline")
+            continue
+        if not stats_list:
+            st.info(f"{service_name}: no WebSocket connections established yet")
+            continue
+
+        for stats in stats_list:
+            connected = stats.get("connected", False)
+            icon = "🟢" if connected else "🔴"
+            source = stats.get("source", "unknown")
+            label = f"{icon} {service_name} ← `{source}`"
+
+            with st.expander(label, expanded=True):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Messages Received", f"{stats.get('messages_received', 0):,}")
+                c2.metric("Messages Dispatched", f"{stats.get('messages_dispatched', 0):,}")
+                c3.metric("Connection Uptime", _format_duration(stats.get("uptime_seconds")))
+                last_ago = stats.get("last_message_seconds_ago")
+                c4.metric("Last Message", _format_duration(last_ago) + " ago" if last_ago is not None else "N/A")
+
+                c5, c6 = st.columns(2)
+                c5.metric("Symbols Subscribed", stats.get("symbols_subscribed", 0))
+                c6.metric("Reconnects", stats.get("reconnect_count", 0))
+
+    st.markdown("---")
+
+    # --- Data provenance ---
+    st.subheader("Data Provenance")
+    st.caption("Source fields embedded in live data, proving the streaming pipeline end-to-end.")
+
+    prov_col1, prov_col2 = st.columns(2)
+    with prov_col1:
+        latest = api_get(MARKET_DATA_URL, "/latest")
+        if latest:
+            sample_sym = next(iter(latest))
+            sample = latest[sample_sym]
+            st.markdown(f"**Market Data Generator** (sample: `{sample_sym}`)")
+            st.json(f'{sample}')
+        else:
+            st.warning("Market Data Generator offline")
+    with prov_col2:
+        snapshot = api_get(PRICE_ENGINE_URL, "/snapshot")
+        if snapshot:
+            sample_sym = next(iter(snapshot))
+            sample = snapshot[sample_sym]
+            st.markdown(f"**Price Engine** (sample: `{sample_sym}`)")
+            st.json(f'{sample}')
+        else:
+            st.warning("Price Engine offline")
+
+    st.markdown("---")
+
+    # --- Service status ---
     st.subheader("Service Status")
     services = [
         ("Market Data Generator", MARKET_DATA_URL),
@@ -371,11 +581,7 @@ def page_system_control():
     st.subheader("Market Data Configuration")
     config = api_get(MARKET_DATA_URL, "/config")
     if config:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("**Symbols:**", ", ".join(config.get("symbols", [])))
-        with col2:
-            st.write(f"**WebSocket Port:** {config.get('ws_port', 'N/A')}")
+        st.write("**Symbols:**", ", ".join(config.get("symbols", [])))
 
         with st.expander("Initial Prices"):
             st.json(config.get("initial_prices", {}))

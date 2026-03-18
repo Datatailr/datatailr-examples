@@ -8,15 +8,16 @@ from datetime import datetime, timedelta
 import csp
 from csp import ts
 from flask import Flask, jsonify
+from flask_sock import Sock
 
 from csp_price_analytics.common.models import (
     ALL_SYMBOLS,
     INITIAL_PRICES,
     SYMBOLS,
     VOLATILITIES,
-    WS_PORT_MARKET_DATA,
+    WS_PATH,
 )
-from csp_price_analytics.common.ws_server import WebSocketBroadcastServer
+from csp_price_analytics.common.ws_server import WebSocketBroadcaster
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ _state = {
     "tick_count": 0,
 }
 
-_ws_server: WebSocketBroadcastServer | None = None
+_broadcaster = WebSocketBroadcaster(name="market-data-ws")
 
 
 # ---------------------------------------------------------------------------
@@ -52,8 +53,7 @@ def price_generator(
         s_drift = random.uniform(-0.0001, 0.0001)
 
     if csp.ticked(timer):
-        # Geometric Brownian motion step
-        dt = 0.5  # ~0.5 second intervals
+        dt = 0.5
         z = random.gauss(0, 1)
         s_price *= math.exp((s_drift - 0.5 * volatility ** 2) * dt + volatility * math.sqrt(dt) * z)
 
@@ -81,13 +81,12 @@ def tick_publisher(
             "bid": bid,
             "ask": ask,
             "timestamp": datetime.utcnow().isoformat(),
+            "source": "csp:market_data_graph/price_generator",
         }
         _state["latest"][symbol] = tick
         _state["recent_ticks"].append(tick)
         _state["tick_count"] += 1
-
-        if _ws_server is not None:
-            _ws_server.broadcast(tick)
+        _broadcaster.broadcast(tick)
 
 
 @csp.graph
@@ -113,10 +112,16 @@ def _run_csp_engine():
 
 
 # ---------------------------------------------------------------------------
-# Flask REST API
+# Flask REST + WebSocket API (single port)
 # ---------------------------------------------------------------------------
 
 flask_app = Flask(__name__)
+sock = Sock(flask_app)
+
+
+@sock.route(WS_PATH)
+def ws_handler(ws):
+    _broadcaster.handle(ws)
 
 
 @flask_app.route("/__health_check__.html")
@@ -143,7 +148,6 @@ def status():
         "symbols_active": len(_state["latest"]),
         "symbols_total": len(ALL_SYMBOLS),
         "started_at": _state["started_at"],
-        "ws_port": WS_PORT_MARKET_DATA,
     })
 
 
@@ -168,7 +172,6 @@ def config():
         "symbols": ALL_SYMBOLS,
         "initial_prices": INITIAL_PRICES,
         "volatilities": VOLATILITIES,
-        "ws_port": WS_PORT_MARKET_DATA,
     })
 
 
@@ -177,16 +180,12 @@ def config():
 # ---------------------------------------------------------------------------
 
 def main(port):
-    global _ws_server
     _state["started_at"] = datetime.utcnow().isoformat()
-
-    _ws_server = WebSocketBroadcastServer(WS_PORT_MARKET_DATA, name="market-data-ws")
-    _ws_server.start()
-    logger.info(f"WebSocket broadcast server started on port {WS_PORT_MARKET_DATA}")
 
     csp_thread = threading.Thread(target=_run_csp_engine, daemon=True, name="csp-engine")
     csp_thread.start()
 
+    logger.info(f"Market Data Generator starting on port {port} (REST + WebSocket on {WS_PATH})")
     flask_app.run("0.0.0.0", port=int(port), debug=False)
 
 

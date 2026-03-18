@@ -1,6 +1,7 @@
 csp
 websockets
 flask
+flask-sock
 pandas
 numpy
 pyarrow

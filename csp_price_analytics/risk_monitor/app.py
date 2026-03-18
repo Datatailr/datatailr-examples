@@ -13,16 +13,14 @@ from flask import Flask, jsonify, request
 from csp_price_analytics.common.models import (
     ALL_SYMBOLS,
     INITIAL_PRICES,
-    WS_PORT_MARKET_DATA,
-    WS_PORT_PRICE_ENGINE,
 )
-from csp_price_analytics.common.ws_adapter import WebSocketAdapterManager
+from csp_price_analytics.common.ws_adapter import WebSocketAdapterManager, get_ws_stats
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MARKET_DATA_WS_URL = f"ws://market-data-generator:{WS_PORT_MARKET_DATA}"
-PRICE_ENGINE_WS_URL = f"ws://price-engine:{WS_PORT_PRICE_ENGINE}"
+MARKET_DATA_WS_URL = "ws://market-data-generator/ws"
+PRICE_ENGINE_WS_URL = "ws://price-engine/ws"
 
 SPIKE_THRESHOLD_PCT = 2.0
 HIGH_VOL_THRESHOLD = 0.05
@@ -189,7 +187,6 @@ def alert_publisher(alert: ts[dict]):
         _state["alerts"].append(alert)
         _state["active_alerts"][alert["alert_id"]] = alert
         _state["alert_count"] += 1
-        # Auto-expire active alerts (keep only last 50)
         if len(_state["active_alerts"]) > 50:
             oldest_key = next(iter(_state["active_alerts"]))
             del _state["active_alerts"][oldest_key]
@@ -222,7 +219,6 @@ def risk_monitor_graph():
         dd_alert = detect_drawdown_alert(pos.drawdown, symbol)
         alert_publisher(dd_alert)
 
-    # Subscribe to price engine signals (for future correlation with risk)
     for symbol in ALL_SYMBOLS:
         sig_raw = signal_adapter.subscribe(symbol, push_mode=csp.PushMode.LAST_VALUE)
         signal_processor(sig_raw)
@@ -230,7 +226,7 @@ def risk_monitor_graph():
 
 def _run_csp_engine():
     logger.info("Starting CSP risk monitor engine in realtime mode")
-    time.sleep(5)  # wait for upstream services
+    time.sleep(5)
     try:
         csp.run(
             risk_monitor_graph,
@@ -243,7 +239,7 @@ def _run_csp_engine():
 
 
 # ---------------------------------------------------------------------------
-# Flask REST API
+# Flask REST API (single port)
 # ---------------------------------------------------------------------------
 
 flask_app = Flask(__name__)
@@ -301,6 +297,11 @@ def risk_metrics():
     return jsonify(_state["risk_metrics"])
 
 
+@flask_app.route("/ws-stats")
+def ws_stats():
+    return jsonify(get_ws_stats())
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
@@ -311,6 +312,7 @@ def main(port):
     csp_thread = threading.Thread(target=_run_csp_engine, daemon=True, name="csp-risk-monitor")
     csp_thread.start()
 
+    logger.info(f"Risk Monitor starting on port {port}")
     flask_app.run("0.0.0.0", port=int(port), debug=False)
 
 

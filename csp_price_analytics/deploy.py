@@ -20,10 +20,12 @@ SERVICE_REQUIREMENTS = [
     "csp",
     "websockets",
     "flask",
+    "flask-sock",
     "numpy",
 ]
 
 PIPELINE_REQUIREMENTS = [
+    "csp",
     "numpy",
 ]
 
@@ -32,6 +34,7 @@ DASHBOARD_REQUIREMENTS = [
     "pandas",
     "plotly",
     "requests",
+    "websockets",
 ]
 
 
@@ -44,7 +47,7 @@ def market_data_service():
     return Service(
         name="Market Data Generator",
         entrypoint=main,
-        resources=Resources(memory="2g", cpu=1),
+        resources=Resources(memory="1g", cpu=1),
         python_requirements=SERVICE_REQUIREMENTS,
     )
 
@@ -54,7 +57,7 @@ def price_engine_service():
     return Service(
         name="Price Engine",
         entrypoint=main,
-        resources=Resources(memory="2g", cpu=1),
+        resources=Resources(memory="1g", cpu=1),
         python_requirements=SERVICE_REQUIREMENTS,
     )
 
@@ -64,7 +67,7 @@ def risk_monitor_service():
     return Service(
         name="Risk Monitor",
         entrypoint=main,
-        resources=Resources(memory="2g", cpu=1),
+        resources=Resources(memory="1g", cpu=1),
         python_requirements=SERVICE_REQUIREMENTS,
     )
 

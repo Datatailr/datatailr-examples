@@ -8,14 +8,11 @@ from datetime import datetime, timedelta
 import csp
 from csp import ts
 from flask import Flask, jsonify, request
+from flask_sock import Sock
 
-from csp_price_analytics.common.models import (
-    ALL_SYMBOLS,
-    WS_PORT_MARKET_DATA,
-    WS_PORT_PRICE_ENGINE,
-)
-from csp_price_analytics.common.ws_adapter import WebSocketAdapterManager
-from csp_price_analytics.common.ws_server import WebSocketBroadcastServer
+from csp_price_analytics.common.models import ALL_SYMBOLS, WS_PATH
+from csp_price_analytics.common.ws_adapter import WebSocketAdapterManager, get_ws_stats
+from csp_price_analytics.common.ws_server import WebSocketBroadcaster
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,9 +24,9 @@ _state = {
     "tick_count": 0,
 }
 
-_ws_server: WebSocketBroadcastServer | None = None
+_broadcaster = WebSocketBroadcaster(name="price-engine-ws")
 
-MARKET_DATA_WS_URL = f"ws://market-data-generator:{WS_PORT_MARKET_DATA}"
+MARKET_DATA_WS_URL = "ws://market-data-generator/ws"
 
 SMA_SHORT_WINDOW = 10
 SMA_LONG_WINDOW = 30
@@ -87,7 +84,6 @@ def compute_analytics(
         for p in prices_list[1:]:
             ema_short = alpha * p + (1 - alpha) * ema_short
 
-        # RSI
         rsi = 50.0
         if len(s_gains) >= RSI_PERIOD:
             avg_gain = sum(s_gains) / RSI_PERIOD
@@ -98,7 +94,6 @@ def compute_analytics(
             else:
                 rsi = 100.0
 
-        # Bollinger bands
         if n >= BOLLINGER_WINDOW:
             bb_prices = prices_list[-BOLLINGER_WINDOW:]
             bb_mean = sum(bb_prices) / BOLLINGER_WINDOW
@@ -123,10 +118,10 @@ def compute_analytics(
             "bollinger_lower": round(bollinger_lower, 6),
             "spread": round(spread, 6),
             "timestamp": datetime.utcnow().isoformat(),
+            "source": "csp:price_engine_graph/compute_analytics <- ws://market-data-generator/ws",
         }
         csp.output(analytics=analytics_data)
 
-        # Signal generation: moving average crossover
         if s_prev_sma_short is not None and s_prev_sma_long is not None and n >= SMA_LONG_WINDOW:
             crossed_up = s_prev_sma_short <= s_prev_sma_long and sma_short > sma_long
             crossed_down = s_prev_sma_short >= s_prev_sma_long and sma_short < sma_long
@@ -145,7 +140,6 @@ def compute_analytics(
                 }
                 csp.output(signal=signal_data)
 
-            # RSI-based signals
             if rsi > 70:
                 signal_data = {
                     "symbol": symbol,
@@ -176,16 +170,14 @@ def analytics_publisher(symbol: str, analytics: ts[dict]):
     if csp.ticked(analytics):
         _state["analytics"][symbol] = analytics
         _state["tick_count"] += 1
-        if _ws_server is not None:
-            _ws_server.broadcast({"type": "analytics", "data": analytics})
+        _broadcaster.broadcast({"type": "analytics", "data": analytics})
 
 
 @csp.node
 def signal_publisher(symbol: str, signal: ts[dict]):
     if csp.ticked(signal):
         _state["signals"].append(signal)
-        if _ws_server is not None:
-            _ws_server.broadcast({"type": "signal", "data": signal})
+        _broadcaster.broadcast({"type": "signal", "data": signal})
 
 
 @csp.graph
@@ -200,7 +192,7 @@ def price_engine_graph():
 
 def _run_csp_engine():
     logger.info("Starting CSP price engine in realtime mode")
-    time.sleep(3)  # wait for market data generator to start producing
+    time.sleep(3)
     try:
         csp.run(
             price_engine_graph,
@@ -213,10 +205,16 @@ def _run_csp_engine():
 
 
 # ---------------------------------------------------------------------------
-# Flask REST API
+# Flask REST + WebSocket API (single port)
 # ---------------------------------------------------------------------------
 
 flask_app = Flask(__name__)
+sock = Sock(flask_app)
+
+
+@sock.route(WS_PATH)
+def ws_handler(ws):
+    _broadcaster.handle(ws)
 
 
 @flask_app.route("/__health_check__.html")
@@ -262,21 +260,22 @@ def symbols():
     return jsonify(list(_state["analytics"].keys()))
 
 
+@flask_app.route("/ws-stats")
+def ws_stats():
+    return jsonify(get_ws_stats())
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
 def main(port):
-    global _ws_server
     _state["started_at"] = datetime.utcnow().isoformat()
-
-    _ws_server = WebSocketBroadcastServer(WS_PORT_PRICE_ENGINE, name="price-engine-ws")
-    _ws_server.start()
-    logger.info(f"WebSocket broadcast server started on port {WS_PORT_PRICE_ENGINE}")
 
     csp_thread = threading.Thread(target=_run_csp_engine, daemon=True, name="csp-price-engine")
     csp_thread.start()
 
+    logger.info(f"Price Engine starting on port {port} (REST + WebSocket on {WS_PATH})")
     flask_app.run("0.0.0.0", port=int(port), debug=False)
 
 
