@@ -1,0 +1,9 @@
+csp
+websockets
+flask
+pandas
+numpy
+pyarrow
+streamlit
+plotly
+requests

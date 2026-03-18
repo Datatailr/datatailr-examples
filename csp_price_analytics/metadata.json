@@ -1,0 +1,6 @@
+{
+  "name": "CSP Price Analytics",
+  "description": "Multi-component demo with live streaming price data using Point72's CSP library for reactive stream processing",
+  "tags": ["csp", "streaming", "price-analytics", "real-time", "websockets"],
+  "author": "Datatailr"
+}
