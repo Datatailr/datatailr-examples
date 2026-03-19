@@ -16,8 +16,8 @@ dashboard = App(
     entrypoint=dashboard_entrypoint,
     framework="flask",
     resources=Resources(memory="1g", cpu=1),
-    python_requirements=["flask", "gunicorn"],
+    python_requirements=["flask", "gunicorn", "requests"],
 )
 
-service.run()
+# service.run()
 dashboard.run()

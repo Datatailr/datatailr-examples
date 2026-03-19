@@ -115,7 +115,6 @@
   </div>
 
   <script>
-    const PRICE_SERVER = "{{ price_server_url }}";
     const MAX_ROWS = 5000;
 
     const TRADE_SCHEMA = {
@@ -188,7 +187,7 @@
         statusEl.textContent = "connecting...";
         statusEl.className   = "connecting";
 
-        const source = new EventSource(PRICE_SERVER + "/stream");
+        const source = new EventSource("{{ stream_url }}");
 
         source.onopen = () => {
           statusEl.textContent = "connected";
