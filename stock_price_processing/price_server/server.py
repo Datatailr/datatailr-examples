@@ -1,50 +1,107 @@
 import asyncio
-import numpy as np
 import json
-import datetime
-import time
 import logging
 import sys
+import datetime
+from dataclasses import dataclass, field
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import numpy as np
+from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, JSONResponse
+from sse_starlette.sse import EventSourceResponse
 import uvicorn
 
 
 HOST = "0.0.0.0"
 PORT = 8080
-last_price: dict[str, float] = {"ABC": 100, "DEF": 35, "XYZ": 49}
+
 log_format = logging.Formatter("[%(asctime)s] [%(levelname)s] - %(message)s")
-log = logging.getLogger("Quote server")
+log = logging.getLogger("Exchange feed")
 log.setLevel(logging.INFO)
 log_handler = logging.StreamHandler(sys.stdout)
 log_handler.setLevel(logging.INFO)
 log_handler.setFormatter(log_format)
 log.addHandler(log_handler)
 
+
+# ---------------------------------------------------------------------------
+# Market micro-structure model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TickerState:
+    """Per-ticker state that drives realistic quote/trade generation.
+
+    Price follows geometric Brownian motion.  The bid-ask spread is modelled
+    as a mean-reverting (Ornstein-Uhlenbeck) process around a base width
+    that scales with price level, so cheap stocks have tighter absolute
+    spreads and expensive stocks have wider ones.
+    """
+    mid: float
+    annual_vol: float = 0.25
+    base_spread_bps: float = 5.0
+    spread_vol_bps: float = 2.0
+    spread_mean_reversion: float = 0.15
+    _current_half_spread: float = field(init=False, default=0.0)
+
+    def __post_init__(self):
+        self._current_half_spread = self.mid * self.base_spread_bps / 10_000
+
+    def step(self, dt: float):
+        sigma = self.annual_vol
+        drift = -0.5 * sigma * sigma * dt
+        diffusion = sigma * np.sqrt(dt) * np.random.standard_normal()
+        self.mid *= np.exp(drift + diffusion)
+
+        target_half = self.mid * self.base_spread_bps / 10_000
+        spread_noise = (self.mid * self.spread_vol_bps / 10_000) * np.sqrt(dt) * np.random.standard_normal()
+        self._current_half_spread += self.spread_mean_reversion * (target_half - self._current_half_spread) * dt + spread_noise
+        self._current_half_spread = max(self._current_half_spread, self.mid * 0.5 / 10_000)
+
+    @property
+    def bid(self):
+        return round(self.mid - self._current_half_spread, 4)
+
+    @property
+    def ask(self):
+        return round(self.mid + self._current_half_spread, 4)
+
+    def random_trade(self):
+        """Generate a trade at a realistic price between bid and ask."""
+        aggressor = np.random.choice(["buy", "sell"])
+        price = self.ask if aggressor == "buy" else self.bid
+        size = int(np.random.lognormal(mean=4.5, sigma=1.0)) * 100
+        return price, size, aggressor
+
+
+INITIAL_TICKERS: dict[str, tuple[float, float]] = {
+    "AAPL": (185.0, 0.22),
+    "MSFT": (420.0, 0.20),
+    "GOOG": (175.0, 0.24),
+    "AMZN": (185.0, 0.28),
+    "TSLA": (250.0, 0.50),
+}
+
+tickers: dict[str, TickerState] = {
+    sym: TickerState(mid=mid, annual_vol=vol)
+    for sym, (mid, vol) in INITIAL_TICKERS.items()
+}
+
+# Sequence number for exchange events
+_seq = 0
+
+
+def next_seq():
+    global _seq
+    _seq += 1
+    return _seq
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
 app = FastAPI()
-
-
-def generate_ohlc(last_price, μ=0.1, σ=0.2, N=1000):
-    freq = 1 / 100
-    time.sleep(np.random.exponential(freq))
-    scale = N * 365 * 24 * 60 * 60 / freq
-    returns = np.random.normal(loc=μ / scale, scale=σ / np.sqrt(scale), size=N)
-    prices = last_price * np.exp(returns.cumsum())
-    return {
-        "Open": np.round(prices[0], 4),
-        "Low": np.round(min(prices), 4),
-        "High": np.round(max(prices), 4),
-        "Close": np.round(prices[-1], 4),
-        "timestamp": datetime.datetime.now(),
-    }
-
-
-def all_tickers():
-    return list(last_price.keys())
-
-
-# --- HTTP endpoints ---
 
 
 @app.get("/__health_check__.html")
@@ -54,106 +111,111 @@ async def health_check():
 
 @app.get("/tickers")
 async def get_tickers():
-    return JSONResponse(all_tickers())
+    return JSONResponse(list(tickers.keys()))
 
 
 @app.put("/add/{ticker}")
-async def add_ticker(ticker: str):
-    if ticker not in last_price:
-        last_price[ticker] = 100
-        log.info(f"Added ticker {ticker}")
-    return JSONResponse(all_tickers())
+async def add_ticker(ticker: str, price: float = 100.0, vol: float = 0.25):
+    ticker = ticker.upper()
+    if ticker not in tickers:
+        tickers[ticker] = TickerState(mid=price, annual_vol=vol)
+        log.info(f"Added {ticker} mid={price} vol={vol}")
+    return JSONResponse(list(tickers.keys()))
 
 
 @app.put("/remove/{ticker}")
 async def remove_ticker(ticker: str):
-    if ticker in last_price:
-        last_price.pop(ticker)
-        log.info(f"Removed ticker {ticker}")
-    return JSONResponse(all_tickers())
+    ticker = ticker.upper()
+    if ticker in tickers:
+        tickers.pop(ticker)
+        log.info(f"Removed {ticker}")
+    return JSONResponse(list(tickers.keys()))
 
 
 @app.get("/quote/{ticker}")
 async def get_quote(ticker: str):
-    if ticker in last_price:
-        prices = generate_ohlc(last_price[ticker])
-        prices["Ticker"] = ticker
-        last_price[ticker] = prices["Close"]
-    else:
-        prices = {
-            "Open": None,
-            "High": None,
-            "Low": None,
-            "Close": None,
-            "timestamp": None,
-            "Ticker": ticker,
-        }
-    prices = {k: [v] for k, v in prices.items()}
-    return JSONResponse(json.loads(json.dumps(prices, default=str)))
+    ticker = ticker.upper()
+    state = tickers.get(ticker)
+    if state is None:
+        return JSONResponse({"error": f"unknown ticker {ticker}"}, status_code=404)
+    return JSONResponse({
+        "ticker": ticker,
+        "bid": state.bid,
+        "ask": state.ask,
+        "mid": round(state.mid, 4),
+        "spread": round(state.ask - state.bid, 4),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    })
 
 
-# --- WebSocket endpoint ---
+# ---------------------------------------------------------------------------
+# SSE streaming
+# ---------------------------------------------------------------------------
+
+DT_PER_EVENT = 1.0 / (252 * 6.5 * 3600)
 
 
-async def _consumer(websocket: WebSocket):
-    """Listen for incoming commands: '?' lists tickers, '-TICKER' removes, 'TICKER' adds."""
-    try:
-        message = await websocket.receive_text()
-    except WebSocketDisconnect:
-        return
-    message = message.strip()
-    if message == "?":
-        await websocket.send_text(json.dumps(all_tickers()))
-    elif message.startswith("-"):
-        ticker = message[1:]
-        if ticker in last_price:
-            last_price.pop(ticker)
-            log.info(f"Removed ticker {ticker}")
-    else:
-        ticker = message
-        if ticker not in last_price:
-            last_price[ticker] = 100
-            log.info(f"Added ticker {ticker}")
+async def _event_generator():
+    """Yield a mix of quote and trade events across all active tickers."""
+    while True:
+        if not tickers:
+            await asyncio.sleep(0.1)
+            continue
+
+        symbols = list(tickers.keys())
+        sym = symbols[np.random.randint(len(symbols))]
+        state = tickers.get(sym)
+        if state is None:
+            continue
+
+        state.step(DT_PER_EVENT)
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        is_trade = np.random.random() < 0.4
+
+        if is_trade:
+            price, size, side = state.random_trade()
+            event = {
+                "type": "trade",
+                "seq": next_seq(),
+                "ticker": sym,
+                "price": price,
+                "size": size,
+                "side": side,
+                "timestamp": now,
+            }
+        else:
+            bid_size = int(np.random.lognormal(mean=5.0, sigma=0.8)) * 100
+            ask_size = int(np.random.lognormal(mean=5.0, sigma=0.8)) * 100
+            event = {
+                "type": "quote",
+                "seq": next_seq(),
+                "ticker": sym,
+                "bid": state.bid,
+                "bid_size": bid_size,
+                "ask": state.ask,
+                "ask_size": ask_size,
+                "mid": round(state.mid, 4),
+                "spread": round(state.ask - state.bid, 4),
+                "timestamp": now,
+            }
+
+        yield json.dumps(event)
+
+        await asyncio.sleep(np.random.exponential(1.0 / 50.0))
 
 
-async def _producer(websocket: WebSocket):
-    """Push OHLC quotes for a random subset of tracked tickers."""
-    num_tickers = len(last_price)
-    if num_tickers < 1:
-        return
-    num_quotes = np.random.randint(1, num_tickers) if num_tickers > 1 else 1
-    for ticker in np.random.choice(list(last_price.keys()), num_quotes):
-        prices = generate_ohlc(last_price[ticker])
-        prices["Ticker"] = ticker
-        if ticker in last_price:
-            last_price[ticker] = prices["Close"]
-        try:
-            await websocket.send_text(json.dumps(prices, default=str))
-        except WebSocketDisconnect:
-            return
+@app.get("/stream")
+async def stream_events():
+    return EventSourceResponse(_event_generator())
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        while True:
-            consumer_task = asyncio.create_task(_consumer(websocket))
-            producer_task = asyncio.create_task(_producer(websocket))
-            done, pending = await asyncio.wait(
-                [consumer_task, producer_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-    except WebSocketDisconnect:
-        log.info("Client disconnected")
-    except Exception:
-        log.info("WebSocket connection closed")
-
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 def main(port: int = PORT):
-    log.info(f"Serving quotes on {HOST}:{port}")
+    log.info(f"Exchange feed on {HOST}:{port}")
     uvicorn.run(app, host=HOST, port=int(port), log_level="info")
 
 
