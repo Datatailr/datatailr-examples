@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 import uvicorn
@@ -102,6 +103,7 @@ def next_seq():
 # ---------------------------------------------------------------------------
 
 app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/__health_check__.html")

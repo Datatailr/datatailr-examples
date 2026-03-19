@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Exchange Monitor</title>
+
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/css/pro.css" />
+
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective/dist/umd/perspective.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/umd/perspective-viewer.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-datagrid/dist/umd/perspective-viewer-datagrid.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-d3fc/dist/umd/perspective-viewer-d3fc.js"></script>
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 20px;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #e6edf3;
+    }
+
+    #status {
+      font-size: 13px;
+      padding: 4px 12px;
+      border-radius: 12px;
+      background: #1f2937;
+    }
+
+    #status.connected    { color: #3fb950; }
+    #status.disconnected { color: #f85149; }
+    #status.connecting   { color: #d29922; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      gap: 6px;
+      padding: 6px;
+      flex: 1;
+      min-height: 0;
+    }
+
+    .panel {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .panel-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #8b949e;
+      padding: 8px 12px;
+      border-bottom: 1px solid #30363d;
+      flex-shrink: 0;
+    }
+
+    .panel perspective-viewer {
+      flex: 1;
+      min-height: 0;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Exchange Monitor</h1>
+    <span id="status" class="connecting">connecting...</span>
+  </header>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="panel-title">Trades</div>
+      <perspective-viewer id="trades-viewer" theme="Pro Dark"></perspective-viewer>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Quotes</div>
+      <perspective-viewer id="quotes-viewer" theme="Pro Dark"></perspective-viewer>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Trade Chart</div>
+      <perspective-viewer id="trade-chart" theme="Pro Dark"></perspective-viewer>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Spread Monitor</div>
+      <perspective-viewer id="spread-viewer" theme="Pro Dark"></perspective-viewer>
+    </div>
+  </div>
+
+  <script>
+    const PRICE_SERVER = "{{ price_server_url }}";
+    const MAX_ROWS = 5000;
+
+    const TRADE_SCHEMA = {
+      seq:       "integer",
+      ticker:    "string",
+      price:     "float",
+      size:      "integer",
+      side:      "string",
+      timestamp: "datetime",
+    };
+
+    const QUOTE_SCHEMA = {
+      seq:       "integer",
+      ticker:    "string",
+      bid:       "float",
+      bid_size:  "integer",
+      ask:       "float",
+      ask_size:  "integer",
+      mid:       "float",
+      spread:    "float",
+      timestamp: "datetime",
+    };
+
+    function parseTimestamp(row) {
+      if (row.timestamp) row.timestamp = new Date(row.timestamp);
+      return row;
+    }
+
+    async function main() {
+      const statusEl = document.getElementById("status");
+      const worker   = perspective.worker();
+
+      const tradeTable  = await worker.table(TRADE_SCHEMA, { limit: MAX_ROWS });
+      const quoteTable  = await worker.table(QUOTE_SCHEMA, { limit: MAX_ROWS });
+
+      const tradesViewer = document.getElementById("trades-viewer");
+      const quotesViewer = document.getElementById("quotes-viewer");
+      const tradeChart   = document.getElementById("trade-chart");
+      const spreadViewer = document.getElementById("spread-viewer");
+
+      await tradesViewer.load(tradeTable);
+      await tradesViewer.restore({
+        sort: [["timestamp", "desc"]],
+      });
+
+      await quotesViewer.load(quoteTable);
+      await quotesViewer.restore({
+        sort: [["timestamp", "desc"]],
+      });
+
+      await tradeChart.load(tradeTable);
+      await tradeChart.restore({
+        plugin:      "Y Line",
+        group_by:    ["timestamp"],
+        split_by:    ["ticker"],
+        columns:     ["price"],
+        sort:        [["timestamp", "asc"]],
+      });
+
+      await spreadViewer.load(quoteTable);
+      await spreadViewer.restore({
+        plugin:      "Y Line",
+        group_by:    ["timestamp"],
+        split_by:    ["ticker"],
+        columns:     ["spread"],
+        sort:        [["timestamp", "asc"]],
+      });
+
+      function connect() {
+        statusEl.textContent = "connecting...";
+        statusEl.className   = "connecting";
+
+        const source = new EventSource(PRICE_SERVER + "/stream");
+
+        source.onopen = () => {
+          statusEl.textContent = "connected";
+          statusEl.className   = "connected";
+        };
+
+        source.onmessage = (msg) => {
+          const event = parseTimestamp(JSON.parse(msg.data));
+          if (event.type === "trade") {
+            delete event.type;
+            tradeTable.update([event]);
+          } else if (event.type === "quote") {
+            delete event.type;
+            quoteTable.update([event]);
+          }
+        };
+
+        source.onerror = () => {
+          statusEl.textContent = "disconnected";
+          statusEl.className   = "disconnected";
+          source.close();
+          setTimeout(connect, 3000);
+        };
+      }
+
+      connect();
+    }
+
+    window.addEventListener("DOMContentLoaded", main);
+  </script>
+</body>
+</html>
