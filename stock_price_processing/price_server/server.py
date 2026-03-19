@@ -181,9 +181,9 @@ async def _event_generator():
         state.step(DT_PER_EVENT)
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-        is_trade = np.random.random() < 0.4
+        r = np.random.random()
 
-        if is_trade:
+        if r < 0.4:
             price, size, side = state.random_trade()
             event = {
                 "type": "trade",
@@ -195,16 +195,17 @@ async def _event_generator():
                 "timestamp": now,
             }
         else:
-            bid_size = int(np.random.lognormal(mean=5.0, sigma=0.8)) * 100
-            ask_size = int(np.random.lognormal(mean=5.0, sigma=0.8)) * 100
+            quote_side = "bid" if r < 0.7 else "ask"
+            size = int(np.random.lognormal(mean=5.0, sigma=0.8)) * 100
             event = {
                 "type": "quote",
                 "seq": next_seq(),
                 "ticker": sym,
+                "quote_side": quote_side,
+                "quote_price": state.bid if quote_side == "bid" else state.ask,
+                "quote_size": size,
                 "bid": state.bid,
-                "bid_size": bid_size,
                 "ask": state.ask,
-                "ask_size": ask_size,
                 "mid": round(state.mid, 4),
                 "spread": round(state.ask - state.bid, 4),
                 "timestamp": now,

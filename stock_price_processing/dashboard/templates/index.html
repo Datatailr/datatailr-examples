@@ -155,15 +155,16 @@
     };
 
     const QUOTE_SCHEMA = {
-      seq:       "integer",
-      ticker:    "string",
-      bid:       "float",
-      bid_size:  "integer",
-      ask:       "float",
-      ask_size:  "integer",
-      mid:       "float",
-      spread:    "float",
-      timestamp: "datetime",
+      seq:         "integer",
+      ticker:      "string",
+      quote_side:  "string",
+      quote_price: "float",
+      quote_size:  "integer",
+      bid:         "float",
+      ask:         "float",
+      mid:         "float",
+      spread:      "float",
+      timestamp:   "datetime",
     };
 
     function parseTimestamp(row) {
