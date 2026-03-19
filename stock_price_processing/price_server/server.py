@@ -111,7 +111,9 @@ async def health_check():
 
 @app.get("/tickers")
 async def get_tickers():
-    return JSONResponse(list(tickers.keys()))
+    tickers_keys = list(tickers.keys())
+    log.info(f"GET /tickers -> {tickers_keys}")
+    return JSONResponse(tickers_keys)
 
 
 @app.put("/add/{ticker}")
@@ -119,7 +121,9 @@ async def add_ticker(ticker: str, price: float = 100.0, vol: float = 0.25):
     ticker = ticker.upper()
     if ticker not in tickers:
         tickers[ticker] = TickerState(mid=price, annual_vol=vol)
-        log.info(f"Added {ticker} mid={price} vol={vol}")
+        log.info(f"PUT /add/{ticker} -> added (price={price}, vol={vol})")
+    else:
+        log.info(f"PUT /add/{ticker} -> already exists, skipped")
     return JSONResponse(list(tickers.keys()))
 
 
@@ -128,7 +132,9 @@ async def remove_ticker(ticker: str):
     ticker = ticker.upper()
     if ticker in tickers:
         tickers.pop(ticker)
-        log.info(f"Removed {ticker}")
+        log.info(f"PUT /remove/{ticker} -> removed")
+    else:
+        log.info(f"PUT /remove/{ticker} -> not found, skipped")
     return JSONResponse(list(tickers.keys()))
 
 
@@ -137,7 +143,9 @@ async def get_quote(ticker: str):
     ticker = ticker.upper()
     state = tickers.get(ticker)
     if state is None:
+        log.info(f"GET /quote/{ticker} -> not found")
         return JSONResponse({"error": f"unknown ticker {ticker}"}, status_code=404)
+    log.info(f"GET /quote/{ticker} -> bid={state.bid} ask={state.ask} mid={round(state.mid, 4)}")
     return JSONResponse({
         "ticker": ticker,
         "bid": state.bid,
