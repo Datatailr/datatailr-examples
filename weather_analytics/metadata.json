@@ -1,0 +1,6 @@
+{
+    "name": "Global Weather Analytics",
+    "description": "Multi-stage weather data pipeline processing 192 cities worldwide via Open-Meteo, with a Streamlit dashboard and Flask REST API -- all deployed as interconnected Datatailr components.",
+    "tags": ["Weather", "Data Pipeline", "Dashboard", "REST API", "Open-Meteo", "Streamlit", "Analytics", "Geospatial"],
+    "author": "Denis Geidman"
+}
