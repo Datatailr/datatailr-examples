@@ -7,6 +7,8 @@
 
   <link rel="stylesheet"
         href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/css/pro.css" />
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/css/pro-dark.css" />
 
   <script src="https://cdn.jsdelivr.net/npm/@finos/perspective/dist/umd/perspective.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/umd/perspective-viewer.js"></script>
@@ -52,6 +54,25 @@
     #status.disconnected { color: #f85149; }
     #status.connecting   { color: #d29922; }
 
+    .header-controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    #ticker-filter {
+      background: #1f2937;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 13px;
+      cursor: pointer;
+      outline: none;
+    }
+
+    #ticker-filter:hover { border-color: #58a6ff; }
+
     .grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -86,36 +107,43 @@
     .panel perspective-viewer {
       flex: 1;
       min-height: 0;
+      background: #fff;
+      color: #212529;
     }
   </style>
 </head>
 <body>
   <header>
     <h1>Exchange Monitor</h1>
-    <span id="status" class="connecting">connecting...</span>
+    <div class="header-controls">
+      <select id="ticker-filter">
+        <option value="">All Tickers</option>
+      </select>
+      <span id="status" class="connecting">connecting...</span>
+    </div>
   </header>
 
   <div class="grid">
     <div class="panel">
       <div class="panel-title">Trades</div>
-      <perspective-viewer id="trades-viewer" theme="Pro Dark"></perspective-viewer>
+      <perspective-viewer id="trades-viewer" theme="Pro Light"></perspective-viewer>
     </div>
     <div class="panel">
       <div class="panel-title">Quotes</div>
-      <perspective-viewer id="quotes-viewer" theme="Pro Dark"></perspective-viewer>
+      <perspective-viewer id="quotes-viewer" theme="Pro Light"></perspective-viewer>
     </div>
     <div class="panel">
       <div class="panel-title">Trade Chart</div>
-      <perspective-viewer id="trade-chart" theme="Pro Dark"></perspective-viewer>
+      <perspective-viewer id="trade-chart" theme="Pro Light"></perspective-viewer>
     </div>
     <div class="panel">
       <div class="panel-title">Spread Monitor</div>
-      <perspective-viewer id="spread-viewer" theme="Pro Dark"></perspective-viewer>
+      <perspective-viewer id="spread-viewer" theme="Pro Light"></perspective-viewer>
     </div>
   </div>
 
   <script>
-    const MAX_ROWS = 5000;
+    const MAX_ROWS = 500;
 
     const TRADE_SCHEMA = {
       seq:       "integer",
@@ -144,43 +172,57 @@
     }
 
     async function main() {
-      const statusEl = document.getElementById("status");
-      const worker   = perspective.worker();
+      const statusEl     = document.getElementById("status");
+      const filterSelect = document.getElementById("ticker-filter");
+      const worker       = perspective.worker();
 
       const tradeTable  = await worker.table(TRADE_SCHEMA, { limit: MAX_ROWS });
       const quoteTable  = await worker.table(QUOTE_SCHEMA, { limit: MAX_ROWS });
 
-      const tradesViewer = document.getElementById("trades-viewer");
-      const quotesViewer = document.getElementById("quotes-viewer");
-      const tradeChart   = document.getElementById("trade-chart");
-      const spreadViewer = document.getElementById("spread-viewer");
+      const viewers = {
+        trades: document.getElementById("trades-viewer"),
+        quotes: document.getElementById("quotes-viewer"),
+        chart:  document.getElementById("trade-chart"),
+        spread: document.getElementById("spread-viewer"),
+      };
 
-      await tradesViewer.load(tradeTable);
-      await tradesViewer.restore({
-        sort: [["timestamp", "desc"]],
-      });
+      await viewers.trades.load(tradeTable);
+      await viewers.trades.restore({ sort: [["timestamp", "desc"]] });
 
-      await quotesViewer.load(quoteTable);
-      await quotesViewer.restore({
-        sort: [["timestamp", "desc"]],
-      });
+      await viewers.quotes.load(quoteTable);
+      await viewers.quotes.restore({ sort: [["timestamp", "desc"]] });
 
-      await tradeChart.load(tradeTable);
-      await tradeChart.restore({
+      await viewers.chart.load(tradeTable);
+      await viewers.chart.restore({
         plugin:      "Y Line",
         group_by:    ["timestamp"],
         split_by:    ["ticker"],
         columns:     ["price"],
+        aggregates:  { price: "last" },
         sort:        [["timestamp", "asc"]],
       });
 
-      await spreadViewer.load(quoteTable);
-      await spreadViewer.restore({
+      await viewers.spread.load(quoteTable);
+      await viewers.spread.restore({
         plugin:      "Y Line",
         group_by:    ["timestamp"],
         split_by:    ["ticker"],
         columns:     ["spread"],
+        aggregates:  { spread: "last" },
         sort:        [["timestamp", "asc"]],
+      });
+
+      const knownTickers = new Set();
+
+      function applyFilter(ticker) {
+        const filter = ticker ? [["ticker", "==", ticker]] : [];
+        for (const v of Object.values(viewers)) {
+          v.restore({ filter });
+        }
+      }
+
+      filterSelect.addEventListener("change", () => {
+        applyFilter(filterSelect.value);
       });
 
       function connect() {
@@ -196,6 +238,13 @@
 
         source.onmessage = (msg) => {
           const event = parseTimestamp(JSON.parse(msg.data));
+          if (event.ticker && !knownTickers.has(event.ticker)) {
+            knownTickers.add(event.ticker);
+            const opt = document.createElement("option");
+            opt.value = event.ticker;
+            opt.textContent = event.ticker;
+            filterSelect.appendChild(opt);
+          }
           if (event.type === "trade") {
             delete event.type;
             tradeTable.update([event]);
