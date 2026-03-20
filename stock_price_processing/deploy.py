@@ -8,6 +8,7 @@ from stock_price_processing.data_collector.service import main as data_collector
 from datatailr import Service, App, Resources
 
 import stock_price_processing.price_server_dashboard.monitoring as dashboard_entrypoint
+import stock_price_processing.lake_query.dashboard as lake_dashboard_entrypoint
 
 
 price_server = Service(
@@ -39,7 +40,16 @@ dashboard = App(
     python_requirements=["flask", "gunicorn", "requests"],
 )
 
+lake_dashboard = App(
+    name="Lake Query Dashboard",
+    entrypoint=lake_dashboard_entrypoint,
+    framework="flask",
+    resources=Resources(memory="4g", cpu=1),
+    python_requirements=["flask", "gunicorn", "requests", "duckdb", "pyarrow", "pandas"],
+)
+
 price_server.run()
 price_processing.run()
 data_collector.run()
 dashboard.run()
+lake_dashboard.run()
