@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ticker control · Exchange Monitor</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 20px;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      flex-shrink: 0;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #e6edf3;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .nav-links a {
+      color: #58a6ff;
+      text-decoration: none;
+      font-size: 14px;
+    }
+
+    .nav-links a:hover { text-decoration: underline; }
+
+    .header-center {
+      flex: 1;
+      display: flex;
+      justify-content: center;
+      min-width: 0;
+    }
+
+    .user-ribbon {
+      font-size: 13px;
+      color: #8b949e;
+      text-align: center;
+      line-height: 1.35;
+    }
+
+    .user-ribbon .user-name { color: #e6edf3; font-weight: 500; }
+    .user-ribbon .user-email { color: #8b949e; font-size: 12px; }
+    .user-ribbon.local { color: #6e7681; font-style: italic; }
+
+    main {
+      padding: 20px;
+      max-width: 720px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin-bottom: 16px;
+    }
+
+    .card h2 {
+      font-size: 14px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #8b949e;
+      margin-bottom: 14px;
+    }
+
+    .msg {
+      padding: 10px 12px;
+      border-radius: 6px;
+      margin-bottom: 14px;
+      font-size: 14px;
+      display: none;
+    }
+
+    .msg.visible { display: block; }
+    .msg.error {
+      background: rgba(248, 81, 73, 0.15);
+      border: 1px solid #f85149;
+      color: #ff7b72;
+    }
+    .msg.ok {
+      background: rgba(63, 185, 80, 0.12);
+      border: 1px solid #3fb950;
+      color: #3fb950;
+    }
+
+    form.add-form {
+      display: grid;
+      grid-template-columns: 1fr 100px 100px auto;
+      gap: 10px;
+      align-items: end;
+    }
+
+    @media (max-width: 640px) {
+      form.add-form {
+        grid-template-columns: 1fr 1fr;
+      }
+      form.add-form button { grid-column: 1 / -1; }
+    }
+
+    label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 12px;
+      color: #8b949e;
+    }
+
+    input {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: #e6edf3;
+      font-size: 14px;
+    }
+
+    input:focus {
+      outline: none;
+      border-color: #58a6ff;
+    }
+
+    button {
+      background: #238636;
+      border: 1px solid rgba(240, 246, 252, 0.1);
+      color: #fff;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+
+    button:hover { background: #2ea043; }
+
+    button.danger {
+      background: transparent;
+      border-color: #f85149;
+      color: #f85149;
+      padding: 4px 10px;
+      font-size: 13px;
+    }
+
+    button.danger:hover {
+      background: rgba(248, 81, 73, 0.15);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    ul.ticker-list {
+      list-style: none;
+    }
+
+    ul.ticker-list li {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #21262d;
+      font-size: 15px;
+      font-weight: 500;
+      color: #e6edf3;
+    }
+
+    ul.ticker-list li:last-child { border-bottom: none; }
+
+    .empty {
+      color: #6e7681;
+      font-size: 14px;
+      padding: 8px 0;
+    }
+
+    .hint {
+      font-size: 12px;
+      color: #6e7681;
+      margin-top: 12px;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Ticker control</h1>
+    <div class="header-center">
+      {% if user_ribbon_show %}
+      <div class="user-ribbon">
+        <div class="user-name">{{ user_display_name }}</div>
+        {% if user_email %}<div class="user-email">{{ user_email }}</div>{% endif %}
+      </div>
+      {% else %}
+      <div class="user-ribbon local">Local session</div>
+      {% endif %}
+    </div>
+    <nav class="nav-links">
+      <a href="{{ monitor_url }}">Exchange Monitor</a>
+    </nav>
+  </header>
+
+  <main>
+    <div id="flash" class="msg" role="status"></div>
+
+    <section class="card">
+      <h2>Add ticker</h2>
+      <form class="add-form" id="add-form">
+        <label>Symbol
+          <input name="ticker" id="fld-ticker" placeholder="e.g. NVDA" required maxlength="32"
+                 pattern="[A-Za-z0-9.\-]+" title="Letters, digits, dot, hyphen" autocomplete="off" />
+        </label>
+        <label>Initial price
+          <input name="price" id="fld-price" type="number" step="0.01" min="0.01" value="100" />
+        </label>
+        <label>Volatility
+          <input name="vol" id="fld-vol" type="number" step="0.01" min="0.01" max="2" value="0.25" />
+        </label>
+        <button type="submit" id="btn-add">Add</button>
+      </form>
+      <p class="hint">Symbols are normalized to uppercase. Duplicate symbols are ignored by the price server.</p>
+    </section>
+
+    <section class="card">
+      <h2>Active tickers</h2>
+      <button type="button" id="btn-refresh" style="margin-bottom:12px;">Refresh list</button>
+      <ul class="ticker-list" id="ticker-list"></ul>
+      <p class="empty" id="ticker-empty" style="display:none;">No tickers returned (is the price server running?).</p>
+    </section>
+  </main>
+
+  <script>
+    const API_TICKERS = {{ api_tickers_url | tojson }};
+
+    const flashEl = document.getElementById("flash");
+    const listEl = document.getElementById("ticker-list");
+    const emptyEl = document.getElementById("ticker-empty");
+    const addForm = document.getElementById("add-form");
+    const btnRefresh = document.getElementById("btn-refresh");
+
+    function showFlash(kind, text) {
+      flashEl.className = "msg visible " + (kind === "error" ? "error" : "ok");
+      flashEl.textContent = text;
+    }
+
+    function clearFlash() {
+      flashEl.className = "msg";
+      flashEl.textContent = "";
+    }
+
+    async function loadTickers() {
+      clearFlash();
+      listEl.innerHTML = "";
+      emptyEl.style.display = "none";
+      btnRefresh.disabled = true;
+      try {
+        const r = await fetch(API_TICKERS);
+        const data = await r.json().catch(() => null);
+        if (!r.ok) {
+          showFlash("error", (data && data.error) || r.statusText || "Failed to load tickers");
+          emptyEl.style.display = "block";
+          return;
+        }
+        if (!Array.isArray(data) || data.length === 0) {
+          emptyEl.style.display = "block";
+          return;
+        }
+        data.sort();
+        for (const sym of data) {
+          const li = document.createElement("li");
+          const span = document.createElement("span");
+          span.textContent = sym;
+          const rm = document.createElement("button");
+          rm.type = "button";
+          rm.className = "danger";
+          rm.textContent = "Remove";
+          rm.addEventListener("click", () => removeTicker(sym));
+          li.appendChild(span);
+          li.appendChild(rm);
+          listEl.appendChild(li);
+        }
+      } catch (e) {
+        showFlash("error", String(e.message || e));
+        emptyEl.style.display = "block";
+      } finally {
+        btnRefresh.disabled = false;
+      }
+    }
+
+    async function removeTicker(sym) {
+      if (!confirm("Remove " + sym + " from the price server?")) return;
+      clearFlash();
+      try {
+        const r = await fetch(API_TICKERS + "/" + encodeURIComponent(sym), { method: "DELETE" });
+        const data = await r.json().catch(() => null);
+        if (!r.ok) {
+          showFlash("error", (data && data.error) || r.statusText || "Remove failed");
+          return;
+        }
+        showFlash("ok", "Updated ticker list.");
+        await loadTickers();
+      } catch (e) {
+        showFlash("error", String(e.message || e));
+      }
+    }
+
+    addForm.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const ticker = document.getElementById("fld-ticker").value.trim();
+      const price = parseFloat(document.getElementById("fld-price").value);
+      const vol = parseFloat(document.getElementById("fld-vol").value);
+      if (!ticker) return;
+      clearFlash();
+      const btn = document.getElementById("btn-add");
+      btn.disabled = true;
+      try {
+        const r = await fetch(API_TICKERS, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ticker, price, vol }),
+        });
+        const data = await r.json().catch(() => null);
+        if (!r.ok) {
+          showFlash("error", (data && data.error) || r.statusText || "Add failed");
+          return;
+        }
+        showFlash("ok", "Ticker list updated.");
+        addForm.reset();
+        document.getElementById("fld-price").value = "100";
+        document.getElementById("fld-vol").value = "0.25";
+        await loadTickers();
+      } catch (e) {
+        showFlash("error", String(e.message || e));
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    btnRefresh.addEventListener("click", loadTickers);
+    loadTickers();
+  </script>
+</body>
+</html>
