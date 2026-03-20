@@ -46,8 +46,19 @@
     .blob-dir, .blob-file { cursor: pointer; }
     .blob-dir { color: #58a6ff; font-weight: 600; }
     .blob-file { color: #c9d1d9; }
-    .query-viewers { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    perspective-viewer { height: 420px; background: #fff; color: #222; display: block; }
+    perspective-viewer {
+      height: 420px;
+      display: block;
+      background: #0d1117;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+    }
+    perspective-viewer::part(menu),
+    perspective-viewer::part(status-bar) {
+      color: #e6edf3;
+      background: #0f141b;
+    }
     .muted { color: #8b949e; font-size: 13px; margin-top: 6px; }
     .error { color: #f85149; margin-top: 8px; }
   </style>
@@ -85,10 +96,7 @@
       <textarea id="q-sql">SELECT * FROM lake
 WHERE ticker = 'AAPL'
 LIMIT 100</textarea>
-      <div class="query-viewers">
-        <perspective-viewer id="q-viewer-table" theme="Pro Light"></perspective-viewer>
-        <perspective-viewer id="q-viewer-chart" theme="Pro Light"></perspective-viewer>
-      </div>
+      <perspective-viewer id="q-viewer-table" theme="Material Dark"></perspective-viewer>
       <div class="muted" id="q-meta"></div>
       <div class="error" id="q-error"></div>
     </section>
@@ -233,7 +241,6 @@ LIMIT 100</textarea>
       const err = document.getElementById("q-error");
       const meta = document.getElementById("q-meta");
       const viewerTable = document.getElementById("q-viewer-table");
-      const viewerChart = document.getElementById("q-viewer-chart");
       const sqlTextarea = document.getElementById("q-sql");
       let worker = null;
       let table = null;
@@ -265,12 +272,11 @@ LIMIT 100</textarea>
         if (!window.perspective || typeof perspective.worker !== "function") {
           throw new Error("Perspective failed to load. Check network/CDN access.");
         }
+        viewerTable.setAttribute("theme", "Material Dark");
         worker = perspective.worker();
         table = await worker.table([]);
         await viewerTable.load(table);
-        await viewerTable.restore({ plugin: "Datagrid" });
-        await viewerChart.load(table);
-        await viewerChart.restore({ plugin: "Y Line" });
+        await viewerTable.restore({ plugin: "Datagrid", theme: "Material Dark" });
       }
 
       runBtn.addEventListener("click", async () => {
@@ -300,9 +306,7 @@ LIMIT 100</textarea>
           }
           table = await worker.table(data.rows || []);
           await viewerTable.load(table);
-          await viewerTable.restore({ plugin: "Datagrid" });
-          await viewerChart.load(table);
-          await viewerChart.restore({ plugin: "Y Line" });
+          await viewerTable.restore({ plugin: "Datagrid", theme: "Material Dark" });
           meta.textContent = `Loaded ${data.row_count} rows`;
         } catch (e) {
           err.textContent = String(e);
