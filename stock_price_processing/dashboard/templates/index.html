@@ -54,10 +54,44 @@
     #status.disconnected { color: #f85149; }
     #status.connecting   { color: #d29922; }
 
+    .header-center {
+      flex: 1;
+      display: flex;
+      justify-content: center;
+      min-width: 0;
+      padding: 0 12px;
+    }
+
+    .user-ribbon {
+      font-size: 13px;
+      color: #8b949e;
+      text-align: center;
+      line-height: 1.35;
+      max-width: 420px;
+      overflow: hidden;
+    }
+
+    .user-ribbon .user-name {
+      color: #e6edf3;
+      font-weight: 500;
+    }
+
+    .user-ribbon .user-email {
+      color: #8b949e;
+      font-size: 12px;
+      word-break: break-all;
+    }
+
+    .user-ribbon.local {
+      color: #6e7681;
+      font-style: italic;
+    }
+
     .header-controls {
       display: flex;
       align-items: center;
       gap: 12px;
+      flex-shrink: 0;
     }
 
     #ticker-filter {
@@ -115,6 +149,18 @@
 <body>
   <header>
     <h1>Exchange Monitor</h1>
+    <div class="header-center">
+      {% if user_ribbon_show %}
+      <div class="user-ribbon" title="Signed-in user">
+        <div class="user-name">{{ user_display_name }}</div>
+        {% if user_email %}
+        <div class="user-email">{{ user_email }}</div>
+        {% endif %}
+      </div>
+      {% else %}
+      <div class="user-ribbon local">Local session</div>
+      {% endif %}
+    </div>
     <div class="header-controls">
       <select id="ticker-filter">
         <option value="">All Tickers</option>

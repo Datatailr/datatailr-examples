@@ -27,6 +27,6 @@ dashboard = App(
     python_requirements=["flask", "gunicorn", "requests"],
 )
 
-price_server.run()
-price_processing.run()
+# price_server.run()
+# price_processing.run()
 dashboard.run()
