@@ -26,26 +26,102 @@
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       font-family: "DM Sans", system-ui, sans-serif;
-      background: var(--bg);
       color: var(--text);
-      min-height: 100vh;
+      height: 100vh;
+      margin: 0;
+      display: flex;
+      flex-direction: row;
+      overflow: hidden;
+      background: #161b22;
+    }
+
+    .sidebar {
+      width: 228px;
+      flex-shrink: 0;
+      background: #161b22;
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .sidebar-brand {
+      padding: 18px 16px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #6e7681;
+    }
+
+    .sidebar-nav {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 8px 10px;
+    }
+
+    .sidebar-nav a {
+      display: block;
+      padding: 10px 12px;
+      border-radius: 8px;
+      color: #c9d1d9;
+      text-decoration: none;
+      font-size: 14px;
+      border-left: 3px solid transparent;
+      margin-left: -3px;
+    }
+
+    .sidebar-nav a:hover {
+      background: rgba(88, 166, 255, 0.08);
+      color: #e6edf3;
+    }
+
+    .sidebar-nav a.active {
+      background: rgba(88, 166, 255, 0.14);
+      border-left-color: #58a6ff;
+      color: #58a6ff;
+      font-weight: 600;
+    }
+
+    .sidebar-footer {
+      margin-top: auto;
+      padding: 14px 16px;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: #8b949e;
+      line-height: 1.4;
+    }
+
+    .sidebar-footer .user-name { color: #e6edf3; font-weight: 600; }
+    .sidebar-footer .user-email { color: #6e7681; font-size: 11px; word-break: break-all; }
+    .sidebar-footer.local { font-style: italic; color: #6e7681; }
+
+    .main-column {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      overflow-y: auto;
+      background: var(--bg);
       background-image:
         linear-gradient(var(--grid) 1px, transparent 1px),
         linear-gradient(90deg, var(--grid) 1px, transparent 1px);
       background-size: 32px 32px;
     }
-    header {
+
+    header.topbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 12px 24px;
-      background: rgba(18, 24, 31, 0.92);
+      padding: 14px 24px;
+      background: rgba(18, 24, 31, 0.88);
       border-bottom: 1px solid var(--border);
       backdrop-filter: blur(8px);
-      flex-wrap: wrap;
-      gap: 12px;
+      flex-shrink: 0;
     }
-    header h1 {
+    header.topbar h1 {
       font-size: 1.15rem;
       font-weight: 700;
       letter-spacing: -0.02em;
@@ -54,24 +130,12 @@
       -webkit-text-fill-color: transparent;
       background-clip: text;
     }
-    header .sub {
+    header.topbar .sub {
       font-family: "JetBrains Mono", monospace;
       font-size: 11px;
       color: var(--muted);
-      margin-top: 2px;
+      margin-top: 4px;
     }
-    .nav-links { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
-    .nav-links a {
-      color: var(--accent);
-      text-decoration: none;
-      font-size: 14px;
-      font-weight: 500;
-    }
-    .nav-links a:hover { text-decoration: underline; }
-    .header-center { flex: 1; display: flex; justify-content: center; min-width: 140px; }
-    .user-ribbon { font-size: 12px; color: var(--muted); text-align: center; }
-    .user-ribbon .user-name { color: var(--text); font-weight: 600; }
-    .user-ribbon.local { font-style: italic; }
 
     .live-strip {
       display: flex;
@@ -104,6 +168,7 @@
       padding: 14px 24px 24px;
       max-width: 1680px;
       margin: 0 auto;
+      align-items: start;
     }
     @media (max-width: 1100px) {
       .layout { grid-template-columns: 1fr; }
@@ -139,11 +204,25 @@
       height: min(52vh, 520px);
       background: #0d1117;
     }
+    /* Fixed-height host: Chart.js + flex:1 parent causes runaway resize (canvas ↔ parent). */
     #chart-wrap {
       padding: 12px 16px 20px;
-      flex: 1;
-      min-height: 300px;
-      height: 340px;
+      flex: 0 0 auto;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow: hidden;
+    }
+    .chart-host {
+      position: relative;
+      width: 100%;
+      height: 260px;
+      flex-shrink: 0;
+    }
+    .chart-host canvas {
+      display: block;
+      max-width: 100%;
     }
     #chart-wrap select {
       margin-bottom: 10px;
@@ -242,25 +321,31 @@
   </style>
 </head>
 <body>
-  <header>
+  <aside class="sidebar" aria-label="Main navigation">
+    <div class="sidebar-brand">Stock dashboards</div>
+    <nav class="sidebar-nav">
+      <a href="{{ monitor_url }}">Exchange Monitor</a>
+      <a href="{{ processor_url }}" class="active">Price processor</a>
+      <a href="{{ tickers_url }}">Ticker control</a>
+    </nav>
+    <div class="sidebar-footer">
+      {% if user_ribbon_show %}
+      <div>
+        <div class="user-name">{{ user_display_name }}</div>
+        {% if user_email %}<div class="user-email">{{ user_email }}</div>{% endif %}
+      </div>
+      {% else %}
+      <div class="local">Local session</div>
+      {% endif %}
+    </div>
+  </aside>
+
+  <div class="main-column">
+  <header class="topbar">
     <div>
       <h1>Price processor cockpit</h1>
       <div class="sub">Live CSP graph · streaming analytics · vis-network + Chart.js</div>
     </div>
-    <div class="header-center">
-      {% if user_ribbon_show %}
-      <div class="user-ribbon">
-        <span class="user-name">{{ user_display_name }}</span>
-        {% if user_email %} · {{ user_email }}{% endif %}
-      </div>
-      {% else %}
-      <div class="user-ribbon local">Local session</div>
-      {% endif %}
-    </div>
-    <nav class="nav-links">
-      <a href="{{ monitor_url }}">Exchange Monitor</a>
-      <a href="{{ tickers_url }}">Tickers</a>
-    </nav>
   </header>
 
   <div class="live-strip">
@@ -287,9 +372,9 @@
         <span class="hint">Stream-selected symbol</span>
       </div>
       <div id="chart-wrap">
-        <label for="chart-ticker" class="hint">Chart ticker</label><br/>
+        <label for="chart-ticker" class="hint">Chart ticker</label>
         <select id="chart-ticker"></select>
-        <canvas id="price-chart" height="220"></canvas>
+        <div class="chart-host" aria-hidden="true"><canvas id="price-chart"></canvas></div>
       </div>
     </div>
   </div>
@@ -299,6 +384,7 @@
 
   <div class="section-title">Per-symbol analytics <span style="font-weight:400;color:var(--muted)">· ~1 Hz + SSE</span></div>
   <div class="ticker-wall" id="ticker-wall"></div>
+  </div>
 
   <script>
     const API_STATS = {{ api_processor_stats | tojson }};
