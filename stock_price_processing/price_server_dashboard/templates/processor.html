@@ -546,8 +546,19 @@
       } catch (_) {}
     }
 
-    function pulsePipeline(ticker) {
-      ["csp_filter", "n_pub", "f_trade", "f_quote"].forEach((id) => pulseNode(id, 500));
+    function pulsePipeline(d) {
+      pulseNode("csp_filter", 500);
+      pulseNode("n_evt", 450);
+      pulseNode("n_pub", 500);
+      const kind = d && d.last_market_event;
+      if (kind === "trade") {
+        pulseNode("f_trade", 500);
+      } else if (kind === "quote") {
+        pulseNode("f_quote", 500);
+      } else {
+        pulseNode("f_trade", 400);
+        pulseNode("f_quote", 400);
+      }
     }
 
     function renderWindows(w) {
@@ -587,6 +598,7 @@
         card.dataset.ticker = t;
         card.innerHTML = `
           <h3>${t}</h3>
+          <div class="row"><span class="k">Last ingest</span><span class="v">${d.last_market_event || "—"}</span></div>
           <div class="row"><span class="k">Last</span><span class="v">${fmt(d.last_price, 4)}</span></div>
           <div class="row"><span class="k">VWAP</span><span class="v">${fmt(d.vwap, 4)}</span></div>
           <div class="row"><span class="k">EMA 10 / 50</span><span class="v">${fmt(d.ema_fast, 4)} / ${fmt(d.ema_slow, 4)}</span></div>
@@ -776,7 +788,7 @@
           const d = JSON.parse(ev.data);
           if (!d.ticker) return;
           latestByTicker[d.ticker] = d;
-          pulsePipeline(d.ticker);
+          pulsePipeline(d);
           pushChartPoint(d);
           scheduleTickerWallRefresh();
           const safe = String(d.ticker).replace(/"/g, "");

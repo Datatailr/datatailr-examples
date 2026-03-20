@@ -267,6 +267,12 @@ def get_topology_payload() -> dict[str, Any]:
                 "group": "quote_math",
             },
             {
+                "id": "n_evt",
+                "label": "market_event_kind",
+                "title": "Emits last event type: trade | quote\n(for dashboards / tracing)",
+                "group": "route",
+            },
+            {
                 "id": "n_pub",
                 "label": "publish_analytics",
                 "title": "1 Hz alarm;\nwrites analytics_store +\nfan-out queue for SSE",
@@ -277,6 +283,7 @@ def get_topology_payload() -> dict[str, Any]:
             {"from": "ext_price", "to": "csp_ingest"},
             {"from": "csp_ingest", "to": "csp_unroll"},
             {"from": "csp_unroll", "to": "csp_filter"},
+            {"from": "csp_filter", "to": "n_evt"},
             {"from": "csp_filter", "to": "f_trade"},
             {"from": "csp_filter", "to": "f_quote"},
             {"from": "f_trade", "to": "n_vwap"},
@@ -294,8 +301,18 @@ def get_topology_payload() -> dict[str, Any]:
             {"from": "n_spread", "to": "n_pub"},
             {"from": "n_ema_f", "to": "n_pub"},
             {"from": "n_ema_s", "to": "n_pub"},
+            {"from": "n_evt", "to": "n_pub"},
         ],
     }
+
+
+@csp.node
+def market_event_kind(events: ts[dict]) -> ts[str]:
+    """Pass through `type` for trade/quote events on this ticker (for published telemetry)."""
+    if csp.ticked(events):
+        typ = events.get("type")
+        if typ in ("trade", "quote"):
+            return str(typ)
 
 
 @csp.node
@@ -312,6 +329,7 @@ def publish_analytics(
     spread_max: ts[float],
     spread_mean: ts[float],
     last_spread: ts[float],
+    ingest_kind: ts[str],
 ):
     with csp.alarms():
         publish_timer = csp.alarm(bool)
@@ -331,6 +349,7 @@ def publish_analytics(
         csp.make_passive(spread_max)
         csp.make_passive(spread_mean)
         csp.make_passive(last_spread)
+        csp.make_passive(ingest_kind)
 
     if csp.ticked(publish_timer):
         csp.schedule_alarm(publish_timer, timedelta(seconds=1), True)
@@ -357,6 +376,8 @@ def publish_analytics(
             s_snapshot["spread_mean"] = spread_mean
         if csp.valid(last_spread):
             s_snapshot["spread"] = last_spread
+        if csp.valid(ingest_kind):
+            s_snapshot["last_market_event"] = ingest_kind
 
         s_snapshot["timestamp"] = datetime.now(timezone.utc).isoformat()
 
@@ -399,6 +420,7 @@ def filter_event_type(events: ts[dict], event_type: str) -> ts[dict]:
 def ticker_analytics(ticker_name: str, events: ts[dict]):
     trades = filter_event_type(events, "trade")
     quotes = filter_event_type(events, "quote")
+    ingest_kind = market_event_kind(events)
 
     trade_price = demux_field_float(trades, "price")
     trade_size = demux_field_float(trades, "size")
@@ -419,6 +441,7 @@ def ticker_analytics(ticker_name: str, events: ts[dict]):
         vol, imb,
         ss.spread_min, ss.spread_max, ss.spread_mean,
         quote_spread,
+        ingest_kind,
     )
 
 
