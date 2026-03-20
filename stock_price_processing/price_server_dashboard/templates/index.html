@@ -320,8 +320,10 @@
 
       const knownTickers = new Set();
 
+      /** Perspective WASM expects datetime filter scalars as epoch ms (number), not JS Date — Date breaks FilterTerm serde. */
       function chartTimeFilter() {
-        return [["timestamp", ">=", new Date(Date.now() - CHART_TIME_WINDOW_MS)]];
+        const cutoffMs = Date.now() - CHART_TIME_WINDOW_MS;
+        return [["timestamp", ">=", cutoffMs]];
       }
 
       function gridFilter(ticker) {
@@ -334,11 +336,22 @@
         return [["ticker", "==", ticker], ...t];
       }
 
+      let leavingPage = false;
+      function safeRestore(viewer, config) {
+        const out = viewer.restore(config);
+        if (out && typeof out.then === "function") {
+          out.catch((err) => {
+            if (!leavingPage) console.debug("Perspective restore:", err);
+          });
+        }
+      }
+
       function applyFilter(ticker) {
-        viewers.trades.restore({ filter: gridFilter(ticker) });
-        viewers.quotes.restore({ filter: gridFilter(ticker) });
-        viewers.chart.restore({ filter: chartFilter(ticker) });
-        viewers.spread.restore({ filter: chartFilter(ticker) });
+        if (leavingPage) return;
+        safeRestore(viewers.trades, { filter: gridFilter(ticker) });
+        safeRestore(viewers.quotes, { filter: gridFilter(ticker) });
+        safeRestore(viewers.chart, { filter: chartFilter(ticker) });
+        safeRestore(viewers.spread, { filter: chartFilter(ticker) });
       }
 
       filterSelect.addEventListener("change", () => {
@@ -347,12 +360,19 @@
 
       applyFilter("");
 
-      const chartTimeTicker = setInterval(() => {
+      let chartTimeTicker = setInterval(() => {
+        if (leavingPage) return;
         const ticker = filterSelect.value;
-        viewers.chart.restore({ filter: chartFilter(ticker) });
-        viewers.spread.restore({ filter: chartFilter(ticker) });
+        safeRestore(viewers.chart, { filter: chartFilter(ticker) });
+        safeRestore(viewers.spread, { filter: chartFilter(ticker) });
       }, CHART_TIME_FILTER_REFRESH_MS);
-      window.addEventListener("beforeunload", () => clearInterval(chartTimeTicker));
+
+      function teardownPerspectiveTimers() {
+        leavingPage = true;
+        clearInterval(chartTimeTicker);
+      }
+      window.addEventListener("pagehide", teardownPerspectiveTimers);
+      window.addEventListener("beforeunload", teardownPerspectiveTimers);
 
       function connect() {
         statusEl.textContent = "connecting...";

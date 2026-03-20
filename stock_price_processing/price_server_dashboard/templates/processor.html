@@ -103,7 +103,7 @@
       flex-direction: column;
       min-width: 0;
       min-height: 0;
-      overflow-y: auto;
+      overflow: hidden;
       background: var(--bg);
       background-image:
         linear-gradient(var(--grid) 1px, transparent 1px),
@@ -161,17 +161,29 @@
     #conn-badge.connected { border-color: var(--green); color: var(--green); }
     #conn-badge.error { border-color: #f85149; color: #f85149; }
 
-    .layout {
-      display: grid;
-      grid-template-columns: 1.15fr 0.85fr;
-      gap: 14px;
-      padding: 14px 24px 24px;
-      max-width: 1680px;
-      margin: 0 auto;
-      align-items: start;
+    /* Fills viewport under topbar + pills; DAG + chart share width 50/50-ish */
+    .dag-chart-row {
+      flex: 1 1 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      padding: 10px 16px 8px;
     }
-    @media (max-width: 1100px) {
-      .layout { grid-template-columns: 1fr; }
+
+    .layout {
+      flex: 1 1 0;
+      min-height: 0;
+      width: 100%;
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+      gap: 12px;
+      align-items: stretch;
+    }
+    @media (max-width: 1000px) {
+      .layout {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(280px, 1fr) minmax(240px, 1fr);
+      }
     }
 
     .panel {
@@ -182,6 +194,7 @@
       display: flex;
       flex-direction: column;
       min-height: 0;
+      height: 100%;
     }
     .panel-head {
       padding: 12px 16px;
@@ -201,13 +214,16 @@
     }
     .panel-head .hint { font-size: 12px; color: var(--muted); }
     #graph-wrap {
-      height: min(52vh, 520px);
+      flex: 1 1 0;
+      min-height: 0;
+      width: 100%;
       background: #0d1117;
     }
-    /* Fixed-height host: Chart.js + flex:1 parent causes runaway resize (canvas ↔ parent). */
+
+    /* Chart fills remaining panel height; host has explicit flex bounds → no runaway canvas growth */
     #chart-wrap {
-      padding: 12px 16px 20px;
-      flex: 0 0 auto;
+      padding: 10px 14px 14px;
+      flex: 1 1 0;
       min-height: 0;
       display: flex;
       flex-direction: column;
@@ -216,9 +232,10 @@
     }
     .chart-host {
       position: relative;
+      flex: 1 1 0;
+      min-height: 160px;
       width: 100%;
-      height: 260px;
-      flex-shrink: 0;
+      overflow: hidden;
     }
     .chart-host canvas {
       display: block;
@@ -234,13 +251,22 @@
       font-size: 14px;
     }
 
+    .processor-scroll-bottom {
+      flex: 0 1 auto;
+      max-height: min(42vh, 520px);
+      min-height: 0;
+      overflow-x: hidden;
+      overflow-y: auto;
+      border-top: 1px solid var(--border);
+      background: rgba(10, 14, 20, 0.35);
+    }
+
     .windows-bar {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      padding: 0 24px 16px;
-      max-width: 1680px;
-      margin: 0 auto;
+      padding: 10px 20px 12px;
+      width: 100%;
     }
     .chip {
       font-family: "JetBrains Mono", monospace;
@@ -256,9 +282,8 @@
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
       gap: 12px;
-      padding: 0 24px 32px;
-      max-width: 1680px;
-      margin: 0 auto;
+      padding: 0 20px 24px;
+      width: 100%;
     }
     .tcard {
       background: var(--surface);
@@ -314,9 +339,8 @@
       text-transform: uppercase;
       letter-spacing: 0.1em;
       color: var(--muted);
-      padding: 8px 24px 10px;
-      max-width: 1680px;
-      margin: 0 auto;
+      padding: 10px 20px 8px;
+      width: 100%;
     }
   </style>
 </head>
@@ -358,32 +382,35 @@
     <div class="pill">symbols <strong id="st-sym">0</strong></div>
   </div>
 
-  <div class="layout">
-    <div class="panel">
-      <div class="panel-head">
-        <h2>Processing DAG</h2>
-        <span class="hint">Drag nodes · scroll zoom · live pulse on analytics tick</span>
+  <div class="dag-chart-row">
+    <div class="layout">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Processing DAG</h2>
+          <span class="hint">Drag · scroll zoom · double-click fit</span>
+        </div>
+        <div id="graph-wrap"></div>
       </div>
-      <div id="graph-wrap"></div>
-    </div>
-    <div class="panel">
-      <div class="panel-head">
-        <h2>Price rails</h2>
-        <span class="hint">Stream-selected symbol</span>
-      </div>
-      <div id="chart-wrap">
-        <label for="chart-ticker" class="hint">Chart ticker</label>
-        <select id="chart-ticker"></select>
-        <div class="chart-host" aria-hidden="true"><canvas id="price-chart"></canvas></div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Price rails</h2>
+          <span class="hint">Stream-selected symbol</span>
+        </div>
+        <div id="chart-wrap">
+          <label for="chart-ticker" class="hint">Chart ticker</label>
+          <select id="chart-ticker"></select>
+          <div class="chart-host" aria-hidden="true"><canvas id="price-chart"></canvas></div>
+        </div>
       </div>
     </div>
   </div>
 
-  <div class="section-title">Rolling windows (from processor /topology)</div>
-  <div class="windows-bar" id="windows-bar"></div>
-
-  <div class="section-title">Per-symbol analytics <span style="font-weight:400;color:var(--muted)">· ~1 Hz + SSE</span></div>
-  <div class="ticker-wall" id="ticker-wall"></div>
+  <div class="processor-scroll-bottom">
+    <div class="section-title">Rolling windows (from processor /topology)</div>
+    <div class="windows-bar" id="windows-bar"></div>
+    <div class="section-title">Per-symbol analytics <span style="font-weight:400;color:var(--muted)">· ~1 Hz + SSE</span></div>
+    <div class="ticker-wall" id="ticker-wall"></div>
+  </div>
   </div>
 
   <script>
@@ -411,6 +438,28 @@
     const chartBuffers = { labels: [], last: [], vwap: [], emaF: [], emaS: [] };
     const latestByTicker = {};
     let prevStats = null;
+    let graphFitTimer = null;
+    let tickerWallRaf = null;
+
+    function scheduleTickerWallRefresh() {
+      if (tickerWallRaf) return;
+      tickerWallRaf = requestAnimationFrame(() => {
+        tickerWallRaf = null;
+        syncChartTickerSelect();
+        renderTickerWall();
+      });
+    }
+
+    function debounceGraphFit() {
+      if (graphFitTimer) clearTimeout(graphFitTimer);
+      graphFitTimer = setTimeout(() => {
+        graphFitTimer = null;
+        if (!network) return;
+        try {
+          network.fit({ animation: false, padding: 20 });
+        } catch (_) {}
+      }, 120);
+    }
 
     function buildGraph(topo) {
       const nodes = topo.nodes.map((n) => {
@@ -424,7 +473,7 @@
           font: { color: "#e6edf3", size: 13, face: "JetBrains Mono" },
           color: { background: st.bg, border: st.border, highlight: { background: st.bg, border: st.highlight } },
           borderWidth: 2,
-          shadow: true,
+          shadow: false,
         };
       });
       const edges = topo.edges.map((e, i) => ({
@@ -458,12 +507,27 @@
             nodeDistance: 115,
           },
           solver: "hierarchicalRepulsion",
-          stabilization: { iterations: 900 },
+          /* Fewer iterations: 900 was blocking the main thread on navigation */
+          stabilization: { iterations: 160, updateInterval: 50 },
         },
-        interaction: { hover: true, tooltipDelay: 120, navigationButtons: true, keyboard: true },
+        interaction: { hover: true, tooltipDelay: 120, navigationButtons: false, keyboard: true },
       });
       network.once("stabilizationIterationsDone", () => {
         network.setOptions({ physics: { enabled: false } });
+        try {
+          network.fit({ animation: false, padding: 28 });
+        } catch (_) {}
+      });
+
+      const graphEl = document.getElementById("graph-wrap");
+      if (graphEl && typeof ResizeObserver !== "undefined") {
+        const ro = new ResizeObserver(() => debounceGraphFit());
+        ro.observe(graphEl);
+      }
+      graphEl?.addEventListener("dblclick", () => {
+        try {
+          network.fit({ animation: true, padding: 32 });
+        } catch (_) {}
       });
     }
 
@@ -606,6 +670,20 @@
       });
     }
 
+    function wireChartResize() {
+      const host = document.querySelector(".chart-host");
+      if (!host || typeof ResizeObserver === "undefined") return;
+      let chartRoTimer = null;
+      const ro = new ResizeObserver(() => {
+        if (chartRoTimer) cancelAnimationFrame(chartRoTimer);
+        chartRoTimer = requestAnimationFrame(() => {
+          chartRoTimer = null;
+          if (priceChart) priceChart.resize();
+        });
+      });
+      ro.observe(host);
+    }
+
     function applyStats(s) {
       document.getElementById("st-uptime").textContent = (s.uptime_sec != null ? s.uptime_sec.toFixed(0) : "—") + " s";
       document.getElementById("st-sse").textContent = s.sse_events_total ?? "—";
@@ -626,7 +704,11 @@
     }
 
     async function bootstrap() {
+      /* Let the shell paint before Chart + vis-network compete for the main thread */
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
       initChart();
+      wireChartResize();
       try {
         const [topoR, anR] = await Promise.all([
           fetch(API_TOPO),
@@ -658,6 +740,24 @@
         } catch (_) {}
       }, 1000);
 
+      /* SSE after layout settles so first vis stabilization isn’t fighting the connection */
+      setTimeout(() => {
+        connectAnalyticsStream();
+      }, 180);
+
+      document.getElementById("chart-ticker").addEventListener("change", () => {
+        chartBuffers.labels = [];
+        chartBuffers.last = [];
+        chartBuffers.vwap = [];
+        chartBuffers.emaF = [];
+        chartBuffers.emaS = [];
+        const t = document.getElementById("chart-ticker").value;
+        const d = latestByTicker[t];
+        if (d) pushChartPoint(d);
+      });
+    }
+
+    function connectAnalyticsStream() {
       const es = new EventSource(STREAM_URL);
       const badge = document.getElementById("conn-badge");
       const connText = document.getElementById("conn-text");
@@ -678,8 +778,7 @@
           latestByTicker[d.ticker] = d;
           pulsePipeline(d.ticker);
           pushChartPoint(d);
-          syncChartTickerSelect();
-          renderTickerWall();
+          scheduleTickerWallRefresh();
           const safe = String(d.ticker).replace(/"/g, "");
           const card = document.querySelector('[data-ticker="' + safe + '"]');
           if (card) {
@@ -688,17 +787,6 @@
           }
         } catch (_) {}
       };
-
-      document.getElementById("chart-ticker").addEventListener("change", () => {
-        chartBuffers.labels = [];
-        chartBuffers.last = [];
-        chartBuffers.vwap = [];
-        chartBuffers.emaF = [];
-        chartBuffers.emaS = [];
-        const t = document.getElementById("chart-ticker").value;
-        const d = latestByTicker[t];
-        if (d) pushChartPoint(d);
-      });
     }
 
     bootstrap();

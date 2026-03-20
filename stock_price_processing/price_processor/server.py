@@ -526,8 +526,23 @@ def start_engine_thread(url: str, tickers_list: list):
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
+# OpenAPI: GET /openapi.json  ·  Swagger UI: /docs  ·  ReDoc: /redoc
 
-app = FastAPI()
+app = FastAPI(
+    title="Price Processor",
+    description=(
+        "Realtime CSP graph over the price-server SSE feed: per-ticker VWAP, EMAs, signals, volatility, "
+        "imbalance, spread stats. **SSE:** `GET /stream` pushes ~1 Hz analytics snapshots per symbol "
+        "(`text/event-stream`, JSON per `data:` line). Omitted from this spec (OpenAPI/Swagger do not model SSE well)."
+    ),
+    version="0.1.0",
+    openapi_tags=[
+        {"name": "health", "description": "Load balancer / platform probes"},
+        {"name": "analytics", "description": "Latest computed metrics per ticker"},
+        {"name": "operations", "description": "Topology and runtime stats for dashboards"},
+        {"name": "stream", "description": "Server-Sent Events — not a JSON body response"},
+    ],
+)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -544,18 +559,19 @@ async def startup():
     start_engine_thread(PRICE_SERVER_URL, initial_tickers)
 
 
-@app.get("/__health_check__.html")
+@app.get("/__health_check__.html", tags=["health"])
 async def health_check():
+    """Plain-text OK for health checks."""
     return PlainTextResponse("OK\n")
 
 
-@app.get("/topology")
+@app.get("/topology", tags=["operations"])
 async def get_topology():
     """DAG + window parameters for operator dashboards."""
-    return JSONResponse(get_topology_payload())
+    return get_topology_payload()
 
 
-@app.get("/stats")
+@app.get("/stats", tags=["operations"])
 async def get_stats():
     """Live counters: SSE throughput, publish rate, queue depth."""
     with _stats_lock:
@@ -570,16 +586,16 @@ async def get_stats():
     snap["analytics_queue_depth"] = analytics_queue.qsize()
     snap["analytics_tickers"] = sorted(analytics_store.keys())
     snap["price_server_url"] = PRICE_SERVER_URL
-    return JSONResponse(snap)
+    return snap
 
 
-@app.get("/analytics")
+@app.get("/analytics", tags=["analytics"])
 async def get_all_analytics():
     log.info(f"GET /analytics -> {list(analytics_store.keys())}")
-    return JSONResponse(analytics_store)
+    return dict(analytics_store)
 
 
-@app.get("/analytics/{ticker}")
+@app.get("/analytics/{ticker}", tags=["analytics"])
 async def get_ticker_analytics(ticker: str):
     ticker = ticker.upper()
     data = analytics_store.get(ticker)
@@ -587,7 +603,7 @@ async def get_ticker_analytics(ticker: str):
         log.info(f"GET /analytics/{ticker} -> not found")
         return JSONResponse({"error": f"no analytics for {ticker}"}, status_code=404)
     log.info(f"GET /analytics/{ticker} -> ok")
-    return JSONResponse(data)
+    return data
 
 
 async def _analytics_event_generator():
@@ -601,8 +617,15 @@ async def _analytics_event_generator():
             await asyncio.sleep(0.1)
 
 
-@app.get("/stream")
+@app.get(
+    "/stream",
+    tags=["stream"],
+    summary="SSE analytics snapshots",
+    response_class=EventSourceResponse,
+    include_in_schema=False,
+)
 async def stream_analytics():
+    """`text/event-stream`. Each `data:` line is one JSON object (fields include `ticker`, `timestamp`, metrics)."""
     return EventSourceResponse(_analytics_event_generator())
 
 

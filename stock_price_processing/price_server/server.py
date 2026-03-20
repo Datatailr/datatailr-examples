@@ -101,24 +101,41 @@ def next_seq():
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
+# OpenAPI: GET /openapi.json  ·  Swagger UI: /docs  ·  ReDoc: /redoc
 
-app = FastAPI()
+app = FastAPI(
+    title="Price Server",
+    description=(
+        "Synthetic market feed: GBM mid prices, stochastic spread, random trades/quotes. "
+        "REST for tickers and snapshots. **SSE:** `GET /stream` returns `text/event-stream` "
+        "(one JSON object per `data:` line; `type` is `trade` or `quote`). "
+        "That route is omitted from this spec because OpenAPI/Swagger do not model SSE cleanly."
+    ),
+    version="0.1.0",
+    openapi_tags=[
+        {"name": "health", "description": "Load balancer / platform probes"},
+        {"name": "tickers", "description": "List and add/remove symbols"},
+        {"name": "market-data", "description": "Point-in-time BBO-style quote"},
+        {"name": "stream", "description": "Server-Sent Events — not a JSON body response"},
+    ],
+)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-@app.get("/__health_check__.html")
+@app.get("/__health_check__.html", tags=["health"])
 async def health_check():
+    """Plain-text OK for health checks."""
     return PlainTextResponse("OK\n")
 
 
-@app.get("/tickers")
+@app.get("/tickers", response_model=list[str], tags=["tickers"])
 async def get_tickers():
     tickers_keys = list(tickers.keys())
     log.info(f"GET /tickers -> {tickers_keys}")
-    return JSONResponse(tickers_keys)
+    return tickers_keys
 
 
-@app.put("/add/{ticker}")
+@app.put("/add/{ticker}", response_model=list[str], tags=["tickers"])
 async def add_ticker(ticker: str, price: float = 100.0, vol: float = 0.25):
     ticker = ticker.upper()
     if ticker not in tickers:
@@ -126,10 +143,10 @@ async def add_ticker(ticker: str, price: float = 100.0, vol: float = 0.25):
         log.info(f"PUT /add/{ticker} -> added (price={price}, vol={vol})")
     else:
         log.info(f"PUT /add/{ticker} -> already exists, skipped")
-    return JSONResponse(list(tickers.keys()))
+    return list(tickers.keys())
 
 
-@app.put("/remove/{ticker}")
+@app.put("/remove/{ticker}", response_model=list[str], tags=["tickers"])
 async def remove_ticker(ticker: str):
     ticker = ticker.upper()
     if ticker in tickers:
@@ -137,10 +154,10 @@ async def remove_ticker(ticker: str):
         log.info(f"PUT /remove/{ticker} -> removed")
     else:
         log.info(f"PUT /remove/{ticker} -> not found, skipped")
-    return JSONResponse(list(tickers.keys()))
+    return list(tickers.keys())
 
 
-@app.get("/quote/{ticker}")
+@app.get("/quote/{ticker}", tags=["market-data"])
 async def get_quote(ticker: str):
     ticker = ticker.upper()
     state = tickers.get(ticker)
@@ -216,8 +233,15 @@ async def _event_generator():
         await asyncio.sleep(np.random.exponential(1.0 / 50.0))
 
 
-@app.get("/stream")
+@app.get(
+    "/stream",
+    tags=["stream"],
+    summary="SSE trade and quote events",
+    response_class=EventSourceResponse,
+    include_in_schema=False,
+)
 async def stream_events():
+    """`text/event-stream`. Each event is one JSON object per `data:` line (`type`: `trade` | `quote`)."""
     return EventSourceResponse(_event_generator())
 
 

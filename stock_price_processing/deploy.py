@@ -19,7 +19,7 @@ price_server = Service(
 price_processing = Service(
     name="Price Processor",
     entrypoint=price_processing_main,
-    resources=Resources(memory="2g", cpu=1),
+    resources=Resources(memory="1g", cpu=1),
     python_requirements="stock_price_processing/requirements.txt",
 )
 
@@ -27,7 +27,7 @@ dashboard = App(
     name="Price Server Dashboard",
     entrypoint=dashboard_entrypoint,
     framework="flask",
-    resources=Resources(memory="1g", cpu=1),
+    resources=Resources(memory="4g", cpu=1),
     python_requirements=["flask", "gunicorn", "requests"],
 )
 
