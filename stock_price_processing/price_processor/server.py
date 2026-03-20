@@ -9,6 +9,8 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from queue import Queue, Empty
+from typing import Any
+
 
 import csp
 from csp import ts
@@ -35,6 +37,8 @@ log_handler.setLevel(logging.INFO)
 log_handler.setFormatter(log_format)
 log.addHandler(log_handler)
 
+SERVICE_STARTED_MONO = time.monotonic()
+SERVICE_STARTED_WALL = time.time()
 
 # ---------------------------------------------------------------------------
 # Shared state: CSP graph writes here, FastAPI reads
@@ -42,6 +46,35 @@ log.addHandler(log_handler)
 
 analytics_store: dict[str, dict] = {}
 analytics_queue: Queue = Queue(maxsize=10_000)
+
+_stats_lock = threading.Lock()
+_runtime_stats: dict[str, Any] = {
+    "sse_batches_total": 0,
+    "sse_events_total": 0,
+    "events_by_ticker": {},  # type: dict[str, int]
+    "analytics_publishes_total": 0,
+    "last_analytics_by_ticker": {},  # type: dict[str, str] ISO timestamps
+}
+
+
+def _record_sse_batch(batch: list) -> None:
+    if not batch:
+        return
+    with _stats_lock:
+        _runtime_stats["sse_batches_total"] += 1
+        _runtime_stats["sse_events_total"] += len(batch)
+        by_t = _runtime_stats["events_by_ticker"]
+        for ev in batch:
+            t = ev.get("ticker")
+            if t:
+                by_t[t] = by_t.get(t, 0) + 1
+
+
+def _record_analytics_publish(ticker_name: str) -> None:
+    ts_iso = datetime.now(timezone.utc).isoformat()
+    with _stats_lock:
+        _runtime_stats["analytics_publishes_total"] += 1
+        _runtime_stats["last_analytics_by_ticker"][ticker_name] = ts_iso
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +172,132 @@ def spread_stats(spread: ts[float]) -> csp.Outputs(
             )
 
 
+def get_topology_payload() -> dict[str, Any]:
+    """Static DAG + tuning knobs for dashboards (matches `ticker_analytics` graph)."""
+    return {
+        "service": "price-processor",
+        "csp_engine": "csp (realtime graph)",
+        "windows": {
+            "VOLATILITY_WINDOW": VOLATILITY_WINDOW,
+            "IMBALANCE_WINDOW": IMBALANCE_WINDOW,
+            "SPREAD_WINDOW": SPREAD_WINDOW,
+            "ema_fast_span": 10,
+            "ema_slow_span": 50,
+            "publish_interval_sec": 1,
+            "sse_poll_ms": 50,
+            "sse_batch_max": 500,
+        },
+        "nodes": [
+            {
+                "id": "ext_price",
+                "label": "Price Server",
+                "title": "Upstream FastAPI\nGET /stream (SSE)\ntrades + quotes JSON",
+                "group": "external",
+            },
+            {
+                "id": "csp_ingest",
+                "label": "SSE ingest",
+                "title": "Node: _sse_source_batched\nThreaded requests + queue;\nCSP polls every 50ms",
+                "group": "ingest",
+            },
+            {
+                "id": "csp_unroll",
+                "label": "unroll",
+                "title": "csp.unroll: fan-out each\nevent into the graph tick",
+                "group": "ingest",
+            },
+            {
+                "id": "csp_filter",
+                "label": "filter_ticker",
+                "title": "One instance per subscribed symbol;\n@csp.graph ticker_analytics",
+                "group": "route",
+            },
+            {
+                "id": "f_trade",
+                "label": "filter_event_type\ntrade",
+                "title": "Trades only",
+                "group": "split",
+            },
+            {
+                "id": "f_quote",
+                "label": "filter_event_type\nquote",
+                "title": "Quotes only",
+                "group": "split",
+            },
+            {
+                "id": "n_vwap",
+                "label": "vwap",
+                "title": "Cumulative VWAP on trades",
+                "group": "trade_math",
+            },
+            {
+                "id": "n_ema_f",
+                "label": "ema (10)",
+                "title": "EMA span=10",
+                "group": "trade_math",
+            },
+            {
+                "id": "n_ema_s",
+                "label": "ema (50)",
+                "title": "EMA span=50",
+                "group": "trade_math",
+            },
+            {
+                "id": "n_sig",
+                "label": "ema_crossover",
+                "title": "buy/sell when fast vs slow flips",
+                "group": "trade_math",
+            },
+            {
+                "id": "n_vol",
+                "label": "rolling_volatility",
+                "title": f"Log-return σ, window={VOLATILITY_WINDOW}",
+                "group": "trade_math",
+            },
+            {
+                "id": "n_imb",
+                "label": "trade_imbalance",
+                "title": f"Buy share of volume, window={IMBALANCE_WINDOW}",
+                "group": "trade_math",
+            },
+            {
+                "id": "n_spread",
+                "label": "spread_stats",
+                "title": f"min/max/mean spread, window={SPREAD_WINDOW}",
+                "group": "quote_math",
+            },
+            {
+                "id": "n_pub",
+                "label": "publish_analytics",
+                "title": "1 Hz alarm;\nwrites analytics_store +\nfan-out queue for SSE",
+                "group": "sink",
+            },
+        ],
+        "edges": [
+            {"from": "ext_price", "to": "csp_ingest"},
+            {"from": "csp_ingest", "to": "csp_unroll"},
+            {"from": "csp_unroll", "to": "csp_filter"},
+            {"from": "csp_filter", "to": "f_trade"},
+            {"from": "csp_filter", "to": "f_quote"},
+            {"from": "f_trade", "to": "n_vwap"},
+            {"from": "f_trade", "to": "n_ema_f"},
+            {"from": "f_trade", "to": "n_ema_s"},
+            {"from": "n_ema_f", "to": "n_sig"},
+            {"from": "n_ema_s", "to": "n_sig"},
+            {"from": "f_trade", "to": "n_vol"},
+            {"from": "f_trade", "to": "n_imb"},
+            {"from": "f_quote", "to": "n_spread"},
+            {"from": "n_vwap", "to": "n_pub"},
+            {"from": "n_sig", "to": "n_pub"},
+            {"from": "n_vol", "to": "n_pub"},
+            {"from": "n_imb", "to": "n_pub"},
+            {"from": "n_spread", "to": "n_pub"},
+            {"from": "n_ema_f", "to": "n_pub"},
+            {"from": "n_ema_s", "to": "n_pub"},
+        ],
+    }
+
+
 @csp.node
 def publish_analytics(
     ticker_name: str,
@@ -206,6 +365,7 @@ def publish_analytics(
             analytics_queue.put_nowait(dict(s_snapshot))
         except Exception:
             pass
+        _record_analytics_publish(ticker_name)
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +493,7 @@ def _sse_source_batched(url: str) -> ts[[dict]]:
         csp.schedule_alarm(poll, timedelta(milliseconds=50), True)
         batch = _drain_queue(s_queue, 500)
         if batch:
+            _record_sse_batch(batch)
             return batch
 
 
@@ -386,6 +547,30 @@ async def startup():
 @app.get("/__health_check__.html")
 async def health_check():
     return PlainTextResponse("OK\n")
+
+
+@app.get("/topology")
+async def get_topology():
+    """DAG + window parameters for operator dashboards."""
+    return JSONResponse(get_topology_payload())
+
+
+@app.get("/stats")
+async def get_stats():
+    """Live counters: SSE throughput, publish rate, queue depth."""
+    with _stats_lock:
+        snap = {
+            "sse_batches_total": _runtime_stats["sse_batches_total"],
+            "sse_events_total": _runtime_stats["sse_events_total"],
+            "analytics_publishes_total": _runtime_stats["analytics_publishes_total"],
+            "events_by_ticker": dict(_runtime_stats["events_by_ticker"]),
+            "last_analytics_by_ticker": dict(_runtime_stats["last_analytics_by_ticker"]),
+        }
+    snap["uptime_sec"] = round(time.time() - SERVICE_STARTED_WALL, 3)
+    snap["analytics_queue_depth"] = analytics_queue.qsize()
+    snap["analytics_tickers"] = sorted(analytics_store.keys())
+    snap["price_server_url"] = PRICE_SERVER_URL
+    return JSONResponse(snap)
 
 
 @app.get("/analytics")

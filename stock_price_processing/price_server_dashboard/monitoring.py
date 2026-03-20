@@ -90,6 +90,12 @@ PRICE_SERVER_URL = "http://price-server"
 if _job_type in ("workstation", ""):
     PRICE_SERVER_URL = "http://localhost:8080"
 
+# Price Processor CSP service — override with PRICE_PROCESSOR_URL if DNS differs
+if _job_type in ("workstation", ""):
+    PRICE_PROCESSOR_URL = os.environ.get("PRICE_PROCESSOR_URL", "http://localhost:8081")
+else:
+    PRICE_PROCESSOR_URL = os.environ.get("PRICE_PROCESSOR_URL", "http://price-processor")
+
 
 def _app_path(suffix: str = "") -> str:
     """Browser-absolute path (includes /job/.../ prefix when deployed on Datatailr)."""
@@ -104,7 +110,12 @@ def _common_template_ctx() -> dict:
     ctx = get_user_ribbon_context()
     ctx["monitor_url"] = _app_path("")
     ctx["tickers_url"] = _app_path("tickers")
+    ctx["processor_url"] = _app_path("processor")
     ctx["api_tickers_url"] = _app_path("api/tickers")
+    ctx["api_processor_stream"] = _app_path("api/processor/stream")
+    ctx["api_processor_analytics"] = _app_path("api/processor/analytics")
+    ctx["api_processor_stats"] = _app_path("api/processor/stats")
+    ctx["api_processor_topology"] = _app_path("api/processor/topology")
     return ctx
 
 
@@ -121,6 +132,85 @@ def index():
 @app.route("/tickers")
 def tickers_page():
     return render_template("tickers.html", **_common_template_ctx())
+
+
+@app.route("/processor")
+def processor_dashboard():
+    return render_template("processor.html", **_common_template_ctx())
+
+
+@app.route("/api/processor/stream")
+def processor_stream_proxy():
+    """Relay analytics SSE from the price processor (same-origin for the browser)."""
+
+    def generate():
+        while True:
+            try:
+                with requests.get(
+                    f"{PRICE_PROCESSOR_URL}/stream",
+                    stream=True,
+                    timeout=(5, None),
+                    headers={"Accept": "text/event-stream"},
+                ) as r:
+                    r.raise_for_status()
+                    for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
+                        if chunk:
+                            yield chunk
+            except Exception as exc:
+                log.warning("Processor SSE proxy error: %s – retrying in 2s", exc)
+                yield 'event: error\ndata: {"error":"processor unavailable"}\n\n'
+                time.sleep(2)
+
+    return Response(
+        generate(),
+        content_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.route("/api/processor/analytics")
+def processor_analytics_proxy():
+    try:
+        r = requests.get(f"{PRICE_PROCESSOR_URL}/analytics", timeout=15)
+        return app.response_class(
+            response=r.content,
+            status=r.status_code,
+            mimetype="application/json",
+        )
+    except requests.RequestException as exc:
+        log.warning("processor_analytics_proxy: %s", exc)
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/api/processor/stats")
+def processor_stats_proxy():
+    try:
+        r = requests.get(f"{PRICE_PROCESSOR_URL}/stats", timeout=15)
+        return app.response_class(
+            response=r.content,
+            status=r.status_code,
+            mimetype="application/json",
+        )
+    except requests.RequestException as exc:
+        log.warning("processor_stats_proxy: %s", exc)
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/api/processor/topology")
+def processor_topology_proxy():
+    try:
+        r = requests.get(f"{PRICE_PROCESSOR_URL}/topology", timeout=15)
+        return app.response_class(
+            response=r.content,
+            status=r.status_code,
+            mimetype="application/json",
+        )
+    except requests.RequestException as exc:
+        log.warning("processor_topology_proxy: %s", exc)
+        return jsonify({"error": str(exc)}), 502
 
 
 @app.route("/__health_check__.html")

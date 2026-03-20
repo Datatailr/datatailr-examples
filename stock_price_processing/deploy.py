@@ -1,3 +1,7 @@
+"""Stock price example: price server, CSP processor, unified Flask dashboard.
+
+Processor cockpit uses http://price-processor unless PRICE_PROCESSOR_URL is set.
+"""
 from stock_price_processing.price_server.server import main as price_server_main
 from stock_price_processing.price_processor.server import main as price_processing_main
 from datatailr import Service, App, Resources
@@ -27,6 +31,6 @@ dashboard = App(
     python_requirements=["flask", "gunicorn", "requests"],
 )
 
-# price_server.run()
-# price_processing.run()
+price_server.run()
+price_processing.run()
 dashboard.run()
