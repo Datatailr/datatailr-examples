@@ -1,8 +1,8 @@
 from stock_price_processing.price_server.server import main as price_server_main
-from stock_price_processing.price_processing.server import main as price_processing_main
+from stock_price_processing.price_processor.server import main as price_processing_main
 from datatailr import Service, App, Resources
 
-import stock_price_processing.dashboard.monitoring as dashboard_entrypoint
+import stock_price_processing.price_server_dashboard.monitoring as dashboard_entrypoint
 
 
 price_server = Service(
