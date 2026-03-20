@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import requests
-from flask import Flask, render_template, Response, request
+from flask import Flask, jsonify, render_template, Response, request
 
 log = logging.getLogger(__name__)
 
@@ -91,15 +91,36 @@ if _job_type in ("workstation", ""):
     PRICE_SERVER_URL = "http://localhost:8080"
 
 
+def _app_path(suffix: str = "") -> str:
+    """Browser-absolute path (includes /job/.../ prefix when deployed on Datatailr)."""
+    base = _PREFIX.rstrip("/")
+    suf = suffix.strip("/")
+    if not suf:
+        return f"{base}/" if base else "/"
+    return f"{base}/{suf}" if base else f"/{suf}"
+
+
+def _common_template_ctx() -> dict:
+    ctx = get_user_ribbon_context()
+    ctx["monitor_url"] = _app_path("")
+    ctx["tickers_url"] = _app_path("tickers")
+    ctx["api_tickers_url"] = _app_path("api/tickers")
+    return ctx
+
+
 @app.route("/")
 def index():
-    stream_url = _PREFIX.rstrip("/") + "/stream" if _PREFIX != "/" else "/stream"
-    user_ctx = get_user_ribbon_context()
+    user_ctx = _common_template_ctx()
     return render_template(
         "index.html",
-        stream_url=stream_url,
+        stream_url=_app_path("stream"),
         **user_ctx,
     )
+
+
+@app.route("/tickers")
+def tickers_page():
+    return render_template("tickers.html", **_common_template_ctx())
 
 
 @app.route("/__health_check__.html")
@@ -136,6 +157,68 @@ def stream_proxy():
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.route("/api/tickers", methods=["GET"])
+def api_tickers_list():
+    """Proxy: GET price-server /tickers."""
+    try:
+        r = requests.get(f"{PRICE_SERVER_URL}/tickers", timeout=15)
+        return app.response_class(
+            response=r.content,
+            status=r.status_code,
+            mimetype="application/json",
+        )
+    except requests.RequestException as exc:
+        log.warning("api_tickers_list: %s", exc)
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/api/tickers", methods=["POST"])
+def api_tickers_add():
+    """Proxy: PUT price-server /add/{ticker} with price & vol query params."""
+    data = request.get_json(silent=True) or {}
+    raw = (data.get("ticker") or data.get("symbol") or "").strip()
+    if not raw:
+        return jsonify({"error": "ticker is required"}), 400
+    ticker = raw.upper()
+    try:
+        price = float(data.get("price", 100.0))
+        vol = float(data.get("vol", 0.25))
+    except (TypeError, ValueError):
+        return jsonify({"error": "price and vol must be numbers"}), 400
+    try:
+        r = requests.put(
+            f"{PRICE_SERVER_URL}/add/{ticker}",
+            params={"price": price, "vol": vol},
+            timeout=15,
+        )
+        return app.response_class(
+            response=r.content,
+            status=r.status_code,
+            mimetype="application/json",
+        )
+    except requests.RequestException as exc:
+        log.warning("api_tickers_add: %s", exc)
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/api/tickers/<ticker>", methods=["DELETE"])
+def api_tickers_remove(ticker: str):
+    """Proxy: PUT price-server /remove/{ticker}."""
+    sym = ticker.strip().upper()
+    if not sym:
+        return jsonify({"error": "invalid ticker"}), 400
+    try:
+        r = requests.put(f"{PRICE_SERVER_URL}/remove/{sym}", timeout=15)
+        return app.response_class(
+            response=r.content,
+            status=r.status_code,
+            mimetype="application/json",
+        )
+    except requests.RequestException as exc:
+        log.warning("api_tickers_remove: %s", exc)
+        return jsonify({"error": str(exc)}), 502
 
 
 if __name__ == "__main__":

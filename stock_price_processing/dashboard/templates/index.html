@@ -162,6 +162,7 @@
       {% endif %}
     </div>
     <div class="header-controls">
+      <a href="{{ tickers_url }}" style="color:#58a6ff;font-size:14px;text-decoration:none;white-space:nowrap;">Tickers</a>
       <select id="ticker-filter">
         <option value="">All Tickers</option>
       </select>
@@ -190,6 +191,14 @@
 
   <script>
     const MAX_ROWS = 500;
+    /**
+     * Charts only: Perspective Y Line scales the x-axis to the min/max timestamp of the
+     * *filtered* rows. There is no built-in "fixed domain" API, so we use a rolling window
+     * so the visible time span stays ~constant while data streams in.
+     * Grids (Trades/Quotes) stay unbounded by time and only use row limit + optional ticker.
+     */
+    const CHART_TIME_WINDOW_MS = 5 * 60 * 1000;
+    const CHART_TIME_FILTER_REFRESH_MS = 3000;
 
     const TRADE_SCHEMA = {
       seq:       "integer",
@@ -261,16 +270,39 @@
 
       const knownTickers = new Set();
 
+      function chartTimeFilter() {
+        return [["timestamp", ">=", new Date(Date.now() - CHART_TIME_WINDOW_MS)]];
+      }
+
+      function gridFilter(ticker) {
+        return ticker ? [["ticker", "==", ticker]] : [];
+      }
+
+      function chartFilter(ticker) {
+        const t = chartTimeFilter();
+        if (!ticker) return t;
+        return [["ticker", "==", ticker], ...t];
+      }
+
       function applyFilter(ticker) {
-        const filter = ticker ? [["ticker", "==", ticker]] : [];
-        for (const v of Object.values(viewers)) {
-          v.restore({ filter });
-        }
+        viewers.trades.restore({ filter: gridFilter(ticker) });
+        viewers.quotes.restore({ filter: gridFilter(ticker) });
+        viewers.chart.restore({ filter: chartFilter(ticker) });
+        viewers.spread.restore({ filter: chartFilter(ticker) });
       }
 
       filterSelect.addEventListener("change", () => {
         applyFilter(filterSelect.value);
       });
+
+      applyFilter("");
+
+      const chartTimeTicker = setInterval(() => {
+        const ticker = filterSelect.value;
+        viewers.chart.restore({ filter: chartFilter(ticker) });
+        viewers.spread.restore({ filter: chartFilter(ticker) });
+      }, CHART_TIME_FILTER_REFRESH_MS);
+      window.addEventListener("beforeunload", () => clearInterval(chartTimeTicker));
 
       function connect() {
         statusEl.textContent = "connecting...";
