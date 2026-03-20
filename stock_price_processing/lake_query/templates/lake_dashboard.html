@@ -104,6 +104,7 @@ LIMIT 100</textarea>
 
   <script>
     const apiBase = "{{ api_base }}".replace(/\/$/, "");
+    const blobBrowserRoot = "{{ blob_browser_root }}";
 
     document.querySelectorAll(".tab-btn").forEach(btn => {
       btn.addEventListener("click", () => {
@@ -167,7 +168,7 @@ LIMIT 100</textarea>
       return node.type === "dir";
     }
 
-    async function fetchBlobTree(prefix = "/") {
+    async function fetchBlobTree(prefix = blobBrowserRoot) {
       const r = await fetch(apiBase + "/blob-tree?prefix=" + encodeURIComponent(prefix));
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || "blob-tree failed");
@@ -189,7 +190,7 @@ LIMIT 100</textarea>
           expanded = !expanded;
           if (expanded) {
             if (node.children == null) {
-              const loaded = await fetchBlobTree(node.path || "/");
+              const loaded = await fetchBlobTree(node.path || blobBrowserRoot);
               node.children = loaded.children || [];
             }
             let last = tr;
@@ -221,7 +222,7 @@ LIMIT 100</textarea>
       const err = document.getElementById("blob-error");
       err.textContent = "";
       try {
-        const tree = await fetchBlobTree("/");
+        const tree = await fetchBlobTree(blobBrowserRoot);
         const host = document.getElementById("blob-tree");
         host.innerHTML = "";
         const table = document.createElement("table");

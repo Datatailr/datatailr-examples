@@ -211,7 +211,14 @@ def _to_json_value(v: Any) -> Any:
 
 @app.route("/")
 def index():
-    return render_template("lake_dashboard.html", api_base=_app_path("api"), app_prefix=_PREFIX, default_prefix=default_blob_prefix())
+    browser_root = _normalize_blob_ls_prefix(default_blob_prefix())
+    return render_template(
+        "lake_dashboard.html",
+        api_base=_app_path("api"),
+        app_prefix=_PREFIX,
+        default_prefix=default_blob_prefix(),
+        blob_browser_root=browser_root,
+    )
 
 
 @app.get("/api/collector-status")
@@ -226,7 +233,7 @@ def collector_status():
 
 @app.get("/api/blob-tree")
 def blob_tree():
-    prefix = request.args.get("prefix", "/")
+    prefix = request.args.get("prefix") or _normalize_blob_ls_prefix(default_blob_prefix())
     return jsonify(_list_blob_dir_at_prefix(prefix))
 
 
