@@ -9,6 +9,7 @@ from datatailr import Service, App, Resources
 
 import stock_price_processing.price_server_dashboard.monitoring as dashboard_entrypoint
 import stock_price_processing.lake_query.dashboard as lake_dashboard_entrypoint
+import stock_price_processing.price_processor.dashboard as processor_dashboard_entrypoint
 
 
 price_server = Service(
@@ -48,8 +49,17 @@ lake_dashboard = App(
     python_requirements=["flask", "gunicorn", "requests", "duckdb", "pyarrow", "pandas"],
 )
 
+processor_dashboard = App(
+    name="Price Processor Dashboard",
+    entrypoint=processor_dashboard_entrypoint,
+    framework="flask",
+    resources=Resources(memory="4g", cpu=1),
+    python_requirements=["flask", "gunicorn", "requests"],
+)
+
 price_server.run()
 price_processing.run()
 data_collector.run()
 dashboard.run()
 lake_dashboard.run()
+processor_dashboard.run()

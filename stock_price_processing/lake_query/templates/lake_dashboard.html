@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lake Query Dashboard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/css/pro.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/css/pro-dark.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective/dist/umd/perspective.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/umd/perspective-viewer.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-datagrid/dist/umd/perspective-viewer-datagrid.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-d3fc/dist/umd/perspective-viewer-d3fc.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/theme/material-darker.css" />
+  <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/sql/sql.js"></script>
+  <style>
+    body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin: 0; background: #0d1117; color: #c9d1d9; }
+    .page { padding: 16px; max-width: 1500px; margin: 0 auto; }
+    h1 { margin: 0 0 12px; font-size: 22px; color: #e6edf3; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+    .tab-btn { background: #161b22; border: 1px solid #30363d; color: #c9d1d9; border-radius: 8px; padding: 8px 12px; cursor: pointer; }
+    .tab-btn.active { color: #58a6ff; border-color: #58a6ff; }
+    .tab { display: none; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 12px; min-height: 420px; }
+    .tab.active { display: block; }
+    .status-grid { display: grid; grid-template-columns: repeat(3, minmax(200px, 1fr)); gap: 10px; }
+    .card { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 10px; }
+    .label { color: #8b949e; font-size: 12px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+    .value { font-size: 18px; color: #e6edf3; }
+    .controls { display: grid; grid-template-columns: 220px 220px 120px 120px 120px 1fr; gap: 10px; margin-bottom: 12px; align-items: end; }
+    .controls input, .controls select, .controls button, textarea {
+      width: 100%; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 8px; padding: 8px;
+    }
+    .controls button { cursor: pointer; background: #1f6feb; border-color: #1f6feb; color: #fff; font-weight: 600; }
+    .controls button:hover { background: #388bfd; }
+    textarea { min-height: 120px; margin-bottom: 10px; font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    .CodeMirror {
+      height: 140px;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      margin-bottom: 10px;
+      font-size: 13px;
+    }
+    .blob-table { width: 100%; border-collapse: collapse; }
+    .blob-table th, .blob-table td { border-bottom: 1px solid #30363d; padding: 7px; }
+    .blob-dir, .blob-file { cursor: pointer; }
+    .blob-dir { color: #58a6ff; font-weight: 600; }
+    .blob-file { color: #c9d1d9; }
+    .query-viewers { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    perspective-viewer { height: 420px; background: #fff; color: #222; display: block; }
+    .muted { color: #8b949e; font-size: 13px; margin-top: 6px; }
+    .error { color: #f85149; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Lake Query Dashboard</h1>
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="status">Collector Status</button>
+      <button class="tab-btn" data-tab="browser">Blob Browser</button>
+      <button class="tab-btn" data-tab="query">Query Builder</button>
+    </div>
+
+    <section class="tab active" id="tab-status">
+      <div class="status-grid" id="status-grid"></div>
+      <div class="muted" id="status-last-update">Waiting for update...</div>
+      <div class="error" id="status-error"></div>
+    </section>
+
+    <section class="tab" id="tab-browser">
+      <div class="muted">Click folder names to expand. File names copy full blob path.</div>
+      <div id="blob-tree"></div>
+      <div class="error" id="blob-error"></div>
+    </section>
+
+    <section class="tab" id="tab-query">
+      <div class="controls">
+        <div><div class="label">Base Prefix</div><input id="q-prefix" value="{{ default_prefix }}" /></div>
+        <div><div class="label">Dataset</div><select id="q-dataset"><option>analytics</option><option>market_events</option></select></div>
+        <div><div class="label">Date (dt)</div><input id="q-dt" placeholder="2026-03-20" /></div>
+        <div><div class="label">Hour</div><input id="q-hour" placeholder="14" /></div>
+        <div><div class="label">Max files</div><input id="q-max" type="number" value="64" min="1" /></div>
+        <div><button id="q-run">Run Query</button></div>
+      </div>
+      <textarea id="q-sql">SELECT * FROM lake
+WHERE ticker = 'AAPL'
+LIMIT 100</textarea>
+      <div class="query-viewers">
+        <perspective-viewer id="q-viewer-table" theme="Pro Light"></perspective-viewer>
+        <perspective-viewer id="q-viewer-chart" theme="Pro Light"></perspective-viewer>
+      </div>
+      <div class="muted" id="q-meta"></div>
+      <div class="error" id="q-error"></div>
+    </section>
+  </div>
+
+  <script>
+    const apiBase = "{{ api_base }}".replace(/\/$/, "");
+
+    document.querySelectorAll(".tab-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+        document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+        btn.classList.add("active");
+        document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+      });
+    });
+
+    async function loadStatus() {
+      const error = document.getElementById("status-error");
+      error.textContent = "";
+      try {
+        const r = await fetch(apiBase + "/collector-status");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || "status request failed");
+        const grid = document.getElementById("status-grid");
+        grid.innerHTML = "";
+        const rows = [
+          ["Analytics buffer rows", data.analytics_buffer_rows],
+          ["Market buffer rows", data.market_buffer_rows],
+          ["Blob prefix", data.blob_prefix],
+          ["Flush interval sec", data.flush_interval_sec],
+          ["Analytics SSE", data.analytics_sse],
+          ["Market SSE", data.market_sse],
+          ["Local dir", data.local_dir || "-"],
+        ];
+        rows.forEach(([k,v]) => {
+          const card = document.createElement("div");
+          card.className = "card";
+          card.innerHTML = `<div class="label">${k}</div><div class="value">${v}</div>`;
+          grid.appendChild(card);
+        });
+        document.getElementById("status-last-update").textContent = "Updated: " + new Date().toLocaleTimeString();
+      } catch (e) {
+        error.textContent = String(e);
+      }
+    }
+
+    function formatDateRawOrEpoch(val) {
+      if (!val) return "";
+      if (typeof val === "number" || /^\d+$/.test(String(val))) {
+        const d = new Date(Number(val) * 1000);
+        if (!isNaN(d)) return d.toLocaleString();
+      }
+      return String(val);
+    }
+
+    function formatSize(bytes) {
+      if (typeof bytes !== "number" || isNaN(bytes)) return "";
+      if (bytes === 0) return "0 B";
+      const k = 1024, units = ["B","KB","MB","GB","TB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return (bytes / Math.pow(k, i)).toFixed(2) + " " + units[i];
+    }
+
+    function isBlobDirectory(node) {
+      if (!node) return false;
+      if (Object.prototype.hasOwnProperty.call(node, "is_file")) return !node.is_file;
+      return node.type === "dir";
+    }
+
+    async function fetchBlobTree(prefix = "/") {
+      const r = await fetch(apiBase + "/blob-tree?prefix=" + encodeURIComponent(prefix));
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "blob-tree failed");
+      return data;
+    }
+
+    function renderBlobRows(node, parent, depth = 0, insertAfter = null) {
+      const indent = (depth * 0.8) + "em";
+      const insert = (tr) => {
+        if (insertAfter && insertAfter.nextSibling) parent.insertBefore(tr, insertAfter.nextSibling);
+        else parent.appendChild(tr);
+      };
+      if (isBlobDirectory(node)) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td style="padding-left:${indent}"><span class="blob-dir">📁 ${node.name}</span></td><td>${node.path || ""}</td><td></td><td></td>`;
+        insert(tr);
+        let expanded = false;
+        tr.addEventListener("click", async () => {
+          expanded = !expanded;
+          if (expanded) {
+            if (node.children == null) {
+              const loaded = await fetchBlobTree(node.path || "/");
+              node.children = loaded.children || [];
+            }
+            let last = tr;
+            (node.children || []).forEach(ch => { last = renderBlobRows(ch, parent, depth + 1, last); });
+          } else {
+            let nx = tr.nextSibling;
+            while (nx) {
+              const pad = nx.firstChild && nx.firstChild.style && nx.firstChild.style.paddingLeft;
+              if (pad && parseFloat(pad) > parseFloat(indent)) {
+                const rm = nx; nx = nx.nextSibling; parent.removeChild(rm);
+              } else break;
+            }
+          }
+        });
+        return tr;
+      }
+      const tr = document.createElement("tr");
+      const path = node.path || node.name;
+      tr.innerHTML = `<td style="padding-left:${indent}"><span class="blob-file">📄 ${node.name}</span></td><td>${path}</td><td>${formatSize(node.size)}</td><td>${formatDateRawOrEpoch(node.last_modified)}</td>`;
+      tr.querySelector(".blob-file").addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try { await navigator.clipboard.writeText(path); } catch (_) {}
+      });
+      insert(tr);
+      return tr;
+    }
+
+    async function loadBrowserRoot() {
+      const err = document.getElementById("blob-error");
+      err.textContent = "";
+      try {
+        const tree = await fetchBlobTree("/");
+        const host = document.getElementById("blob-tree");
+        host.innerHTML = "";
+        const table = document.createElement("table");
+        table.className = "blob-table";
+        table.innerHTML = "<thead><tr><th>Name</th><th>Path</th><th>Size</th><th>Last Modified</th></tr></thead>";
+        const tb = document.createElement("tbody");
+        renderBlobRows(tree, tb, 0, null);
+        table.appendChild(tb);
+        host.appendChild(table);
+      } catch (e) {
+        err.textContent = String(e);
+      }
+    }
+
+    async function initQuery() {
+      const runBtn = document.getElementById("q-run");
+      const err = document.getElementById("q-error");
+      const meta = document.getElementById("q-meta");
+      const viewerTable = document.getElementById("q-viewer-table");
+      const viewerChart = document.getElementById("q-viewer-chart");
+      const sqlTextarea = document.getElementById("q-sql");
+      let worker = null;
+      let table = null;
+      let sqlEditor = null;
+
+      if (window.CodeMirror && sqlTextarea) {
+        sqlEditor = CodeMirror.fromTextArea(sqlTextarea, {
+          mode: "text/x-sql",
+          theme: "material-darker",
+          lineNumbers: true,
+          indentWithTabs: false,
+          indentUnit: 2,
+          extraKeys: {
+            "Cmd-Enter": () => runBtn.click(),
+            "Ctrl-Enter": () => runBtn.click(),
+          },
+        });
+      } else if (sqlTextarea) {
+        sqlTextarea.addEventListener("keydown", (e) => {
+          if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+            e.preventDefault();
+            runBtn.click();
+          }
+        });
+      }
+
+      async function ensurePerspective() {
+        if (worker) return;
+        if (!window.perspective || typeof perspective.worker !== "function") {
+          throw new Error("Perspective failed to load. Check network/CDN access.");
+        }
+        worker = perspective.worker();
+        table = await worker.table([]);
+        await viewerTable.load(table);
+        await viewerTable.restore({ plugin: "Datagrid" });
+        await viewerChart.load(table);
+        await viewerChart.restore({ plugin: "Y Line" });
+      }
+
+      runBtn.addEventListener("click", async () => {
+        err.textContent = "";
+        meta.textContent = "Running...";
+        runBtn.disabled = true;
+        try {
+          const payload = {
+            base_prefix: document.getElementById("q-prefix").value,
+            dataset: document.getElementById("q-dataset").value,
+            dt: document.getElementById("q-dt").value,
+            hour: document.getElementById("q-hour").value,
+            max_files: Number(document.getElementById("q-max").value || 64),
+            sql: sqlEditor ? sqlEditor.getValue() : document.getElementById("q-sql").value
+          };
+          const r = await fetch(apiBase + "/query", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.error || "query failed");
+
+          await ensurePerspective();
+          if (table) {
+            try { table.delete(); } catch (_) {}
+          }
+          table = await worker.table(data.rows || []);
+          await viewerTable.load(table);
+          await viewerTable.restore({ plugin: "Datagrid" });
+          await viewerChart.load(table);
+          await viewerChart.restore({ plugin: "Y Line" });
+          meta.textContent = `Loaded ${data.row_count} rows`;
+        } catch (e) {
+          err.textContent = String(e);
+          meta.textContent = "";
+        } finally {
+          runBtn.disabled = false;
+        }
+      });
+    }
+
+    loadStatus();
+    setInterval(loadStatus, 5000);
+    loadBrowserRoot();
+    initQuery();
+  </script>
+</body>
+</html>

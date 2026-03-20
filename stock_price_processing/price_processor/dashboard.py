@@ -5,16 +5,14 @@ import time
 from pathlib import Path
 
 import requests
-from flask import Flask, jsonify, render_template, Response, request
+from flask import Flask, Response, jsonify, render_template, request
 
 log = logging.getLogger(__name__)
 
-# Cache User lookups by platform username (from x-datatailr-user) to avoid repeated SDK calls.
 _user_info_cache: dict[str, tuple[str, str]] = {}
 
 
 def _resolve_user_display_name_and_email(username: str) -> tuple[str, str]:
-    """Return (display_name, email) for a platform username; uses datatailr.User once per username."""
     if username in _user_info_cache:
         return _user_info_cache[username]
     display_name = username
@@ -33,10 +31,6 @@ def _resolve_user_display_name_and_email(username: str) -> tuple[str, str]:
 
 
 def get_user_ribbon_context() -> dict:
-    """
-    Build template variables for the header ribbon.
-    Uses X-Datatailr-User JSON header when present; otherwise local / off-platform.
-    """
     raw = request.headers.get("x-datatailr-user")
     if not raw or not raw.strip():
         return {
@@ -69,8 +63,8 @@ def get_user_ribbon_context() -> dict:
         "user_email": email,
     }
 
+
 _PKG = Path(__file__).parent
-_STATIC_DIR = str(_PKG / "static")
 _TEMPLATES_DIR = str(_PKG / "templates")
 
 _env = os.environ.get("DATATAILR_JOB_ENVIRONMENT", "")
@@ -78,20 +72,21 @@ _job = os.environ.get("DATATAILR_JOB_NAME", "")
 _job_type = os.environ.get("DATATAILR_JOB_TYPE", "")
 
 if _job_type == "workstation":
-    _PREFIX = f"/workstation/{_env}/{_job}/ide/proxy/5050/"
+    _PREFIX = f"/workstation/{_env}/{_job}/ide/proxy/5070/"
 elif _env and _job:
     _PREFIX = f"/job/{_env}/{_job}/"
 else:
     _PREFIX = "/"
 
-app = Flask(__name__, template_folder=_TEMPLATES_DIR, static_folder=_STATIC_DIR)
+app = Flask(__name__, template_folder=_TEMPLATES_DIR)
 
-PRICE_SERVER_URL = "http://price-server"
 if _job_type in ("workstation", ""):
-    PRICE_SERVER_URL = "http://localhost:8080"
+    PRICE_PROCESSOR_URL = os.environ.get("PRICE_PROCESSOR_URL", "http://localhost:8081")
+else:
+    PRICE_PROCESSOR_URL = os.environ.get("PRICE_PROCESSOR_URL", "http://price-processor")
+
 
 def _app_path(suffix: str = "") -> str:
-    """Browser-absolute path (includes /job/.../ prefix when deployed on Datatailr)."""
     base = _PREFIX.rstrip("/")
     suf = suffix.strip("/")
     if not suf:
@@ -101,40 +96,25 @@ def _app_path(suffix: str = "") -> str:
 
 def _common_template_ctx() -> dict:
     ctx = get_user_ribbon_context()
-    ctx["monitor_url"] = _app_path("")
-    ctx["tickers_url"] = _app_path("tickers")
-    ctx["api_tickers_url"] = _app_path("api/tickers")
+    ctx["api_processor_stream"] = _app_path("api/processor/stream")
+    ctx["api_processor_analytics"] = _app_path("api/processor/analytics")
+    ctx["api_processor_stats"] = _app_path("api/processor/stats")
+    ctx["api_processor_topology"] = _app_path("api/processor/topology")
     return ctx
 
 
 @app.route("/")
-def index():
-    user_ctx = _common_template_ctx()
-    return render_template(
-        "index.html",
-        stream_url=_app_path("stream"),
-        **user_ctx,
-    )
+def processor_dashboard():
+    return render_template("processor.html", **_common_template_ctx())
 
 
-@app.route("/tickers")
-def tickers_page():
-    return render_template("tickers.html", **_common_template_ctx())
-
-
-@app.route("/__health_check__.html")
-def health_check():
-    return "OK\n"
-
-
-@app.route("/stream")
-def stream_proxy():
-    """Relay the SSE stream from the price server so the browser stays same-origin."""
+@app.route("/api/processor/stream")
+def processor_stream_proxy():
     def generate():
         while True:
             try:
                 with requests.get(
-                    f"{PRICE_SERVER_URL}/stream",
+                    f"{PRICE_PROCESSOR_URL}/stream",
                     stream=True,
                     timeout=(5, None),
                     headers={"Accept": "text/event-stream"},
@@ -144,8 +124,8 @@ def stream_proxy():
                         if chunk:
                             yield chunk
             except Exception as exc:
-                log.warning("SSE upstream error: %s – retrying in 2s", exc)
-                yield f"event: error\ndata: upstream unavailable\n\n"
+                log.warning("Processor SSE proxy error: %s - retrying in 2s", exc)
+                yield 'event: error\ndata: {"error":"processor unavailable"}\n\n'
                 time.sleep(2)
 
     return Response(
@@ -158,67 +138,52 @@ def stream_proxy():
     )
 
 
-@app.route("/api/tickers", methods=["GET"])
-def api_tickers_list():
-    """Proxy: GET price-server /tickers."""
+@app.route("/api/processor/analytics")
+def processor_analytics_proxy():
     try:
-        r = requests.get(f"{PRICE_SERVER_URL}/tickers", timeout=15)
+        r = requests.get(f"{PRICE_PROCESSOR_URL}/analytics", timeout=15)
         return app.response_class(
             response=r.content,
             status=r.status_code,
             mimetype="application/json",
         )
     except requests.RequestException as exc:
-        log.warning("api_tickers_list: %s", exc)
+        log.warning("processor_analytics_proxy: %s", exc)
         return jsonify({"error": str(exc)}), 502
 
 
-@app.route("/api/tickers", methods=["POST"])
-def api_tickers_add():
-    """Proxy: PUT price-server /add/{ticker} with price & vol query params."""
-    data = request.get_json(silent=True) or {}
-    raw = (data.get("ticker") or data.get("symbol") or "").strip()
-    if not raw:
-        return jsonify({"error": "ticker is required"}), 400
-    ticker = raw.upper()
+@app.route("/api/processor/stats")
+def processor_stats_proxy():
     try:
-        price = float(data.get("price", 100.0))
-        vol = float(data.get("vol", 0.25))
-    except (TypeError, ValueError):
-        return jsonify({"error": "price and vol must be numbers"}), 400
-    try:
-        r = requests.put(
-            f"{PRICE_SERVER_URL}/add/{ticker}",
-            params={"price": price, "vol": vol},
-            timeout=15,
-        )
+        r = requests.get(f"{PRICE_PROCESSOR_URL}/stats", timeout=15)
         return app.response_class(
             response=r.content,
             status=r.status_code,
             mimetype="application/json",
         )
     except requests.RequestException as exc:
-        log.warning("api_tickers_add: %s", exc)
+        log.warning("processor_stats_proxy: %s", exc)
         return jsonify({"error": str(exc)}), 502
 
 
-@app.route("/api/tickers/<ticker>", methods=["DELETE"])
-def api_tickers_remove(ticker: str):
-    """Proxy: PUT price-server /remove/{ticker}."""
-    sym = ticker.strip().upper()
-    if not sym:
-        return jsonify({"error": "invalid ticker"}), 400
+@app.route("/api/processor/topology")
+def processor_topology_proxy():
     try:
-        r = requests.put(f"{PRICE_SERVER_URL}/remove/{sym}", timeout=15)
+        r = requests.get(f"{PRICE_PROCESSOR_URL}/topology", timeout=15)
         return app.response_class(
             response=r.content,
             status=r.status_code,
             mimetype="application/json",
         )
     except requests.RequestException as exc:
-        log.warning("api_tickers_remove: %s", exc)
+        log.warning("processor_topology_proxy: %s", exc)
         return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/__health_check__.html")
+def health_check():
+    return "OK\n"
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5050)
+    app.run(debug=True, port=5070)
