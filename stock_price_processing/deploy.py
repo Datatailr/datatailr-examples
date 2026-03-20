@@ -10,6 +10,7 @@ from datatailr import Service, App, Resources
 import stock_price_processing.price_server_dashboard.monitoring as dashboard_entrypoint
 import stock_price_processing.lake_query.dashboard as lake_dashboard_entrypoint
 import stock_price_processing.price_processor.dashboard as processor_dashboard_entrypoint
+from stock_price_processing.compaction_workflow.deploy import hourly_compaction_workflow
 
 
 price_server = Service(
@@ -57,9 +58,10 @@ processor_dashboard = App(
     python_requirements=["flask", "gunicorn", "requests"],
 )
 
-price_server.run()
-price_processing.run()
-data_collector.run()
-dashboard.run()
-lake_dashboard.run()
-processor_dashboard.run()
+# price_server.run()
+# price_processing.run()
+# data_collector.run()
+# dashboard.run()
+# lake_dashboard.run()
+# processor_dashboard.run()
+hourly_compaction_workflow(local_run=True)

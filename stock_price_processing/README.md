@@ -71,6 +71,27 @@ SELECT * FROM read_parquet('market_events/**/*.parquet', hive_partitioning = tru
 
 Use paths that match where you synced blobs (e.g. `dt` / `hour` columns appear from directory names).
 
+### Hourly compaction workflow (`compaction_workflow/`)
+
+An hourly batch workflow compacts small parquet shards to reduce DuckDB file scans.
+
+- Schedule: every hour (`Schedule(every_hour=True)`).
+- Scope: sliding window over recent partitions (`last_n_hours`, default `24`).
+- Partition key: `dataset/dt/hour/ticker`.
+- Idempotence:
+  - Skips partitions already compacted (`_COMPACTED.json` marker + compacted file exists).
+  - Skips partitions with too few files (threshold `COMPACTION_MIN_FILES`, default `3`).
+  - Compacts into deterministic output `compact-dt=...-hour=...-ticker=....parquet`.
+  - Writes/updates marker metadata, then deletes original shards only after successful write.
+
+Tunables (env vars):
+
+| Env | Meaning |
+|-----|---------|
+| `COMPACTION_LAST_N_HOURS` | Sliding scan window in hours (default `24`) |
+| `COMPACTION_MIN_FILES` | Minimum shard count required before compaction (default `3`) |
+| `COMPACTION_DRY_RUN` | `1` to list actions without writing/deleting |
+
 ### Lake query (`lake_query/`)
 
 Read Parquet from **blob** using the same mechanism as the collector write path: **`Blob().ls`** and **`Blob().get_blob`** (i.e. `dt blob ls` / `dt blob get`). This avoids assuming a local filesystem or direct object-store URLs.
