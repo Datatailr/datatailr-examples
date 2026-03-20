@@ -4,6 +4,7 @@ Processor cockpit uses http://price-processor unless PRICE_PROCESSOR_URL is set.
 """
 from stock_price_processing.price_server.server import main as price_server_main
 from stock_price_processing.price_processor.server import main as price_processing_main
+from stock_price_processing.data_collector.service import main as data_collector_main
 from datatailr import Service, App, Resources
 
 import stock_price_processing.price_server_dashboard.monitoring as dashboard_entrypoint
@@ -23,6 +24,13 @@ price_processing = Service(
     python_requirements="stock_price_processing/requirements.txt",
 )
 
+data_collector = Service(
+    name="Stock data collector",
+    entrypoint=data_collector_main,
+    resources=Resources(memory="2g", cpu=1),
+    python_requirements="stock_price_processing/requirements.txt",
+)
+
 dashboard = App(
     name="Price Server Dashboard",
     entrypoint=dashboard_entrypoint,
@@ -33,4 +41,5 @@ dashboard = App(
 
 price_server.run()
 price_processing.run()
+data_collector.run()
 dashboard.run()

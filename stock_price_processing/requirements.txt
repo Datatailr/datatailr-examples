@@ -4,3 +4,5 @@ uvicorn[standard]
 sse-starlette
 csp
 requests
+pandas
+pyarrow
