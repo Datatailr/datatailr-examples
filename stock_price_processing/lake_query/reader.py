@@ -200,6 +200,9 @@ def iter_dataset_parquet_keys(
     Yield parquet keys from one dataset with optional partition pruning.
 
     Layout assumed:
+      {base}/{dataset}/dt=YYYY-MM-DD/hour=HH/ticker=<TICKER>/part-*.parquet
+
+    Also supports legacy files directly under hour partition:
       {base}/{dataset}/dt=YYYY-MM-DD/hour=HH/part-*.parquet
     """
     root = _dataset_root(base_prefix, dataset)
@@ -244,9 +247,10 @@ def iter_dataset_parquet_keys(
         for hour_dir in sorted(hour_scan):
             hour_prefix = _join_key(dt_prefix, hour_dir)
             try:
-                _subdirs, hour_files = _list_immediate(blob, hour_prefix)
+                hour_subdirs, hour_files = _list_immediate(blob, hour_prefix)
             except Exception:
                 continue
+            # Legacy layout support: files directly under hour partition.
             for key in hour_files:
                 if not key.endswith(".parquet"):
                     continue
@@ -254,6 +258,20 @@ def iter_dataset_parquet_keys(
                 yielded += 1
                 if max_files is not None and yielded >= max_files:
                     return
+            # Current layout: descend one level into ticker=... partition folders.
+            for ticker_dir in sorted(d for d in hour_subdirs if d.startswith("ticker=")):
+                ticker_prefix = _join_key(hour_prefix, ticker_dir)
+                try:
+                    _nested, ticker_files = _list_immediate(blob, ticker_prefix)
+                except Exception:
+                    continue
+                for key in ticker_files:
+                    if not key.endswith(".parquet"):
+                        continue
+                    yield key
+                    yielded += 1
+                    if max_files is not None and yielded >= max_files:
+                        return
 
 
 def get_blob_bytes(blob: Any, key: str) -> bytes:

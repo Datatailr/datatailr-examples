@@ -4,8 +4,8 @@ buffers rows, and flushes Parquet files under a Hive-style layout for DuckDB.
 
 Layout (under COLLECTOR_BLOB_PREFIX or COLLECTOR_LOCAL_DIR):
 
-  analytics/dt=YYYY-MM-DD/hour=HH/part-<nanos>.parquet
-  market_events/dt=YYYY-MM-DD/hour=HH/part-<nanos>.parquet
+  analytics/dt=YYYY-MM-DD/hour=HH/ticker=<TICKER>/part-<nanos>.parquet
+  market_events/dt=YYYY-MM-DD/hour=HH/ticker=<TICKER>/part-<nanos>.parquet
 
 DuckDB (after sync or with mounted paths):
 
@@ -109,22 +109,32 @@ def _store_parquet(rel_path: str, table: pa.Table) -> None:
         raise
 
 
+def _ticker_partition_value(raw: Any) -> str:
+    t = str(raw or "").strip().upper()
+    if not t:
+        return "UNKNOWN"
+    # Keep Hive partition values path-safe and predictable.
+    cleaned = "".join(ch if (ch.isalnum() or ch in ("_", "-", ".")) else "_" for ch in t)
+    return cleaned or "UNKNOWN"
+
+
 def _flush_partitioned(kind: str, rows: list[dict[str, Any]]) -> None:
-    """Write one Parquet file per (dt, hour) partition (Hive-style paths for DuckDB)."""
+    """Write one Parquet file per (dt, hour, ticker) partition (Hive-style paths for DuckDB)."""
     if not rows:
         return
-    parts: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    parts: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         ts_raw = r.get("timestamp")
         if not isinstance(ts_raw, str):
             ts_raw = r.get("ingested_at")
         dt_s, h_s = _partition_from_ts(ts_raw if isinstance(ts_raw, str) else None)
-        parts[(dt_s, h_s)].append(r)
+        ticker = _ticker_partition_value(r.get("ticker"))
+        parts[(dt_s, h_s, ticker)].append(r)
 
-    for (dt_s, h_s), part_rows in parts.items():
+    for (dt_s, h_s, ticker), part_rows in parts.items():
         df = pd.DataFrame(part_rows)
         table = pa.Table.from_pandas(df, preserve_index=False)
-        name = f"{kind}/dt={dt_s}/hour={h_s}/part-{time.time_ns()}.parquet"
+        name = f"{kind}/dt={dt_s}/hour={h_s}/ticker={ticker}/part-{time.time_ns()}.parquet"
         _store_parquet(name, table)
 
 

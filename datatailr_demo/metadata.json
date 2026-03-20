@@ -2,5 +2,5 @@
     "name": "DataTailr Demo",
     "description": "A demo of DataTailr's capabilities in data analysis and visualization.",
     "tags": ["Data Analysis", "Visualization", "Demo", "panel", "streamlit", "excel", "dash", "dashboards", "workflows", "data pipelines"],
-    "author": "Denis Geidman"
+    "author": "Datatailr"
 }

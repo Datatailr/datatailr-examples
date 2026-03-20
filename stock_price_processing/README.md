@@ -44,8 +44,8 @@ Long-running **Service** that reads:
 Every **`COLLECTOR_FLUSH_INTERVAL_SEC`** (default **120**), buffered rows are written under a **Hive-style** path (DuckDB-friendly):
 
 ```text
-{blob_prefix}/analytics/dt=YYYY-MM-DD/hour=HH/part-<nanos>.parquet
-{blob_prefix}/market_events/dt=YYYY-MM-DD/hour=HH/part-<nanos>.parquet
+{blob_prefix}/analytics/dt=YYYY-MM-DD/hour=HH/ticker=<TICKER>/part-<nanos>.parquet
+{blob_prefix}/market_events/dt=YYYY-MM-DD/hour=HH/ticker=<TICKER>/part-<nanos>.parquet
 ```
 
 On **Datatailr**, files go to **blob** via `Blob().put` under `COLLECTOR_BLOB_PREFIX` (default `stock_price_lake`). Locally, set **`COLLECTOR_LOCAL_DIR`** (e.g. `./_lake`) to skip blob and write files on disk.
