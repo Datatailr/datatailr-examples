@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Exchange Monitor</title>
+
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/css/pro.css" />
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/css/pro-dark.css" />
+
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective/dist/umd/perspective.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/umd/perspective-viewer.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-datagrid/dist/umd/perspective-viewer-datagrid.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-d3fc/dist/umd/perspective-viewer-d3fc.js"></script>
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      height: 100vh;
+      margin: 0;
+      display: flex;
+      flex-direction: row;
+      overflow: hidden;
+    }
+
+    .sidebar {
+      width: 228px;
+      flex-shrink: 0;
+      background: #161b22;
+      border-right: 1px solid #30363d;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .sidebar-brand {
+      padding: 18px 16px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #6e7681;
+    }
+
+    .sidebar-nav {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 8px 10px;
+    }
+
+    .sidebar-nav a {
+      display: block;
+      padding: 10px 12px;
+      border-radius: 8px;
+      color: #c9d1d9;
+      text-decoration: none;
+      font-size: 14px;
+      border-left: 3px solid transparent;
+      margin-left: -3px;
+    }
+
+    .sidebar-nav a:hover {
+      background: rgba(88, 166, 255, 0.08);
+      color: #e6edf3;
+    }
+
+    .sidebar-nav a.active {
+      background: rgba(88, 166, 255, 0.14);
+      border-left-color: #58a6ff;
+      color: #58a6ff;
+      font-weight: 600;
+    }
+
+    .sidebar-footer {
+      margin-top: auto;
+      padding: 14px 16px;
+      border-top: 1px solid #30363d;
+      font-size: 12px;
+      color: #8b949e;
+      line-height: 1.4;
+    }
+
+    .sidebar-footer .user-name { color: #e6edf3; font-weight: 500; }
+    .sidebar-footer .user-email { color: #6e7681; font-size: 11px; word-break: break-all; }
+    .sidebar-footer.local { font-style: italic; color: #6e7681; }
+
+    .main-column {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+    }
+
+    header.topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 20px;
+      background: #0d1117;
+      border-bottom: 1px solid #30363d;
+      flex-shrink: 0;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    header.topbar h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #e6edf3;
+    }
+
+    #status {
+      font-size: 13px;
+      padding: 4px 12px;
+      border-radius: 12px;
+      background: #1f2937;
+    }
+
+    #status.connected    { color: #3fb950; }
+    #status.disconnected { color: #f85149; }
+    #status.connecting   { color: #d29922; }
+
+    .header-controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    #ticker-filter {
+      background: #1f2937;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 13px;
+      cursor: pointer;
+      outline: none;
+    }
+
+    #ticker-filter:hover { border-color: #58a6ff; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      gap: 6px;
+      padding: 6px;
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+    }
+
+    .panel {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .panel-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #8b949e;
+      padding: 8px 12px;
+      border-bottom: 1px solid #30363d;
+      flex-shrink: 0;
+    }
+
+    .panel perspective-viewer {
+      flex: 1;
+      min-height: 0;
+      background: #fff;
+      color: #212529;
+    }
+  </style>
+</head>
+<body>
+  <aside class="sidebar" aria-label="Main navigation">
+    <div class="sidebar-brand">Stock dashboards</div>
+    <nav class="sidebar-nav">
+      <a href="{{ monitor_url }}" class="active">Exchange Monitor</a>
+      <a href="{{ tickers_url }}">Ticker control</a>
+    </nav>
+    <div class="sidebar-footer">
+      {% if user_ribbon_show %}
+      <div title="Signed-in user">
+        <div class="user-name">{{ user_display_name }}</div>
+        {% if user_email %}<div class="user-email">{{ user_email }}</div>{% endif %}
+      </div>
+      {% else %}
+      <div class="local">Local session</div>
+      {% endif %}
+    </div>
+  </aside>
+
+  <div class="main-column">
+  <header class="topbar">
+    <h1>Exchange Monitor</h1>
+    <div class="header-controls">
+      <select id="ticker-filter">
+        <option value="">All Tickers</option>
+      </select>
+      <span id="status" class="connecting">connecting...</span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="panel-title">Trades</div>
+      <perspective-viewer id="trades-viewer" theme="Pro Light"></perspective-viewer>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Quotes</div>
+      <perspective-viewer id="quotes-viewer" theme="Pro Light"></perspective-viewer>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Trade Chart</div>
+      <perspective-viewer id="trade-chart" theme="Pro Light"></perspective-viewer>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Spread Monitor</div>
+      <perspective-viewer id="spread-viewer" theme="Pro Light"></perspective-viewer>
+    </div>
+  </div>
+  </div>
+
+  <script>
+    const MAX_ROWS = 500;
+    /**
+     * Charts only: Perspective Y Line scales the x-axis to the min/max timestamp of the
+     * *filtered* rows. There is no built-in "fixed domain" API, so we use a rolling window
+     * so the visible time span stays ~constant while data streams in.
+     * Grids (Trades/Quotes) stay unbounded by time and only use row limit + optional ticker.
+     */
+    const CHART_TIME_WINDOW_MS = 5 * 60 * 1000;
+    const CHART_TIME_FILTER_REFRESH_MS = 3000;
+
+    const TRADE_SCHEMA = {
+      seq:       "integer",
+      ticker:    "string",
+      price:     "float",
+      size:      "integer",
+      side:      "string",
+      timestamp: "datetime",
+    };
+
+    const QUOTE_SCHEMA = {
+      seq:         "integer",
+      ticker:      "string",
+      quote_side:  "string",
+      quote_price: "float",
+      quote_size:  "integer",
+      bid:         "float",
+      ask:         "float",
+      mid:         "float",
+      spread:      "float",
+      timestamp:   "datetime",
+    };
+
+    function parseTimestamp(row) {
+      if (row.timestamp) row.timestamp = new Date(row.timestamp);
+      return row;
+    }
+
+    async function main() {
+      const statusEl     = document.getElementById("status");
+      const filterSelect = document.getElementById("ticker-filter");
+      const worker       = perspective.worker();
+
+      const tradeTable  = await worker.table(TRADE_SCHEMA, { limit: MAX_ROWS });
+      const quoteTable  = await worker.table(QUOTE_SCHEMA, { limit: MAX_ROWS });
+
+      const viewers = {
+        trades: document.getElementById("trades-viewer"),
+        quotes: document.getElementById("quotes-viewer"),
+        chart:  document.getElementById("trade-chart"),
+        spread: document.getElementById("spread-viewer"),
+      };
+
+      await viewers.trades.load(tradeTable);
+      await viewers.trades.restore({ sort: [["timestamp", "desc"]] });
+
+      await viewers.quotes.load(quoteTable);
+      await viewers.quotes.restore({ sort: [["timestamp", "desc"]] });
+
+      await viewers.chart.load(tradeTable);
+      await viewers.chart.restore({
+        plugin:      "Y Line",
+        group_by:    ["timestamp"],
+        split_by:    ["ticker"],
+        columns:     ["price"],
+        aggregates:  { price: "last" },
+        sort:        [["timestamp", "asc"]],
+      });
+
+      await viewers.spread.load(quoteTable);
+      await viewers.spread.restore({
+        plugin:      "Y Line",
+        group_by:    ["timestamp"],
+        split_by:    ["ticker"],
+        columns:     ["spread"],
+        aggregates:  { spread: "last" },
+        sort:        [["timestamp", "asc"]],
+      });
+
+      const knownTickers = new Set();
+
+      /** Perspective WASM expects datetime filter scalars as epoch ms (number), not JS Date — Date breaks FilterTerm serde. */
+      function chartTimeFilter() {
+        const cutoffMs = Date.now() - CHART_TIME_WINDOW_MS;
+        return [["timestamp", ">=", cutoffMs]];
+      }
+
+      function gridFilter(ticker) {
+        return ticker ? [["ticker", "==", ticker]] : [];
+      }
+
+      function chartFilter(ticker) {
+        const t = chartTimeFilter();
+        if (!ticker) return t;
+        return [["ticker", "==", ticker], ...t];
+      }
+
+      let leavingPage = false;
+      function safeRestore(viewer, config) {
+        const out = viewer.restore(config);
+        if (out && typeof out.then === "function") {
+          out.catch((err) => {
+            if (!leavingPage) console.debug("Perspective restore:", err);
+          });
+        }
+      }
+
+      function applyFilter(ticker) {
+        if (leavingPage) return;
+        safeRestore(viewers.trades, { filter: gridFilter(ticker) });
+        safeRestore(viewers.quotes, { filter: gridFilter(ticker) });
+        safeRestore(viewers.chart, { filter: chartFilter(ticker) });
+        safeRestore(viewers.spread, { filter: chartFilter(ticker) });
+      }
+
+      filterSelect.addEventListener("change", () => {
+        applyFilter(filterSelect.value);
+      });
+
+      applyFilter("");
+
+      let chartTimeTicker = setInterval(() => {
+        if (leavingPage) return;
+        const ticker = filterSelect.value;
+        safeRestore(viewers.chart, { filter: chartFilter(ticker) });
+        safeRestore(viewers.spread, { filter: chartFilter(ticker) });
+      }, CHART_TIME_FILTER_REFRESH_MS);
+
+      function teardownPerspectiveTimers() {
+        leavingPage = true;
+        clearInterval(chartTimeTicker);
+      }
+      window.addEventListener("pagehide", teardownPerspectiveTimers);
+      window.addEventListener("beforeunload", teardownPerspectiveTimers);
+
+      function connect() {
+        statusEl.textContent = "connecting...";
+        statusEl.className   = "connecting";
+
+        const source = new EventSource("{{ stream_url }}");
+
+        source.onopen = () => {
+          statusEl.textContent = "connected";
+          statusEl.className   = "connected";
+        };
+
+        source.onmessage = (msg) => {
+          const event = parseTimestamp(JSON.parse(msg.data));
+          if (event.ticker && !knownTickers.has(event.ticker)) {
+            knownTickers.add(event.ticker);
+            const opt = document.createElement("option");
+            opt.value = event.ticker;
+            opt.textContent = event.ticker;
+            filterSelect.appendChild(opt);
+          }
+          if (event.type === "trade") {
+            delete event.type;
+            tradeTable.update([event]);
+          } else if (event.type === "quote") {
+            delete event.type;
+            quoteTable.update([event]);
+          }
+        };
+
+        source.onerror = () => {
+          statusEl.textContent = "disconnected";
+          statusEl.className   = "disconnected";
+          source.close();
+          setTimeout(connect, 3000);
+        };
+      }
+
+      connect();
+    }
+
+    window.addEventListener("DOMContentLoaded", main);
+  </script>
+</body>
+</html>

@@ -29,6 +29,14 @@ function renderTree(node, container) {
   container.appendChild(table);
 }
 
+function isBlobDirectory(node) {
+  if (!node) return false;
+  if (Object.prototype.hasOwnProperty.call(node, 'is_file')) {
+    return !node.is_file;
+  }
+  return node.type === 'dir';
+}
+
 function formatDateRawOrEpoch(val) {
   if (!val) return '';
   // If it's a number or a string of digits, treat as epoch seconds
@@ -45,29 +53,74 @@ function formatDateRawOrEpoch(val) {
 
 function renderTreeRows(node, parent, prefix = '', depth = 0, insertAfter = null) {
   const indent = (depth * 0.5) + 'em';
-  if (node.type === 'dir') {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td style="padding-left:${indent}"><span class='blob-dir'><span class='folder-icon'>📁</span> <span class='folder-name'>${node.name}</span></span></td><td class='size-col'>${typeof node.size === 'number' ? formatSize(node.size) : ''}</td><td class='mod-col'>${node.last_modified ? formatDateRawOrEpoch(node.last_modified) : ''}</td>`;
-    tr.classList.add('dir-row');
+  const isDir = isBlobDirectory(node);
+
+  function insertRow(tr) {
     if (insertAfter && insertAfter.nextSibling) {
       parent.insertBefore(tr, insertAfter.nextSibling);
     } else {
       parent.appendChild(tr);
     }
+  }
+
+  if (isDir) {
+    const tr = document.createElement('tr');
+    tr.classList.add('dir-row');
+
+    const tdName = document.createElement('td');
+    tdName.style.paddingLeft = indent;
+    const wrap = document.createElement('span');
+    wrap.className = 'blob-dir';
+    const icon = document.createElement('span');
+    icon.className = 'folder-icon';
+    icon.textContent = '📁';
+    const nameEl = document.createElement('span');
+    nameEl.className = 'folder-name';
+    nameEl.textContent = node.name;
+    wrap.appendChild(icon);
+    wrap.appendChild(nameEl);
+    tdName.appendChild(wrap);
+
+    const tdSize = document.createElement('td');
+    tdSize.className = 'size-col';
+    if (typeof node.size === 'number') tdSize.textContent = formatSize(node.size);
+
+    const tdMod = document.createElement('td');
+    tdMod.className = 'mod-col';
+    if (node.last_modified) tdMod.textContent = formatDateRawOrEpoch(node.last_modified);
+
+    tr.appendChild(tdName);
+    tr.appendChild(tdSize);
+    tr.appendChild(tdMod);
+    insertRow(tr);
+
     let expanded = false;
-    let childRows = [];
-    const toggle = () => {
+    const listPrefix = node.path != null && node.path !== '' ? node.path : '/';
+
+    const toggle = async (e) => {
+      if (e) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
       expanded = !expanded;
       if (expanded) {
+        if (node.children == null) {
+          try {
+            const resp = await axios.get("{{ prefix }}/api/blob-tree", { params: { prefix: listPrefix } });
+            node.children = resp.data.children || [];
+          } catch (err) {
+            expanded = false;
+            alert('Failed to load folder: ' + (err.message || String(err)));
+            return;
+          }
+        }
         let lastInserted = tr;
         (node.children || []).forEach(child => {
-          lastInserted = renderTreeRows(child, parent, (prefix ? prefix + '/' : '') + node.name, depth + 1, lastInserted);
+          lastInserted = renderTreeRows(child, parent, prefix, depth + 1, lastInserted);
         });
       } else {
-        // Remove all descendant rows
         let next = tr.nextSibling;
-        while (next && next.classList.contains('dir-row') || next && next.querySelector && next.querySelector('.blob-file')) {
-          // Check depth by padding-left
+        while (next && (next.classList.contains('dir-row') || (next.querySelector && next.querySelector('.blob-file')))) {
           const pad = next.firstChild && next.firstChild.style && next.firstChild.style.paddingLeft;
           if (pad && parseFloat(pad) > parseFloat(indent)) {
             const toRemove = next;
@@ -79,35 +132,52 @@ function renderTreeRows(node, parent, prefix = '', depth = 0, insertAfter = null
         }
       }
     };
-    tr.querySelector('.folder-icon').onclick = toggle;
-    tr.querySelector('.folder-name').onclick = toggle;
-    return tr;
-  } else {
-    const tr = document.createElement('tr');
-    const fullPath = (prefix ? prefix + '/' : '') + node.name;
-    const blobPath = fullPath;
-    tr.innerHTML = `<td style="padding-left:${indent}"><span class='blob-file' title='Click to copy path'>📄 ${node.name}</span></td><td class='size-col'>${typeof node.size === 'number' ? formatSize(node.size) : ''}</td><td class='mod-col'>${node.last_modified ? formatDateRawOrEpoch(node.last_modified) : ''}</td>`;
-    tr.querySelector('.blob-file').onclick = async (e) => {
-      e.stopPropagation();
-      try {
-        await navigator.clipboard.writeText(blobPath);
-        tr.querySelector('.blob-file').classList.add('copied');
-        tr.querySelector('.blob-file').textContent = `📄 ${node.name} (copied!)`;
-        setTimeout(() => {
-          tr.querySelector('.blob-file').classList.remove('copied');
-          tr.querySelector('.blob-file').textContent = `📄 ${node.name}`;
-        }, 1200);
-      } catch (err) {
-        alert('Failed to copy path');
-      }
-    };
-    if (insertAfter && insertAfter.nextSibling) {
-      parent.insertBefore(tr, insertAfter.nextSibling);
-    } else {
-      parent.appendChild(tr);
-    }
+
+    tr.addEventListener('click', toggle);
     return tr;
   }
+
+  const tr = document.createElement('tr');
+  const blobPath = node.path || ((prefix ? prefix + '/' : '') + node.name);
+
+  const tdName = document.createElement('td');
+  tdName.style.paddingLeft = indent;
+  const fileSpan = document.createElement('span');
+  fileSpan.className = 'blob-file';
+  fileSpan.title = 'Click to copy path';
+  fileSpan.textContent = '📄 ' + node.name;
+  tdName.appendChild(fileSpan);
+
+  const tdSize = document.createElement('td');
+  tdSize.className = 'size-col';
+  if (typeof node.size === 'number') tdSize.textContent = formatSize(node.size);
+
+  const tdMod = document.createElement('td');
+  tdMod.className = 'mod-col';
+  if (node.last_modified) tdMod.textContent = formatDateRawOrEpoch(node.last_modified);
+
+  tr.appendChild(tdName);
+  tr.appendChild(tdSize);
+  tr.appendChild(tdMod);
+
+  fileSpan.addEventListener('click', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(blobPath);
+      fileSpan.classList.add('copied');
+      fileSpan.textContent = '📄 ' + node.name + ' (copied!)';
+      setTimeout(() => {
+        fileSpan.classList.remove('copied');
+        fileSpan.textContent = '📄 ' + node.name;
+      }, 1200);
+    } catch (err) {
+      alert('Failed to copy path');
+    }
+  });
+
+  insertRow(tr);
+  return tr;
 }
 
 function formatSize(bytes) {
@@ -128,6 +198,8 @@ document.addEventListener('DOMContentLoaded', fetchBlobTree);
   padding-left: 0;
 }
 .blob-dir { cursor: pointer; font-weight: bold; }
+.folder-icon { margin-right: 0.35em; }
+tr.dir-row { cursor: pointer; }
 .blob-file { color: #4a90e2; cursor: pointer; }
 .blob-file.copied { color: #7ed957; }
 .blob-size {

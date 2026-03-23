@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Price Processor · CSP pipeline</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/styles/vis-network.min.css" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0a0e14;
+      --surface: #12181f;
+      --border: #21262d;
+      --text: #c9d1d9;
+      --muted: #6e7681;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --amber: #d29922;
+      --magenta: #db61a2;
+      --grid: rgba(88, 166, 255, 0.06);
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: "DM Sans", system-ui, sans-serif;
+      color: var(--text);
+      height: 100vh;
+      margin: 0;
+      display: flex;
+      flex-direction: row;
+      overflow: hidden;
+      background: #161b22;
+    }
+
+    .main-column {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      background: var(--bg);
+      background-image:
+        linear-gradient(var(--grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+      background-size: 32px 32px;
+    }
+
+    header.topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 24px;
+      background: rgba(18, 24, 31, 0.88);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+      flex-shrink: 0;
+    }
+    header.topbar h1 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      background: linear-gradient(135deg, #fff 0%, var(--accent) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    header.topbar .sub {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+
+    .live-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 14px 24px;
+      border-bottom: 1px solid var(--border);
+    }
+    .pill {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 12px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .pill strong { color: var(--accent); font-weight: 600; }
+    .pill .delta { color: var(--green); font-size: 11px; }
+    #conn-badge { border-color: var(--amber); }
+    #conn-badge.connected { border-color: var(--green); color: var(--green); }
+    #conn-badge.error { border-color: #f85149; color: #f85149; }
+
+    /* Fills viewport under topbar + pills; DAG + chart share width 50/50-ish */
+    .dag-chart-row {
+      flex: 1 1 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      padding: 10px 16px 8px;
+    }
+
+    .layout {
+      flex: 1 1 0;
+      min-height: 0;
+      width: 100%;
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+      gap: 12px;
+      align-items: stretch;
+    }
+    @media (max-width: 1000px) {
+      .layout {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(280px, 1fr) minmax(240px, 1fr);
+      }
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      height: 100%;
+    }
+    .panel-head {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .panel-head h2 {
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    .panel-head .hint { font-size: 12px; color: var(--muted); }
+    #graph-wrap {
+      flex: 1 1 0;
+      min-height: 0;
+      width: 100%;
+      background: #0d1117;
+    }
+
+    /* Chart fills remaining panel height; host has explicit flex bounds → no runaway canvas growth */
+    #chart-wrap {
+      padding: 10px 14px 14px;
+      flex: 1 1 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow: hidden;
+    }
+    .chart-host {
+      position: relative;
+      flex: 1 1 0;
+      min-height: 160px;
+      width: 100%;
+      overflow: hidden;
+    }
+    .chart-host canvas {
+      display: block;
+      max-width: 100%;
+    }
+    #chart-wrap select {
+      margin-bottom: 10px;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 14px;
+    }
+
+    .processor-scroll-bottom {
+      flex: 0 1 auto;
+      max-height: min(42vh, 520px);
+      min-height: 0;
+      overflow-x: hidden;
+      overflow-y: auto;
+      border-top: 1px solid var(--border);
+      background: rgba(10, 14, 20, 0.35);
+    }
+
+    .windows-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px 20px 12px;
+      width: 100%;
+    }
+    .chip {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      background: rgba(88, 166, 255, 0.08);
+      border: 1px solid rgba(88, 166, 255, 0.25);
+      color: var(--accent);
+    }
+
+    .ticker-wall {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 12px;
+      padding: 0 20px 24px;
+      width: 100%;
+    }
+    .tcard {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .tcard.pulse {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.35);
+    }
+    .tcard h3 {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 15px;
+      margin-bottom: 10px;
+      color: #fff;
+    }
+    .tcard .row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      padding: 3px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+    .tcard .row:last-child { border-bottom: none; }
+    .tcard .k { color: var(--muted); }
+    .tcard .v { font-family: "JetBrains Mono", monospace; color: var(--text); }
+    .tcard .signal-buy .v { color: var(--green); font-weight: 600; }
+    .tcard .signal-sell .v { color: #f85149; font-weight: 600; }
+    .imb-bar {
+      height: 6px;
+      border-radius: 3px;
+      background: linear-gradient(90deg, #f85149 0%, #30363d 50%, var(--green) 100%);
+      margin-top: 8px;
+      position: relative;
+    }
+    .imb-bar i {
+      position: absolute;
+      top: -2px;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 0 8px var(--accent);
+      transform: translateX(-50%);
+      left: 50%;
+    }
+
+    .section-title {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      padding: 10px 20px 8px;
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div class="main-column">
+  <header class="topbar">
+    <div>
+      <h1>Price processor cockpit</h1>
+      <div class="sub">Live CSP graph · streaming analytics · vis-network + Chart.js</div>
+    </div>
+  </header>
+
+  <div class="live-strip">
+    <div class="pill" id="conn-badge">● <span id="conn-text">connecting…</span></div>
+    <div class="pill">uptime <strong id="st-uptime">—</strong></div>
+    <div class="pill">SSE events <strong id="st-sse">0</strong> <span class="delta" id="st-sse-rate"></span></div>
+    <div class="pill">ingest batches <strong id="st-batches">0</strong></div>
+    <div class="pill">1 Hz publishes <strong id="st-pub">0</strong> <span class="delta" id="st-pub-rate"></span></div>
+    <div class="pill">queue depth <strong id="st-q">0</strong></div>
+    <div class="pill">symbols <strong id="st-sym">0</strong></div>
+  </div>
+
+  <div class="dag-chart-row">
+    <div class="layout">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Processing DAG</h2>
+          <span class="hint">Drag · scroll zoom · double-click fit</span>
+        </div>
+        <div id="graph-wrap"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Price rails</h2>
+          <span class="hint">Stream-selected symbol</span>
+        </div>
+        <div id="chart-wrap">
+          <label for="chart-ticker" class="hint">Chart ticker</label>
+          <select id="chart-ticker"></select>
+          <div class="chart-host" aria-hidden="true"><canvas id="price-chart"></canvas></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="processor-scroll-bottom">
+    <div class="section-title">Rolling windows (from processor /topology)</div>
+    <div class="windows-bar" id="windows-bar"></div>
+    <div class="section-title">Per-symbol analytics <span style="font-weight:400;color:var(--muted)">· ~1 Hz + SSE</span></div>
+    <div class="ticker-wall" id="ticker-wall"></div>
+  </div>
+  </div>
+
+  <script>
+    const API_STATS = {{ api_processor_stats | tojson }};
+    const API_TOPO = {{ api_processor_topology | tojson }};
+    const API_ANALYTICS = {{ api_processor_analytics | tojson }};
+    const STREAM_URL = {{ api_processor_stream | tojson }};
+
+    const GROUP_STYLE = {
+      external:   { bg: "#152a45", border: "#58a6ff", highlight: "#79b8ff" },
+      ingest:     { bg: "#152d22", border: "#3fb950", highlight: "#56d364" },
+      route:      { bg: "#3d3015", border: "#d29922", highlight: "#e3b341" },
+      split:      { bg: "#2a1f3d", border: "#a371f7", highlight: "#bc8cff" },
+      trade_math: { bg: "#1a2838", border: "#58a6ff", highlight: "#79c0ff" },
+      quote_math: { bg: "#1a3035", border: "#39d0d6", highlight: "#56d4dd" },
+      sink:       { bg: "#3d1520", border: "#ff7b72", highlight: "#ffa198" },
+    };
+
+    let network = null;
+    let nodesDS = null;
+    let edgesDS = null;
+    let nodePulseTimer = null;
+    let priceChart = null;
+    const seriesMax = 90;
+    const chartBuffers = { labels: [], last: [], vwap: [], emaF: [], emaS: [] };
+    const latestByTicker = {};
+    let prevStats = null;
+    let graphFitTimer = null;
+    let tickerWallRaf = null;
+
+    function scheduleTickerWallRefresh() {
+      if (tickerWallRaf) return;
+      tickerWallRaf = requestAnimationFrame(() => {
+        tickerWallRaf = null;
+        syncChartTickerSelect();
+        renderTickerWall();
+      });
+    }
+
+    function debounceGraphFit() {
+      if (graphFitTimer) clearTimeout(graphFitTimer);
+      graphFitTimer = setTimeout(() => {
+        graphFitTimer = null;
+        if (!network) return;
+        try {
+          network.fit({ animation: false, padding: 20 });
+        } catch (_) {}
+      }, 120);
+    }
+
+    function buildGraph(topo) {
+      const nodes = topo.nodes.map((n) => {
+        const st = GROUP_STYLE[n.group] || GROUP_STYLE.trade_math;
+        return {
+          id: n.id,
+          label: n.label,
+          title: n.title,
+          shape: "box",
+          margin: 10,
+          font: { color: "#e6edf3", size: 13, face: "JetBrains Mono" },
+          color: { background: st.bg, border: st.border, highlight: { background: st.bg, border: st.highlight } },
+          borderWidth: 2,
+          shadow: false,
+        };
+      });
+      const edges = topo.edges.map((e, i) => ({
+        id: "e" + i,
+        from: e.from,
+        to: e.to,
+        arrows: "to",
+        color: { color: "#484f58", highlight: "#58a6ff" },
+        smooth: { type: "cubicBezier", forceDirection: "horizontal", roundness: 0.35 },
+      }));
+      nodesDS = new vis.DataSet(nodes);
+      edgesDS = new vis.DataSet(edges);
+      const container = document.getElementById("graph-wrap");
+      network = new vis.Network(container, { nodes: nodesDS, edges: edgesDS }, {
+        layout: {
+          hierarchical: {
+            enabled: true,
+            direction: "LR",
+            sortMethod: "directed",
+            levelSeparation: 160,
+            nodeSpacing: 95,
+            treeSpacing: 110,
+          },
+        },
+        physics: {
+          enabled: true,
+          hierarchicalRepulsion: {
+            centralGravity: 0.12,
+            springLength: 130,
+            springConstant: 0.04,
+            nodeDistance: 115,
+          },
+          solver: "hierarchicalRepulsion",
+          /* Fewer iterations: 900 was blocking the main thread on navigation */
+          stabilization: { iterations: 160, updateInterval: 50 },
+        },
+        interaction: { hover: true, tooltipDelay: 120, navigationButtons: false, keyboard: true },
+      });
+      network.once("stabilizationIterationsDone", () => {
+        network.setOptions({ physics: { enabled: false } });
+        try {
+          network.fit({ animation: false, padding: 28 });
+        } catch (_) {}
+      });
+
+      const graphEl = document.getElementById("graph-wrap");
+      if (graphEl && typeof ResizeObserver !== "undefined") {
+        const ro = new ResizeObserver(() => debounceGraphFit());
+        ro.observe(graphEl);
+      }
+      graphEl?.addEventListener("dblclick", () => {
+        try {
+          network.fit({ animation: true, padding: 32 });
+        } catch (_) {}
+      });
+    }
+
+    function pulseNode(id, ms = 700) {
+      if (!nodesDS) return;
+      try {
+        const n = nodesDS.get(id);
+        if (!n) return;
+        nodesDS.update({ id, borderWidth: 4, font: { ...n.font, size: 14 } });
+        clearTimeout(nodePulseTimer);
+        nodePulseTimer = setTimeout(() => {
+          try {
+            nodesDS.update({ id, borderWidth: 2, font: { ...n.font, size: 13 } });
+          } catch (_) {}
+        }, ms);
+      } catch (_) {}
+    }
+
+    function pulsePipeline(d) {
+      pulseNode("csp_filter", 500);
+      pulseNode("n_evt", 450);
+      pulseNode("n_pub", 500);
+      const kind = d && d.last_market_event;
+      if (kind === "trade") {
+        pulseNode("f_trade", 500);
+      } else if (kind === "quote") {
+        pulseNode("f_quote", 500);
+      } else {
+        pulseNode("f_trade", 400);
+        pulseNode("f_quote", 400);
+      }
+    }
+
+    function renderWindows(w) {
+      const bar = document.getElementById("windows-bar");
+      bar.innerHTML = "";
+      if (!w) return;
+      Object.entries(w).forEach(([k, v]) => {
+        const el = document.createElement("span");
+        el.className = "chip";
+        el.textContent = k + " = " + v;
+        bar.appendChild(el);
+      });
+    }
+
+    function fmt(x, d = 4) {
+      if (x === undefined || x === null) return "—";
+      if (typeof x === "number" && !Number.isFinite(x)) return "—";
+      return typeof x === "number" ? x.toFixed(d) : String(x);
+    }
+
+    function renderTickerWall() {
+      const wall = document.getElementById("ticker-wall");
+      const tickers = Object.keys(latestByTicker).sort();
+      if (!tickers.length) {
+        wall.innerHTML = '<p style="color:var(--muted);grid-column:1/-1;padding:12px;">No analytics yet — start the price processor and ensure it reaches the price server.</p>';
+        return;
+      }
+      wall.innerHTML = "";
+      for (const t of tickers) {
+        const d = latestByTicker[t];
+        const sig = (d.signal || "").toLowerCase();
+        const sigClass = sig === "buy" ? "signal-buy" : sig === "sell" ? "signal-sell" : "";
+        const imb = d.trade_imbalance;
+        const imbPct = imb != null ? Math.max(0, Math.min(100, imb * 100)) : 50;
+        const card = document.createElement("div");
+        card.className = "tcard";
+        card.dataset.ticker = t;
+        card.innerHTML = `
+          <h3>${t}</h3>
+          <div class="row"><span class="k">Last ingest</span><span class="v">${d.last_market_event || "—"}</span></div>
+          <div class="row"><span class="k">Last</span><span class="v">${fmt(d.last_price, 4)}</span></div>
+          <div class="row"><span class="k">VWAP</span><span class="v">${fmt(d.vwap, 4)}</span></div>
+          <div class="row"><span class="k">EMA 10 / 50</span><span class="v">${fmt(d.ema_fast, 4)} / ${fmt(d.ema_slow, 4)}</span></div>
+          <div class="row ${sigClass}"><span class="k">Signal</span><span class="v">${d.signal || "—"}</span></div>
+          <div class="row"><span class="k">Realized vol</span><span class="v">${fmt(d.volatility, 6)}</span></div>
+          <div class="row"><span class="k">Spread (last / mean)</span><span class="v">${fmt(d.spread, 4)} / ${fmt(d.spread_mean, 4)}</span></div>
+          <div class="row"><span class="k">Spread range</span><span class="v">${fmt(d.spread_min, 4)} – ${fmt(d.spread_max, 4)}</span></div>
+          <div class="imb-bar" title="Buy volume share"><i style="left:${imbPct}%"></i></div>
+        `;
+        wall.appendChild(card);
+      }
+    }
+
+    function syncChartTickerSelect() {
+      const sel = document.getElementById("chart-ticker");
+      const keys = Object.keys(latestByTicker).sort();
+      const prev = sel.value;
+      sel.innerHTML = "";
+      keys.forEach((k) => {
+        const o = document.createElement("option");
+        o.value = k;
+        o.textContent = k;
+        sel.appendChild(o);
+      });
+      if (keys.length) {
+        sel.value = keys.includes(prev) ? prev : keys[0];
+      }
+    }
+
+    function pushChartPoint(d) {
+      const sel = document.getElementById("chart-ticker").value;
+      if (!sel || d.ticker !== sel) return;
+      const tshort = (d.timestamp || "").split("T").pop()?.slice(0, 8) || "";
+      chartBuffers.labels.push(tshort);
+      chartBuffers.last.push(d.last_price);
+      chartBuffers.vwap.push(d.vwap);
+      chartBuffers.emaF.push(d.ema_fast);
+      chartBuffers.emaS.push(d.ema_slow);
+      while (chartBuffers.labels.length > seriesMax) {
+        chartBuffers.labels.shift();
+        chartBuffers.last.shift();
+        chartBuffers.vwap.shift();
+        chartBuffers.emaF.shift();
+        chartBuffers.emaS.shift();
+      }
+      if (priceChart) {
+        priceChart.data.labels = [...chartBuffers.labels];
+        priceChart.data.datasets[0].data = [...chartBuffers.last];
+        priceChart.data.datasets[1].data = [...chartBuffers.vwap];
+        priceChart.data.datasets[2].data = [...chartBuffers.emaF];
+        priceChart.data.datasets[3].data = [...chartBuffers.emaS];
+        priceChart.update("none");
+      }
+    }
+
+    function initChart() {
+      const ctx = document.getElementById("price-chart").getContext("2d");
+      priceChart = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels: [],
+          datasets: [
+            { label: "Last", data: [], borderColor: "#58a6ff", tension: 0.25, pointRadius: 0, borderWidth: 2 },
+            { label: "VWAP", data: [], borderColor: "#a371f7", tension: 0.25, pointRadius: 0, borderWidth: 1.5 },
+            { label: "EMA 10", data: [], borderColor: "#3fb950", tension: 0.25, pointRadius: 0, borderWidth: 1.5 },
+            { label: "EMA 50", data: [], borderColor: "#d29922", tension: 0.25, pointRadius: 0, borderWidth: 1.5 },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            legend: { labels: { color: "#8b949e", font: { size: 11 } } },
+          },
+          scales: {
+            x: { ticks: { color: "#6e7681", maxTicksLimit: 8 }, grid: { color: "rgba(255,255,255,0.04)" } },
+            y: { ticks: { color: "#6e7681" }, grid: { color: "rgba(255,255,255,0.06)" } },
+          },
+        },
+      });
+    }
+
+    function wireChartResize() {
+      const host = document.querySelector(".chart-host");
+      if (!host || typeof ResizeObserver === "undefined") return;
+      let chartRoTimer = null;
+      const ro = new ResizeObserver(() => {
+        if (chartRoTimer) cancelAnimationFrame(chartRoTimer);
+        chartRoTimer = requestAnimationFrame(() => {
+          chartRoTimer = null;
+          if (priceChart) priceChart.resize();
+        });
+      });
+      ro.observe(host);
+    }
+
+    function applyStats(s) {
+      document.getElementById("st-uptime").textContent = (s.uptime_sec != null ? s.uptime_sec.toFixed(0) : "—") + " s";
+      document.getElementById("st-sse").textContent = s.sse_events_total ?? "—";
+      document.getElementById("st-batches").textContent = s.sse_batches_total ?? "—";
+      document.getElementById("st-pub").textContent = s.analytics_publishes_total ?? "—";
+      document.getElementById("st-q").textContent = s.analytics_queue_depth ?? "—";
+      const syms = s.analytics_tickers || [];
+      document.getElementById("st-sym").textContent = syms.length;
+
+      if (prevStats && s) {
+        const dt = Math.max(0.5, (s._t - prevStats._t) / 1000);
+        const dSse = (s.sse_events_total || 0) - (prevStats.sse_events_total || 0);
+        const dPub = (s.analytics_publishes_total || 0) - (prevStats.analytics_publishes_total || 0);
+        document.getElementById("st-sse-rate").textContent = dSse > 0 ? `(~${(dSse / dt).toFixed(0)} /s)` : "";
+        document.getElementById("st-pub-rate").textContent = dPub > 0 ? `(~${(dPub / dt).toFixed(1)} /s)` : "";
+      }
+      prevStats = { ...s, _t: Date.now() };
+    }
+
+    async function bootstrap() {
+      /* Let the shell paint before Chart + vis-network compete for the main thread */
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+      initChart();
+      wireChartResize();
+      try {
+        const [topoR, anR] = await Promise.all([
+          fetch(API_TOPO),
+          fetch(API_ANALYTICS),
+        ]);
+        const topo = await topoR.json();
+        if (topo.nodes && topo.edges) {
+          buildGraph(topo);
+          renderWindows(topo.windows);
+        }
+        const all = await anR.json();
+        if (all && typeof all === "object" && !all.error) {
+          Object.keys(all).forEach((k) => {
+            latestByTicker[k] = all[k];
+          });
+        }
+        syncChartTickerSelect();
+        renderTickerWall();
+      } catch (e) {
+        console.warn(e);
+      }
+
+      setInterval(async () => {
+        try {
+          const r = await fetch(API_STATS);
+          const s = await r.json();
+          if (!r.ok) throw new Error(s.error || r.statusText);
+          applyStats(s);
+        } catch (_) {}
+      }, 1000);
+
+      /* SSE after layout settles so first vis stabilization isn’t fighting the connection */
+      setTimeout(() => {
+        connectAnalyticsStream();
+      }, 180);
+
+      document.getElementById("chart-ticker").addEventListener("change", () => {
+        chartBuffers.labels = [];
+        chartBuffers.last = [];
+        chartBuffers.vwap = [];
+        chartBuffers.emaF = [];
+        chartBuffers.emaS = [];
+        const t = document.getElementById("chart-ticker").value;
+        const d = latestByTicker[t];
+        if (d) pushChartPoint(d);
+      });
+    }
+
+    function connectAnalyticsStream() {
+      const es = new EventSource(STREAM_URL);
+      const badge = document.getElementById("conn-badge");
+      const connText = document.getElementById("conn-text");
+      es.onopen = () => {
+        badge.classList.add("connected");
+        badge.classList.remove("error");
+        connText.textContent = "analytics stream live";
+      };
+      es.onerror = () => {
+        badge.classList.remove("connected");
+        badge.classList.add("error");
+        connText.textContent = "stream disconnected (retrying…)";
+      };
+      es.onmessage = (ev) => {
+        try {
+          const d = JSON.parse(ev.data);
+          if (!d.ticker) return;
+          latestByTicker[d.ticker] = d;
+          pulsePipeline(d);
+          pushChartPoint(d);
+          scheduleTickerWallRefresh();
+          const safe = String(d.ticker).replace(/"/g, "");
+          const card = document.querySelector('[data-ticker="' + safe + '"]');
+          if (card) {
+            card.classList.add("pulse");
+            setTimeout(() => card.classList.remove("pulse"), 400);
+          }
+        } catch (_) {}
+      };
+    }
+
+    bootstrap();
+  </script>
+</body>
+</html>
