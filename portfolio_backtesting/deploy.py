@@ -1,8 +1,8 @@
 from datatailr import App, Resources
 from datatailr.logging import CYAN
 
-import dashboard.app as dashboard_entrypoint
-from workflows.tasks import create_backtest_workflow
+import portfolio_backtesting.dashboard.app as dashboard_entrypoint
+from portfolio_backtesting.workflows.tasks import create_backtest_workflow
 
 
 def deploy_workflow():
