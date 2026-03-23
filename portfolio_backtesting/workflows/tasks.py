@@ -69,13 +69,55 @@ def _normalize_params(run_params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _first_present_column(columns: list[Any], candidates: list[str]) -> Any | None:
+    candidate_set = {name.lower() for name in candidates}
+    for col in columns:
+        tokens: list[str] = []
+        if isinstance(col, tuple):
+            tokens = [str(part).strip().lower() for part in col if str(part).strip()]
+        else:
+            tokens = [str(col).strip().lower()]
+
+        for token in tokens:
+            for candidate in candidate_set:
+                if token == candidate or token.startswith(f"{candidate}_"):
+                    return col
+    return None
+
+
+def _flatten_column_name(col: Any) -> str:
+    if isinstance(col, tuple):
+        parts = [str(part).strip() for part in col if str(part).strip()]
+        return "_".join(parts) if parts else "unnamed"
+    return str(col).strip()
+
+
+def _flatten_frame_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    renamed = frame.copy()
+    renamed.columns = [_flatten_column_name(col) for col in frame.columns]
+    return renamed
+
+
 def _read_run_index(blob: Blob) -> list[dict[str, Any]]:
-    if not blob.exists(RUN_INDEX_PATH):
+    try:
+        if not blob.exists(RUN_INDEX_PATH):
+            return []
+    except Exception:
+        # Some backends may error on exists/get for missing blobs.
         return []
-    data = blob.get(RUN_INDEX_PATH)
+
+    try:
+        data = blob.get(RUN_INDEX_PATH)
+    except Exception:
+        return []
+
     if isinstance(data, bytes):
         data = data.decode("utf-8")
-    parsed = json.loads(data)
+
+    try:
+        parsed = json.loads(data)
+    except Exception:
+        return []
     return parsed if isinstance(parsed, list) else []
 
 
@@ -179,12 +221,34 @@ def fetch_price_data(params: dict[str, Any]) -> dict[str, Any]:
         auto_adjust=True,
     )
 
-    if data.empty or "Close" not in data.columns:
+    if data.empty:
         raise ValueError(f"No close price data found for symbol '{ticker}'.")
 
-    frame = data.reset_index().rename(columns={"Date": "timestamp"})
-    if "timestamp" not in frame.columns:
-        frame = frame.rename(columns={frame.columns[0]: "timestamp"})
+    frame = _flatten_frame_columns(data.reset_index())
+
+    timestamp_col = _first_present_column(
+        list(frame.columns),
+        [
+            "timestamp",
+            "date",
+            "datetime",
+            "index",
+            "level_0",
+            "date_",
+            "datetime_",
+        ],
+    )
+    if timestamp_col is None:
+        timestamp_col = frame.columns[0]
+
+    close_col = _first_present_column(
+        list(frame.columns),
+        ["close", "adj close", "adj_close"],
+    )
+    if close_col is None:
+        raise ValueError(f"No close price column found for symbol '{ticker}'.")
+
+    frame = frame.rename(columns={timestamp_col: "timestamp", close_col: "Close"})
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True).dt.strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
@@ -196,10 +260,27 @@ def run_sma_strategy(
     market_data: dict[str, Any],
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    frame = pd.DataFrame(market_data["rows"])
+    frame = _flatten_frame_columns(pd.DataFrame(market_data.get("rows", [])))
     if frame.empty:
         raise ValueError("No market data available for strategy run.")
 
+    timestamp_col = _first_present_column(
+        list(frame.columns), ["timestamp", "date", "datetime", "index", "level_0"]
+    )
+    close_col = _first_present_column(
+        list(frame.columns), ["close", "adj close", "adj_close"]
+    )
+
+    if timestamp_col is None:
+        raise ValueError(
+            f"Missing timestamp column in market data. Columns: {list(frame.columns)}"
+        )
+    if close_col is None:
+        raise ValueError(
+            f"Missing close column in market data. Columns: {list(frame.columns)}"
+        )
+
+    frame = frame.rename(columns={timestamp_col: "timestamp", close_col: "Close"})
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     frame = frame.set_index("timestamp").sort_index()
     price = frame["Close"].astype(float)
@@ -333,8 +414,8 @@ def create_backtest_workflow():
         params = _normalize_params(run_params or {})
         market_data = fetch_price_data(params).set_resources(memory="1g", cpu=1)
         strategy_output = run_sma_strategy(market_data, params)
-        computed = compute_metrics(strategy_output, params)
-        persist_artifacts(computed)
+        computed = compute_metrics(strategy_output, params).set_resources(memory="1g", cpu=1)
+        persist_artifacts(computed).set_resources(memory="1g", cpu=1)
 
     return portfolio_backtest_workflow
 
