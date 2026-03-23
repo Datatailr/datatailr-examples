@@ -1,12 +1,21 @@
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from flask import Flask, redirect, render_template, request, url_for
 
 from portfolio_backtesting.workflows.tasks import get_run_artifacts, list_runs, submit_backtest_workflow
 
-app = Flask(__name__)
+_STATIC_DIR = Path(__file__).parent / "static"
+_TEMPLATES_DIR = Path(__file__).parent / "templates"
+
+app = Flask(
+    __name__,
+    template_folder=_TEMPLATES_DIR,
+    static_folder=_STATIC_DIR,
+    static_url_path="/static",
+)
 
 
 def _default_dates() -> tuple[str, str]:
