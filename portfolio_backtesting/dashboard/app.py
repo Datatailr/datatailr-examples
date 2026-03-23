@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -7,15 +8,37 @@ from flask import Flask, redirect, render_template, request, url_for
 
 from portfolio_backtesting.workflows.tasks import get_run_artifacts, list_runs, submit_backtest_workflow
 
-_STATIC_DIR = Path(__file__).parent / "static"
-_TEMPLATES_DIR = Path(__file__).parent / "templates"
+__FILE_DIR = Path(__file__).parent
+
+_env = os.environ.get("DATATAILR_JOB_ENVIRONMENT", "")
+_job = os.environ.get("DATATAILR_JOB_NAME", "")
+_job_type = os.environ.get("DATATAILR_JOB_TYPE", "")
+_job_type = 'job' if _job_type != 'workstation' else 'workstation'
+
+_PREFIX = f'/{_job_type}/{_env}/{_job}' if _env and _job else ""
+
+if _job_type == 'workstation':
+    _PREFIX += '/ide/proxy/5000/'
 
 app = Flask(
     __name__,
-    template_folder=_TEMPLATES_DIR,
-    static_folder=_STATIC_DIR,
+    template_folder=__FILE_DIR / 'templates',
+    static_folder=__FILE_DIR / 'static',
     static_url_path="/static",
 )
+
+
+@app.context_processor
+def _inject_prefix():
+    return {"prefix": _PREFIX, "prefixed_url": _prefixed_url}
+
+
+def _prefixed_url(path: str) -> str:
+    if not _PREFIX:
+        return path
+    if path.startswith(_PREFIX):
+        return path
+    return f"{_PREFIX}{path}"
 
 
 def _default_dates() -> tuple[str, str]:
@@ -72,7 +95,7 @@ def launch_backtest():
 
     try:
         result = submit_backtest_workflow(params)
-        return redirect(url_for("run_detail", run_id=result["run_id"]))
+        return redirect(_prefixed_url(url_for("run_detail", run_id=result["run_id"])))
     except Exception as exc:
         return render_template(
             "index.html",
@@ -116,9 +139,6 @@ def run_detail(run_id: str):
     )
 
 
-def main():
-    app.run(host="0.0.0.0", port=5050)
-
 
 if __name__ == "__main__":
-    main()
+    app.run(debug=True)

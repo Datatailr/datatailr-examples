@@ -331,7 +331,7 @@ def create_backtest_workflow():
     )
     def portfolio_backtest_workflow(run_params: dict[str, Any] | None = None):
         params = _normalize_params(run_params or {})
-        market_data = fetch_price_data(params)
+        market_data = fetch_price_data(params).set_resources(memory="1g", cpu=1)
         strategy_output = run_sma_strategy(market_data, params)
         computed = compute_metrics(strategy_output, params)
         persist_artifacts(computed)

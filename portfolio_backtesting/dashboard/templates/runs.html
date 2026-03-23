@@ -17,7 +17,7 @@
       <tbody>
       {% for run in runs %}
         <tr>
-          <td><a href="{{ url_for('run_detail', run_id=run.run_id) }}">{{ run.run_id }}</a></td>
+          <td><a href="{{ prefixed_url(url_for('run_detail', run_id=run.run_id)) }}">{{ run.run_id }}</a></td>
           <td>{{ run.symbol or "-" }}</td>
           <td>{{ run.status or "-" }}</td>
           <td>{{ run.submitted_at or "-" }}</td>
@@ -27,7 +27,7 @@
       </tbody>
     </table>
   {% else %}
-    <p>No runs found yet. Start one from <a href="{{ url_for('index') }}">New Backtest</a>.</p>
+    <p>No runs found yet. Start one from <a href="{{ prefixed_url(url_for('index')) }}">New Backtest</a>.</p>
   {% endif %}
 </section>
 {% endblock %}

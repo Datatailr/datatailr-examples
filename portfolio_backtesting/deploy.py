@@ -31,7 +31,7 @@ def deploy_app():
 
 
 def deploy_all():
-    # deploy_workflow()
+    deploy_workflow()
     deploy_app()
 
 
