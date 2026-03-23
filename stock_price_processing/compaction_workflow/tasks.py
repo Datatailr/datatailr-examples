@@ -274,7 +274,7 @@ def compact_partition_impl(
 
     marker_exists = _blob_exists(blob, marker_key)
     compact_exists = _blob_exists(blob, compact_key)
-    if marker_exists and compact_exists:
+    if marker_exists and compact_exists and not source_files:
         return {
             "partition": part,
             "action": "skip_already_compacted",
@@ -292,7 +292,9 @@ def compact_partition_impl(
             "marker_key": marker_key,
         }
 
-    if len(source_files) < min_files:
+    # If a compacted file already exists, always fold in newly-arrived files
+    # even when below the regular threshold, to keep one coherent schema/file.
+    if not compact_exists and len(source_files) < min_files:
         return {
             "partition": part,
             "action": "skip_below_threshold",
@@ -303,17 +305,21 @@ def compact_partition_impl(
         }
 
     if dry_run:
+        merge_inputs = ([compact_key] if compact_exists else []) + source_files
         return {
             "partition": part,
             "action": "would_compact",
             "source_file_count": len(source_files),
+            "merge_input_file_count": len(merge_inputs),
             "compact_key": compact_key,
             "marker_key": marker_key,
+            "merge_candidates": merge_inputs,
             "delete_candidates": source_files,
         }
 
+    merge_inputs = ([compact_key] if compact_exists else []) + source_files
     tables: list[pa.Table] = []
-    for key in source_files:
+    for key in merge_inputs:
         raw = _blob_get(blob, key)
         tables.append(pq.read_table(io.BytesIO(raw)))
     merged = pa.concat_tables(tables, promote_options="default")
@@ -330,11 +336,12 @@ def compact_partition_impl(
         "hour": part["hour"],
         "ticker": part["ticker"],
         "source_file_count": len(source_files),
+        "merge_input_file_count": len(merge_inputs),
         "row_count": int(merged.num_rows),
         "compacted_file": compact_key,
         "compacted_at": _now_utc().isoformat(),
         "run_id": run_id,
-        "source_hash": hashlib.sha256("\n".join(source_files).encode("utf-8")).hexdigest(),
+        "source_hash": hashlib.sha256("\n".join(merge_inputs).encode("utf-8")).hexdigest(),
     }
     _blob_put(blob, marker_key, json.dumps(marker).encode("utf-8"))
 
@@ -347,6 +354,7 @@ def compact_partition_impl(
         "partition": part,
         "action": "compacted",
         "source_file_count": len(source_files),
+        "merge_input_file_count": len(merge_inputs),
         "row_count": int(merged.num_rows),
         "bytes_written": len(compact_bytes),
         "deleted_files": deleted,
