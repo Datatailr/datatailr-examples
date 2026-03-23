@@ -58,10 +58,10 @@ processor_dashboard = App(
     python_requirements=["flask", "gunicorn", "requests"],
 )
 
-# price_server.run()
-# price_processing.run()
-# data_collector.run()
-# dashboard.run()
-# lake_dashboard.run()
-# processor_dashboard.run()
-hourly_compaction_workflow(local_run=True)
+price_server.run()
+price_processing.run()
+data_collector.run()
+dashboard.run()
+lake_dashboard.run()
+processor_dashboard.run()
+hourly_compaction_workflow()
