@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card">
+  <h2>Run {{ run_id }}</h2>
+  <p>Status: <strong>{{ summary.status or "submitted" }}</strong></p>
+  <p>Symbol: <strong>{{ params.symbol or "-" }}</strong></p>
+  <p>Submitted: {{ summary.submitted_at or params.submitted_at or "-" }}</p>
+  <p>Completed: {{ summary.completed_at or "-" }}</p>
+</section>
+
+<section class="card metrics">
+  <h3>Metrics</h3>
+  <div class="metric-grid">
+    <div class="metric">
+      <span>Total Return</span>
+      <strong>{{ metrics.total_return_pct or "-" }}%</strong>
+    </div>
+    <div class="metric">
+      <span>Max Drawdown</span>
+      <strong>{{ metrics.max_drawdown_pct or "-" }}%</strong>
+    </div>
+    <div class="metric">
+      <span>Sharpe</span>
+      <strong>{{ metrics.sharpe_ratio or "-" }}</strong>
+    </div>
+    <div class="metric">
+      <span>Trades</span>
+      <strong>{{ metrics.trade_count or "-" }}</strong>
+    </div>
+    <div class="metric">
+      <span>Win Rate</span>
+      <strong>{{ metrics.win_rate_pct or "-" }}%</strong>
+    </div>
+    <div class="metric">
+      <span>Start / End Value</span>
+      <strong>{{ metrics.start_value or "-" }} / {{ metrics.end_value or "-" }}</strong>
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <h3>Equity Curve</h3>
+  <canvas id="equity-chart"></canvas>
+</section>
+
+<section class="card">
+  <h3>Drawdown Curve</h3>
+  <canvas id="drawdown-chart"></canvas>
+</section>
+
+<section class="card">
+  <h3>Trades ({{ trade_count }})</h3>
+  {% if trades %}
+    <table>
+      <thead>
+        <tr>
+          {% for col in trades[0].keys() %}
+            <th>{{ col }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+      {% for trade in trades %}
+        <tr>
+          {% for val in trade.values() %}
+            <td>{{ val }}</td>
+          {% endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>No trade records are available yet.</p>
+  {% endif %}
+</section>
+
+<script>
+  window.runChartData = {{ chart_payload | safe }};
+</script>
+{% endblock %}

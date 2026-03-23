@@ -1,0 +1,6 @@
+vectorbt
+pandas
+numpy
+yfinance
+flask
+gunicorn

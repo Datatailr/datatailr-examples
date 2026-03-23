@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card">
+  <h2>Run History</h2>
+  {% if runs %}
+    <table>
+      <thead>
+        <tr>
+          <th>Run ID</th>
+          <th>Symbol</th>
+          <th>Status</th>
+          <th>Submitted</th>
+          <th>Completed</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for run in runs %}
+        <tr>
+          <td><a href="{{ url_for('run_detail', run_id=run.run_id) }}">{{ run.run_id }}</a></td>
+          <td>{{ run.symbol or "-" }}</td>
+          <td>{{ run.status or "-" }}</td>
+          <td>{{ run.submitted_at or "-" }}</td>
+          <td>{{ run.completed_at or "-" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>No runs found yet. Start one from <a href="{{ url_for('index') }}">New Backtest</a>.</p>
+  {% endif %}
+</section>
+{% endblock %}

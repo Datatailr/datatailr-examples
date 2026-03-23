@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card">
+  <h2>Launch New Backtest</h2>
+  <p>Submit an SMA crossover strategy run using vectorbt + yfinance.</p>
+
+  {% if error %}
+    <div class="error">{{ error }}</div>
+  {% endif %}
+
+  <form action="{{ url_for('launch_backtest') }}" method="post" class="form-grid">
+    <label>
+      Symbol
+      <input type="text" name="symbol" value="{{ defaults.symbol }}" required />
+    </label>
+    <label>
+      Interval
+      <select name="interval">
+        <option value="1d" {% if defaults.interval == "1d" %}selected{% endif %}>1d</option>
+        <option value="1h" {% if defaults.interval == "1h" %}selected{% endif %}>1h</option>
+      </select>
+    </label>
+    <label>
+      Start
+      <input type="date" name="start" value="{{ defaults.start }}" />
+    </label>
+    <label>
+      End
+      <input type="date" name="end" value="{{ defaults.end }}" />
+    </label>
+    <label>
+      Fast SMA
+      <input type="number" name="fast_window" min="2" value="{{ defaults.fast_window }}" required />
+    </label>
+    <label>
+      Slow SMA
+      <input type="number" name="slow_window" min="3" value="{{ defaults.slow_window }}" required />
+    </label>
+    <label>
+      Fee (fraction)
+      <input type="number" step="0.0001" min="0" name="fee" value="{{ defaults.fee }}" />
+    </label>
+    <label>
+      Initial Cash
+      <input type="number" step="100" min="1" name="init_cash" value="{{ defaults.init_cash }}" />
+    </label>
+
+    <div class="actions">
+      <button type="submit">Run Backtest Workflow</button>
+    </div>
+  </form>
+</section>
+{% endblock %}
