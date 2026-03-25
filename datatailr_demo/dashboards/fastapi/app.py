@@ -135,6 +135,7 @@ async def index(request: Request):
     cat_totals = _category_totals()
     reg_totals = _region_totals()
     return templates.TemplateResponse(
+        request,
         "overview.html",
         {
             "request": request,
@@ -154,6 +155,7 @@ async def index(request: Request):
 @app.get("/time-series", response_class=HTMLResponse)
 async def time_series(request: Request):
     return templates.TemplateResponse(
+        request,
         "time_series.html",
         {"request": request, "page": "time_series"},
     )
@@ -162,6 +164,7 @@ async def time_series(request: Request):
 @app.get("/explorer", response_class=HTMLResponse)
 async def explorer(request: Request):
     return templates.TemplateResponse(
+        request,
         "explorer.html",
         {
             "request": request,
@@ -175,6 +178,7 @@ async def explorer(request: Request):
 @app.get("/distributions", response_class=HTMLResponse)
 async def distributions(request: Request):
     return templates.TemplateResponse(
+        request,
         "distributions.html",
         {"request": request, "page": "distributions"},
     )
@@ -183,6 +187,7 @@ async def distributions(request: Request):
 @app.get("/data-table", response_class=HTMLResponse)
 async def data_table(request: Request):
     return templates.TemplateResponse(
+        request,
         "data_table.html",
         {
             "request": request,
