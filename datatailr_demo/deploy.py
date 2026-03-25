@@ -79,6 +79,7 @@ def simple_app(framework: str = "streamlit"):
         entrypoint=entrypoint,
         framework=framework,
         resources=resources,
+        app_section='Demo Apps',
         python_requirements=python_requirements,
     )
 

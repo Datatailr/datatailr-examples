@@ -39,6 +39,7 @@ dashboard = App(
     entrypoint=dashboard_entrypoint,
     framework="flask",
     resources=Resources(memory="4g", cpu=1),
+    app_section='Stock Price Processing',
     python_requirements=["flask", "gunicorn", "requests"],
 )
 
@@ -47,6 +48,7 @@ lake_dashboard = App(
     entrypoint=lake_dashboard_entrypoint,
     framework="flask",
     resources=Resources(memory="4g", cpu=1),
+    app_section='Stock Price Processing',
     python_requirements=["flask", "gunicorn", "requests", "duckdb", "pyarrow", "pandas"],
 )
 
@@ -55,6 +57,7 @@ processor_dashboard = App(
     entrypoint=processor_dashboard_entrypoint,
     framework="flask",
     resources=Resources(memory="4g", cpu=1),
+    app_section='Stock Price Processing',
     python_requirements=["flask", "gunicorn", "requests"],
 )
 
