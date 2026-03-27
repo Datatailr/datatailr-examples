@@ -8,24 +8,15 @@
 #  of this file, in parts or full, via any medium is strictly prohibited.
 # *************************************************************************
 from typing import Any
-
 from datatailr.logging import DatatailrLogger
-
-# --8<-- [start:import_example]
 from datatailr import task
-# --8<-- [end:import_example]
 
 logger = DatatailrLogger(__name__).get_logger()
 
 
-# --8<-- [start:task_example]
 @task(memory="123m", cpu=0.5)
 def func_no_args() -> str:
     return "no_args"
-
-
-# --8<-- [end:task_example]
-
 
 @task()
 def get_number() -> int:
