@@ -2,6 +2,7 @@
 
 Processor cockpit uses http://price-processor unless PRICE_PROCESSOR_URL is set.
 """
+import pathlib
 from stock_price_processing.price_server.server import main as price_server_main
 from stock_price_processing.price_processor.server import main as price_processing_main
 from stock_price_processing.data_collector.service import main as data_collector_main
@@ -13,25 +14,29 @@ import stock_price_processing.price_processor.dashboard as processor_dashboard_e
 from stock_price_processing.compaction_workflow.deploy import hourly_compaction_workflow
 
 
+requirements_file = pathlib.Path(__file__).parent / "requirements.txt"
+assert requirements_file.exists(), f"Requirements file not found: {requirements_file}"
+requirements_file = str(requirements_file)
+
 price_server = Service(
     name="Price Server",
     entrypoint=price_server_main,
     resources=Resources(memory="1g", cpu=1),
-    python_requirements="stock_price_processing/requirements.txt",
+    python_requirements=requirements_file,
 )
 
 price_processing = Service(
     name="Price Processor",
     entrypoint=price_processing_main,
     resources=Resources(memory="1g", cpu=1),
-    python_requirements="stock_price_processing/requirements.txt",
+    python_requirements=requirements_file,
 )
 
 data_collector = Service(
     name="Stock data collector",
     entrypoint=data_collector_main,
     resources=Resources(memory="2g", cpu=1),
-    python_requirements="stock_price_processing/requirements.txt",
+    python_requirements=requirements_file,
 )
 
 dashboard = App(

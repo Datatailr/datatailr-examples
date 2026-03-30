@@ -1,5 +1,6 @@
 numpy
 fastapi
+flask
 uvicorn[standard]
 sse-starlette
 csp
