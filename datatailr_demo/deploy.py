@@ -7,9 +7,8 @@
 #  defined in 'LICENSE.txt'. Unauthorized copying and/or distribution
 #  of this file, in parts or full, via any medium is strictly prohibited.
 # *************************************************************************
+import sys
 from datatailr.logging import CYAN
-
-
 from datatailr import workflow, App, Service, ExcelAddin, Resources
 from data_pipelines.data_processing import func_no_args
 
@@ -107,6 +106,37 @@ def simple_excel_addin():
     )
     return addin
 
+def jupyter_notebook():
+    from pathlib import Path
+    from datatailr import App
+
+    path_to_notebook = Path(__file__).parent / "notebooks" / "demo_notebook.ipynb"
+    assert path_to_notebook.exists(), f"Notebook not found: {path_to_notebook}"
+    notebook = App(
+        name="Jupyter Notebook",
+        entrypoint=str(path_to_notebook),
+        build_script_pre='echo DONE I',
+        framework="jupyter",
+        resources=Resources(memory="2g", cpu=1),
+        python_requirements=["jupyter", "pandas", "perspective-python", "jupyterlab_widgets", "pyarrow"],
+    )
+    return notebook
+
+def voila_notebook():
+    from pathlib import Path
+    from datatailr import App
+
+    path_to_notebook = Path(__file__).parent / "notebooks" / "demo_notebook.ipynb"
+    assert path_to_notebook.exists(), f"Notebook not found: {path_to_notebook}"
+    notebook = App(
+        name="Voila Notebook",
+        entrypoint=str(path_to_notebook),
+        build_script_pre='echo DONE I',
+        framework="voila",
+        resources=Resources(memory="2g", cpu=1),
+        python_requirements=["voila", "jupyter", "pandas", "perspective-python", "jupyterlab_widgets", "pyarrow"],
+    )
+    return notebook
 
 def deploy_pipeline():
     wf = simple_workflow()
@@ -115,9 +145,15 @@ def deploy_pipeline():
 
 
 def deploy_app(framework: str = "streamlit"):
-    if framework not in ["streamlit", "dash", "flask", "panel", "fastapi"]:
+    if framework not in ["streamlit", "dash", "flask", "panel", "fastapi", "jupyter", "voila"]:
         raise ValueError(f"Unsupported framework '{framework}' for app deployment.")
-    app = simple_app(framework=framework)
+    
+    if framework == "jupyter":
+        app = jupyter_notebook()
+    elif framework == "voila":
+        app = voila_notebook()
+    else:
+        app = simple_app(framework=framework)
     print(CYAN("Deploying app..."))
     app.run()
 
@@ -153,4 +189,32 @@ def deploy_all():
 
 
 if __name__ == "__main__":
-    deploy_all()
+    usage = """
+    python deploy.py <command>
+    Commands:
+    - all: Deploy all components
+    - workflow: Deploy the workflow
+    - app: Deploy the app
+    - service: Deploy the service
+    - excel: Deploy the Excel add-in
+    """
+    if len(sys.argv) < 2:
+        print(usage)
+        sys.exit(1)
+    command = sys.argv[1]
+    if command == "all":
+        deploy_all()
+    elif command == "workflow":
+        deploy_pipeline()
+    elif command == "app":
+        framework = sys.argv[2] if len(sys.argv) > 2 else "streamlit"
+        deploy_app(framework)
+    elif command == "service":
+        deploy_service()
+    elif command == "excel-addin":
+        deploy_excel_addin()
+    else:
+        print(f"Unknown command: {command}")
+        print(usage)
+        sys.exit(1)
+    
