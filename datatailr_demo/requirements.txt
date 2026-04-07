@@ -11,3 +11,6 @@ python-multipart
 gunicorn
 plotly
 panel
+networkx
+ipycytoscape
+bqplot

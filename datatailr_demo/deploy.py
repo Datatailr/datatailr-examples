@@ -106,36 +106,24 @@ def simple_excel_addin():
     )
     return addin
 
-def jupyter_notebook():
+def notebook(voila=True):
     from pathlib import Path
     from datatailr import App
 
     path_to_notebook = Path(__file__).parent / "notebooks" / "demo_notebook.ipynb"
     assert path_to_notebook.exists(), f"Notebook not found: {path_to_notebook}"
-    notebook = App(
-        name="Jupyter Notebook",
-        entrypoint=str(path_to_notebook),
-        build_script_pre='echo DONE I',
-        framework="jupyter",
-        resources=Resources(memory="2g", cpu=1),
-        python_requirements=["jupyter", "pandas", "perspective-python", "jupyterlab_widgets", "pyarrow"],
-    )
-    return notebook
 
-def voila_notebook():
-    from pathlib import Path
-    from datatailr import App
-
-    path_to_notebook = Path(__file__).parent / "notebooks" / "demo_notebook.ipynb"
-    assert path_to_notebook.exists(), f"Notebook not found: {path_to_notebook}"
+    python_requirements=["jupyter", "pandas", "perspective-python", "jupyterlab_widgets", "pyarrow", "networkx", "ipycytoscape", "bqplot"]
+    if voila:
+        python_requirements += ['voila']
+    framework = "voila" if voila else "jupyter"
     notebook = App(
-        name="Voila Notebook",
+        name=f"{framework.capitalize()} Notebook",
         entrypoint=str(path_to_notebook),
-        build_script_pre='echo DONE I',
-        framework="voila",
+        framework=framework,
         resources=Resources(memory="2g", cpu=1),
-        python_requirements=["voila", "jupyter", "pandas", "perspective-python", "jupyterlab_widgets", "pyarrow"],
-    )
+        python_requirements=python_requirements
+        )
     return notebook
 
 def deploy_pipeline():
@@ -147,11 +135,11 @@ def deploy_pipeline():
 def deploy_app(framework: str = "streamlit"):
     if framework not in ["streamlit", "dash", "flask", "panel", "fastapi", "jupyter", "voila"]:
         raise ValueError(f"Unsupported framework '{framework}' for app deployment.")
-    
+
     if framework == "jupyter":
-        app = jupyter_notebook()
+        app = notebook(voila=False)
     elif framework == "voila":
-        app = voila_notebook()
+        app = notebook(voila=True)
     else:
         app = simple_app(framework=framework)
     print(CYAN("Deploying app..."))
