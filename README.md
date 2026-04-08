@@ -12,24 +12,31 @@ It is intended to include two types of content:
 - provide starter projects you can copy and adapt
 - create a shared public library of examples maintained by both Datatailr and the community
 
-## Current example package
+## Current example packages
 
-The main package in this repository is:
-- `datatailr_demo/` - deployment-ready examples covering services, pipelines, dashboards, and Excel add-ins
+The main packages in this repository are:
+- `datatailr_demo/` - broad deployment-ready examples covering services, pipelines, dashboards, and Excel add-ins
+- `stock_price_processing/` - end-to-end market data pipeline with realtime processing, dashboards, and scheduled compaction
+- `smart_building_energy/` - end-to-end building telemetry pipeline with ingestion, processing workflow, analytics API, dashboard, and lake compaction
 
-See `datatailr_demo/README.md` for detailed commands and component-level documentation.
+See each folder's `README.md` for detailed commands and component-level documentation.
 
 ## How to use this repo
 
 1. Clone the repository.
-2. Open the example folder you want to run (start with `datatailr_demo/`).
+2. Open the example folder you want to run.
 3. Follow that folder's README for setup, authentication, and deployment steps.
 
-Quick start from the demo folder:
+Quick start examples:
 
 ```bash
 cd datatailr_demo
-python deploy.py
+python deploy.py all
+```
+
+```bash
+cd smart_building_energy
+python deploy.py all
 ```
 
 ## Contributing
