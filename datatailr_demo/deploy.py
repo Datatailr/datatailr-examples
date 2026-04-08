@@ -172,6 +172,7 @@ def deploy_dag_generator(num_tasks: int):
 def deploy_all():
     deploy_pipeline()
     deploy_app()
+    deploy_app('voila')
     deploy_service()
     deploy_excel_addin()
 

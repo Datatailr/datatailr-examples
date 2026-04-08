@@ -3,6 +3,10 @@
 Processor cockpit uses http://price-processor unless PRICE_PROCESSOR_URL is set.
 """
 import pathlib
+import sys
+current_dirname = pathlib.Path(__file__).parent
+sys.path.append(str(current_dirname.parent))
+
 from stock_price_processing.price_server.server import main as price_server_main
 from stock_price_processing.price_processor.server import main as price_processing_main
 from stock_price_processing.data_collector.service import main as data_collector_main
@@ -14,7 +18,7 @@ import stock_price_processing.price_processor.dashboard as processor_dashboard_e
 from stock_price_processing.compaction_workflow.deploy import hourly_compaction_workflow
 
 
-requirements_file = pathlib.Path(__file__).parent / "requirements.txt"
+requirements_file = current_dirname / "requirements.txt"
 assert requirements_file.exists(), f"Requirements file not found: {requirements_file}"
 requirements_file = str(requirements_file)
 
@@ -43,7 +47,7 @@ dashboard = App(
     name="Price Server Dashboard",
     entrypoint=dashboard_entrypoint,
     framework="flask",
-    resources=Resources(memory="4g", cpu=1),
+    resources=Resources(memory="2g", cpu=1),
     app_section='Stock Price Processing',
     python_requirements=["flask", "gunicorn", "requests"],
 )
@@ -52,7 +56,7 @@ lake_dashboard = App(
     name="Lake Query Dashboard",
     entrypoint=lake_dashboard_entrypoint,
     framework="flask",
-    resources=Resources(memory="4g", cpu=1),
+    resources=Resources(memory="2g", cpu=1),
     app_section='Stock Price Processing',
     python_requirements=["flask", "gunicorn", "requests", "duckdb", "pyarrow", "pandas"],
 )
@@ -61,7 +65,7 @@ processor_dashboard = App(
     name="Price Processor Dashboard",
     entrypoint=processor_dashboard_entrypoint,
     framework="flask",
-    resources=Resources(memory="4g", cpu=1),
+    resources=Resources(memory="2g", cpu=1),
     app_section='Stock Price Processing',
     python_requirements=["flask", "gunicorn", "requests"],
 )
