@@ -5,61 +5,68 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Lake Query Dashboard</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/css/pro.css" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/css/pro-dark.css" />
   <script src="https://cdn.jsdelivr.net/npm/@finos/perspective/dist/umd/perspective.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer/dist/umd/perspective-viewer.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-datagrid/dist/umd/perspective-viewer-datagrid.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-d3fc/dist/umd/perspective-viewer-d3fc.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.css" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/theme/material-darker.css" />
   <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/sql/sql.js"></script>
   <style>
-    body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin: 0; background: #0d1117; color: #c9d1d9; }
+    body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin: 0; background: #f6f8fa; color: #24292f; }
     .page { padding: 16px; max-width: 1500px; margin: 0 auto; }
-    h1 { margin: 0 0 12px; font-size: 22px; color: #e6edf3; }
+    h1 { margin: 0 0 12px; font-size: 22px; color: #24292f; }
     .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
-    .tab-btn { background: #161b22; border: 1px solid #30363d; color: #c9d1d9; border-radius: 8px; padding: 8px 12px; cursor: pointer; }
-    .tab-btn.active { color: #58a6ff; border-color: #58a6ff; }
-    .tab { display: none; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 12px; min-height: 420px; }
+    .tab-btn { background: #ffffff; border: 1px solid #d0d7de; color: #24292f; border-radius: 8px; padding: 8px 12px; cursor: pointer; }
+    .tab-btn.active { color: #0969da; border-color: #0969da; }
+    .tab { display: none; background: #ffffff; border: 1px solid #d0d7de; border-radius: 10px; padding: 12px; min-height: 420px; }
     .tab.active { display: block; }
     .status-grid { display: grid; grid-template-columns: repeat(3, minmax(200px, 1fr)); gap: 10px; }
-    .card { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 10px; }
-    .label { color: #8b949e; font-size: 12px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
-    .value { font-size: 18px; color: #e6edf3; }
-    .controls { display: grid; grid-template-columns: 220px 220px 120px 120px 120px 1fr; gap: 10px; margin-bottom: 12px; align-items: end; }
+    .card { background: #ffffff; border: 1px solid #d0d7de; border-radius: 8px; padding: 10px; }
+    .label { color: #656d76; font-size: 12px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+    .value { font-size: 18px; color: #24292f; }
+    .controls { display: grid; grid-template-columns: 220px 220px 120px 120px 120px 150px; gap: 10px; margin-bottom: 12px; align-items: end; }
     .controls input, .controls select, .controls button, textarea {
-      width: 100%; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 8px; padding: 8px;
+      width: 100%; background: #ffffff; border: 1px solid #d0d7de; color: #24292f; border-radius: 8px; padding: 8px;
     }
-    .controls button { cursor: pointer; background: #1f6feb; border-color: #1f6feb; color: #fff; font-weight: 600; }
-    .controls button:hover { background: #388bfd; }
+    .controls button { cursor: pointer; background: #0969da; border-color: #0969da; color: #fff; font-weight: 600; }
+    .controls button:hover { background: #1f6feb; }
+    .q-run-wrap { padding-left: 8px; }
+    #q-run { width: 130px; }
     textarea { min-height: 120px; margin-bottom: 10px; font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
     .CodeMirror {
       height: 140px;
-      border: 1px solid #30363d;
+      border: 1px solid #d0d7de;
       border-radius: 8px;
       margin-bottom: 10px;
       font-size: 13px;
     }
     .blob-table { width: 100%; border-collapse: collapse; }
-    .blob-table th, .blob-table td { border-bottom: 1px solid #30363d; padding: 7px; }
+    .blob-table th, .blob-table td { border-bottom: 1px solid #d0d7de; padding: 7px; }
     .blob-dir, .blob-file { cursor: pointer; }
-    .blob-dir { color: #58a6ff; font-weight: 600; }
-    .blob-file { color: #c9d1d9; }
-    perspective-viewer {
+    .blob-dir { color: #0969da; font-weight: 600; }
+    .blob-file { color: #24292f; }
+    .q-viewer-shell {
       height: 420px;
-      display: block;
-      background: #0d1117;
-      color: #c9d1d9;
-      border: 1px solid #30363d;
+      background: #ffffff;
+      border: 1px solid #d0d7de;
       border-radius: 8px;
+      overflow: hidden;
+    }
+    perspective-viewer {
+      height: 100%;
+      display: block;
+      background: transparent;
+      color: #24292f;
+      border: 0;
+      border-radius: 0;
     }
     perspective-viewer::part(menu),
     perspective-viewer::part(status-bar) {
-      color: #e6edf3;
-      background: #0f141b;
+      color: #24292f;
+      background: #f6f8fa;
     }
-    .muted { color: #8b949e; font-size: 13px; margin-top: 6px; }
+    .muted { color: #656d76; font-size: 13px; margin-top: 6px; }
     .error { color: #f85149; margin-top: 8px; }
   </style>
 </head>
@@ -91,12 +98,14 @@
         <div><div class="label">Date (dt)</div><input id="q-dt" placeholder="2026-03-20" /></div>
         <div><div class="label">Hour</div><input id="q-hour" placeholder="14" /></div>
         <div><div class="label">Max files</div><input id="q-max" type="number" value="64" min="1" /></div>
-        <div><button id="q-run">Run Query</button></div>
+        <div class="q-run-wrap"><button id="q-run">Run Query</button></div>
       </div>
       <textarea id="q-sql">SELECT * FROM lake
 WHERE ticker = 'AAPL'
 LIMIT 100</textarea>
-      <perspective-viewer id="q-viewer-table" theme="Material Dark"></perspective-viewer>
+      <div class="q-viewer-shell">
+        <perspective-viewer id="q-viewer-table" theme="Pro Dark"></perspective-viewer>
+      </div>
       <div class="muted" id="q-meta"></div>
       <div class="error" id="q-error"></div>
     </section>
@@ -166,6 +175,22 @@ LIMIT 100</textarea>
       if (!node) return false;
       if (Object.prototype.hasOwnProperty.call(node, "is_file")) return !node.is_file;
       return node.type === "dir";
+    }
+
+    function formatErr(err) {
+      if (!err) return "Unknown error";
+      if (err instanceof Error) return err.message || String(err);
+      if (typeof err === "string") return err;
+      if (typeof err === "object") {
+        if (typeof err.error === "string") return err.error;
+        if (typeof err.message === "string") return err.message;
+        try {
+          return JSON.stringify(err);
+        } catch (_) {
+          return String(err);
+        }
+      }
+      return String(err);
     }
 
     async function fetchBlobTree(prefix = blobBrowserRoot) {
@@ -246,11 +271,11 @@ LIMIT 100</textarea>
       let worker = null;
       let table = null;
       let sqlEditor = null;
+      let viewerConfigured = false;
 
       if (window.CodeMirror && sqlTextarea) {
         sqlEditor = CodeMirror.fromTextArea(sqlTextarea, {
           mode: "text/x-sql",
-          theme: "material-darker",
           lineNumbers: true,
           indentWithTabs: false,
           indentUnit: 2,
@@ -259,6 +284,12 @@ LIMIT 100</textarea>
             "Ctrl-Enter": () => runBtn.click(),
           },
         });
+        const queryTabBtn = document.querySelector('.tab-btn[data-tab="query"]');
+        if (queryTabBtn) {
+          queryTabBtn.addEventListener("click", () => {
+            setTimeout(() => sqlEditor.refresh(), 0);
+          });
+        }
       } else if (sqlTextarea) {
         sqlTextarea.addEventListener("keydown", (e) => {
           if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -269,15 +300,31 @@ LIMIT 100</textarea>
       }
 
       async function ensurePerspective() {
-        if (worker) return;
+        if (worker) return worker;
         if (!window.perspective || typeof perspective.worker !== "function") {
           throw new Error("Perspective failed to load. Check network/CDN access.");
         }
-        viewerTable.setAttribute("theme", "Material Dark");
+        viewerTable.setAttribute("theme", "Pro Light");
         worker = perspective.worker();
-        table = await worker.table([]);
-        await viewerTable.load(table);
-        await viewerTable.restore({ plugin: "Datagrid", theme: "Material Dark" });
+        return worker;
+      }
+
+      async function loadRowsIntoViewer(rows) {
+        await ensurePerspective();
+        if (table) {
+          try { table.delete(); } catch (_) {}
+          table = null;
+        }
+        try {
+          table = await worker.table(rows || []);
+          await viewerTable.load(table);
+          if (!viewerConfigured) {
+            await viewerTable.restore({ plugin: "Datagrid", theme: "Pro Light" });
+            viewerConfigured = true;
+          }
+        } catch (e) {
+          throw new Error("Failed to render query results: " + formatErr(e));
+        }
       }
 
       runBtn.addEventListener("click", async () => {
@@ -298,19 +345,19 @@ LIMIT 100</textarea>
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
           });
-          const data = await r.json();
-          if (!r.ok) throw new Error(data.error || "query failed");
-
-          await ensurePerspective();
-          if (table) {
-            try { table.delete(); } catch (_) {}
+          let data = null;
+          try {
+            data = await r.json();
+          } catch (_) {
+            data = {};
           }
-          table = await worker.table(data.rows || []);
-          await viewerTable.load(table);
-          await viewerTable.restore({ plugin: "Datagrid", theme: "Material Dark" });
+          if (!r.ok) {
+            throw new Error((data && data.error) || `Query failed (${r.status})`);
+          }
+          await loadRowsIntoViewer(data.rows || []);
           meta.textContent = `Loaded ${data.row_count} rows`;
         } catch (e) {
-          err.textContent = String(e);
+          err.textContent = formatErr(e);
           meta.textContent = "";
         } finally {
           runBtn.disabled = false;
