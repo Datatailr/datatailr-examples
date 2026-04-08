@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Smart Building Energy Intelligence</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    .card { background: #111827; border: 1px solid #334155; border-radius: 8px; padding: 12px; }
+    .metric { flex: 1 1 220px; }
+    .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    select, button { padding: 8px 10px; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid #334155; padding: 6px 8px; text-align: left; }
+    .high { color: #fca5a5; font-weight: bold; }
+    .small { font-size: 12px; color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Smart Building Energy Intelligence</h1>
+    <p class="small">Realtime KPI snapshot + historical trend + open alerts from the analytics API.</p>
+
+    <div class="card controls">
+      <label for="building">Building:</label>
+      <select id="building"></select>
+      <label for="metric">Metric:</label>
+      <select id="metric">
+        <option value="energy_per_occupant">Energy / Occupant</option>
+        <option value="comfort_score">Comfort Score</option>
+        <option value="avg_co2_ppm">CO2 (ppm)</option>
+        <option value="energy_total_kwh">Energy (kWh)</option>
+        <option value="anomaly_score">Anomaly Score</option>
+      </select>
+      <button id="refresh">Refresh</button>
+    </div>
+
+    <div class="row">
+      <div class="card metric"><div class="small">Rows in latest window</div><h2 id="latest-count">-</h2></div>
+      <div class="card metric"><div class="small">Average comfort score</div><h2 id="avg-comfort">-</h2></div>
+      <div class="card metric"><div class="small">Average CO2 ppm</div><h2 id="avg-co2">-</h2></div>
+      <div class="card metric"><div class="small">Open alerts</div><h2 id="open-alerts">-</h2></div>
+    </div>
+
+    <div class="card" style="margin-bottom: 16px;">
+      <h3>Trend</h3>
+      <canvas id="trendChart" height="90"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>Open Alerts</h3>
+      <table id="alerts-table">
+        <thead>
+          <tr>
+            <th>Building</th>
+            <th>Zone</th>
+            <th>Type</th>
+            <th>Severity</th>
+            <th>Metric</th>
+            <th>Value</th>
+            <th>Opened At</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    let trendChart = null;
+
+    async function getJson(url) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json();
+    }
+
+    function selectedBuilding() {
+      const v = document.getElementById("building").value;
+      return v === "__all__" ? null : v;
+    }
+
+    async function loadBuildings() {
+      const payload = await getJson("/api/buildings");
+      const buildings = payload.buildings || [];
+      const sel = document.getElementById("building");
+      sel.innerHTML = "";
+      const all = document.createElement("option");
+      all.value = "__all__";
+      all.textContent = "All";
+      sel.appendChild(all);
+      for (const b of buildings) {
+        const opt = document.createElement("option");
+        opt.value = b;
+        opt.textContent = b;
+        sel.appendChild(opt);
+      }
+    }
+
+    function avg(nums) {
+      if (!nums.length) return null;
+      return nums.reduce((a, b) => a + b, 0) / nums.length;
+    }
+
+    async function loadLatest() {
+      const building = selectedBuilding();
+      const q = building ? `?building_id=${encodeURIComponent(building)}` : "";
+      const payload = await getJson(`/api/latest${q}`);
+      const items = payload.items || [];
+      document.getElementById("latest-count").textContent = items.length;
+
+      const comfortVals = items.map(x => Number(x.comfort_score)).filter(x => !Number.isNaN(x));
+      const co2Vals = items.map(x => Number(x.avg_co2_ppm)).filter(x => !Number.isNaN(x));
+      const comfort = avg(comfortVals);
+      const co2 = avg(co2Vals);
+      document.getElementById("avg-comfort").textContent = comfort == null ? "-" : comfort.toFixed(1);
+      document.getElementById("avg-co2").textContent = co2 == null ? "-" : co2.toFixed(0);
+    }
+
+    async function loadTimeseries() {
+      const building = selectedBuilding();
+      const metric = document.getElementById("metric").value;
+      const params = new URLSearchParams({ metric, hours: "24" });
+      if (building) params.set("building_id", building);
+      const payload = await getJson(`/api/timeseries?${params.toString()}`);
+      const items = payload.items || [];
+      const labels = items.map(x => new Date(x.window_start).toLocaleTimeString());
+      const values = items.map(x => Number(x.value));
+
+      const ctx = document.getElementById("trendChart").getContext("2d");
+      if (trendChart) trendChart.destroy();
+      trendChart = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [{
+            label: metric,
+            data: values,
+            borderColor: "#22d3ee",
+            backgroundColor: "rgba(34,211,238,0.2)",
+            tension: 0.25,
+            fill: true,
+          }]
+        },
+        options: {
+          responsive: true,
+          scales: {
+            x: { ticks: { color: "#94a3b8" }, grid: { color: "#334155" } },
+            y: { ticks: { color: "#94a3b8" }, grid: { color: "#334155" } },
+          },
+          plugins: { legend: { labels: { color: "#e2e8f0" } } }
+        }
+      });
+    }
+
+    async function loadAlerts() {
+      const building = selectedBuilding();
+      const params = new URLSearchParams({ status: "open" });
+      if (building) params.set("building_id", building);
+      const payload = await getJson(`/api/alerts?${params.toString()}`);
+      const items = payload.items || [];
+      document.getElementById("open-alerts").textContent = items.length;
+
+      const tbody = document.querySelector("#alerts-table tbody");
+      tbody.innerHTML = "";
+      for (const a of items.slice(0, 30)) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${a.building_id ?? ""}</td>
+          <td>${a.zone ?? ""}</td>
+          <td>${a.type ?? ""}</td>
+          <td class="${a.severity === "high" ? "high" : ""}">${a.severity ?? ""}</td>
+          <td>${a.metric_name ?? ""}</td>
+          <td>${Number(a.metric_value ?? 0).toFixed(2)}</td>
+          <td>${a.opened_at ?? ""}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function refresh() {
+      await loadLatest();
+      await loadTimeseries();
+      await loadAlerts();
+    }
+
+    document.getElementById("refresh").addEventListener("click", refresh);
+    document.getElementById("building").addEventListener("change", refresh);
+    document.getElementById("metric").addEventListener("change", loadTimeseries);
+
+    (async () => {
+      await loadBuildings();
+      await refresh();
+    })();
+  </script>
+</body>
+</html>
+

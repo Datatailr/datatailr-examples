@@ -1,0 +1,18 @@
+{
+    "name": "Smart Building Energy Intelligence",
+    "description": "An end-to-end Datatailr example with telemetry ingestion, scheduled processing, analytics API, and dashboard.",
+    "tags": [
+        "Datatailr",
+        "Demo",
+        "IoT",
+        "Energy",
+        "Workflows",
+        "Services",
+        "Dashboards",
+        "FastAPI",
+        "Flask",
+        "Analytics"
+    ],
+    "author": "Datatailr"
+}
+

@@ -1,0 +1,10 @@
+datatailr
+fastapi
+uvicorn
+flask
+requests
+pandas
+numpy
+duckdb
+pyarrow
+
