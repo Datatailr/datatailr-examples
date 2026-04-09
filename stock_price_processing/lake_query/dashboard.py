@@ -74,10 +74,18 @@ def _full_blob_path(list_prefix: str, entry_name: str) -> str:
     base = list_prefix.rstrip("/")
     if not base:
         return "/" + e.lstrip("/")
+    e_clean = e.lstrip("/")
     base_tail = base.lstrip("/")
-    if e == base_tail or e.startswith(base_tail + "/"):
-        return "/" + e
-    return f"{base}/{e.lstrip('/')}"
+    if e_clean == base_tail or e_clean.startswith(base_tail + "/"):
+        return "/" + e_clean
+    # Some Blob.ls() implementations return names relative to the bucket root:
+    # list_prefix: /bucket/a/b/, entry: a/b/file.parquet (bucket omitted).
+    # Reattach the bucket segment to avoid duplicating prefix segments.
+    if "/" in base_tail:
+        bucket, current_rel = base_tail.split("/", 1)
+        if current_rel and (e_clean == current_rel or e_clean.startswith(current_rel + "/")):
+            return f"/{bucket}/{e_clean}"
+    return f"{base}/{e_clean}"
 
 
 def _relative_under_prefix(list_prefix: str, full_path: str) -> str:

@@ -71,6 +71,13 @@ def _full_key(parent_prefix: str, entry_name: str) -> str:
     child = raw.strip("/")
     if child == tail or child.startswith(tail + "/"):
         return "/" + child
+    # Some Blob.ls() implementations return names relative to the bucket root:
+    # parent_prefix: /bucket/a/b, entry: a/b/file.parquet (bucket omitted).
+    # Reattach the bucket segment to avoid duplicating prefix segments.
+    if "/" in tail:
+        bucket, current_rel = tail.split("/", 1)
+        if current_rel and (child == current_rel or child.startswith(current_rel + "/")):
+            return f"/{bucket}/{child}"
     return f"{base}/{child}"
 
 
