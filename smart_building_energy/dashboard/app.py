@@ -6,21 +6,33 @@ from typing import Any
 import requests
 from flask import Flask, jsonify, render_template, request
 
+_env = os.environ.get("DATATAILR_JOB_ENVIRONMENT", "")
+_job = os.environ.get("DATATAILR_JOB_NAME", "")
+_job_type = os.environ.get("DATATAILR_JOB_TYPE", "")
+if _job_type == "workstation":
+    _PREFIX = f"/workstation/{_env}/{_job}/ide/proxy/5060/"
+elif _env and _job:
+    _PREFIX = f"/job/{_env}/{_job}/"
+else:
+    _PREFIX = "/"
+
 app = Flask(__name__)
 
+if _job_type in ("workstation", ""):
+    ANALYTICS_API_URL = os.environ.get("ANALYTICS_API_URL", "http://localhost:8091")
+else:
+    ANALYTICS_API_URL = os.environ.get("ANALYTICS_API_URL", "http://building-analytics-api")
 
-def _analytics_url() -> str:
-    explicit = os.environ.get("ANALYTICS_API_URL", "").strip()
-    if explicit:
-        return explicit.rstrip("/")
-    if os.getenv("DATATAILR_JOB_TYPE", "workstation") in ("workstation", ""):
-        return "http://localhost:8091"
-    return "http://building-analytics-api"
-
+def _app_path(suffix: str = "") -> str:
+    base = _PREFIX.rstrip("/")
+    suf = suffix.strip("/")
+    if not suf:
+        return f"{base}/" if base else "/"
+    return f"{base}/{suf}" if base else f"/{suf}"
 
 def _fetch_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    url = f"{_analytics_url()}/{path.lstrip('/')}"
-    r = requests.get(url, params=params or {}, timeout=10)
+    url = f"{ANALYTICS_API_URL}/{path.lstrip('/')}"
+    r = requests.get(url, params=params or {}, timeout=60)
     r.raise_for_status()
     return r.json()
 
@@ -32,7 +44,7 @@ def health_check() -> str:
 
 @app.get("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", api_base=_app_path("api"))
 
 
 @app.get("/api/buildings")
@@ -75,3 +87,5 @@ def alerts():
     return jsonify(data)
 
 
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5050)

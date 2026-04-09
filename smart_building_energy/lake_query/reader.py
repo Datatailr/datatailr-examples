@@ -239,4 +239,3 @@ def list_buildings(blob_prefix: str = DEFAULT_BLOB_PREFIX) -> list[str]:
     if df.empty or "building_id" not in df.columns:
         return []
     return sorted([x for x in df["building_id"].dropna().unique().tolist() if isinstance(x, str)])
-
