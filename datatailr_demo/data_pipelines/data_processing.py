@@ -24,6 +24,11 @@ def get_number() -> int:
 
 
 @task()
+def use_rundate(rundate: str) -> str:
+    logger.info(f"rundate: {rundate}")
+    return f"rundate: {rundate}"
+
+@task()
 def get_number_from_service(min_val: int, max_val: int) -> int:
     import requests
 

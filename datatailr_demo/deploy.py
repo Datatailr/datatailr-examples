@@ -20,29 +20,7 @@ def data_pipeline_with_one_task():
 
 
 def simple_workflow():
-    from data_pipelines.data_processing import (
-        get_data,
-        process_data,
-        get_number,
-        add,
-        get_number_from_service,
-    )
-
-    @workflow(name="Simple Data Pipeline", python_requirements=["requests"])
-    def simple_data_pipeline():
-        data = get_data()
-        process_data(data)
-
-        a = get_number().alias("a")
-        b = get_number().alias("b")
-        add(a, b).alias("Add a and b")
-        add(a, 18).alias("Add a and 18")
-        rand_low = get_number_from_service(0, 10).alias("Random 0-10")
-        rand_high = get_number_from_service(90, 100).alias("Random 90-100")
-        random = get_number_from_service(rand_low, rand_high).alias(
-            "Random between previous two"
-        )
-
+    from data_pipelines.deploy import simple_data_pipeline
     return simple_data_pipeline
 
 
