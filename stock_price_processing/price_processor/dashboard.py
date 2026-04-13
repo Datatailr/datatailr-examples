@@ -180,7 +180,7 @@ def processor_topology_proxy():
         return jsonify({"error": str(exc)}), 502
 
 
-@app.route("/__health_check__.html")
+@app.route("/health")
 def health_check():
     return "OK\n"
 

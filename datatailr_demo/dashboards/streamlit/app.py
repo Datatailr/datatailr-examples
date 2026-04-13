@@ -22,7 +22,7 @@ def _data_service_url() -> str:
 
 def _health_check(url: str) -> str:
     try:
-        resp = requests.get(f"{url}/__health_check__.html", timeout=2)
+        resp = requests.get(f"{url}/health", timeout=2)
         if resp.status_code == 200 and resp.text.strip() == "OK":
             return "Healthy"
         return f"Unhealthy: {resp.text.strip()}"

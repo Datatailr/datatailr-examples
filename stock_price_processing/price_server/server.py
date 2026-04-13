@@ -122,7 +122,7 @@ app = FastAPI(
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-@app.get("/__health_check__.html", tags=["health"])
+@app.get("/health", tags=["health"])
 async def health_check():
     """Plain-text OK for health checks."""
     return PlainTextResponse("OK\n")

@@ -289,7 +289,7 @@ def _start_stream_threads() -> list[threading.Thread]:
 app = FastAPI(title="Stock data collector", version="0.1.0")
 
 
-@app.get("/__health_check__.html")
+@app.get("/health")
 async def health():
     return PlainTextResponse("OK\n")
 

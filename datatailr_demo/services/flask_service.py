@@ -17,7 +17,7 @@ def index():
     return "Data Service running on datatailr!\n"
 
 
-@app.route("/__health_check__.html", methods=["GET"])
+@app.route("/health", methods=["GET"])
 def health_check():
     return "OK\n"
 

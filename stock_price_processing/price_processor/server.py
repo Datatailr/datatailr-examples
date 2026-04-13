@@ -582,7 +582,7 @@ async def startup():
     start_engine_thread(PRICE_SERVER_URL, initial_tickers)
 
 
-@app.get("/__health_check__.html", tags=["health"])
+@app.get("/health", tags=["health"])
 async def health_check():
     """Plain-text OK for health checks."""
     return PlainTextResponse("OK\n")

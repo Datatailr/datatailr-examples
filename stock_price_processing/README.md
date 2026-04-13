@@ -107,7 +107,7 @@ stock_price_processing/
   - `trade`: ticker, price, size, side, seq, timestamp
   - `quote`: bid/ask/mid/spread + quote-side fields
 - Exposes operational endpoints:
-  - `/tickers`, `/add/{ticker}`, `/remove/{ticker}`, `/quote/{ticker}`, `/__health_check__.html`
+  - `/tickers`, `/add/{ticker}`, `/remove/{ticker}`, `/quote/{ticker}`, `/health`
 
 ### 2) Price Processor (`price_processor/server.py`)
 

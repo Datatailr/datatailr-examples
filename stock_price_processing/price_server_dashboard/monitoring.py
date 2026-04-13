@@ -122,7 +122,7 @@ def tickers_page():
     return render_template("tickers.html", **_common_template_ctx())
 
 
-@app.route("/__health_check__.html")
+@app.route("/health")
 def health_check():
     return "OK\n"
 

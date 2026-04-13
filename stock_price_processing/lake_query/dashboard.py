@@ -282,7 +282,7 @@ def run_query():
     return jsonify({"columns": cols, "rows": out_rows, "row_count": len(out_rows)})
 
 
-@app.route("/__health_check__.html")
+@app.route("/health")
 def health_check():
     return "OK\n"
 
