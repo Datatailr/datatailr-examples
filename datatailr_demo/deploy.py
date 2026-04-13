@@ -31,7 +31,7 @@ def simple_app(framework: str = "streamlit"):
     if framework == "streamlit":
         import dashboards.streamlit.app as entrypoint
 
-        python_requirements = ["streamlit", "pandas"]
+        python_requirements = ["streamlit", "pandas", "requests"]
     elif framework == "dash":
         import dashboards.dash.app as entrypoint
 
