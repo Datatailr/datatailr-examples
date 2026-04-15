@@ -26,7 +26,7 @@ schedule = Schedule(at_minutes=[0])
 @workflow(
     name="Stock Lake Hourly Compaction",
     schedule=schedule,
-    python_requirements=str(Path(__file__).parent.parent / "requirements.txt"),
+    python_requirements=str(str(Path(__file__).parent.parent / "requirements.txt")),
     resources=Resources(memory="2g", cpu=1),
     env_vars={
         "COLLECTOR_BLOB_PREFIX": BASE_PREFIX,
