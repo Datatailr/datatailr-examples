@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from datatailr import Resources, Schedule, workflow
 
@@ -25,7 +26,7 @@ schedule = Schedule(at_minutes=[0])
 @workflow(
     name="Stock Lake Hourly Compaction",
     schedule=schedule,
-    python_requirements="stock_price_processing/requirements.txt",
+    python_requirements=str(Path(__file__).parent.parent / "requirements.txt"),
     resources=Resources(memory="2g", cpu=1),
     env_vars={
         "COLLECTOR_BLOB_PREFIX": BASE_PREFIX,

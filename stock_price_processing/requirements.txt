@@ -2,7 +2,7 @@ numpy
 fastapi
 flask
 uvicorn[standard]
-sse-starlette
+sse_starlette
 csp
 requests
 pandas
