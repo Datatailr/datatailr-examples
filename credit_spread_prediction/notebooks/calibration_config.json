@@ -1,0 +1,48 @@
+{
+  "cv_splits": 4,
+  "jobs": [
+    {
+      "target": "BAMLC0A4CBBB",
+      "horizon": 1,
+      "label_kind": "level",
+      "model_family": "elasticnet",
+      "params": {
+        "alpha": 0.05,
+        "l1_ratio": 0.6
+      }
+    },
+    {
+      "target": "BAMLC0A4CBBB",
+      "horizon": 5,
+      "label_kind": "delta",
+      "model_family": "gbr",
+      "params": {
+        "n_estimators": 300,
+        "learning_rate": 0.03,
+        "max_depth": 2
+      }
+    },
+    {
+      "target": "BAA10Y",
+      "horizon": 1,
+      "label_kind": "delta",
+      "model_family": "elasticnet",
+      "params": {
+        "alpha": 0.2,
+        "l1_ratio": 0.4
+      }
+    },
+    {
+      "target": "BAA10Y",
+      "horizon": 5,
+      "label_kind": "level",
+      "model_family": "gbr",
+      "params": {
+        "n_estimators": 250,
+        "learning_rate": 0.05,
+        "max_depth": 2
+      }
+    }
+  ]
+}
+
