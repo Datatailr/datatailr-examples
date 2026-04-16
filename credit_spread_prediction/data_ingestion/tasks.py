@@ -16,6 +16,7 @@ from credit_spread_prediction.data_ingestion.fred_client import (
     FredSeriesRequest,
     fetch_observations,
     observations_to_frame,
+    require_fred_api_key,
     today_iso,
 )
 
@@ -33,9 +34,11 @@ def fetch_fred_series(
     series_id: str,
     observation_start: str = "1990-01-01",
     observation_end: str | None = None,
+    credentials_check: str | None = None,
 ) -> dict[str, str]:
     from datatailr import Blob
 
+    _ = credentials_check
     req = FredSeriesRequest(
         series_id=series_id,
         observation_start=observation_start,
@@ -84,10 +87,17 @@ def get_default_series() -> list[str]:
 
 
 @task()
+def validate_fred_api_key() -> str:
+    require_fred_api_key()
+    return "ok"
+
+
+@task()
 def fetch_all_fred_series(
     observation_start: str = "1990-01-01",
     observation_end: str | None = None,
 ) -> dict[str, str]:
+    require_fred_api_key()
     results = []
     for series_id in ALL_SERIES:
         results.append(

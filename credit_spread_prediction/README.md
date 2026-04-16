@@ -38,6 +38,9 @@ This example demonstrates a complete Datatailr project for forecasting credit sp
 python credit_spread_prediction/deploy.py
 ```
 
+Before running ingestion/training, create Datatailr secret `fred_api_key` in Secrets Manager
+(or set `FRED_API_KEY` as an environment variable).
+
 This deploys:
 - Streamlit app: **Credit Spread Examination Dashboard**
 - Scheduled ingestion workflow

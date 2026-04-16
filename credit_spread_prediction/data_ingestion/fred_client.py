@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 import pandas as pd
 import requests
 
-from credit_spread_prediction.config import FRED_API_KEY, FRED_BASE_URL
+from credit_spread_prediction.config import FRED_BASE_URL
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,32 @@ class FredSeriesRequest:
     observation_start: str = "1990-01-01"
     observation_end: str | None = None
     frequency: str | None = None
+
+
+def _resolve_fred_api_key() -> str:
+    env_key = (
+        os.environ.get("FRED_API_KEY", "").strip()
+        or os.environ.get("FRED_APIKEY", "").strip()
+    )
+    if env_key:
+        return env_key
+
+    try:
+        from datatailr import Secrets
+
+        secret_val = Secrets().get("fred_api_key")
+        return str(secret_val).strip()
+    except Exception:
+        return ""
+
+
+def require_fred_api_key() -> None:
+    api_key = _resolve_fred_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "Missing FRED API key. Add secret `fred_api_key` in Datatailr Secrets Manager "
+            "or set env var `FRED_API_KEY`."
+        )
 
 
 def _build_params(req: FredSeriesRequest) -> dict[str, Any]:
@@ -31,8 +58,11 @@ def _build_params(req: FredSeriesRequest) -> dict[str, Any]:
         params["observation_end"] = req.observation_end
     if req.frequency:
         params["frequency"] = req.frequency
-    if FRED_API_KEY:
-        params["api_key"] = FRED_API_KEY
+    api_key = _resolve_fred_api_key()
+    if not api_key:
+        require_fred_api_key()
+        api_key = _resolve_fred_api_key()
+    params["api_key"] = api_key
     return params
 
 

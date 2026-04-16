@@ -8,7 +8,11 @@ from pathlib import Path
 from datatailr import Resources, workflow
 
 from credit_spread_prediction.config import ALL_SERIES
-from credit_spread_prediction.data_ingestion.tasks import collect_ingestion_summary, fetch_fred_series
+from credit_spread_prediction.data_ingestion.tasks import (
+    collect_ingestion_summary,
+    fetch_fred_series,
+    validate_fred_api_key,
+)
 from credit_spread_prediction.evaluation.tasks import evaluate_run
 from credit_spread_prediction.features.tasks import build_features_from_latest_ingestion
 from credit_spread_prediction.modeling.calibration import load_local_calibration_config
@@ -43,12 +47,14 @@ def credit_spread_training_workflow(
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     if bootstrap_ingestion:
+        creds = validate_fred_api_key().alias("validate_fred_api_key")
         fetches = []
         for series_id in ALL_SERIES:
             fetches.append(
                 fetch_fred_series(
                     series_id=series_id,
                     observation_start=observation_start,
+                    credentials_check=creds,
                 ).alias(f"bootstrap_{series_id.lower()}")
             )
         collect_ingestion_summary(fetches).alias("bootstrap_ingestion_summary")

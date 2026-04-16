@@ -13,8 +13,7 @@ CALIBRATION_CONFIG_KEY = os.environ.get(
     f"{MODELS_PREFIX}/calibration/calibration_config.json",
 )
 
-# FRED API key is optional for many endpoints but improves reliability.
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
+# FRED API key should be supplied via secret `fred_api_key` (or env var fallback).
 FRED_BASE_URL = os.environ.get("FRED_BASE_URL", "https://api.stlouisfed.org/fred")
 
 TARGET_SERIES = (
