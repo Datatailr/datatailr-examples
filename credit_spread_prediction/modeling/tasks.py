@@ -31,7 +31,7 @@ def _entry_name(entry: str | dict[str, Any]) -> str:
     return str(entry).strip()
 
 
-@task()
+@task(memory="2g", cpu=1)
 def write_calibration_manifest(run_id: str, config: dict[str, Any]) -> dict[str, str]:
     from datatailr import Blob
 
