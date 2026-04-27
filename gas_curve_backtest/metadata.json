@@ -1,0 +1,6 @@
+{
+    "name": "Gas Curve Backtest",
+    "description": "Commodity forward curve backtester with stack-model pricing, ECMWF-driven signals, and dynamic regime-aware workflow fan-out on Datatailr.",
+    "tags": ["backtesting", "commodities", "futures", "energy", "gas", "power", "workflows", "dynamic dag", "streamlit", "demo"],
+    "author": "Datatailr"
+}
