@@ -100,8 +100,8 @@ def compute_signals(run_id: str) -> str:
 def detect_regimes_and_launch(
     run_id: str,
     n_regimes: int = 4,
-    grid_signal_steps: int = 11,
-    grid_pivot_steps: int = 5,
+    grid_signal_steps: int = 3,
+    grid_pivot_steps: int = 2,
     bootstrap_samples: int = 64,
 ) -> dict:
     """Stage 3 — cluster the historical signal/asymmetry/spread into regimes

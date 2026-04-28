@@ -28,8 +28,8 @@ def build_regime_workflow(
     run_id: str,
     regimes: list[dict],
     n_tenors: int,
-    grid_signal_steps: int = 11,
-    grid_pivot_steps: int = 5,
+    grid_signal_steps: int = 3,
+    grid_pivot_steps: int = 2,
     bootstrap_samples: int = 64,
 ):
     """Return a fresh @workflow-decorated function ready to deploy.
@@ -66,6 +66,6 @@ def build_regime_workflow(
                             bootstrap_samples,
                         ).alias(f"r{r_id}_t{tenor}_s{sig_idx}_p{pivot_idx}")
                         cell_results.append(out)
-        aggregate_results(run_id, *cell_results).alias("aggregate")
+        aggregate_results(*cell_results).alias("aggregate")
 
     return regime_sweep

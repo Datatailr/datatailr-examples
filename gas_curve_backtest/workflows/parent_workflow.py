@@ -43,8 +43,8 @@ def parent_backtest_workflow(
     n_days: int = 750,
     n_tenors: int = 8,
     n_regimes: int = 4,
-    grid_signal_steps: int = 11,
-    grid_pivot_steps: int = 5,
+    grid_signal_steps: int = 3,
+    grid_pivot_steps: int = 2,
     bootstrap_samples: int = 64,
 ):
     rid = run_id or os.environ.get("DATATAILR_RUN_ID") or make_run_id()
