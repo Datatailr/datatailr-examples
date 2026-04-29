@@ -443,6 +443,7 @@ def aggregate_results(run_id: str, *_cells: Any) -> dict:
     import pyarrow.parquet as pq
 
     t0 = time.perf_counter()
+
     logger.info(
         f"[aggregate_results] start run_id={run_id} "
         f"upstream_cells_signalled={len(_cells)}"

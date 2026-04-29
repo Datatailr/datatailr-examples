@@ -47,7 +47,7 @@ def parent_backtest_workflow(
     grid_pivot_steps: int = 2,
     bootstrap_samples: int = 64,
 ):
-    rid = run_id or os.environ.get("DATATAILR_RUN_ID") or make_run_id()
+    rid = run_id or os.environ.get("DATATAILR_JOB_RUN_ID") or make_run_id()
     market_done = generate_market(rid, n_days, n_tenors).alias("generate_market")
     signals_done = compute_signals(market_done).alias("compute_signals")
     detect_regimes_and_launch(
@@ -60,6 +60,6 @@ def parent_backtest_workflow(
 
 
 if __name__ == "__main__":
-    rid = os.environ.get("DATATAILR_RUN_ID") or make_run_id()
+    rid = os.environ.get("DATATAILR_JOB_RUN_ID") or make_run_id()
     print(f"Deploying parent backtest workflow with run_id={rid}")
     parent_backtest_workflow(rid)
