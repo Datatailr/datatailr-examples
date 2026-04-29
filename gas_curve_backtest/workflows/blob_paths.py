@@ -13,10 +13,6 @@ def run_root(run_id: str) -> str:
     return f"{ROOT}/runs/{run_id}"
 
 
-def market_data(run_id: str) -> str:
-    return f"{run_root(run_id)}/market.npz"
-
-
 def signals(run_id: str) -> str:
     return f"{run_root(run_id)}/signals.npz"
 

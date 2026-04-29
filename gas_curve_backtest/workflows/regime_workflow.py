@@ -54,10 +54,9 @@ def build_regime_workflow(
         name=f"Regime Sweep — {run_id} ({n_cells} cells)",
         python_requirements=_REQ,
         resources=Resources(memory="500m", cpu=0.5),
-        env_vars={"DATATAILR_JOB_RUN_ID": run_id},
     )
     def regime_sweep():
-        cell_results = []
+        cell_results = [run_id]
         for regime in regimes:
             grid = regime_aware_grid(regime, base)
             r_id = int(regime["regime_id"])
@@ -84,6 +83,6 @@ def build_regime_workflow(
         logger.info(
             f"[build_regime_workflow] DAG composed total_cells={len(cell_results)}"
         )
-        aggregate_results(run_id, *cell_results).alias("aggregate")
+        aggregate_results(*cell_results).alias("aggregate")
 
     return regime_sweep

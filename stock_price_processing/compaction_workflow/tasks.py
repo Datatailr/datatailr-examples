@@ -336,7 +336,7 @@ def compact_partition_impl(
     compact_bytes = buf.getvalue()
     _blob_put(blob, compact_key, compact_bytes)
 
-    run_id = os.environ.get("DATATAILR_BATCH_RUN_ID", "")
+    run_id = os.environ.get("DATATAILR_JOB_RUN_ID", "")
     marker = {
         "dataset": part["dataset"],
         "dt": part["dt"],

@@ -78,16 +78,16 @@ def load_regimes(run_id: str) -> dict | None:
 
 
 # Pipeline stages, in order. The dashboard derives the current stage
-# from which artifacts exist on Blob — task return values are also
-# auto-persisted by the platform, so we don't write a separate
-# status.json.
+# from which artifacts exist on Blob; the parent workflow's market and
+# signals payloads now flow between tasks via auto-persisted return
+# values, so the only on-disk waypoint before regime detection is
+# `signals.npz` (written once by `compute_signals`).
 STAGES = [
-    ("generate_market", "1. Generate market"),
-    ("compute_signals", "2. Compute signals"),
-    ("detect_regimes", "3. Detect regimes"),
-    ("child_launched", "4. Child workflow launched"),
-    ("aggregate", "5. Aggregating cells"),
-    ("done", "6. Done"),
+    ("compute_signals", "1. Generate market & compute signals"),
+    ("detect_regimes", "2. Detect regimes"),
+    ("child_launched", "3. Child workflow launched"),
+    ("aggregate", "4. Aggregating cells"),
+    ("done", "5. Done"),
 ]
 
 
@@ -120,13 +120,7 @@ def derive_stage(run_id: str) -> str:
         return "child_launched"
     if _exists(blob_paths.signals(run_id)):
         return "detect_regimes"
-    if _exists(blob_paths.market_data(run_id)):
-        return "compute_signals"
-    return "generate_market"
-
-
-def load_market(run_id: str):
-    return safe_get_npz(blob_paths.market_data(run_id))
+    return "compute_signals"
 
 
 def load_signals(run_id: str):

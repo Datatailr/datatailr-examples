@@ -6,6 +6,11 @@ Stage 3: detect regimes; this task **dynamically deploys a child
          workflow** that fans out a backtest cell per
          (regime, tenor, threshold).
 
+Market and signals payloads flow between tasks via the platform's
+auto-persisted task-return channel; only the artifacts that have to
+cross the parent → child or workflow → dashboard boundaries are
+written to Blob storage (see `tasks.py`).
+
 The parent itself ends as soon as the child is launched; the child
 contains the aggregator and writes the final heatmap to Blob storage.
 The dashboard reads the heatmap by `run_id`.
@@ -13,7 +18,6 @@ The dashboard reads the heatmap by `run_id`.
 
 from __future__ import annotations
 
-import os
 import time
 import uuid
 from pathlib import Path
@@ -47,11 +51,12 @@ def parent_backtest_workflow(
     grid_pivot_steps: int = 2,
     bootstrap_samples: int = 64,
 ):
-    rid = run_id or os.environ.get("DATATAILR_JOB_RUN_ID") or make_run_id()
-    market_done = generate_market(rid, n_days, n_tenors).alias("generate_market")
-    signals_done = compute_signals(market_done).alias("compute_signals")
+    rid = run_id or make_run_id()
+    market = generate_market(n_days, n_tenors).alias("generate_market")
+    signals = compute_signals(rid, market).alias("compute_signals")
     detect_regimes_and_launch(
-        signals_done,
+        rid,
+        signals,
         n_regimes,
         grid_signal_steps,
         grid_pivot_steps,
@@ -60,6 +65,6 @@ def parent_backtest_workflow(
 
 
 if __name__ == "__main__":
-    rid = os.environ.get("DATATAILR_JOB_RUN_ID") or make_run_id()
+    rid = make_run_id()
     print(f"Deploying parent backtest workflow with run_id={rid}")
     parent_backtest_workflow(rid)

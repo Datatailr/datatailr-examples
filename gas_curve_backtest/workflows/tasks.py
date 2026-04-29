@@ -1,10 +1,19 @@
 """@task functions used by the parent and child backtest workflows.
 
-Each task's return value is automatically persisted by the Datatailr
-platform — we only write to Blob storage explicitly when the data is
-either too large for the cache (numpy arrays) or needs a stable,
-predictable key for the dashboard to poll without knowing the batch
-run id (regimes, cell results, aggregated summary).
+Within a single workflow run, payloads flow between tasks via the
+platform's auto-persisted return-value channel — we only write to Blob
+storage when data has to cross a boundary the channel does not span:
+
+  * the parent → dynamically-deployed child workflow boundary (the
+    cells live in a separate DAG), and
+  * the workflow → out-of-DAG dashboard boundary (Streamlit polls Blob
+    by `run_id` because it has no task handle).
+
+So `generate_market` returns its payload directly; `compute_signals`
+consumes that payload and persists `signals.npz` once, since the child
+cells and the Regime Drilldown page both read it back; regimes / cell
+results / aggregated summary are persisted because the dashboard reads
+them.
 """
 
 from __future__ import annotations
@@ -74,14 +83,17 @@ def _get_json(key: str) -> Any:
 
 
 @task(memory="1g", cpu=1)
-def generate_market(run_id: str, n_days: int = 750, n_tenors: int = 8, seed: int = 11) -> str:
-    """Stage 1 — synthesise forward curves, ECMWF ensembles and market mid."""
+def generate_market(n_days: int = 750, n_tenors: int = 8, seed: int = 11) -> dict:
+    """Stage 1 — synthesise forward curves, ECMWF ensembles and market mid.
+
+    Returned dict is consumed directly by `compute_signals` via the
+    platform's task-return channel; nothing is written to Blob here.
+    """
     from gas_curve_backtest.market.curve_generator import CurveConfig, generate_history
 
     t0 = time.perf_counter()
     logger.info(
-        f"[generate_market] start run_id={run_id} n_days={n_days} "
-        f"n_tenors={n_tenors} seed={seed}"
+        f"[generate_market] start n_days={n_days} n_tenors={n_tenors} seed={seed}"
     )
 
     h = generate_history(CurveConfig(n_days=n_days, n_tenors=n_tenors, seed=seed))
@@ -96,38 +108,35 @@ def generate_market(run_id: str, n_days: int = 750, n_tenors: int = 8, seed: int
         f"ensemble shape={ens.shape} | "
         f"avg bid-ask spread={spread_pct:.3f}%"
     )
-
-    _put_npz(
-        blob_paths.market_data(run_id),
-        model_price_ensemble=ens,
-        market_mid=mid,
-        bid=h["bid"],
-        ask=h["ask"],
-        realised_temp=h["realised_temp"],
-        spread_regime=h["spread_regime"],
-    )
-    _blob().put(blob_paths.latest_pointer(), run_id.encode("utf-8"))
     logger.info(
-        f"[generate_market] done run_id={run_id} "
-        f"elapsed={time.perf_counter() - t0:.2f}s"
+        f"[generate_market] done elapsed={time.perf_counter() - t0:.2f}s"
     )
-    return run_id
+    return {
+        "model_price_ensemble": ens,
+        "market_mid": mid,
+        "bid": h["bid"],
+        "ask": h["ask"],
+        "realised_temp": h["realised_temp"],
+        "spread_regime": h["spread_regime"],
+    }
 
 
 @task(memory="2g", cpu=1)
-def compute_signals(run_id: str) -> str:
-    """Stage 2 — derive percentile signal, asymmetry, short-term overlay."""
+def compute_signals(run_id: str, market: dict) -> dict:
+    """Stage 2 — derive percentile signal, asymmetry, short-term overlay.
+
+    Receives the market payload directly from `generate_market`; persists
+    `signals.npz` so the dynamically-deployed child workflow and the
+    dashboard's Regime Drilldown page can fetch it by `run_id`.
+    """
     from gas_curve_backtest.signals.asymmetry import asymmetry_and_spread
     from gas_curve_backtest.signals.percentile_signals import percentile_signal
     from gas_curve_backtest.signals.short_term import short_term_signal
 
     t0 = time.perf_counter()
-    logger.info(f"[compute_signals] start run_id={run_id}")
-
-    market = _get_npz(blob_paths.market_data(run_id))
     n_days, n_tenors = market["market_mid"].shape
     logger.info(
-        f"[compute_signals] inputs n_days={n_days} n_tenors={n_tenors}"
+        f"[compute_signals] start run_id={run_id} n_days={n_days} n_tenors={n_tenors}"
     )
 
     t = time.perf_counter()
@@ -161,25 +170,27 @@ def compute_signals(run_id: str) -> str:
         f"abs-mean={float(np.abs(pnl_per_unit).mean()):.4f}"
     )
 
-    _put_npz(
-        blob_paths.signals(run_id),
-        percentile_signal=pct_sig,
-        asymmetry=asym,
-        spread=spread,
-        short_term=st,
-        combined_signal=combined,
-        pnl_per_unit=pnl_per_unit,
-    )
+    signals_payload = {
+        "percentile_signal": pct_sig,
+        "asymmetry": asym,
+        "spread": spread,
+        "short_term": st,
+        "combined_signal": combined,
+        "pnl_per_unit": pnl_per_unit,
+    }
+    _put_npz(blob_paths.signals(run_id), **signals_payload)
+    _blob().put(blob_paths.latest_pointer(), run_id.encode("utf-8"))
     logger.info(
         f"[compute_signals] done run_id={run_id} "
         f"elapsed={time.perf_counter() - t0:.2f}s"
     )
-    return run_id
+    return signals_payload
 
 
 @task(memory="2g", cpu=1)
 def detect_regimes_and_launch(
     run_id: str,
+    signals: dict,
     n_regimes: int = 4,
     grid_signal_steps: int = 3,
     grid_pivot_steps: int = 2,
@@ -189,27 +200,24 @@ def detect_regimes_and_launch(
     and dynamically launch a child workflow with one branch per
     (regime × tenor × threshold cell).
 
+    Receives the in-memory signals payload from `compute_signals`; only
+    the regimes summary is persisted here, since the cells will pull
+    `signals.npz` back from Blob (written upstream by `compute_signals`).
+
     This is the moment the DAG shape is decided by data, not by code.
     """
     from sklearn.cluster import KMeans
 
     t0 = time.perf_counter()
+    asym = signals["asymmetry"]
+    spread = signals["spread"]
+    combined = signals["combined_signal"]
+    n_days, n_tenors = combined.shape
     logger.info(
         f"[detect_regimes] start run_id={run_id} n_regimes={n_regimes} "
         f"grid={grid_signal_steps}x{grid_pivot_steps} "
-        f"bootstrap_samples={bootstrap_samples}"
-    )
-
-    market = _get_npz(blob_paths.market_data(run_id))
-    sigs = _get_npz(blob_paths.signals(run_id))
-
-    asym = sigs["asymmetry"]
-    spread = sigs["spread"]
-    combined = sigs["combined_signal"]
-    n_days, n_tenors = combined.shape
-    logger.info(
-        f"[detect_regimes] feature inputs n_days={n_days} n_tenors={n_tenors} "
-        f"market keys={list(market.keys())}"
+        f"bootstrap_samples={bootstrap_samples} "
+        f"feature inputs n_days={n_days} n_tenors={n_tenors}"
     )
 
     feat_asym = np.log(np.clip(asym.mean(axis=1), 1e-3, None))
@@ -431,7 +439,7 @@ def run_backtest_cell(
 
 
 @task(memory="2g", cpu=1)
-def aggregate_results(run_id: str, *_cells: Any) -> dict:
+def aggregate_results(*_cells: Any) -> dict:
     """Sweep all cell result blobs, write a tidy parquet + a summary JSON.
 
     The `*_cells` varargs make this task wait for every fan-out cell
@@ -443,15 +451,16 @@ def aggregate_results(run_id: str, *_cells: Any) -> dict:
     import pyarrow.parquet as pq
 
     t0 = time.perf_counter()
-
+    backtest_id = _cells[0]
+    cells = _cells[1:]
     logger.info(
-        f"[aggregate_results] start run_id={run_id} "
+        f"[aggregate_results] start run_id={backtest_id} "
         f"upstream_cells_signalled={len(_cells)}"
     )
 
     blob = _blob()
     rows: list[dict] = []
-    cell_root = blob_paths.cell_dir(run_id)
+    cell_root = blob_paths.cell_dir(backtest_id)
 
     keys: list[str] = []
     try:
@@ -481,12 +490,12 @@ def aggregate_results(run_id: str, *_cells: Any) -> dict:
 
     if not rows:
         logger.warning(
-            f"[aggregate_results] no cells available for run_id={run_id}; "
+            f"[aggregate_results] no cells available for run_id={backtest_id}; "
             "writing empty summary"
         )
-        _put_json(blob_paths.aggregated(run_id), {"cells": 0})
+        _put_json(blob_paths.aggregated(backtest_id), {"cells": 0})
         logger.info(
-            f"[aggregate_results] done (empty) run_id={run_id} "
+            f"[aggregate_results] done (empty) run_id={backtest_id} "
             f"elapsed={time.perf_counter() - t0:.2f}s"
         )
         return {"cells": 0}
@@ -494,11 +503,11 @@ def aggregate_results(run_id: str, *_cells: Any) -> dict:
     table = pa.Table.from_pylist(rows)
     buf = io.BytesIO()
     pq.write_table(table, buf, compression="snappy")
-    blob.put(blob_paths.heatmap(run_id), buf.getvalue())
+    blob.put(blob_paths.heatmap(backtest_id), buf.getvalue())
     logger.info(
         f"[aggregate_results] wrote heatmap parquet "
         f"rows={table.num_rows} cols={table.num_columns} "
-        f"size={_fmt_bytes(buf.tell())} key={blob_paths.heatmap(run_id)}"
+        f"size={_fmt_bytes(buf.tell())} key={blob_paths.heatmap(backtest_id)}"
     )
 
     by_regime: dict[int, dict] = {}
@@ -520,9 +529,9 @@ def aggregate_results(run_id: str, *_cells: Any) -> dict:
         )
 
     summary = {"cells": len(rows), "best_per_regime": list(by_regime.values())}
-    _put_json(blob_paths.aggregated(run_id), summary)
+    _put_json(blob_paths.aggregated(backtest_id), summary)
     logger.info(
-        f"[aggregate_results] done run_id={run_id} cells={len(rows)} "
+        f"[aggregate_results] done run_id={backtest_id} cells={len(rows)} "
         f"regimes={len(by_regime)} elapsed={time.perf_counter() - t0:.2f}s"
     )
     return summary

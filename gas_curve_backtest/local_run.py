@@ -99,16 +99,6 @@ def run_locally(
     t0 = time.time()
     h = generate_history(CurveConfig(n_days=n_days, n_tenors=n_tenors))
     timings["generate_market"] = time.time() - t0
-    _put_npz(
-        blob,
-        blob_paths.market_data(rid),
-        model_price_ensemble=h["model_price_ensemble"],
-        market_mid=h["market_mid"],
-        bid=h["bid"],
-        ask=h["ask"],
-        realised_temp=h["realised_temp"],
-        spread_regime=h["spread_regime"],
-    )
 
     if progress_cb:
         progress_cb("Computing signals", 0.1)

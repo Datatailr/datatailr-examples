@@ -59,8 +59,8 @@ def main() -> None:
         n_regimes = c3.slider("Regimes (KMeans)", 2, 8, 4)
 
         c4, c5, c6 = st.columns(3)
-        sig_steps = c4.slider("Signal threshold grid", 5, 21, 11)
-        pivot_steps = c5.slider("Asymmetry-pivot grid", 3, 15, 5)
+        sig_steps = c4.slider("Signal threshold grid", 2, 21, 3)
+        pivot_steps = c5.slider("Asymmetry-pivot grid", 2, 15, 2)
         bootstrap = c6.slider("Bootstrap samples per cell", 1, 256, 64)
 
         cells_estimate = n_regimes * n_tenors * sig_steps * pivot_steps

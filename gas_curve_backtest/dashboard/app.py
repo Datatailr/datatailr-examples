@@ -35,9 +35,18 @@ def main() -> None:
 
     runs = storage.list_runs(20)
     latest = storage.latest_run_id()
+    # Keep an in-flight run visible even before its first blob lands —
+    # the parent's early tasks (`generate_market`, `compute_signals`)
+    # pass their payloads through the platform's task-return channel,
+    # so nothing is written under `runs/<rid>/` until `compute_signals`
+    # finishes. Without this, navigating back to the main page would
+    # silently re-elect an older run and clobber `active_run_id`.
+    in_flight = st.session_state.get("active_run_id")
+    if in_flight and in_flight not in runs:
+        runs = [in_flight] + runs
     default_idx = 0
-    if "active_run_id" in st.session_state and st.session_state["active_run_id"] in runs:
-        default_idx = runs.index(st.session_state["active_run_id"])
+    if in_flight and in_flight in runs:
+        default_idx = runs.index(in_flight)
     elif latest and latest in runs:
         default_idx = runs.index(latest)
 
