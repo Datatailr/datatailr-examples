@@ -2,16 +2,16 @@
 
 Components:
   - parent workflow (data + signals + regime detection + dynamic child)
-  - dashboard app (Streamlit cockpit, all pages bundled)
+  - Flask cockpit (run discovery + per-run drilldown via the Workflow API)
 
 The child workflow is *not* deployed up-front: it is generated and
 deployed by the parent's `detect_regimes_and_launch` task at runtime,
 which is the entire point of the demo.
 
 Usage:
-    python deploy.py                 # deploy workflow + dashboard
+    python deploy.py                 # deploy workflow + cockpit
     python deploy.py workflow        # workflow only
-    python deploy.py app             # dashboard only
+    python deploy.py app             # cockpit only
     python deploy.py run             # also kick off one parent run
 """
 
@@ -23,7 +23,7 @@ from pathlib import Path
 from datatailr import App, Resources
 from datatailr.logging import CYAN
 
-import gas_curve_backtest.dashboard.app as dashboard_entrypoint
+import gas_curve_backtest.flask_app.app as flask_entrypoint
 from gas_curve_backtest.workflows.parent_workflow import (
     make_run_id,
     parent_backtest_workflow,
@@ -44,11 +44,11 @@ def deploy_workflow(run_now: bool = False) -> str | None:
 
 
 def deploy_dashboard() -> None:
-    print(CYAN("Deploying Streamlit cockpit..."))
+    print(CYAN("Deploying Flask cockpit..."))
     app = App(
         name="Gas Curve Backtest",
-        entrypoint=dashboard_entrypoint,
-        framework="streamlit",
+        entrypoint=flask_entrypoint,
+        framework="flask",
         resources=Resources(memory="2g", cpu=1),
         app_section="Gas Curve Backtest",
         python_requirements=REQUIREMENTS,

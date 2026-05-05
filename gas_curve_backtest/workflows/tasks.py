@@ -326,12 +326,27 @@ def detect_regimes_and_launch(
         f"regimes={len(regimes)} expected_cells={expected_cells} "
         f"child_launched={launched} elapsed={time.perf_counter() - t0:.2f}s"
     )
+    # Trim regime entries to the fields the Flask cockpit renders
+    # (day_indices can be hundreds of ints per regime; we don't need
+    # them in the cached task return).
+    regime_summary = [
+        {
+            "regime_id": r["regime_id"],
+            "size": r["size"],
+            "median_asymmetry": r["median_asymmetry"],
+            "median_spread": r["median_spread"],
+            "median_signal": r["median_signal"],
+        }
+        for r in regimes
+    ]
     return {
+        "run_id": run_id,
         "regime_count": len(regimes),
         "tenors": int(n_tenors),
         "grid_size": grid_signal_steps * grid_pivot_steps,
         "expected_cells": int(expected_cells),
         "child_launched": launched,
+        "regimes": regime_summary,
     }
 
 
@@ -440,12 +455,14 @@ def run_backtest_cell(
 
 @task(memory="2g", cpu=1)
 def aggregate_results(*_cells: Any) -> dict:
-    """Sweep all cell result blobs, write a tidy parquet + a summary JSON.
+    """Sweep all cell results, write a tidy parquet + a summary JSON.
 
     The `*_cells` varargs make this task wait for every fan-out cell
-    before running. We then re-read the per-cell JSON blobs (rather
-    than the in-memory varargs) so the same code path works whether
-    the cells ran in this DAG or in a detached child run.
+    before running. The first vararg is the parent's `run_id`; the rest
+    are the metric dicts returned by `run_backtest_cell`. We use them
+    directly — `Blob.ls()` on the platform is non-recursive, so a
+    single ls of the cell root would only see `regime=R/` directories,
+    not the leaf `.json` files several levels below.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -455,38 +472,17 @@ def aggregate_results(*_cells: Any) -> dict:
     cells = _cells[1:]
     logger.info(
         f"[aggregate_results] start run_id={backtest_id} "
-        f"upstream_cells_signalled={len(_cells)}"
+        f"upstream_cells_signalled={len(cells)}"
     )
 
     blob = _blob()
-    rows: list[dict] = []
-    cell_root = blob_paths.cell_dir(backtest_id)
-
-    keys: list[str] = []
-    try:
-        keys = [k for k in blob.ls(cell_root) if str(k).endswith(".json")]
-        logger.info(
-            f"[aggregate_results] listed {len(keys)} cell blobs under {cell_root}"
-        )
-    except Exception as e:
+    rows: list[dict] = [c for c in cells if isinstance(c, dict)]
+    if len(rows) != len(cells):
         logger.warning(
-            f"[aggregate_results] blob.ls({cell_root}) failed: {e}; "
-            "proceeding with empty key list"
+            f"[aggregate_results] dropped {len(cells) - len(rows)} non-dict "
+            "upstream values"
         )
-        keys = []
-
-    failed = 0
-    for k in keys:
-        try:
-            rows.append(_get_json(k))
-        except Exception as e:
-            failed += 1
-            logger.warning(f"[aggregate_results] failed to read cell {k}: {e}")
-            continue
-    logger.info(
-        f"[aggregate_results] read {len(rows)} rows ({failed} failed) "
-        f"from {len(keys)} keys"
-    )
+    logger.info(f"[aggregate_results] collected {len(rows)} rows from task returns")
 
     if not rows:
         logger.warning(
@@ -534,4 +530,7 @@ def aggregate_results(*_cells: Any) -> dict:
         f"[aggregate_results] done run_id={backtest_id} cells={len(rows)} "
         f"regimes={len(by_regime)} elapsed={time.perf_counter() - t0:.2f}s"
     )
-    return summary
+    # Include the full per-cell rows in the task return so the Flask app
+    # can fetch them in one call via `Workflow.result(run_id, "aggregate")`
+    # without having to read the parquet from blob storage.
+    return {**summary, "run_id": backtest_id, "rows": rows}

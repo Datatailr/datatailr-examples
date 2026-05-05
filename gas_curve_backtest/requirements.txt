@@ -2,6 +2,6 @@ numpy
 pandas
 numba
 scikit-learn
-streamlit
-plotly
+flask
+gunicorn
 pyarrow

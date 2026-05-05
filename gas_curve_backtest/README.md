@@ -14,8 +14,10 @@ Datatailr capabilities at once:
    with that exact shape.
 3. **Elastic scale-out**: same Numba kernel runs in 1 process on a
    laptop and across N containers on the platform.
-4. **Hosted Streamlit cockpit** that reads the same blob layout the
-   workflow writes — so the dashboard works against either run mode.
+4. **Hosted Flask cockpit** that reads runs and per-task results back
+   from the platform via the `Workflow` API — `runs()`,
+   `run_details()`, and `result()` — so the dashboard reflects exactly
+   what the scheduler stored, without any blob-storage scraping.
 
 ```mermaid
 flowchart TD
@@ -32,8 +34,8 @@ flowchart TD
     R2[regime ... cells] --> AGG
   end
 
-  AGG --> BLOB[(Blob storage<br/>heatmap.parquet,<br/>aggregated.json)]
-  BLOB --> DASH[Streamlit cockpit]
+  AGG -->|task return| API[Workflow.result&#40;run_id, "aggregate"&#41;]
+  API --> DASH[Flask cockpit]
 ```
 
 ## Folder layout
@@ -64,48 +66,50 @@ gas_curve_backtest/
     parent_workflow.py            # entrypoint, declares 3 stages
     regime_workflow.py            # built at runtime by parent
     tasks.py                      # @task implementations
-    blob_paths.py                 # single source of truth for keys
+    blob_paths.py                 # blob layout for the signals.npz handoff
 
-  dashboard/
-    app.py                        # Streamlit landing page
-    _storage.py                   # Blob shim (works locally too)
-    pages/
-      1_Run_Backtest.py           # configure & launch (laptop or platform)
-      2_Live_Progress.py          # workflow stage tracker
-      3_Threshold_Heatmap.py      # the answer Marco wants
-      4_Regime_Drilldown.py       # equity curves and per-regime stats
+  flask_app/
+    app.py                        # Flask routes + JSON APIs
+    workflow_io.py                # Workflow().runs() / run_details() / result()
+    templates/
+      base.html
+      overview.html               # run list + launch form
+      run_detail.html             # parent + child tasks, regimes, heatmap
+    static/
+      style.css
+      app.js
 ```
 
 ## Demo flow (45 minutes)
 
 | Time   | Step                                                                               | What it proves                            |
 | ------ | ---------------------------------------------------------------------------------- | ----------------------------------------- |
-| 0–5    | Open dashboard, point out stack-pricing / ECMWF / asymmetry vocabulary             | We listened to the call                   |
-| 5–10   | "Run on laptop" with a small grid (≈ 250 cells, single process, ~30–60 s)          | His current pain                          |
-| 10–15  | "Run on Datatailr" — full grid, same code                                          | Trivial deployment of his Python+Numba    |
-| 15–25  | Watch parent DAG; **child DAG materialises** when `detect_regimes` finishes        | Branching / dynamic workflows             |
+| 0–5    | Open Flask cockpit, point out stack-pricing / ECMWF / asymmetry vocabulary         | We listened to the call                   |
+| 5–10   | "Launch new run" with a small grid (≈ 250 cells, single process, ~30–60 s)         | His current pain                          |
+| 10–15  | Launch full grid on Datatailr — same code                                          | Trivial deployment of his Python+Numba    |
+| 15–25  | Watch parent run; **child run materialises** when `detect_regimes` finishes        | Branching / dynamic workflows             |
 | 25–30  | Show the autoscaler bringing up VMs and shutting down                              | Elastic scale, cost story                 |
-| 30–35  | *Threshold Heatmap* + *Regime Drilldown* in the cockpit                            | Answers his actual quant question         |
+| 30–35  | Per-run threshold heatmap (regime × tenor) in the cockpit                          | Answers his actual quant question         |
 | 35–45  | Q&A; offer to swap synthetic feed for EEX/NBP if they share a data source          | Low switching cost                        |
 
 ## Run it
 
-### Local
+### Local benchmark
 
 ```bash
 pip install -r gas_curve_backtest/requirements.txt
 python -m gas_curve_backtest.local_run --n-days 500 --sig-steps 7 --pivot-steps 3
-streamlit run gas_curve_backtest/dashboard/app.py
 ```
 
-The dashboard reads from `/tmp/gas_curve_backtest/` when no Datatailr
-job context is detected, so you can develop offline.
+The local runner is for sanity-checking the kernels; the Flask cockpit
+talks exclusively to the platform's Workflow API and needs to run
+inside a Datatailr-connected environment to see runs.
 
 ### On Datatailr
 
 ```bash
 cd gas_curve_backtest
-python deploy.py                # deploy parent workflow + dashboard
+python deploy.py                # deploy parent workflow + Flask cockpit
 python deploy.py run            # also kick off one parent run
 ```
 
@@ -123,20 +127,37 @@ UI — the new DAG will appear once `detect_regimes_and_launch` completes.
 | "We compute percentiles of market prices in our distribution"       | `signals/percentile_signals.py`                         |
 | "Each signal has its own asymmetry / risk-reward"                   | `signals/asymmetry.py`, used as the position-sizing pivot |
 | "Asymmetry changes with each forecast — we can't predict beforehand"| `workflows/parent_workflow.py` -> `regime_workflow.py` (built at runtime) |
-| "Need a real threshold to filter and size trades"                   | `dashboard/pages/3_Threshold_Heatmap.py`                |
+| "Need a real threshold to filter and size trades"                   | `flask_app/templates/run_detail.html` (heatmap)         |
 | "Optimised with Numba on a single laptop"                           | `backtest/core.py` (same kernel runs in containers)     |
-| "Streamlit dashboard"                                               | `dashboard/` (deployed via `App(framework="streamlit")`) |
+| "We want a hosted dashboard"                                        | `flask_app/` (deployed via `App(framework="flask")`)    |
 
 ## Configuration knobs
 
-The dashboard exposes the four most-relevant knobs (trading days,
-tenors, regime count, grid size). For headless runs, the same
-parameters are accepted by `parent_backtest_workflow(...)` and
-`run_locally(...)`.
+The cockpit's *Launch new run* form exposes the four most-relevant
+knobs (trading days, tenors, regime count, grid size). For headless
+runs, the same parameters are accepted by `parent_backtest_workflow(...)`
+and `run_locally(...)`.
 
 A practical default sweep is **4 regimes × 8 tenors × 11 × 5 cells =
 1 760 cells**. On Datatailr this fans out across containers; on a
 laptop it runs sequentially in a few minutes.
+
+## How the cockpit fetches results
+
+`flask_app/workflow_io.py` is a thin layer over the Datatailr SDK:
+
+- `Workflow(name="Gas Curve Backtest — Parent", get_existing=True)` →
+  open a handle to the deployed parent.
+- `wf.runs()` → list every parent run with state and timestamps.
+- `wf.run_details(run_id)` → per-task state for that run.
+- `wf.result(run_id, task_name="detect_regimes_and_launch_child")` →
+  the regime summary and the deterministic child workflow name.
+- The same APIs on the child workflow give us the per-task states and
+  the `aggregate` task's full return value (every per-cell metric row).
+
+Because everything flows through task return values, the cockpit shows
+exactly what the scheduler stored and never has to reconcile blob
+listings with workflow state.
 
 ## Notes
 
@@ -144,9 +165,9 @@ laptop it runs sequentially in a few minutes.
   `@workflow`-decorated function from inside a running `@task`. The
   Datatailr SDK detects the child invocation and submits a new Batch
   via the same code path used by `parent_workflow.py`.
-- The dashboard reads cell results directly from Blob storage rather
-  than depending on the workflow runtime, so it remains useful even
-  while a run is mid-flight.
-- All paths are computed by `workflows/blob_paths.py`. To swap to a
-  real data feed (EEX gas, NBP, etc.), replace `generate_market` —
-  every downstream stage already operates on the same dictionary.
+- `signals.npz` is still written to Blob storage — the parent and the
+  dynamically-deployed child are separate DAGs, so the cells need a
+  durable handoff for the input arrays.
+- To swap to a real data feed (EEX gas, NBP, etc.), replace
+  `generate_market` — every downstream stage already operates on the
+  same dictionary.
