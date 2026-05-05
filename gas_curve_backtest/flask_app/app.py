@@ -18,6 +18,7 @@ storage scraping in this app.
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,31 @@ def _inject_prefix():
     return {"prefix": _PREFIX}
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+@app.template_filter("hms")
+def _format_hms(value: Any) -> str:
+    """Render a timestamp as HH:MM:SS (no fractional seconds, no tz)."""
+    parsed = _parse_iso(value)
+    return parsed.strftime("%H:%M:%S") if parsed else "—"
+
+
+@app.template_filter("ymd")
+def _format_ymd(value: Any) -> str:
+    """Render a timestamp as YYYY-MM-DD."""
+    parsed = _parse_iso(value)
+    return parsed.strftime("%Y-%m-%d") if parsed else ""
+
+
 def _round_or_none(value: Any, ndigits: int = 3) -> float | None:
     try:
         return round(float(value), ndigits)
@@ -59,6 +85,83 @@ def _round_or_none(value: Any, ndigits: int = 3) -> float | None:
 
 def _pretty_run(run: dict) -> dict:
     return {**run, "label": f"#{run.get('run_id')}"}
+
+
+def _build_gantt(tasks: list[dict]) -> dict:
+    """Compute % offsets and % widths so the template can render bars in CSS.
+
+    Bars are anchored to the earliest task `start_time` and span up to
+    the latest known boundary (`end_time`, falling back to `now`). Tasks
+    without a start are rendered as a thin marker at the right edge so
+    the user still sees that they exist.
+    """
+    parsed: list[tuple[dict, datetime | None, datetime | None]] = []
+    starts: list[datetime] = []
+    ends: list[datetime] = []
+    for t in tasks:
+        s = _parse_iso(t.get("start_time"))
+        e = _parse_iso(t.get("end_time"))
+        if s is not None:
+            starts.append(s)
+        if e is not None:
+            ends.append(e)
+        parsed.append((t, s, e))
+
+    if not starts:
+        return {"rows": [], "t_min": None, "t_max": None, "duration": 0.0}
+
+    t_min = min(starts)
+    t_max = max(ends) if ends else datetime.now(t_min.tzinfo)
+    if t_max <= t_min:
+        t_max = t_min
+    span = max((t_max - t_min).total_seconds(), 1.0)
+
+    rows: list[dict] = []
+    for t, s, e in parsed:
+        state = (t.get("state") or "unknown").lower()
+        if s is None:
+            rows.append(
+                {
+                    "name": t.get("name", ""),
+                    "state": state,
+                    "offset_pct": 100.0,
+                    "width_pct": 0.0,
+                    "pending": True,
+                    "start_label": "—",
+                    "end_label": "—",
+                    "duration_s": None,
+                }
+            )
+            continue
+        end = e or t_max
+        offset_pct = max(0.0, (s - t_min).total_seconds() / span * 100.0)
+        width_pct = max(
+            0.6,
+            (end - s).total_seconds() / span * 100.0,
+        )
+        if offset_pct + width_pct > 100.0:
+            width_pct = max(0.6, 100.0 - offset_pct)
+        rows.append(
+            {
+                "name": t.get("name", ""),
+                "state": state,
+                "offset_pct": round(offset_pct, 2),
+                "width_pct": round(width_pct, 2),
+                "pending": False,
+                "start_label": s.strftime("%H:%M:%S"),
+                "end_label": e.strftime("%H:%M:%S") if e else "running",
+                "duration_s": round((end - s).total_seconds(), 2),
+            }
+        )
+
+    rows.sort(key=lambda r: (r["pending"], r["offset_pct"], r["name"]))
+
+    return {
+        "rows": rows,
+        "t_min": t_min.strftime("%H:%M:%S"),
+        "t_max": t_max.strftime("%H:%M:%S"),
+        "duration": round(span, 1),
+    }
 
 
 @app.route("/")
@@ -111,6 +214,8 @@ def run_detail(run_id: int):
                     "hit_rate": _round_or_none(best.get("hit_rate"), 3),
                 }
             )
+    child_tasks = (summary.get("child") or {}).get("tasks") or []
+    gantt = _build_gantt(child_tasks)
     return render_template(
         "run_detail.html",
         page="runs",
@@ -120,6 +225,7 @@ def run_detail(run_id: int):
         regimes=regimes,
         tenors=tenors,
         best_per_regime=best_per_regime,
+        gantt=gantt,
     )
 
 

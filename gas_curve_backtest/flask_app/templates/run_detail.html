@@ -4,7 +4,12 @@
 {% block content %}
 <header class="page-header">
   <div>
-    <h1>Run #{{ run_id }}</h1>
+    <h1>
+      Run #{{ run_id }}
+      {% if summary and summary.parent.start_time %}
+      <span class="run-date">{{ summary.parent.start_time | ymd }}</span>
+      {% endif %}
+    </h1>
     {% if summary %}
     <p class="subtitle">
       Parent: <span class="state state-{{ (summary.parent.state or 'unknown') | lower }}">{{ summary.parent.state or 'unknown' }}</span>
@@ -47,19 +52,21 @@
   <div class="card">
     <h2>Parent tasks</h2>
     {% if summary.parent.tasks %}
-    <table class="data-table">
-      <thead><tr><th>Task</th><th>State</th><th>Start</th><th>End</th></tr></thead>
-      <tbody>
-        {% for t in summary.parent.tasks %}
-        <tr>
-          <td><code>{{ t.name }}</code></td>
-          <td><span class="state state-{{ (t.state or 'unknown') | lower }}">{{ t.state or 'unknown' }}</span></td>
-          <td><time>{{ t.start_time or '—' }}</time></td>
-          <td><time>{{ t.end_time or '—' }}</time></td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead><tr><th>Task</th><th>State</th><th>Start</th><th>End</th></tr></thead>
+        <tbody>
+          {% for t in summary.parent.tasks %}
+          <tr>
+            <td><code>{{ t.name }}</code></td>
+            <td><span class="state state-{{ (t.state or 'unknown') | lower }}">{{ t.state or 'unknown' }}</span></td>
+            <td><time>{{ t.start_time | hms }}</time></td>
+            <td><time>{{ t.end_time | hms }}</time></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
     {% else %}
     <p class="muted">No tasks reported.</p>
     {% endif %}
@@ -80,22 +87,37 @@
       {% endif %}
     </p>
     {% if summary.child.tasks %}
-    <details>
+    <details open>
       <summary>{{ summary.child.tasks | length }} child tasks</summary>
-      <table class="data-table compact">
-        <thead><tr><th>Task</th><th>State</th></tr></thead>
-        <tbody>
-          {% for t in summary.child.tasks[:200] %}
-          <tr>
-            <td><code>{{ t.name }}</code></td>
-            <td><span class="state state-{{ (t.state or 'unknown') | lower }}">{{ t.state or 'unknown' }}</span></td>
-          </tr>
-          {% endfor %}
-          {% if summary.child.tasks | length > 200 %}
-          <tr><td colspan="2"><em>… and {{ summary.child.tasks | length - 200 }} more</em></td></tr>
-          {% endif %}
-        </tbody>
-      </table>
+      {% if gantt and gantt.rows %}
+      <div class="gantt-meta">
+        <span>{{ gantt.t_min }}</span>
+        <span class="muted">span {{ gantt.duration }}s</span>
+        <span>{{ gantt.t_max }}</span>
+      </div>
+      <div class="gantt scroll-y">
+        {% for row in gantt.rows %}
+        <div class="gantt-row" title="{{ row.name }} · {{ row.state }} · {{ row.start_label }} → {{ row.end_label }}{% if row.duration_s is not none %} ({{ row.duration_s }}s){% endif %}">
+          <span class="gantt-name"><code>{{ row.name }}</code></span>
+          <div class="gantt-track">
+            {% if row.pending %}
+            <span class="gantt-bar gantt-pending state-{{ row.state }}" style="left: calc(100% - 4px);"></span>
+            {% else %}
+            <span class="gantt-bar state-{{ row.state }}" style="left: {{ row.offset_pct }}%; width: {{ row.width_pct }}%;"></span>
+            {% endif %}
+          </div>
+          <span class="gantt-time">{{ row.start_label }}</span>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="gantt-legend">
+        {% for s in ['completed', 'running', 'pending', 'failed', 'starting', 'stopped'] %}
+        <span class="legend-item"><span class="state state-{{ s }}">{{ s }}</span></span>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="muted small">Tasks haven't started yet.</p>
+      {% endif %}
     </details>
     {% endif %}
     {% else %}
