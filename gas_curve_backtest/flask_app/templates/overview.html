@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Overview &middot; Gas Curve Backtest{% endblock %}
+{% block content %}
+<header class="page-header">
+  <div>
+    <h1>Backtest cockpit</h1>
+    <p class="subtitle">Runs of <code>{{ parent_workflow }}</code> on Datatailr.</p>
+  </div>
+  <button class="btn btn-primary" onclick="document.getElementById('launch-modal').classList.add('open')">Launch new run</button>
+</header>
+
+<section class="kpi-grid">
+  <div class="kpi-card">
+    <span class="kpi-label">Total runs</span>
+    <span class="kpi-value">{{ runs | length }}</span>
+  </div>
+  {% for state, count in states.items() %}
+  <div class="kpi-card">
+    <span class="kpi-label state state-{{ state }}">{{ state }}</span>
+    <span class="kpi-value">{{ count }}</span>
+  </div>
+  {% endfor %}
+</section>
+
+<section class="card">
+  <h2>Recent runs</h2>
+  {% if runs %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Run</th>
+        <th>State</th>
+        <th>Started</th>
+        <th>Ended</th>
+        <th>Version</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in runs %}
+      <tr>
+        <td><strong>{{ r.label }}</strong></td>
+        <td><span class="state state-{{ (r.state or 'unknown') | lower }}">{{ r.state or 'unknown' }}</span></td>
+        <td><time>{{ r.start_time or '—' }}</time></td>
+        <td><time>{{ r.end_time or '—' }}</time></td>
+        <td>{{ r.job_version or '—' }}</td>
+        <td><a class="btn btn-link" href="{{ prefix }}/runs/{{ r.run_id }}">Open &rarr;</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No parent runs found yet. Launch one from the button above.</p>
+  {% endif %}
+</section>
+
+<div id="launch-modal" class="modal">
+  <div class="modal-card">
+    <header>
+      <h2>Launch a parent run</h2>
+      <button class="btn btn-ghost" onclick="document.getElementById('launch-modal').classList.remove('open')">&times;</button>
+    </header>
+    <form id="launch-form">
+      <div class="form-grid">
+        <label>Trading days<input type="number" name="n_days" value="750" min="200" max="2500"></label>
+        <label>Tenors<input type="number" name="n_tenors" value="8" min="2" max="16"></label>
+        <label>Regimes (KMeans)<input type="number" name="n_regimes" value="4" min="2" max="10"></label>
+        <label>Signal grid<input type="number" name="grid_signal_steps" value="3" min="2" max="21"></label>
+        <label>Pivot grid<input type="number" name="grid_pivot_steps" value="2" min="2" max="15"></label>
+        <label>Bootstrap samples<input type="number" name="bootstrap_samples" value="64" min="1" max="512"></label>
+      </div>
+      <div class="form-footer">
+        <p id="launch-status" class="muted"></p>
+        <button type="submit" class="btn btn-primary">Deploy &amp; run</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+(function() {
+  const form = document.getElementById('launch-form');
+  const status = document.getElementById('launch-status');
+  if (!form) return;
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    status.textContent = 'Deploying...';
+    const data = Object.fromEntries(new FormData(form).entries());
+    try {
+      const res = await fetch(PREFIX + '/api/launch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data),
+      });
+      const out = await res.json();
+      if (!res.ok) throw new Error(out.error || 'launch failed');
+      status.innerHTML = 'Launched run <code>' + out.run_id + '</code>. Refresh to see it.';
+    } catch (e) {
+      status.textContent = 'Error: ' + e.message;
+    }
+  });
+})();
+</script>
+{% endblock %}

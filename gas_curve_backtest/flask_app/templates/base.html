@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Gas Curve Backtest{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="{{ prefix }}/static/style.css">
+  <script>var PREFIX = {{ prefix | tojson }};</script>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <h2>Gas Curve Backtest</h2>
+      <span class="sidebar-subtitle">Datatailr cockpit</span>
+    </div>
+    <nav class="sidebar-nav">
+      <a href="{{ prefix }}/" class="nav-link {% if page == 'overview' %}active{% endif %}">Overview</a>
+      {% if active_run_id %}
+      <a href="{{ prefix }}/runs/{{ active_run_id }}" class="nav-link {% if page == 'runs' %}active{% endif %}">Run #{{ active_run_id }}</a>
+      {% endif %}
+    </nav>
+    <div class="sidebar-footer">
+      Flask &middot; Chart.js
+    </div>
+  </aside>
+
+  <main class="content">
+    {% block content %}{% endblock %}
+  </main>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>

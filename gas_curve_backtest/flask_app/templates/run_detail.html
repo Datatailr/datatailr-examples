@@ -1,0 +1,268 @@
+{% extends "base.html" %}
+{% block title %}Run #{{ run_id }} &middot; Gas Curve Backtest{% endblock %}
+{% set active_run_id = run_id %}
+{% block content %}
+<header class="page-header">
+  <div>
+    <h1>Run #{{ run_id }}</h1>
+    {% if summary %}
+    <p class="subtitle">
+      Parent: <span class="state state-{{ (summary.parent.state or 'unknown') | lower }}">{{ summary.parent.state or 'unknown' }}</span>
+      &middot; Backtest id: <code>{{ summary.backtest_id or '—' }}</code>
+      &middot; Expected cells: {{ summary.expected_cells or '—' }}
+    </p>
+    {% else %}
+    <p class="subtitle">No data found for this run.</p>
+    {% endif %}
+  </div>
+  <a class="btn btn-ghost" href="{{ prefix }}/">&larr; All runs</a>
+</header>
+
+{% if not summary %}
+<section class="card">
+  <p class="muted">The platform has no runs with this id, or the workflow definition couldn't be resolved.</p>
+</section>
+{% else %}
+
+<section class="kpi-grid">
+  <div class="kpi-card">
+    <span class="kpi-label">Regimes detected</span>
+    <span class="kpi-value">{{ (summary.detect_summary.regime_count if summary.detect_summary else None) or 0 }}</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-label">Tenors</span>
+    <span class="kpi-value">{{ (summary.detect_summary.tenors if summary.detect_summary else None) or 0 }}</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-label">Cells expected</span>
+    <span class="kpi-value">{{ summary.expected_cells or '—' }}</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-label">Cells completed</span>
+    <span class="kpi-value">{{ cells | length }}</span>
+  </div>
+</section>
+
+<section class="cards-row">
+  <div class="card">
+    <h2>Parent tasks</h2>
+    {% if summary.parent.tasks %}
+    <table class="data-table">
+      <thead><tr><th>Task</th><th>State</th><th>Start</th><th>End</th></tr></thead>
+      <tbody>
+        {% for t in summary.parent.tasks %}
+        <tr>
+          <td><code>{{ t.name }}</code></td>
+          <td><span class="state state-{{ (t.state or 'unknown') | lower }}">{{ t.state or 'unknown' }}</span></td>
+          <td><time>{{ t.start_time or '—' }}</time></td>
+          <td><time>{{ t.end_time or '—' }}</time></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">No tasks reported.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Child workflow</h2>
+    {% if summary.child %}
+    <p>
+      <code>{{ summary.child.name }}</code>
+      {% if summary.child.found %}
+      &middot; runs: {{ summary.child.runs | length }}
+      {% if summary.child.latest_run %}
+      &middot; latest: <span class="state state-{{ (summary.child.latest_run.state or 'unknown') | lower }}">{{ summary.child.latest_run.state }}</span>
+      {% endif %}
+      {% else %}
+      <span class="muted">(not deployed yet)</span>
+      {% endif %}
+    </p>
+    {% if summary.child.tasks %}
+    <details>
+      <summary>{{ summary.child.tasks | length }} child tasks</summary>
+      <table class="data-table compact">
+        <thead><tr><th>Task</th><th>State</th></tr></thead>
+        <tbody>
+          {% for t in summary.child.tasks[:200] %}
+          <tr>
+            <td><code>{{ t.name }}</code></td>
+            <td><span class="state state-{{ (t.state or 'unknown') | lower }}">{{ t.state or 'unknown' }}</span></td>
+          </tr>
+          {% endfor %}
+          {% if summary.child.tasks | length > 200 %}
+          <tr><td colspan="2"><em>… and {{ summary.child.tasks | length - 200 }} more</em></td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </details>
+    {% endif %}
+    {% else %}
+    <p class="muted">Parent hasn't reached <code>detect_regimes_and_launch_child</code> yet.</p>
+    {% endif %}
+  </div>
+</section>
+
+{% if summary.regimes %}
+<section class="card">
+  <h2>Detected regimes</h2>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Regime</th><th>Days</th><th>Median asym</th><th>Median spread</th><th>Median signal</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in summary.regimes %}
+      <tr>
+        <td><strong>{{ r.regime_id }}</strong></td>
+        <td>{{ r.size }}</td>
+        <td>{{ '%.3f' % r.median_asymmetry }}</td>
+        <td>{{ '%.4f' % r.median_spread }}</td>
+        <td>{{ '%+.3f' % r.median_signal }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if best_per_regime %}
+<section class="card">
+  <h2>Best cell per regime</h2>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Regime</th><th>Tenor</th><th>Sig threshold</th><th>Asym pivot</th>
+        <th>Sharpe</th><th>PnL</th><th>Max DD</th><th>Hit rate</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for b in best_per_regime %}
+      <tr>
+        <td><strong>{{ b.regime_id }}</strong></td>
+        <td>{{ b.tenor }}</td>
+        <td>{{ b.sig_threshold }}</td>
+        <td>{{ b.asym_pivot }}</td>
+        <td>{{ b.sharpe }}</td>
+        <td>{{ b.pnl }}</td>
+        <td>{{ b.max_drawdown }}</td>
+        <td>{{ b.hit_rate }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if cells %}
+<section class="card">
+  <header class="card-header">
+    <h2>Threshold heatmap</h2>
+    <div class="controls">
+      <label>Regime
+        <select id="regime-select">
+          {% for r in regimes %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Tenor
+        <select id="tenor-select">
+          {% for t in tenors %}<option value="{{ t }}">M+{{ t }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Metric
+        <select id="metric-select">
+          <option value="sharpe">Sharpe</option>
+          <option value="pnl">PnL</option>
+          <option value="max_drawdown">Max DD</option>
+          <option value="hit_rate">Hit rate</option>
+        </select>
+      </label>
+    </div>
+  </header>
+  <div id="heatmap-status" class="muted"></div>
+  <div id="heatmap" class="heatmap"></div>
+  <p class="muted small">Best cell highlighted. Min/Max colour scale auto-fits the selected metric.</p>
+</section>
+{% else %}
+<section class="card">
+  <p class="muted">The child workflow's <code>aggregate</code> task hasn't returned cells yet — refresh once it finishes.</p>
+</section>
+{% endif %}
+
+{% endif %}
+
+{% endblock %}
+{% block scripts %}
+{% if cells %}
+<script>
+(function() {
+  const RUN_ID = {{ run_id | tojson }};
+  const $regime = document.getElementById('regime-select');
+  const $tenor = document.getElementById('tenor-select');
+  const $metric = document.getElementById('metric-select');
+  const $status = document.getElementById('heatmap-status');
+  const $heatmap = document.getElementById('heatmap');
+
+  function colour(value, lo, hi, metric) {
+    if (value === null || value === undefined || Number.isNaN(value)) return '#f1f3f7';
+    if (hi === lo) return '#bcd2e8';
+    const t = (value - lo) / (hi - lo);
+    if (metric === 'max_drawdown') {
+      const r = Math.round(220 - 120 * t);
+      return 'rgb(' + r + ',' + Math.round(80 + 60 * (1 - t)) + ',' + Math.round(80 + 60 * (1 - t)) + ')';
+    }
+    const r = Math.round(220 - 180 * t);
+    const g = Math.round(60 + 140 * t);
+    const b = Math.round(60 + 140 * t);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  async function refresh() {
+    const params = new URLSearchParams({
+      regime: $regime.value,
+      tenor: $tenor.value,
+      metric: $metric.value,
+    });
+    $status.textContent = 'Loading...';
+    try {
+      const res = await fetch(PREFIX + '/api/runs/' + RUN_ID + '/heatmap?' + params.toString());
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'failed');
+      render(data);
+      const best = data.best;
+      $status.innerHTML = best
+        ? 'Best ' + data.metric + ': sig=' + best.sig_threshold + ', pivot=' + best.asym_pivot + ' (sharpe=' + best.sharpe + ')'
+        : 'No cells in this slice.';
+    } catch (e) {
+      $status.textContent = 'Error: ' + e.message;
+    }
+  }
+
+  function render(data) {
+    const flat = [].concat.apply([], data.grid).filter(v => v !== null && v !== undefined && !Number.isNaN(v));
+    const lo = flat.length ? Math.min.apply(null, flat) : 0;
+    const hi = flat.length ? Math.max.apply(null, flat) : 1;
+    let html = '<table class="heatmap-table"><thead><tr><th></th>';
+    for (const s of data.sig_thresholds) html += '<th>' + s + '</th>';
+    html += '</tr></thead><tbody>';
+    for (let i = 0; i < data.asym_pivots.length; i++) {
+      html += '<tr><th>' + data.asym_pivots[i] + '</th>';
+      for (let j = 0; j < data.sig_thresholds.length; j++) {
+        const v = data.grid[i][j];
+        const col = colour(v, lo, hi, data.metric);
+        html += '<td style="background:' + col + '">' + (v === null || v === undefined ? '' : v) + '</td>';
+      }
+      html += '</tr>';
+    }
+    html += '</tbody></table>';
+    $heatmap.innerHTML = html;
+  }
+
+  [$regime, $tenor, $metric].forEach(el => el.addEventListener('change', refresh));
+  refresh();
+})();
+</script>
+{% endif %}
+{% endblock %}
