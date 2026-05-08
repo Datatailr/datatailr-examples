@@ -1,0 +1,6 @@
+{
+    "name": "Blob Streaming Demo",
+    "description": "Demo of blob streaming with Parquet files.",
+    "tags": ["blob", "streaming", "parquet", "demo"],
+    "author": "Datatailr"
+}
