@@ -1,0 +1,10 @@
+numpy
+pandas
+fastapi
+uvicorn[standard]
+sse_starlette
+requests
+dash
+plotly
+gunicorn
+openai
