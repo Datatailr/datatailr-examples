@@ -1,7 +1,7 @@
 # Trading Dashboard on Datatailr
 
 End-to-end demo of a buy-side trading dashboard built on Datatailr. It
-addresses the two requirements from the brief:
+addresses the two main areas:
 
 1. **A web page hosting the firm's strategies, PnL, and fundamentals**, designed
    from day one to support live ticking (the same UI works against static
