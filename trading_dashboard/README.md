@@ -13,6 +13,8 @@ Everything required to **generate** the data, **persist** it and **serve** it
 is included here -- there are no external dependencies on third-party
 market-data, fundamentals or email feeds, so the demo runs out of the box.
 
+![](screenshot.png)
+
 ## Architecture
 
 ```mermaid
