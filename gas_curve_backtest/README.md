@@ -21,21 +21,31 @@ Datatailr capabilities at once:
 
 ```mermaid
 flowchart TD
-  subgraph Parent[Parent workflow]
-    A[generate_market] --> B[compute_signals]
-    B --> C[detect_regimes_and_launch]
-  end
+    subgraph Parent["Parent workflow — workflows/parent_workflow.py"]
+        direction TB
+        GM["generate_market<br/>synthetic curves + ECMWF ensemble"]
+        CS["compute_signals<br/>percentile · asymmetry · short-term"]
+        DR["detect_regimes_and_launch<br/>KMeans on (asym, spread, signal)"]
+        GM --> CS --> DR
+    end
 
-  C -->|"deploys at runtime<br/>(N regimes, M tenors, K thresholds)"| Child
+    Blob[("Blob storage<br/>signals.npz · regimes.json")]
+    CS -. "put signals.npz" .-> Blob
+    DR -. "put regimes.json" .-> Blob
 
-  subgraph Child[Child workflow — built at runtime]
-    R0[regime 0 cells] --> AGG[aggregate]
-    R1[regime 1 cells] --> AGG
-    R2[regime ... cells] --> AGG
-  end
+    DR ==>|"deploys child DAG at runtime<br/>shape = N regimes × M tenors × K grid cells"| Child
 
-  AGG -->|task return| API[Workflow.result&#40;run_id, "aggregate"&#41;]
-  API --> DASH[Flask cockpit]
+    subgraph Child["Child workflow — workflows/regime_workflow.py (built at runtime)"]
+        direction TB
+        Cells["run_backtest_cell × (regimes · tenors · grid)<br/>@njit kernel, fans out across containers"]
+        Agg["aggregate_results<br/>writes heatmap.parquet, returns per-cell rows"]
+        Cells --> Agg
+    end
+
+    Blob -. "get signals + regimes per cell" .-> Cells
+
+    Agg ==>|"task return"| SDK["Workflow SDK<br/>runs() · run_details() · result(run_id, 'aggregate')"]
+    SDK --> Dash["Flask cockpit — flask_app/<br/>run list · regime drilldown · threshold heatmap"]
 ```
 
 ## Folder layout
