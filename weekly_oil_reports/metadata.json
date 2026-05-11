@@ -1,0 +1,6 @@
+{
+    "name": "EIA Weekly Petroleum Status Report",
+    "description": "A demo of DataTailr's capabilities in ingesting and analyzing the EIA Weekly Petroleum Status Report.",
+    "tags": ["EIA", "Workflow", "Data Ingestion", "Dashboard", "Streamlit", "Public API"],
+    "author": "Datatailr"
+}
