@@ -6,7 +6,7 @@ equity curve. Position sizing is asymmetry-aware: the upside/downside
 ratio scales the size when the distribution favours one side.
 
 The kernel is intentionally tight so that thousands of cells fit
-comfortably inside one container: this is exactly the workload Marco
+comfortably inside one container: this is exactly the workload the user
 described as currently sitting in his Numba code.
 """
 

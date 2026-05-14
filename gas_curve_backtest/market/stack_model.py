@@ -1,6 +1,6 @@
 """Marginal-cost (merit-order) stack pricing model for power/gas forwards.
 
-Mirrors the language Marco used on the call: the "stack" sets the marginal
+Mirrors the language the user used on the call: the "stack" sets the marginal
 clearing price as a function of demand, where demand is itself a function
 of temperature (heating + cooling). Different generators have different
 marginal costs (coal, CCGT-baseload, CCGT-peaker, oil-peaker), and the

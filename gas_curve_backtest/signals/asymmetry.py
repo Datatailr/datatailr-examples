@@ -1,4 +1,4 @@
-"""Distribution asymmetry — Marco's "risk-reward" framing.
+"""Distribution asymmetry — the user's "risk-reward" framing.
 
 For each (day, tenor) we measure how skewed the ensemble of model prices
 is around its median:

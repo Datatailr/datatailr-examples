@@ -1,7 +1,7 @@
 # Gas Curve Backtest on Datatailr
 
 End-to-end backtester for a commodity-curve trading desk. Mirrors the
-problem Marco described on the call: stack-model-priced forward curves,
+problem the user described on the call: stack-model-priced forward curves,
 ECMWF-driven signals, distribution percentile and asymmetry filters, and
 a search for **profitable thresholds** to filter and size trades.
 
@@ -128,9 +128,9 @@ computes signals, then deploys a fresh child workflow whose **shape
 depends on the regimes detected at runtime**. Watch it in the platform
 UI — the new DAG will appear once `detect_regimes_and_launch` completes.
 
-## Speaking to Marco's specific points
+## Speaking to the user's specific points
 
-| Marco said                                                          | What to point at                                        |
+| the user said                                                          | What to point at                                        |
 | ------------------------------------------------------------------- | ------------------------------------------------------- |
 | "I price futures with a stack model"                                | `market/stack_model.py`                                 |
 | "Signals come from ECMWF forecasts"                                 | `market/ecmwf_simulator.py`, `signals/short_term.py`    |

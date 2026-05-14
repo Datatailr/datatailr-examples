@@ -44,7 +44,7 @@ def default_grid(
 def regime_aware_grid(regime_stats: dict, base: ThresholdGrid | None = None) -> ThresholdGrid:
     """Slide the asymmetry pivots toward the regime's median asymmetry.
 
-    This is exactly the data-dependence Marco described: the grid we
+    This is exactly the data-dependence the user described: the grid we
     want to evaluate depends on the regime detected at runtime, so we
     cannot pre-bake the workflow shape.
     """
