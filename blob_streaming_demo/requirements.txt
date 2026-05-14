@@ -1,0 +1,5 @@
+flask
+streamlit
+pandas
+requests
+pyarrow
