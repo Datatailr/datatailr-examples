@@ -27,6 +27,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
+from blueprints.service_api.routes import service_api_bp
 
 _STATIC_DIR = Path(__file__).parent / 'static'
 _TEMPLATES_DIR = Path(__file__).parent / 'templates'
@@ -47,6 +48,8 @@ app = Flask(
     static_folder=_STATIC_DIR,
     static_url_path="/static",
 )
+
+app.register_blueprint(service_api_bp)
 
 
 @app.context_processor

@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Service API Viewer — Flask Showcase{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Service API Viewer</h1>
+  <p class="page-subtitle">Browse OpenAPI documentation for running services</p>
+</div>
+
+<div class="card" style="margin-bottom: 1.5rem;">
+  <h3 class="card-title">Select a Service</h3>
+  <div style="display: flex; gap: 1rem; align-items: center;">
+    <select id="serviceSelect" style="padding: 0.5rem 1rem; border-radius: 6px; border: 1px solid #ccc; font-family: Inter; font-size: 0.9rem; min-width: 250px;">
+      <option value="">Loading services...</option>
+    </select>
+    <button id="loadBtn" onclick="loadApiDocs()" style="padding: 0.5rem 1.2rem; background: #0072B5; color: white; border: none; border-radius: 6px; font-family: Inter; font-size: 0.9rem; cursor: pointer;">
+      Load API Docs
+    </button>
+  </div>
+</div>
+
+<div class="card">
+  <div id="api-viewer">
+    <p style="color: #888; text-align: center; padding: 2rem;">Select a service and click "Load API Docs"</p>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+
+<script>
+(function() {
+  fetch(PREFIX + '/api/services')
+    .then(r => r.json())
+    .then(services => {
+      const select = document.getElementById('serviceSelect');
+      if (!services.length) {
+        select.innerHTML = '<option value="">No running services found</option>';
+        return;
+      }
+      select.innerHTML = services.map(s =>
+        `<option value="${s.name}">${s.name}</option>`
+      ).join('');
+    })
+    .catch(() => {
+      document.getElementById('serviceSelect').innerHTML = '<option value="">Error loading services</option>';
+    });
+})();
+
+function loadApiDocs() {
+  const name = document.getElementById('serviceSelect').value;
+  if (!name) return;
+
+  const viewer = document.getElementById('api-viewer');
+  viewer.innerHTML = '<p style="color: #888; text-align: center; padding: 2rem;">Loading...</p>';
+
+  fetch(PREFIX + '/api/service-openapi?name=' + encodeURIComponent(name))
+    .then(r => r.json())
+    .then(spec => {
+      if (spec.error) {
+        viewer.innerHTML = `<p style="color: red; padding: 1rem;">Error: ${spec.error}</p>`;
+        return;
+      }
+      viewer.innerHTML = '<div id="swagger-ui"></div>';
+      SwaggerUIBundle({
+        spec: spec,
+        domNode: document.getElementById('swagger-ui'),
+        presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+        layout: 'BaseLayout',
+      });
+    })
+    .catch(e => {
+      viewer.innerHTML = `<p style="color: red; padding: 1rem;">Error: ${e.message}</p>`;
+    });
+}
+</script>
+{% endblock %}
