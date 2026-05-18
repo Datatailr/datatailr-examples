@@ -27,7 +27,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
-from blueprints.service_api.routes import service_api_bp
+from datatailr_demo.dashboards.flask.blueprints import service_api_bp
 
 _STATIC_DIR = Path(__file__).parent / 'static'
 _TEMPLATES_DIR = Path(__file__).parent / 'templates'

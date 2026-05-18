@@ -19,7 +19,10 @@ try:
 except ImportError:
     DATATAILR_AVAILABLE = False
 
+
 service_api_bp = Blueprint("service_api", __name__)
+"""Blueprint for the service API"""
+
 
 def _get_job_client():
     if DATATAILR_AVAILABLE:

@@ -8,3 +8,7 @@
 #  defined in 'LICENSE.txt'. Unauthorized copying and/or distribution
 #  of this file, in parts or full, via any medium is strictly prohibited.
 # *************************************************************************
+
+from .routes import service_api_bp
+
+__all__ = ["service_api_bp"]
