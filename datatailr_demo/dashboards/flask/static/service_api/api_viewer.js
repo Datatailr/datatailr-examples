@@ -30,6 +30,15 @@ function renderSwaggerUI(spec) {
 }
 
 /**
+ * Render an error message in the viewer.
+ * @param {string} message - The error message.
+ * @param {HTMLElement} viewer - The element to display the error.
+ */
+function renderError(message, viewer) {
+  viewer.innerHTML = `<p style="color: red; padding: 1rem;">Error: ${message}</p>`
+}
+
+/**
  * Render the API viewer for a service.
  * @param {Object} data - The data containing the health status and OpenAPI specification.
  */
@@ -49,8 +58,30 @@ function renderApiViewer(data) {
 }
 
 /**
+ * Handle the error when loading the API docs.
+ * @param {Error} error - The error that occurred.
+ * @param {HTMLElement} viewer - The element to display the error.
+ */
+function handleLoadApiDocsError(error, viewer) {
+  console.error(error)
+  renderError(error.message, viewer)
+}
+
+/**
+ * Process the API docs.
+ * @param {Object} data - The data containing the health status and OpenAPI specification.
+ * @param {HTMLElement} viewer - The element to display the data.
+ */
+function processApiDocs(data, viewer) {
+  if (data.error) {
+    renderError(data.error, viewer)
+    return
+  }
+  renderApiViewer(data)
+}
+
+/**
  * Load the API docs for a service.
- * @returns {void}
  */
 function loadApiDocs() {
   const name = document.getElementById('serviceSelect').value
@@ -62,43 +93,8 @@ function loadApiDocs() {
 
   fetch(PREFIX + '/api/service-openapi?name=' + encodeURIComponent(name))
     .then((r) => r.json())
-    .then((data) => {
-      if (data.error) {
-        viewer.innerHTML = `<p style="color: red; padding: 1rem;">Error: ${data.error}</p>`
-        return
-      }
-      renderApiViewer(data)
-    })
-    .catch((e) => {
-      viewer.innerHTML = `<p style="color: red; padding: 1rem;">Error: ${e.message}</p>`
-    })
+    .then((data) => processApiDocs(data, viewer))
+    .catch((error) => handleLoadApiDocsError(error, viewer))
 }
 
-/**
- * Load the services for the API viewer.
- * @returns {void}
- */
-function loadServices() {
-  fetch(PREFIX + '/api/services')
-    .then((r) => r.json())
-    .then((services) => {
-      const select = document.getElementById('serviceSelect')
-      if (!services.length) {
-        select.innerHTML = '<option value="">No running services found</option>'
-        return
-      }
-      select.innerHTML = services
-        .map((s) => `<option value="${s.name}">${s.name}</option>`)
-        .join('')
-    })
-    .catch(() => {
-      document.getElementById('serviceSelect').innerHTML =
-        '<option value="">Error loading services</option>'
-    })
-}
-
-/**
- * Load the services for the API viewer when the DOM is loaded.
- * @returns {void}
- */
-document.addEventListener('DOMContentLoaded', loadServices)
+export { loadApiDocs }

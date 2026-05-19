@@ -9,6 +9,7 @@
 #  of this file, in parts or full, via any medium is strictly prohibited.
 # *************************************************************************
 
+"""Blueprint for the service API."""
 from .routes import service_api_bp
 
 __all__ = ["service_api_bp"]
