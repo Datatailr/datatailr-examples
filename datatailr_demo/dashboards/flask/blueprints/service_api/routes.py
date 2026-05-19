@@ -82,9 +82,9 @@ def _get_openapi_spec(base_url: str) -> dict | None:
     try:
         resp = req.get(f"{base_url}/openapi.json", timeout=5)
         resp.raise_for_status()
-        spec = resp.json()
-        spec["servers"] = [{"url": base_url}]
-        return spec
+        if not resp.content:
+            return None
+        return {**resp.json(), "servers": [{"url": base_url}]}
     except Exception:  # pylint: disable=broad-exception-caught
         return None
 
