@@ -18,6 +18,9 @@ from flask import Blueprint, jsonify, render_template, request
 try:
     import requests as req
     from datatailr import construct_remote_base_url  # type: ignore
+    from datatailr import get_dt_env  # type: ignore
+    from datatailr import get_remote_base_url  # type: ignore
+    from datatailr import get_remote_http_headers  # type: ignore
     from datatailr.wrapper import dt__Job  # type: ignore
 
     DATATAILR_AVAILABLE = True
@@ -71,10 +74,8 @@ def api_service_openapi():
 def _get_auth_headers() -> dict:
     """Get the authentication headers for requests to the platform."""
     try:
-        from datatailr import get_remote_http_headers
-
         return get_remote_http_headers()
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         return {}
 
 
@@ -98,15 +99,30 @@ def _get_openapi_spec(base_url: str) -> dict | None:
         resp.raise_for_status()
         if not resp.content:
             return None
+        spec = resp.json()
+        print(f"DEBUG spec keys: {list(spec.keys())}")
+        print(f"DEBUG servers before: {spec.get('servers')}")
         servers = [{"url": f"{base_url.rstrip('/')}/"}]
-        return {**resp.json(), "servers": servers}
+        res: dict = {**spec, "servers": servers}
+        print(f"DEBUG servers after: {res.get('servers')}")
+        return res
     except Exception:  # pylint: disable=broad-exception-caught
         return None
 
 
+def _get_service_base_url(service_name: str) -> str:
+    """Build the external URL for a service."""
+    try:
+        base = get_remote_base_url().rstrip("/")
+        env = get_dt_env()
+        return f"{base}/job/{env}/{service_name}"
+    except Exception:  # pylint: disable=broad-exception-caught
+        return construct_remote_base_url(service_name)
+
+
 def _get_service_openapi(service_name: str):
     """Get the OpenAPI specification and health status for a service."""
-    base_url = construct_remote_base_url(service_name)
+    base_url = _get_service_base_url(service_name)
     return jsonify(
         {
             "spec": _get_openapi_spec(base_url),
