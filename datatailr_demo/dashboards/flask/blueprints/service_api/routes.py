@@ -68,10 +68,24 @@ def api_service_openapi():
     return _process_request(lambda: _get_service_openapi(service_name))
 
 
+def _get_auth_headers() -> dict:
+    """Get the authentication headers for requests to the platform."""
+    try:
+        from datatailr import get_remote_http_headers
+
+        return get_remote_http_headers()
+    except Exception:
+        return {}
+
+
+def _get(url: str) -> req.Response:
+    return req.get(url, timeout=5, headers=_get_auth_headers())
+
+
 def _get_health_status(base_url: str) -> dict:
     """Get the health status of a service."""
     try:
-        health_resp = req.get(f"{base_url}/health", timeout=5)
+        health_resp = _get(f"{base_url}/health")
         return {"status": "healthy", "code": health_resp.status_code}
     except Exception:  # pylint: disable=broad-exception-caught
         return {"status": "unreachable", "code": None}
@@ -80,11 +94,12 @@ def _get_health_status(base_url: str) -> dict:
 def _get_openapi_spec(base_url: str) -> dict | None:
     """Get the OpenAPI specification for a service."""
     try:
-        resp = req.get(f"{base_url}/openapi.json", timeout=5)
+        resp = _get(f"{base_url}/openapi.json")
         resp.raise_for_status()
         if not resp.content:
             return None
-        return {**resp.json(), "servers": [{"url": base_url}]}
+        servers = [{"url": f"{base_url.rstrip('/')}/"}]
+        return {**resp.json(), "servers": servers}
     except Exception:  # pylint: disable=broad-exception-caught
         return None
 

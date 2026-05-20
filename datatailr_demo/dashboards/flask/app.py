@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
 
-from blueprints import service_api_bp
+from dashboards.flask.blueprints import service_api_bp
 from flask import Flask, jsonify, render_template, request
 
 _STATIC_DIR = Path(__file__).parent / "static"
