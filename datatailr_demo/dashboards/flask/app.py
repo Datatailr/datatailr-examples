@@ -20,26 +20,28 @@ Features demonstrated:
 """
 
 from __future__ import annotations
+
 import os
 import random
 from datetime import datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
 
+from dashboards.flask.blueprints import service_api_bp
 from flask import Flask, jsonify, render_template, request
 
-_STATIC_DIR = Path(__file__).parent / 'static'
-_TEMPLATES_DIR = Path(__file__).parent / 'templates'
+_STATIC_DIR = Path(__file__).parent / "static"
+_TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 _env = os.environ.get("DATATAILR_JOB_ENVIRONMENT", "")
 _job = os.environ.get("DATATAILR_JOB_NAME", "")
 _job_type = os.environ.get("DATATAILR_JOB_TYPE", "")
-_job_type = 'job' if _job_type != 'workstation' else 'workstation'
+_job_type = "job" if _job_type != "workstation" else "workstation"
 
-_PREFIX = f'/{_job_type}/{_env}/{_job}' if _env and _job else ""
+_PREFIX = f"/{_job_type}/{_env}/{_job}" if _env and _job else ""
 
-if _job_type == 'workstation':
-    _PREFIX += '/ide/proxy/5000/'
+if _job_type == "workstation":
+    _PREFIX += "/ide/proxy/5000/"
 
 app = Flask(
     __name__,
@@ -47,6 +49,8 @@ app = Flask(
     static_folder=_STATIC_DIR,
     static_url_path="/static",
 )
+
+app.register_blueprint(service_api_bp)
 
 
 @app.context_processor
@@ -136,7 +140,10 @@ def _rolling_average(values: list[float], window: int) -> list[float]:
 
 
 def _daily_change(values: list[float]) -> list[float]:
-    return [0.0] + [round(values[i] - values[i - 1], 2) for i in range(1, len(values))]
+    rounded_values = [
+        round(values[i] - values[i - 1], 2) for i in range(1, len(values))
+    ]
+    return [0.0] + rounded_values
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +206,7 @@ def data_table():
 
 try:
     from datatailr import Blob
+
     blob_storage = Blob()
 except ImportError:
     blob_storage = None
@@ -251,7 +259,9 @@ def _full_blob_path(list_prefix: str, entry_name: str) -> str:
     # Reattach the bucket segment to avoid duplicating prefix segments.
     if "/" in base_tail:
         bucket, current_rel = base_tail.split("/", 1)
-        if current_rel and (e_clean == current_rel or e_clean.startswith(current_rel + "/")):
+        if current_rel and (
+            e_clean == current_rel or e_clean.startswith(current_rel + "/")
+        ):
             return f"/{bucket}/{e_clean}"
     return f"{base}/{e_clean}"
 
@@ -293,7 +303,9 @@ def _entry_implies_directory(is_nested: bool, meta: dict | None) -> bool:
     return False
 
 
-def _blob_entry_meta(meta: dict | None, full_path: str) -> tuple[int | None, object | None]:
+def _blob_entry_meta(
+    meta: dict | None, full_path: str
+) -> tuple[int | None, object | None]:
     if meta:
         return meta.get("size", 0), meta.get("last_modified")
     stat_fn = getattr(blob_storage, "stat", None)
@@ -323,7 +335,11 @@ def _collect_immediate_children(list_prefix: str, entries: list) -> list[dict]:
         is_nested = len(parts) > 1
         parsed.append((head, is_nested, full, meta))
 
-    dir_heads = {h for h, is_nested, _, meta in parsed if _entry_implies_directory(is_nested, meta)}
+    dir_heads = {
+        h
+        for h, is_nested, _, meta in parsed
+        if _entry_implies_directory(is_nested, meta)
+    }
     children: list[dict] = []
 
     for h in sorted(dir_heads, key=str.casefold):
