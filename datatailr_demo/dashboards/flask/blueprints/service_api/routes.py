@@ -1,4 +1,5 @@
 # datatailr_demo/dashboards/flask/blueprints/service_api/routes.py
+
 # *************************************************************************
 #
 #  Copyright (c) 2026 - Datatailr Inc.
@@ -13,26 +14,27 @@
 
 from __future__ import annotations
 
-from flask import Blueprint, jsonify, render_template, request
+from typing import Any, Callable
+
+from flask import Blueprint, Response, jsonify, render_template
 
 try:
-    import requests as req
-    from datatailr import construct_remote_base_url  # type: ignore
     from datatailr import get_dt_env  # type: ignore
-    from datatailr import get_remote_base_url  # type: ignore
-    from datatailr import get_remote_http_headers  # type: ignore
     from datatailr.wrapper import dt__Job  # type: ignore
 
     DATATAILR_AVAILABLE = True
 except ImportError:
     DATATAILR_AVAILABLE = False
 
+ResponseOrError = Response | tuple[Response, int]
+RequestFunc = Callable[..., Response]
+RequestArgs = tuple[Any, ...]
 
 service_api_bp = Blueprint("service_api", __name__)
 """Blueprint for the service API"""
 
 
-def _get_job_client():
+def _get_job_client() -> Any:
     if DATATAILR_AVAILABLE:
         return dt__Job()
     return None
@@ -42,98 +44,56 @@ job_client = _get_job_client()
 
 
 @service_api_bp.route("/service-api")
-def service_api():
+def service_api() -> str:
     """Render the service API page."""
-    return render_template("service_api.html", page="service_api")
+    try:
+        env = str(get_dt_env())
+    except Exception:  # pylint: disable=broad-exception-caught
+        env = "dev"
+    return render_template("service_api.html", page="service_api", env=env)
 
 
 @service_api_bp.route("/api/services")
-def api_services():
+def api_services() -> ResponseOrError:
     """Get the list of services endpoint."""
     if not job_client:
         return jsonify([])
-    return _process_request(_get_services)
+    filter_string = "type = service and state = running"
+    return _process_request(
+        _get_services,
+        args=(filter_string,),
+    )
 
 
-def _get_services():
-    """Get the list of services."""
-    runs = job_client.runs(filter="type = service and state = running")
+def _get_services(filter_string: str) -> Response:
+    """
+    Get the list of services.
+
+    Args:
+        filter_string (str): The filter string to use to get the list
+        of services.
+
+    Returns:
+        Response: A response containing the list of services.
+    """
+    runs = job_client.runs(filter=filter_string)
     names = [r["job_name"] for r in runs]
     return jsonify([{"name": n} for n in names])
 
 
-@service_api_bp.route("/api/service-openapi")
-def api_service_openapi():
-    """Get the OpenAPI specification for a service endpoint."""
-    service_name = request.args.get("name")
-    if not service_name:
-        return jsonify({"error": "name is required"}), 400
-    return _process_request(lambda: _get_service_openapi(service_name))
+def _process_request(
+    func: RequestFunc,
+    args: RequestArgs = (),
+) -> ResponseOrError:
+    """
+    Process a request.
 
-
-def _get_auth_headers() -> dict:
-    """Get the authentication headers for requests to the platform."""
+    Args:
+        func (RequestFunc): The function to process the request.
+    Returns:
+        ResponseOrError: A response or a tuple of a response and an error code.
+    """
     try:
-        return get_remote_http_headers()
-    except Exception:  # pylint: disable=broad-exception-caught
-        return {}
-
-
-def _get(url: str) -> req.Response:
-    return req.get(url, timeout=5, headers=_get_auth_headers())
-
-
-def _get_health_status(base_url: str) -> dict:
-    """Get the health status of a service."""
-    try:
-        health_resp = _get(f"{base_url}/health")
-        return {"status": "healthy", "code": health_resp.status_code}
-    except Exception:  # pylint: disable=broad-exception-caught
-        return {"status": "unreachable", "code": None}
-
-
-def _get_openapi_spec(base_url: str) -> dict | None:
-    """Get the OpenAPI specification for a service."""
-    try:
-        resp = _get(f"{base_url}/openapi.json")
-        resp.raise_for_status()
-        if not resp.content:
-            return None
-        spec = resp.json()
-        print(f"DEBUG spec keys: {list(spec.keys())}")
-        print(f"DEBUG servers before: {spec.get('servers')}")
-        servers = [{"url": f"{base_url.rstrip('/')}/"}]
-        res: dict = {**spec, "servers": servers}
-        print(f"DEBUG servers after: {res.get('servers')}")
-        return res
-    except Exception:  # pylint: disable=broad-exception-caught
-        return None
-
-
-def _get_service_base_url(service_name: str) -> str:
-    """Build the external URL for a service."""
-    try:
-        base = get_remote_base_url().rstrip("/")
-        env = get_dt_env()
-        return f"{base}/job/{env}/{service_name}"
-    except Exception:  # pylint: disable=broad-exception-caught
-        return construct_remote_base_url(service_name)
-
-
-def _get_service_openapi(service_name: str):
-    """Get the OpenAPI specification and health status for a service."""
-    base_url = _get_service_base_url(service_name)
-    return jsonify(
-        {
-            "spec": _get_openapi_spec(base_url),
-            "health": _get_health_status(base_url),
-        }
-    )
-
-
-def _process_request(func):
-    """Process a request."""
-    try:
-        return func()
+        return func(*args)
     except Exception as e:  # pylint: disable=broad-exception-caught
         return jsonify({"error": str(e)}), 500

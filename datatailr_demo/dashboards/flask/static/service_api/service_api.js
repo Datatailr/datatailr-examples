@@ -1,3 +1,4 @@
+// datatailr_demo/dashboards/flask/static/service_api/service_api.js
 import { loadApiDocs } from './api_viewer.js'
 import { loadServices } from './service_select.js'
 

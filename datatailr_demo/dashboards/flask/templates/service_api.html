@@ -1,3 +1,4 @@
+<!-- datatilr_demo/dashboards/flask/templates/service_api.html -->  
 {% extends "base.html" %}
   
 {% block title %}
@@ -68,5 +69,6 @@
   rel="stylesheet"
   href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"
 />
+<script id="service-api-env" type="application/json">{{ env | tojson }}</script>
 <script type="module" src="{{ prefix }}/static/service_api/service_api.js"></script>
 {% endblock %}
