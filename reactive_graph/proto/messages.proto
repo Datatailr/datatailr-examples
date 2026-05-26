@@ -1,0 +1,37 @@
+// Schema for messages flowing through the reactive graph demo.
+//
+// A single `GraphMessage` represents one event/edge in the graph. Every node
+// stamps the message with its name when it sees it, so the dashboard can
+// reconstruct the path the message has taken.
+
+syntax = "proto3";
+
+package reactive_graph;
+
+message GraphMessage {
+  // Unique id for a message lineage. Replies (e.g. pong) share the
+  // `correlation_id` of the original ping so the UI can pair them up.
+  string id = 1;
+  string correlation_id = 2;
+
+  // "ping", "pong", "hello", ... -- application-level message kind.
+  string kind = 3;
+
+  // The node that produced this message and the node it is addressed to.
+  // `to_node` is empty for broadcasts.
+  string from_node = 4;
+  string to_node = 5;
+
+  // Free-form payload. Kept as a string for human-readable demos; you would
+  // normally use `bytes` and a sub-message here.
+  string text = 6;
+
+  // Unix epoch seconds (set by the sender).
+  double timestamp = 7;
+
+  // Monotonic sequence number assigned by the sender. Useful for ordering.
+  int64 sequence = 8;
+
+  // Audit trail: every node that has handled this message appends its name.
+  repeated string hops = 9;
+}
