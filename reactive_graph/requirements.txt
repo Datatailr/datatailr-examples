@@ -1,4 +1,6 @@
 fastapi
-zmq
+pyzmq
 protobuf
 uvicorn
+pyarrow
+duckdb

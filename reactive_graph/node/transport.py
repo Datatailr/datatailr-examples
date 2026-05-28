@@ -1,0 +1,371 @@
+"""Shared ZMQ ROUTER/DEALER transport for reactive-graph nodes.
+
+Every reactive-graph node binds a single **ROUTER** socket on its
+platform-assigned port and exchanges three frame types with peers that
+connect via **DEALER**:
+
+  +------------------+-------------------------------------+-------------------------+
+  | Direction        | Frames                              | Meaning                 |
+  +------------------+-------------------------------------+-------------------------+
+  | DEALER -> ROUTER | ``[b"SUB"]``                        | register subscriber     |
+  | ROUTER -> DEALER | ``[b"EVT", topic, protobuf]``       | event broadcast         |
+  | DEALER -> ROUTER | ``[b"CTL", json_bytes]``            | control command         |
+  | ROUTER -> DEALER | ``[b"CTL", json_bytes]``            | control reply           |
+  +------------------+-------------------------------------+-------------------------+
+
+`ZmqNode` packages this protocol so the role-specific service modules
+(market-feed, analytics, signal-engine, risk-engine, execution-simulator,
+notification-bus) can focus on business logic.  Callers register
+callbacks for control commands and upstream events, optionally an idle
+callback that drives time-based behaviour (e.g. tick generation), and
+call :meth:`ZmqNode.run`.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+import zmq
+
+from reactive_graph.node.messages_pb2 import GraphMessage  # type: ignore[import-not-found]
+
+log = logging.getLogger("reactive_graph.transport")
+
+EventHandler = Callable[[str, GraphMessage], None]
+ControlHandler = Callable[[dict], dict]
+IdleHandler = Callable[[], Optional[float]]
+
+DEFAULT_SUB_REFRESH_S = 5.0
+
+
+class ZmqNode:
+    """ROUTER + (optional) upstream DEALERs with SUB/EVT/CTL framing."""
+
+    def __init__(
+        self,
+        name: str,
+        port: int,
+        sub_refresh_s: float = DEFAULT_SUB_REFRESH_S,
+    ) -> None:
+        self.name = name
+        self.port = int(port)
+        self.sub_refresh_s = float(sub_refresh_s)
+
+        self.ctx = zmq.Context.instance()
+        self.router: Optional[zmq.Socket] = None
+        self.dealers: List[Tuple[str, zmq.Socket]] = []
+        self.subscribers: Set[bytes] = set()
+        self.poller = zmq.Poller()
+
+        self._seq = 0
+        self._on_event: Optional[EventHandler] = None
+        self._on_control: Optional[ControlHandler] = None
+        self._on_idle: Optional[IdleHandler] = None
+        self._last_sub_refresh = 0.0
+        self._running = False
+
+        self.total_published = 0
+        self.total_received = 0
+        self.started_at = time.time()
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def bind(self) -> None:
+        router = self.ctx.socket(zmq.ROUTER)
+        router.setsockopt(zmq.LINGER, 200)
+        router.setsockopt(zmq.SNDHWM, 100_000)
+        router.setsockopt(zmq.RCVHWM, 100_000)
+        router.bind(f"tcp://*:{self.port}")
+        self.router = router
+        self.poller.register(router, zmq.POLLIN)
+        log.info("[%s] ROUTER bound on port %d", self.name, self.port)
+
+    def connect_upstream(self, host: str, port: int) -> zmq.Socket:
+        """Open a DEALER to an upstream ROUTER and register as subscriber."""
+        dealer = self.ctx.socket(zmq.DEALER)
+        identity = f"{self.name}-to-{host}".encode("utf-8")
+        dealer.setsockopt(zmq.IDENTITY, identity)
+        dealer.setsockopt(zmq.LINGER, 200)
+        dealer.setsockopt(zmq.RCVHWM, 100_000)
+        dealer.setsockopt(zmq.RECONNECT_IVL, 500)
+        dealer.setsockopt(zmq.RECONNECT_IVL_MAX, 5000)
+        endpoint = f"tcp://{host}:{port}"
+        dealer.connect(endpoint)
+        dealer.send(b"SUB")
+        self.dealers.append((host, dealer))
+        self.poller.register(dealer, zmq.POLLIN)
+        log.info(
+            "[%s] DEALER connected to %s (subscribed)",
+            self.name,
+            endpoint,
+        )
+        return dealer
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
+
+    def on_event(self, handler: EventHandler) -> None:
+        """Register a callback for ``[EVT, topic, protobuf]`` from upstream."""
+        self._on_event = handler
+
+    def on_control(self, handler: ControlHandler) -> None:
+        """Register a callback for ``[CTL, json]`` commands.
+
+        The handler returns a JSON-serialisable dict that is sent back as
+        the control reply.
+        """
+        self._on_control = handler
+
+    def on_idle(self, handler: IdleHandler) -> None:
+        """Register an idle callback driven by the poll loop.
+
+        The handler is called every iteration of the loop.  It may
+        return the desired next poll timeout in seconds; if it returns
+        ``None`` the default 100 ms timeout is used.
+        """
+        self._on_idle = handler
+
+    # ------------------------------------------------------------------
+    # Message factory + broadcast
+    # ------------------------------------------------------------------
+
+    def next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def new_message(
+        self,
+        kind: str,
+        to_node: str = "",
+        parent: Optional[object] = None,
+    ) -> GraphMessage:
+        """Build a GraphMessage with header fields populated.
+
+        If *parent* is provided, the new message inherits its ``hops``
+        and ``correlation_id`` so the dashboard can reconstruct the
+        full path the lineage has taken through the graph.  *parent*
+        may be a :class:`GraphMessage`, a dict carrying ``hops`` /
+        ``correlation_id`` keys (useful when the original protobuf is
+        not retained), or an iterable of hop names.
+        """
+        msg = GraphMessage(
+            id=str(uuid.uuid4()),
+            kind=kind,
+            from_node=self.name,
+            to_node=to_node,
+            timestamp=time.time(),
+            sequence=self.next_seq(),
+        )
+
+        upstream_hops: List[str] = []
+        correlation_id = ""
+        if parent is None:
+            pass
+        elif isinstance(parent, GraphMessage):
+            upstream_hops = list(parent.hops)
+            correlation_id = parent.correlation_id or parent.id
+        elif isinstance(parent, dict):
+            raw_hops = parent.get("hops") or []
+            upstream_hops = [str(h) for h in raw_hops]
+            correlation_id = (
+                str(parent.get("correlation_id") or parent.get("id") or "")
+            )
+        else:
+            try:
+                upstream_hops = [str(h) for h in parent]  # type: ignore[union-attr]
+            except TypeError:
+                pass
+
+        msg.correlation_id = correlation_id or msg.id
+        for h in upstream_hops:
+            msg.hops.append(h)
+        if not list(msg.hops) or list(msg.hops)[-1] != self.name:
+            msg.hops.append(self.name)
+        return msg
+
+    def broadcast(self, topic: str, msg: GraphMessage) -> None:
+        """Send ``[EVT, topic, protobuf]`` to every subscribed peer."""
+        if self.router is None or not self.subscribers:
+            return
+        payload = msg.SerializeToString()
+        topic_bytes = topic.encode("utf-8")
+        for peer_id in list(self.subscribers):
+            try:
+                self.router.send_multipart(
+                    [peer_id, b"EVT", topic_bytes, payload], zmq.NOBLOCK
+                )
+            except zmq.ZMQError:
+                pass
+        self.total_published += 1
+
+    def forward(self, topic: str, msg: GraphMessage) -> None:
+        """Re-broadcast an incoming message, stamping our node into ``hops``."""
+        if self.name not in list(msg.hops):
+            msg.hops.append(self.name)
+        self.broadcast(topic, msg)
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+        """Run the poll loop until interrupted."""
+        if self.router is None:
+            self.bind()
+        self._running = True
+        self._last_sub_refresh = time.time()
+        log.info("[%s] main loop starting", self.name)
+        try:
+            while self._running:
+                now = time.time()
+
+                # Periodically re-subscribe to upstreams (handles restarts).
+                if (
+                    self.dealers
+                    and now - self._last_sub_refresh >= self.sub_refresh_s
+                ):
+                    for _host, dealer in self.dealers:
+                        try:
+                            dealer.send(b"SUB", zmq.NOBLOCK)
+                        except zmq.ZMQError:
+                            pass
+                    self._last_sub_refresh = now
+
+                next_timeout: Optional[float] = None
+                if self._on_idle is not None:
+                    try:
+                        next_timeout = self._on_idle()
+                    except Exception:  # noqa: BLE001
+                        log.exception("[%s] idle handler raised", self.name)
+
+                timeout_ms = (
+                    max(1, int(next_timeout * 1000))
+                    if next_timeout is not None
+                    else 100
+                )
+                events = dict(self.poller.poll(timeout=timeout_ms))
+
+                if self.router in events:
+                    self._drain_router()
+
+                for _host, dealer in self.dealers:
+                    if dealer in events:
+                        self._drain_dealer(dealer)
+        except KeyboardInterrupt:
+            log.info("[%s] interrupted", self.name)
+        finally:
+            self.close()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def close(self) -> None:
+        if self.router is not None:
+            self.router.close()
+            self.router = None
+        for _host, dealer in self.dealers:
+            dealer.close()
+        self.dealers = []
+        log.info("[%s] shutdown complete", self.name)
+
+    # ------------------------------------------------------------------
+    # Internal frame dispatch
+    # ------------------------------------------------------------------
+
+    def _drain_router(self) -> None:
+        assert self.router is not None
+        while True:
+            try:
+                frames = self.router.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            if len(frames) < 2:
+                continue
+            peer_id = bytes(frames[0])
+            cmd = frames[1]
+
+            if cmd == b"SUB":
+                if peer_id not in self.subscribers:
+                    log.info(
+                        "[%s] subscriber registered: %r", self.name, peer_id
+                    )
+                self.subscribers.add(peer_id)
+                continue
+
+            if cmd == b"CTL" and len(frames) >= 3:
+                try:
+                    ctl_data = json.loads(frames[2])
+                except (json.JSONDecodeError, TypeError):
+                    ctl_data = {"action": ""}
+                try:
+                    if self._on_control is not None:
+                        result: Dict = self._on_control(ctl_data)
+                    else:
+                        result = {"ok": False, "error": "no control handler"}
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("[%s] control handler raised", self.name)
+                    result = {"ok": False, "error": str(exc)}
+                try:
+                    self.router.send_multipart(
+                        [peer_id, b"CTL", json.dumps(result).encode()],
+                        zmq.NOBLOCK,
+                    )
+                except zmq.ZMQError:
+                    pass
+                action = (
+                    ctl_data.get("action") if isinstance(ctl_data, dict) else "?"
+                )
+                log.info(
+                    "[%s] control: %s -> ok=%s",
+                    self.name,
+                    action,
+                    result.get("ok"),
+                )
+
+    def _drain_dealer(self, dealer: zmq.Socket) -> None:
+        while True:
+            try:
+                frames = dealer.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            if len(frames) < 3 or frames[0] != b"EVT":
+                continue
+            topic = frames[1].decode("utf-8", "replace")
+            msg = GraphMessage()
+            try:
+                msg.ParseFromString(frames[2])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] bad protobuf: %s", self.name, exc)
+                continue
+            self.total_received += 1
+            if self._on_event is not None:
+                try:
+                    self._on_event(topic, msg)
+                except Exception:  # noqa: BLE001
+                    log.exception("[%s] event handler raised", self.name)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_upstreams(raw: str, default_port: int) -> List[Tuple[str, int]]:
+    """Parse ``"host[:port],host[:port]"`` env-style strings."""
+    result: List[Tuple[str, int]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        host = parts[0]
+        port = int(parts[1]) if len(parts) > 1 else default_port
+        result.append((host, port))
+    return result

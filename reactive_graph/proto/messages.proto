@@ -1,8 +1,14 @@
 // Schema for messages flowing through the reactive graph demo.
 //
-// A single `GraphMessage` represents one event/edge in the graph. Every node
-// stamps the message with its name when it sees it, so the dashboard can
-// reconstruct the path the message has taken.
+// A single `GraphMessage` represents one event/edge in the graph. Every
+// node stamps the message with its name when it sees it, so the
+// dashboard can reconstruct the path the message has taken.
+//
+// The payload of a message is one of the typed sub-messages declared at
+// the bottom of this file (`Tick`, `Analytics`, `Signal`, `OrderIntent`,
+// `Fill`, `PositionUpdate`, `SystemEvent`).  Free-form string content
+// remains available via the `text` field for control replies and
+// debugging.
 
 syntax = "proto3";
 
@@ -14,17 +20,14 @@ message GraphMessage {
   string id = 1;
   string correlation_id = 2;
 
-  // "ping", "pong", "hello", ... -- application-level message kind.
+  // Application-level message kind: "tick", "analytics", "signal",
+  // "order_intent", "fill", "position_update", "system", ...
   string kind = 3;
 
   // The node that produced this message and the node it is addressed to.
   // `to_node` is empty for broadcasts.
   string from_node = 4;
   string to_node = 5;
-
-  // Free-form payload. Kept as a string for human-readable demos; you would
-  // normally use `bytes` and a sub-message here.
-  string text = 6;
 
   // Unix epoch seconds (set by the sender).
   double timestamp = 7;
@@ -34,4 +37,110 @@ message GraphMessage {
 
   // Audit trail: every node that has handled this message appends its name.
   repeated string hops = 9;
+
+  // Exactly one of the typed payload variants is populated.  `text`
+  // remains a fallback for free-form string content (e.g. CTL replies
+  // or human-readable demos).
+  oneof payload {
+    string text = 6;
+    Tick tick = 10;
+    Analytics analytics = 11;
+    Signal signal = 12;
+    OrderIntent order_intent = 13;
+    Fill fill = 14;
+    PositionUpdate position_update = 15;
+    SystemEvent system = 16;
+    RejectedTick rejected = 17;
+  }
+}
+
+// --------------------------------------------------------------------------
+// Typed payloads
+// --------------------------------------------------------------------------
+
+// A single stock tick produced by the market-feed.
+message Tick {
+  string symbol = 1;
+  double price = 2;
+  double bid = 3;
+  double ask = 4;
+  int64 volume = 5;
+  double change = 6;
+  double change_pct = 7;
+}
+
+// A market-feed tick rejected by analytics validation.
+message RejectedTick {
+  string symbol = 1;
+  string reason = 2;
+  string original_id = 3;
+}
+
+// Rolling analytics emitted by analytics-engine.
+message Analytics {
+  string symbol = 1;
+  double price = 2;
+  double sma_short = 3;
+  double sma_long = 4;
+  double vwap = 5;
+  double high = 6;
+  double low = 7;
+  double volatility = 8;
+  int64 volume_avg = 9;
+  double session_change = 10;
+  double session_change_pct = 11;
+  string trend = 12;       // "up" / "down" / "neutral"
+  int64 samples = 13;
+  int64 window = 14;
+}
+
+// A trading signal emitted by signal-engine.
+message Signal {
+  string symbol = 1;
+  string side = 2;         // "buy" / "sell" / "flat"
+  string strategy = 3;     // "momentum" / "mean_reversion"
+  double strength = 4;     // 0..1 confidence
+  double reference_price = 5;
+  int64 suggested_qty = 6;
+}
+
+// Proposed order produced by risk-engine after applying limits.
+message OrderIntent {
+  string symbol = 1;
+  string side = 2;         // "buy" / "sell"
+  string status = 3;       // "approved" / "rejected"
+  string reason = 4;       // e.g. "position_limit", "ok"
+  int64 qty = 5;
+  double price = 6;
+  string strategy = 7;
+}
+
+// Simulated fill produced by execution-simulator.
+message Fill {
+  string symbol = 1;
+  string side = 2;
+  int64 qty = 3;
+  double price = 4;
+  double slippage = 5;     // signed difference vs reference price
+  string strategy = 6;
+  string order_id = 7;
+}
+
+// Position update broadcast after each fill (or warm-up seed).
+message PositionUpdate {
+  string symbol = 1;
+  int64 net_qty = 2;
+  double avg_price = 3;
+  double market_price = 4;
+  double realised_pnl = 5;
+  double unrealised_pnl = 6;
+}
+
+// Cross-cutting platform events injected by workflow tasks (or any
+// short-lived process) via the notification-bus.
+message SystemEvent {
+  string kind = 1;         // "market_open" / "eod_complete" / "custom"
+  string summary = 2;
+  string detail = 3;       // free-form JSON or text
+  string source = 4;       // e.g. "EOD Reconciliation"
 }
