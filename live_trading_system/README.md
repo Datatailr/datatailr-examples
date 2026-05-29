@@ -1,5 +1,7 @@
 # Live Trading System
 
+![Live Trading System Dashboard](./screenshot.gif)
+
 An end-to-end Datatailr demo built around a simulated algorithmic-trading
 desk. **Seven long-running ZMQ services** stream market data through a
 five-stage pipeline, a FastAPI dashboard subscribes to every node
