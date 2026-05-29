@@ -33,28 +33,48 @@ message bus.  All services and the dashboard share the same
 
 ## Architecture
 
-```
-                       single ZMQ port (8080) per service
-                       ROUTER on every service, DEALER on every peer
+Every service binds a single ZMQ ROUTER on port 8080; every peer
+connects with a DEALER socket. Solid arrows are streamed `EVT`
+messages, dashed arrows are `CTL` control frames, and the dotted arrows
+are Parquet/DuckDB reads and writes against blob storage.
 
-   market-feed  --tick-->  analytics-engine  --analytics-->  signal-engine
-        |                                                          |
-        |                                                          v
-        v                                                     risk-engine
-   execution-simulator  <--order_intent--  risk-engine            |
-        |    |     |                        ^                     |
-        |    |     +------fills------------>|                     |
-        |    v                                                    |
-        |  persistence-sink  --parquet-->  Blob (trades/, positions/)
-        v                                                         |
-   notification-bus  <----CTL broadcast----  workflows  <---------+
-        ^                                       |
-        |                                       v
-        +--system events-->   Live Trading System  <---all nodes
-                                  Dashboard
-                              (FastAPI + topology + DuckDB history)
-                                       |
-                                       +---- DuckDB read ----> Blob
+```mermaid
+flowchart LR
+    MF[market-feed]
+    AN[analytics-engine]
+    SIG[signal-engine]
+    RISK[risk-engine]
+    EXEC[execution-simulator]
+    PERSIST[persistence-sink]
+    BUS[notification-bus]
+    WF[workflows<br/>warmup / EOD]
+    DASH[Live Trading System Dashboard<br/>FastAPI + topology + DuckDB history]
+    BLOB[(Blob storage<br/>trades/ &middot; positions/ &middot; eod/)]
+
+    MF -- tick --> AN
+    AN -- analytics --> SIG
+    SIG -- signal --> RISK
+    RISK -- order_intent --> EXEC
+    EXEC -- fills --> RISK
+    MF -- last price --> EXEC
+    EXEC -- fills / positions --> PERSIST
+
+    PERSIST -. parquet write .-> BLOB
+    WF -. DuckDB read .-> BLOB
+    DASH -. DuckDB read .-> BLOB
+
+    WF -. CTL broadcast .-> BUS
+    WF -. CTL seed / snapshot .-> MF & RISK & EXEC & SIG
+    BUS -- system events --> DASH
+
+    MF -- EVT --> DASH
+    AN -- EVT --> DASH
+    SIG -- EVT --> DASH
+    RISK -- EVT --> DASH
+    EXEC -- EVT --> DASH
+    PERSIST -- EVT --> DASH
+
+    DASH -. CTL controls .-> MF & AN & SIG & RISK & EXEC
 ```
 
 ### Single-port protocol
