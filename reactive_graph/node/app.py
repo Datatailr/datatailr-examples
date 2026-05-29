@@ -27,6 +27,8 @@ NODE_ROLE               role selector (see above)
 UPSTREAM_NODES          comma-separated upstream specs ``host[:port]``
 UPSTREAM_ZMQ_PORT       default upstream port when not in ``UPSTREAM_NODES``
 SUB_REFRESH_S           re-send SUB to upstreams every N seconds (default 5)
+DEALER_RECREATE_AFTER_S  recreate upstream DEALER if silent for this many
+                        seconds (default 30); set to 0 to disable
 """
 
 from __future__ import annotations

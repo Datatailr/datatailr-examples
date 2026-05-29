@@ -562,6 +562,7 @@ def _probe_node_sync(cfg: Dict[str, Any], timeout_ms: int = 1500) -> Dict[str, A
                 "total_published": payload.get("total_published"),
                 "subscribers": payload.get("subscribers"),
                 "upstreams_connected": payload.get("upstreams_connected"),
+                "upstreams": payload.get("upstreams") or [],
             }
         return {
             "name": name, "host": host, "port": port,
@@ -1599,13 +1600,23 @@ tr.new-intent td{animation:flash-yellow .8s ease-out}
   function fmtDiagRow(n){
     const ok = n.reachable;
     const icon = ok ? '\u2713' : '\u2717';
-    const main = ok
-      ? `${icon} ${n.name||n.host}  (${n.host}:${n.port})  role=${n.role||'?'} `
-        + `uptime=${n.uptime_s||0}s  rx=${n.total_received||0}  tx=${n.total_published||0}  `
-        + `subs=${n.subscribers!=null?n.subscribers:'-'}  ups=${n.upstreams_connected!=null?n.upstreams_connected:'-'}  `
-        + `(${n.elapsed_ms}ms)`
-      : `${icon} ${n.name||n.host}  (${n.host}:${n.port})  UNREACHABLE  error=${n.error||'?'} (${n.elapsed_ms}ms)`;
-    return main;
+    if(!ok){
+      return `${icon} ${n.name||n.host}  (${n.host}:${n.port})  UNREACHABLE  `
+        + `error=${n.error||'?'} (${n.elapsed_ms}ms)`;
+    }
+    const head = `${icon} ${n.name||n.host}  (${n.host}:${n.port})  role=${n.role||'?'} `
+      + `uptime=${n.uptime_s||0}s  rx=${n.total_received||0}  tx=${n.total_published||0}  `
+      + `subs=${n.subscribers!=null?n.subscribers:'-'}  ups=${n.upstreams_connected!=null?n.upstreams_connected:'-'}  `
+      + `(${n.elapsed_ms}ms)`;
+    const ups=(n.upstreams||[]);
+    if(!ups.length) return head;
+    const upLines = ups.map(u=>{
+      const stuck = (u.silent_for_s||0) > 15 ? ' STUCK' : '';
+      return `        - ${u.host}:${u.port}  rx=${u.events_received||0}  `
+        + `silent=${(u.silent_for_s||0).toFixed?u.silent_for_s.toFixed(1):u.silent_for_s}s  `
+        + `recreations=${u.recreations||0}${stuck}`;
+    });
+    return head + '\n' + upLines.join('\n');
   }
   const diagBtn=document.getElementById('btn-diagnostics');
   if(diagBtn){
@@ -1654,16 +1665,33 @@ tr.new-intent td{animation:flash-yellow .8s ease-out}
 
   function renderHistory(h){
     if(!h){return;}
-    if(h.error){
-      histWhen.textContent='error: '+h.error.slice(0,40);
-      return;
-    }
     const totals=h.totals||{};
-    histFiles.textContent=(h.trades_files||0).toLocaleString();
+    const tradesFiles=h.trades_files||0;
+    const tradesDl=h.trades_downloaded!=null?h.trades_downloaded:tradesFiles;
+    const posFiles=h.positions_files||0;
+    histFiles.textContent=tradesFiles.toLocaleString();
     histFills.textContent=(totals.fill_count||0).toLocaleString();
     histNotional.textContent='$'+Math.round(totals.notional||0).toLocaleString();
     histSlip.textContent='$'+fmt(totals.slippage_cost||0);
-    histWhen.textContent=fmtTime(h.computed_at);
+    if(h.error){
+      histWhen.textContent='error  \u00b7  hover for details';
+      histWhen.title=`error: ${h.error}\n\nbackend: ${h.blob_backend||'?'}`
+        + `\ntrades_prefix: ${h.trades_prefix||'?'}`
+        + `\nfiles found: ${tradesFiles}  downloaded: ${tradesDl}`
+        + `\npositions found: ${posFiles}`;
+      console.warn('history error', h);
+    } else if (tradesFiles > tradesDl) {
+      histWhen.textContent=`${tradesDl}/${tradesFiles} files OK \u00b7 ${fmtTime(h.computed_at)}`;
+      histWhen.title=`${tradesFiles - tradesDl} file(s) failed to download.\n`
+        + (h.trades_download_errors||[]).map(e=>`  ${e.path}: ${e.error}`).join('\n');
+      console.warn('history partial download', h);
+    } else if (tradesFiles === 0 && posFiles === 0) {
+      histWhen.textContent=`no parquet yet \u00b7 ${fmtTime(h.computed_at)}`;
+      histWhen.title=`backend=${h.blob_backend||'?'}\ntrades_prefix=${h.trades_prefix||'?'}\npositions_prefix=${h.positions_prefix||'?'}`;
+    } else {
+      histWhen.textContent=fmtTime(h.computed_at);
+      histWhen.title=`backend=${h.blob_backend||'?'} \u00b7 trades=${tradesDl}/${tradesFiles} positions=${posFiles}`;
+    }
 
     const bs=h.by_symbol||[];
     if(bs.length){

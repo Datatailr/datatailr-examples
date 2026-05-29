@@ -161,9 +161,7 @@ def run(node: ZmqNode, config: dict) -> None:
                     pos.realised_pnl = float(data.get("realised_pnl", 0.0))
             return {"ok": True, "seeded": list(state.positions.keys())}
         if action in ("status", "snapshot"):
-            return {
-                "ok": True,
-                "node_name": node.name,
+            return node.status_snapshot({
                 "role": "risk-engine",
                 "max_position": state.max_position,
                 "max_notional": state.max_notional,
@@ -178,8 +176,7 @@ def run(node: ZmqNode, config: dict) -> None:
                     }
                     for sym, p in state.positions.items()
                 },
-                "uptime_s": round(time.time() - node.started_at, 1),
-            }
+            })
         return {"ok": False, "error": f"unknown action: {action!r}"}
 
     node.on_control(control)

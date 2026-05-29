@@ -187,9 +187,7 @@ def run(node: ZmqNode, config: dict) -> None:
             state.flush_interval_s = v
             return {"ok": True, "flush_interval_s": v}
         if action in ("status", "snapshot"):
-            return {
-                "ok": True,
-                "node_name": node.name,
+            return node.status_snapshot({
                 "role": "persistence-sink",
                 "flush_interval_s": state.flush_interval_s,
                 "buffered_fills": len(state.unflushed_fills),
@@ -199,8 +197,7 @@ def run(node: ZmqNode, config: dict) -> None:
                 "last_flush_at": state.last_flush_at,
                 "last_flush_summary": state.last_flush_summary,
                 "last_error": state.last_error,
-                "uptime_s": round(time.time() - node.started_at, 1),
-            }
+            })
         return {"ok": False, "error": f"unknown action: {action!r}"}
 
     node.on_event(event)

@@ -183,9 +183,7 @@ def run(node: ZmqNode, config: dict) -> None:
                 "signals_emitted": state.signals_emitted,
             }
         if action in ("status", "snapshot"):
-            return {
-                "ok": True,
-                "node_name": node.name,
+            return node.status_snapshot({
                 "role": "signal-engine",
                 "enabled_strategies": sorted(state.enabled_strategies),
                 "suggested_qty": state.suggested_qty,
@@ -193,11 +191,8 @@ def run(node: ZmqNode, config: dict) -> None:
                 "cooldown_s": state.cooldown_s,
                 "analytics_seen": state.analytics_seen,
                 "signals_emitted": state.signals_emitted,
-                "subscribers": len(node.subscribers),
-                "upstreams_connected": len(node.dealers),
                 "last_signals": state.last_signals,
-                "uptime_s": round(time.time() - node.started_at, 1),
-            }
+            })
         return {"ok": False, "error": f"unknown action: {action!r}"}
 
     node.on_control(control)

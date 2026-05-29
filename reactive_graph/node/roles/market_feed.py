@@ -115,17 +115,13 @@ def run(node: ZmqNode, config: dict) -> None:
                 state.symbols.remove(sym)
             return {"ok": True, "symbols": state.symbols}
         if action in ("status", "snapshot"):
-            return {
-                "ok": True,
-                "node_name": node.name,
+            return node.status_snapshot({
                 "role": "market-feed",
                 "paused": state.paused,
                 "tick_interval_s": state.tick_interval_s,
                 "symbols": state.symbols,
                 "prices": {s: round(p, 2) for s, p in state.prices.items()},
-                "total_published": node.total_published,
-                "uptime_s": round(time.time() - node.started_at, 1),
-            }
+            })
         return {"ok": False, "error": f"unknown action: {action!r}"}
 
     node.on_control(control)

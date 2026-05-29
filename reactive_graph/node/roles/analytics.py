@@ -145,17 +145,12 @@ def run(node: ZmqNode, config: dict) -> None:
             state.window = w
             return {"ok": True, "analytics_window": w}
         if action in ("status", "snapshot"):
-            return {
-                "ok": True,
-                "node_name": node.name,
+            return node.status_snapshot({
                 "role": "analytics",
                 "analytics_window": state.window,
-                "total_received": node.total_received,
-                "total_published": node.total_published,
                 "total_rejected": state.total_rejected,
                 "analytics": dict(state.cache),
-                "uptime_s": round(time.time() - node.started_at, 1),
-            }
+            })
         return {"ok": False, "error": f"unknown action: {action!r}"}
 
     node.on_control(control)

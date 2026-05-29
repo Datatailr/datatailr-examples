@@ -25,9 +25,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import zmq
 
@@ -41,23 +42,50 @@ IdleHandler = Callable[[], Optional[float]]
 
 DEFAULT_SUB_REFRESH_S = 5.0
 
+# How long an upstream DEALER may go without receiving any EVT before we
+# tear it down and re-open the socket.  Restarts in containerised /
+# platform-managed environments often shift the upstream to a new IP;
+# ZMQ caches DNS at connect() time, so without a recreate the DEALER
+# stays stuck pointing at the old IP forever.
+DEFAULT_DEALER_RECREATE_AFTER_S = 30.0
+
 
 class ZmqNode:
-    """ROUTER + (optional) upstream DEALERs with SUB/EVT/CTL framing."""
+    """ROUTER + (optional) upstream DEALERs with SUB/EVT/CTL framing.
+
+    Upstream DEALERs are tracked in ``self._upstreams``; the legacy
+    ``self.dealers`` attribute is preserved as a derived read-only list
+    of ``(host, socket)`` tuples for compatibility with existing roles
+    that just call ``len(node.dealers)``.
+
+    Each upstream auto-recovers from silent / stuck connections: if no
+    EVT arrives for ``dealer_recreate_after_s`` seconds the DEALER is
+    closed and re-opened (forcing DNS re-resolution and a fresh peer-id
+    handshake with the upstream's ROUTER).
+    """
 
     def __init__(
         self,
         name: str,
         port: int,
         sub_refresh_s: float = DEFAULT_SUB_REFRESH_S,
+        dealer_recreate_after_s: Optional[float] = None,
     ) -> None:
         self.name = name
         self.port = int(port)
         self.sub_refresh_s = float(sub_refresh_s)
+        if dealer_recreate_after_s is None:
+            dealer_recreate_after_s = float(
+                os.environ.get(
+                    "DEALER_RECREATE_AFTER_S",
+                    DEFAULT_DEALER_RECREATE_AFTER_S,
+                )
+            )
+        self.dealer_recreate_after_s = float(dealer_recreate_after_s)
 
         self.ctx = zmq.Context.instance()
         self.router: Optional[zmq.Socket] = None
-        self.dealers: List[Tuple[str, zmq.Socket]] = []
+        self._upstreams: List[Dict[str, Any]] = []
         self.subscribers: Set[bytes] = set()
         self.poller = zmq.Poller()
 
@@ -71,6 +99,11 @@ class ZmqNode:
         self.total_published = 0
         self.total_received = 0
         self.started_at = time.time()
+
+    @property
+    def dealers(self) -> List[Tuple[str, zmq.Socket]]:
+        """Backwards-compat view of upstream DEALERs as ``(host, sock)``."""
+        return [(u["host"], u["socket"]) for u in self._upstreams]
 
     # ------------------------------------------------------------------
     # Setup
@@ -86,26 +119,78 @@ class ZmqNode:
         self.poller.register(router, zmq.POLLIN)
         log.info("[%s] ROUTER bound on port %d", self.name, self.port)
 
-    def connect_upstream(self, host: str, port: int) -> zmq.Socket:
-        """Open a DEALER to an upstream ROUTER and register as subscriber."""
+    def _open_dealer(self, host: str, port: int) -> zmq.Socket:
+        """Create + connect a DEALER and send an initial SUB.
+
+        The DEALER identity is suffixed with ``pid+ts`` so when this
+        node recreates a socket the upstream ROUTER sees it as a fresh
+        peer (rather than reusing a stale entry in its subscriber set).
+        """
         dealer = self.ctx.socket(zmq.DEALER)
-        identity = f"{self.name}-to-{host}".encode("utf-8")
+        identity = (
+            f"{self.name}-to-{host}-{os.getpid()}-{int(time.time() * 1000)}"
+        ).encode("utf-8")
         dealer.setsockopt(zmq.IDENTITY, identity)
         dealer.setsockopt(zmq.LINGER, 200)
+        dealer.setsockopt(zmq.SNDHWM, 100_000)
         dealer.setsockopt(zmq.RCVHWM, 100_000)
         dealer.setsockopt(zmq.RECONNECT_IVL, 500)
         dealer.setsockopt(zmq.RECONNECT_IVL_MAX, 5000)
-        endpoint = f"tcp://{host}:{port}"
-        dealer.connect(endpoint)
-        dealer.send(b"SUB")
-        self.dealers.append((host, dealer))
+        try:
+            dealer.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            dealer.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+            dealer.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 10)
+        except (zmq.ZMQError, AttributeError):
+            pass
+        dealer.connect(f"tcp://{host}:{port}")
+        try:
+            dealer.send(b"SUB", zmq.NOBLOCK)
+        except zmq.ZMQError:
+            pass
         self.poller.register(dealer, zmq.POLLIN)
+        return dealer
+
+    def connect_upstream(self, host: str, port: int) -> zmq.Socket:
+        """Open a DEALER to an upstream ROUTER and register as subscriber."""
+        endpoint = f"tcp://{host}:{port}"
+        dealer = self._open_dealer(host, int(port))
+        now = time.time()
+        info = {
+            "host": host,
+            "port": int(port),
+            "socket": dealer,
+            "connected_at": now,
+            "last_recv_at": now,
+            "events_received": 0,
+            "recreations": 0,
+        }
+        self._upstreams.append(info)
         log.info(
-            "[%s] DEALER connected to %s (subscribed)",
-            self.name,
-            endpoint,
+            "[%s] DEALER connected to %s (subscribed)", self.name, endpoint,
         )
         return dealer
+
+    def _recreate_upstream(self, info: Dict[str, Any], reason: str) -> None:
+        """Close + re-open the DEALER for a single upstream entry."""
+        old = info["socket"]
+        endpoint = f"tcp://{info['host']}:{info['port']}"
+        log.warning(
+            "[%s] recreating DEALER to %s after %s (recreations=%d)",
+            self.name, endpoint, reason, info["recreations"] + 1,
+        )
+        try:
+            self.poller.unregister(old)
+        except (KeyError, zmq.ZMQError):
+            pass
+        try:
+            old.close(linger=0)
+        except zmq.ZMQError:
+            pass
+        new = self._open_dealer(info["host"], info["port"])
+        info["socket"] = new
+        info["connected_at"] = time.time()
+        info["last_recv_at"] = time.time()
+        info["recreations"] += 1
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -221,19 +306,33 @@ class ZmqNode:
             self.bind()
         self._running = True
         self._last_sub_refresh = time.time()
-        log.info("[%s] main loop starting", self.name)
+        log.info(
+            "[%s] main loop starting (sub_refresh=%.1fs recreate_after=%.1fs)",
+            self.name, self.sub_refresh_s, self.dealer_recreate_after_s,
+        )
         try:
             while self._running:
                 now = time.time()
 
-                # Periodically re-subscribe to upstreams (handles restarts).
+                # Auto-recreate DEALERs that have been silent for too long
+                # (the upstream container may have moved to a new IP).
+                if self._upstreams and self.dealer_recreate_after_s > 0:
+                    for info in self._upstreams:
+                        silent_for = now - info["last_recv_at"]
+                        if silent_for >= self.dealer_recreate_after_s:
+                            self._recreate_upstream(
+                                info, reason=f"silent {silent_for:.0f}s",
+                            )
+
+                # Periodically re-subscribe to upstreams (handles restarts
+                # where the upstream's subscriber set was cleared).
                 if (
-                    self.dealers
+                    self._upstreams
                     and now - self._last_sub_refresh >= self.sub_refresh_s
                 ):
-                    for _host, dealer in self.dealers:
+                    for info in self._upstreams:
                         try:
-                            dealer.send(b"SUB", zmq.NOBLOCK)
+                            info["socket"].send(b"SUB", zmq.NOBLOCK)
                         except zmq.ZMQError:
                             pass
                     self._last_sub_refresh = now
@@ -255,9 +354,9 @@ class ZmqNode:
                 if self.router in events:
                     self._drain_router()
 
-                for _host, dealer in self.dealers:
-                    if dealer in events:
-                        self._drain_dealer(dealer)
+                for info in self._upstreams:
+                    if info["socket"] in events:
+                        self._drain_dealer(info)
         except KeyboardInterrupt:
             log.info("[%s] interrupted", self.name)
         finally:
@@ -270,9 +369,12 @@ class ZmqNode:
         if self.router is not None:
             self.router.close()
             self.router = None
-        for _host, dealer in self.dealers:
-            dealer.close()
-        self.dealers = []
+        for info in self._upstreams:
+            try:
+                info["socket"].close()
+            except zmq.ZMQError:
+                pass
+        self._upstreams = []
         log.info("[%s] shutdown complete", self.name)
 
     # ------------------------------------------------------------------
@@ -329,7 +431,8 @@ class ZmqNode:
                     result.get("ok"),
                 )
 
-    def _drain_dealer(self, dealer: zmq.Socket) -> None:
+    def _drain_dealer(self, info: Dict[str, Any]) -> None:
+        dealer = info["socket"]
         while True:
             try:
                 frames = dealer.recv_multipart(zmq.NOBLOCK)
@@ -345,11 +448,52 @@ class ZmqNode:
                 log.warning("[%s] bad protobuf: %s", self.name, exc)
                 continue
             self.total_received += 1
+            info["last_recv_at"] = time.time()
+            info["events_received"] += 1
             if self._on_event is not None:
                 try:
                     self._on_event(topic, msg)
                 except Exception:  # noqa: BLE001
                     log.exception("[%s] event handler raised", self.name)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def upstream_status(self) -> List[Dict[str, Any]]:
+        """Per-upstream snapshot for status / diagnostics CTL replies."""
+        now = time.time()
+        out: List[Dict[str, Any]] = []
+        for info in self._upstreams:
+            out.append({
+                "host": info["host"],
+                "port": info["port"],
+                "events_received": info["events_received"],
+                "recreations": info["recreations"],
+                "connected_for_s": round(now - info["connected_at"], 1),
+                "silent_for_s": round(now - info["last_recv_at"], 1),
+            })
+        return out
+
+    def status_snapshot(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Common status payload that every role can fold into its CTL reply.
+
+        Returns a dict with uptime, total counters, subscriber count, and
+        per-upstream diagnostics.  Roles can ``return {**node.status_snapshot(), **role_specific}``.
+        """
+        base: Dict[str, Any] = {
+            "ok": True,
+            "node_name": self.name,
+            "uptime_s": round(time.time() - self.started_at, 1),
+            "total_received": self.total_received,
+            "total_published": self.total_published,
+            "subscribers": len(self.subscribers),
+            "upstreams_connected": len(self._upstreams),
+            "upstreams": self.upstream_status(),
+        }
+        if extra:
+            base.update(extra)
+        return base
 
 
 # ---------------------------------------------------------------------------

@@ -79,15 +79,11 @@ def run(node: ZmqNode, config: dict) -> None:
         if action == "broadcast":
             return do_broadcast(cmd)
         if action in ("status", "snapshot"):
-            return {
-                "ok": True,
-                "node_name": node.name,
+            return node.status_snapshot({
                 "role": "notification-bus",
-                "subscribers": len(node.subscribers),
                 "total_broadcasts": state.total_broadcasts,
                 "recent": list(state.recent),
-                "uptime_s": round(time.time() - node.started_at, 1),
-            }
+            })
         return {"ok": False, "error": f"unknown action: {action!r}"}
 
     node.on_control(control)

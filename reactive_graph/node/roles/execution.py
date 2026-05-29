@@ -199,9 +199,7 @@ def run(node: ZmqNode, config: dict) -> None:
                 "total_fills": state.total_fills,
             }
         if action in ("status", "snapshot"):
-            return {
-                "ok": True,
-                "node_name": node.name,
+            return node.status_snapshot({
                 "role": "execution-simulator",
                 "slippage_bps": state.slippage_bps,
                 "fill_delay_s": state.fill_delay_s,
@@ -216,8 +214,7 @@ def run(node: ZmqNode, config: dict) -> None:
                     }
                     for sym, p in state.positions.items()
                 },
-                "uptime_s": round(time.time() - node.started_at, 1),
-            }
+            })
         return {"ok": False, "error": f"unknown action: {action!r}"}
 
     node.on_control(control)

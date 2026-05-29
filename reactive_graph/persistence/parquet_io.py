@@ -101,11 +101,35 @@ class _LocalFsBlob:
             p.unlink()
 
 
+def _datatailr_cli_available() -> bool:
+    """True iff the ``dt`` CLI is actually invocable on this machine.
+
+    The Datatailr SDK is happy to import even when the CLI isn't present,
+    but every Blob operation shells out to ``dt`` and would then raise at
+    call time.  We probe up-front and gracefully fall back to the
+    filesystem mock so local development stays usable.
+    """
+    try:
+        from datatailr.wrapper import CLI_TOOL  # type: ignore[import-not-found]
+        return CLI_TOOL is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def get_blob():
     """Return the active blob backend (Datatailr or filesystem mock)."""
+    if os.environ.get("REACTIVE_GRAPH_FORCE_LOCAL_BLOB", "").lower() in (
+        "1", "true", "yes"
+    ):
+        root = os.environ.get(
+            "REACTIVE_GRAPH_LOCAL_BLOB_DIR", "/tmp/reactive_graph_blob"
+        )
+        log.info("using local-fs blob at %s (forced by env)", root)
+        return _LocalFsBlob(root)
     try:
         from datatailr import Blob  # type: ignore[import-not-found]
-
+        if not _datatailr_cli_available():
+            raise RuntimeError("datatailr CLI ('dt') not available")
         return Blob()
     except Exception as exc:  # noqa: BLE001
         root = os.environ.get(
@@ -210,14 +234,52 @@ def positions_to_parquet_bytes(positions: Dict[str, Dict[str, Any]]) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+def _normalise_ls_entries(entries: Iterable[Any], prefix: str) -> List[str]:
+    """Coerce a heterogeneous ``blob.ls()`` result into full path strings.
+
+    The two backends we support disagree on the shape of ``ls()``:
+
+    * :class:`_LocalFsBlob.ls` returns ``List[str]`` of full relative paths.
+    * :class:`datatailr.Blob.ls` returns ``List[dict]`` with ``name``
+      (relative to *prefix*), ``is_file``, ``last_modified`` and ``size``.
+
+    This helper normalises both into a flat list of full paths (no
+    ``blob://`` scheme), prepending *prefix* when the entry is a bare
+    basename.
+    """
+    norm_prefix = prefix.rstrip("/") + "/"
+    out: List[str] = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            if entry.get("is_file") is False:
+                continue
+            name = entry.get("name") or entry.get("path") or ""
+        else:
+            name = str(entry)
+        if not name:
+            continue
+        if name.startswith("blob://"):
+            name = name[len("blob://"):]
+        if not name.startswith(norm_prefix):
+            name = norm_prefix + name.lstrip("/")
+        out.append(name)
+    return out
+
+
 def list_parquet_files(blob, prefix: str) -> List[str]:
-    """Return every blob key under *prefix* that ends in ``.parquet``."""
+    """Return every blob key under *prefix* that ends in ``.parquet``.
+
+    Works against both :class:`_LocalFsBlob` and :class:`datatailr.Blob`
+    by normalising the heterogeneous ``ls()`` return shapes.
+    """
+    entries: List[Any] = []
     try:
-        paths = blob.ls(prefix)
+        entries = list(blob.ls(prefix))
     except Exception as exc:  # noqa: BLE001
         log.warning("blob.ls(%s) failed: %s", prefix, exc)
         return []
-    return sorted(p for p in paths if p.endswith(".parquet"))
+    paths = _normalise_ls_entries(entries, prefix)
+    return sorted({p for p in paths if p.endswith(".parquet")})
 
 
 def today_partition(prefix: str, date: Optional[str] = None) -> str:
@@ -228,9 +290,17 @@ def today_partition(prefix: str, date: Optional[str] = None) -> str:
     return f"{prefix}/dt={date}/"
 
 
-def _materialise_locally(blob, paths: Iterable[str], tmpdir: str) -> List[str]:
-    """Download *paths* into *tmpdir* and return the local file paths."""
+def _materialise_locally(
+    blob, paths: Iterable[str], tmpdir: str
+) -> Dict[str, Any]:
+    """Download *paths* into *tmpdir*.
+
+    Returns ``{"local_files": [...], "errors": [{"path", "error"}, ...]}``
+    so callers can both consume the local files and surface why downloads
+    failed (network, permissions, path normalisation, ...).
+    """
     local_files: List[str] = []
+    errors: List[Dict[str, str]] = []
     for i, p in enumerate(paths):
         local = os.path.join(tmpdir, f"{i:06d}.parquet")
         try:
@@ -238,7 +308,38 @@ def _materialise_locally(blob, paths: Iterable[str], tmpdir: str) -> List[str]:
             local_files.append(local)
         except Exception as exc:  # noqa: BLE001
             log.warning("could not download %s: %s", p, exc)
-    return local_files
+            errors.append({"path": p, "error": str(exc)})
+    return {"local_files": local_files, "errors": errors}
+
+
+def _empty_view_sql(view_name: str, schema_fields) -> str:
+    """SQL that creates a properly-typed empty view.
+
+    DuckDB queries that reference specific columns blow up with a
+    ``Binder Error`` when the view is built with no schema (the previous
+    ``SELECT NULL WHERE FALSE`` trick), so we instead emit a typed CTE
+    that guarantees every expected column exists.
+    """
+    duck_types = {
+        "string": "VARCHAR",
+        "int64": "BIGINT",
+        "float64": "DOUBLE",
+    }
+    cols = ", ".join(
+        f"NULL::{duck_types[ty]} AS {name}" for name, ty in schema_fields
+    )
+    return (
+        f"CREATE OR REPLACE VIEW {view_name} AS "
+        f"SELECT {cols} WHERE FALSE"
+    )
+
+
+def _view_schema_for(view_name: str):
+    if view_name == "trades":
+        return FILLS_SCHEMA_FIELDS
+    if view_name in ("positions", "positions_history"):
+        return POSITIONS_SCHEMA_FIELDS
+    return None
 
 
 def duckdb_query(
@@ -247,6 +348,7 @@ def duckdb_query(
     blob=None,
     views: Optional[Dict[str, List[str]]] = None,
     params: Optional[List[Any]] = None,
+    schemas: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Run *sql* in a fresh DuckDB connection.
 
@@ -254,19 +356,24 @@ def duckdb_query(
     up that view; each list is downloaded to a tempdir and registered
     via ``CREATE VIEW <name> AS SELECT * FROM read_parquet([...])``.
 
-    The view is empty (no rows) when the path list is empty so callers
-    can still ``SELECT FROM`` it without checking first.
+    When the path list is empty (or every download fails) the view is
+    still registered, but as a properly-typed empty view derived from
+    *schemas* (or the built-in defaults for ``trades`` / ``positions``)
+    so callers can ``SELECT specific_column FROM <view>`` without ever
+    hitting a Binder Error.
     """
     import duckdb  # type: ignore[import-not-found]
 
     blob = blob if blob is not None else get_blob()
+    schemas = schemas or {}
     con = duckdb.connect()
     tmpdirs: List[str] = []
     try:
         for view_name, paths in (views or {}).items():
             tmp = tempfile.mkdtemp(prefix=f"rg_{view_name}_")
             tmpdirs.append(tmp)
-            files = _materialise_locally(blob, paths, tmp)
+            mat = _materialise_locally(blob, paths, tmp)
+            files = mat["local_files"]
             if files:
                 files_json = json.dumps(files)
                 con.execute(
@@ -275,10 +382,14 @@ def duckdb_query(
                     "union_by_name=true)"
                 )
             else:
-                con.execute(
-                    f"CREATE OR REPLACE VIEW {view_name} AS SELECT NULL "
-                    "WHERE FALSE"
-                )
+                schema = schemas.get(view_name) or _view_schema_for(view_name)
+                if schema is not None:
+                    con.execute(_empty_view_sql(view_name, schema))
+                else:
+                    con.execute(
+                        f"CREATE OR REPLACE VIEW {view_name} AS SELECT NULL "
+                        "WHERE FALSE"
+                    )
 
         cur = con.execute(sql, params) if params else con.execute(sql)
         cols = [d[0] for d in (cur.description or [])]
@@ -310,60 +421,137 @@ def positions_history_paths(
     )
 
 
+def _materialise_views(
+    blob, view_paths: Dict[str, List[str]]
+) -> Dict[str, Dict[str, Any]]:
+    """Download every path listed in *view_paths* into temporary files.
+
+    Returns ``{view_name: {"local_files": [...], "errors": [...], "tmpdir"}}``
+    so callers can wire the files into DuckDB and clean up tempdirs.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for view_name, paths in view_paths.items():
+        tmp = tempfile.mkdtemp(prefix=f"rg_{view_name}_")
+        mat = _materialise_locally(blob, paths, tmp)
+        mat["tmpdir"] = tmp
+        out[view_name] = mat
+    return out
+
+
 def history_summary(blob=None, date: Optional[str] = None) -> Dict[str, Any]:
     """Aggregate today's fills + latest positions via DuckDB.
 
-    Returns a small dict the dashboard renders directly.
+    Returns a small dict the dashboard renders directly.  Always includes
+    diagnostic fields (``trades_prefix``, ``positions_prefix``,
+    ``blob_backend``, sample paths, download error counts) so an empty
+    result can be explained at a glance.
     """
+    import duckdb  # type: ignore[import-not-found]
+
     blob = blob if blob is not None else get_blob()
-    trades = today_trades_paths(blob, date)
-    positions = latest_positions_paths(blob)
-    views = {"trades": trades, "positions": positions}
+    trades_prefix = today_partition(TRADES_PREFIX, date)
+    trades_paths = today_trades_paths(blob, date)
+    positions_paths = latest_positions_paths(blob)
 
-    totals_sql = (
-        "SELECT COUNT(*) AS fill_count, "
-        "       COALESCE(SUM(qty * price), 0) AS notional, "
-        "       COALESCE(SUM(ABS(slippage * qty)), 0) AS slippage_cost "
-        "FROM trades"
-    )
-    by_symbol_sql = (
-        "SELECT symbol, "
-        "       SUM(CASE WHEN side='buy' THEN qty ELSE -qty END) AS net_qty, "
-        "       SUM(qty) AS total_qty, "
-        "       COUNT(*) AS fills, "
-        "       AVG(price) AS avg_price "
-        "FROM trades GROUP BY symbol ORDER BY total_qty DESC"
-    )
-    by_strategy_sql = (
-        "SELECT COALESCE(strategy,'unknown') AS strategy, "
-        "       COUNT(*) AS fills, SUM(qty) AS qty "
-        "FROM trades GROUP BY strategy ORDER BY fills DESC"
-    )
-    recent_sql = (
-        'SELECT symbol, side, qty, price, slippage, strategy, "at" AS ts '
-        'FROM trades ORDER BY "at" DESC LIMIT 20'
-    )
-    pos_sql = (
-        "SELECT symbol, net_qty, avg_price, market_price, "
-        '       realised_pnl, unrealised_pnl, "at" AS ts '
-        "FROM positions ORDER BY symbol"
-    )
-
-    out = {
-        "trades_files": len(trades),
-        "positions_files": len(positions),
+    out: Dict[str, Any] = {
+        "blob_backend": type(blob).__name__,
+        "trades_prefix": trades_prefix,
+        "positions_prefix": POSITIONS_LATEST,
+        "trades_files": len(trades_paths),
+        "positions_files": len(positions_paths),
+        "sample_trade_paths": trades_paths[:3],
+        "sample_position_paths": positions_paths[:3],
+        "totals": {"fill_count": 0, "notional": 0.0, "slippage_cost": 0.0},
+        "by_symbol": [],
+        "by_strategy": [],
+        "recent": [],
+        "positions": [],
     }
+
+    materialised = _materialise_views(blob, {
+        "trades": trades_paths,
+        "positions": positions_paths,
+    })
+    trades_local = materialised["trades"]["local_files"]
+    positions_local = materialised["positions"]["local_files"]
+    trades_errors = materialised["trades"]["errors"]
+    positions_errors = materialised["positions"]["errors"]
+
+    out["trades_downloaded"] = len(trades_local)
+    out["positions_downloaded"] = len(positions_local)
+    if trades_errors:
+        out["trades_download_errors"] = trades_errors[:5]
+    if positions_errors:
+        out["positions_download_errors"] = positions_errors[:5]
+
     try:
-        out["totals"] = (
-            duckdb_query(totals_sql, blob=blob, views=views) or [{}]
-        )[0]
-        out["by_symbol"] = duckdb_query(by_symbol_sql, blob=blob, views=views)
-        out["by_strategy"] = duckdb_query(
-            by_strategy_sql, blob=blob, views=views
-        )
-        out["recent"] = duckdb_query(recent_sql, blob=blob, views=views)
-        out["positions"] = duckdb_query(pos_sql, blob=blob, views=views)
+        con = duckdb.connect()
+        try:
+            if trades_local:
+                con.execute(
+                    "CREATE OR REPLACE VIEW trades AS "
+                    f"SELECT * FROM read_parquet({json.dumps(trades_local)}, "
+                    "union_by_name=true)"
+                )
+            else:
+                con.execute(_empty_view_sql("trades", FILLS_SCHEMA_FIELDS))
+            if positions_local:
+                con.execute(
+                    "CREATE OR REPLACE VIEW positions AS "
+                    f"SELECT * FROM read_parquet({json.dumps(positions_local)}, "
+                    "union_by_name=true)"
+                )
+            else:
+                con.execute(_empty_view_sql("positions", POSITIONS_SCHEMA_FIELDS))
+
+            totals_rows = con.execute(
+                "SELECT COUNT(*) AS fill_count, "
+                "COALESCE(SUM(qty * price), 0) AS notional, "
+                "COALESCE(SUM(ABS(slippage * qty)), 0) AS slippage_cost "
+                "FROM trades"
+            ).fetchall()
+            if totals_rows:
+                cols = ["fill_count", "notional", "slippage_cost"]
+                out["totals"] = dict(zip(cols, totals_rows[0]))
+
+            cur = con.execute(
+                "SELECT symbol, "
+                "SUM(CASE WHEN side='buy' THEN qty ELSE -qty END) AS net_qty, "
+                "SUM(qty) AS total_qty, COUNT(*) AS fills, "
+                "AVG(price) AS avg_price "
+                "FROM trades GROUP BY symbol ORDER BY total_qty DESC"
+            )
+            cols = [d[0] for d in (cur.description or [])]
+            out["by_symbol"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            cur = con.execute(
+                "SELECT COALESCE(strategy,'unknown') AS strategy, "
+                "COUNT(*) AS fills, SUM(qty) AS qty "
+                "FROM trades GROUP BY strategy ORDER BY fills DESC"
+            )
+            cols = [d[0] for d in (cur.description or [])]
+            out["by_strategy"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            cur = con.execute(
+                'SELECT symbol, side, qty, price, slippage, strategy, '
+                '"at" AS ts FROM trades ORDER BY "at" DESC LIMIT 20'
+            )
+            cols = [d[0] for d in (cur.description or [])]
+            out["recent"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            cur = con.execute(
+                "SELECT symbol, net_qty, avg_price, market_price, "
+                'realised_pnl, unrealised_pnl, "at" AS ts '
+                "FROM positions ORDER BY symbol"
+            )
+            cols = [d[0] for d in (cur.description or [])]
+            out["positions"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+        finally:
+            con.close()
     except Exception as exc:  # noqa: BLE001
         log.exception("history_summary duckdb failure")
         out["error"] = str(exc)
+    finally:
+        for v in materialised.values():
+            shutil.rmtree(v.get("tmpdir") or "", ignore_errors=True)
     return out
