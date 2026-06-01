@@ -33,7 +33,7 @@ DEALER_RECREATE_AFTER_S  recreate upstream DEALER if silent for this many
 
 from __future__ import annotations
 
-import logging
+from datatailr.logging import DatatailrLogger
 import os
 
 from live_trading_system.node.transport import ZmqNode, parse_upstreams
@@ -47,7 +47,7 @@ from live_trading_system.node.roles import (
     signals as signals_role,
 )
 
-log = logging.getLogger("live_trading_system.node")
+log = DatatailrLogger(__name__).get_logger()
 
 ROLES = {
     "market-feed": (market_feed_role.run, market_feed_role.config_from_env),
