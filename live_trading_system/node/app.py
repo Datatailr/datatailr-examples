@@ -63,11 +63,6 @@ ROLES = {
 def main(port: int) -> None:
     """Datatailr entry point.  *port* is the platform-assigned port."""
     port = int(port)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-
     role = os.environ.get("NODE_ROLE", "market-feed")
     name = os.environ.get("NODE_NAME", role)
     if role not in ROLES:
