@@ -1,0 +1,6 @@
+fastapi
+pyzmq
+protobuf
+uvicorn
+pyarrow
+duckdb
