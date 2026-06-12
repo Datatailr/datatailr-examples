@@ -29,4 +29,4 @@ if __name__ == "__main__":
     # run locally with the rundate set in the environment variables
     import os
     os.environ["DATATAILR_BATCH_ARG_RUNDATE"] = "2026-04-09"
-    simple_data_pipeline(local_run=True)
+    simple_data_pipeline(local_run=False)

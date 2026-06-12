@@ -23,6 +23,9 @@ from pathlib import Path
 from datatailr import App, Resources
 from datatailr.logging import CYAN
 
+# Add the project root to the path so that the Flask app can import the workflow code.
+sys.path.append(str(Path(__file__).parent.parent))
+
 import gas_curve_backtest.flask_app.app as flask_entrypoint
 from gas_curve_backtest.workflows.parent_workflow import (
     make_run_id,
