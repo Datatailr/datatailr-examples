@@ -1,0 +1,82 @@
+name: Deploy to dev
+
+# Step 1 of the GitFlow promotion pipeline.
+#
+# Running an example's deploy script builds/registers its jobs in the `dev`
+# environment of your Datatailr installation. From there, use the "Promote"
+# workflow to move a specific version up to `pre` and then `prod`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Path to the folder containing the deploy script to run."
+        required: true
+        type: choice
+        default: datatailr_demo
+        options:
+          - datatailr_demo
+          - stock_price_processing
+          - gas_curve_backtest
+          - live_trading_system
+          - weekly_oil_reports
+          - blob_streaming_demo
+      deploy-script:
+        description: "Name of the deploy script inside the selected folder."
+        required: true
+        type: string
+        default: deploy.py
+      datatailr-version:
+        description: "datatailr package version (leave empty for latest)."
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  # Avoid two deploys of the same project racing each other.
+  group: deploy-dev-${{ github.event.inputs.project }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ github.event.inputs.project }} to dev
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Datatailr CLI
+        uses: ./.github/actions/datatailr-cli
+        with:
+          base-url: ${{ secrets.DATATAILR_BASE_URL }}
+          username: ${{ secrets.DATATAILR_USER_NAME }}
+          password: ${{ secrets.DATATAILR_USER_PASSWORD }}
+          datatailr-version: ${{ github.event.inputs.datatailr-version }}
+
+      - name: Install project requirements
+        shell: bash
+        run: |
+          set -euo pipefail
+          req="${{ github.event.inputs.project }}/requirements.txt"
+          if [ -f "$req" ]; then
+            python -m pip install -r "$req"
+          else
+            echo "No requirements.txt found at $req; skipping."
+          fi
+
+      - name: Run deploy script (builds jobs in dev)
+        shell: bash
+        run: |
+          set -euo pipefail
+          script="${{ github.event.inputs.project }}/${{ github.event.inputs.deploy-script }}"
+          if [ ! -f "$script" ]; then
+            echo "::error::Deploy script not found: $script"
+            exit 1
+          fi
+          echo "Deploying $script to the dev environment..."
+          python "$script"
+
+      - name: List jobs in dev
+        shell: bash
+        run: dt job ls -f "environment = dev"

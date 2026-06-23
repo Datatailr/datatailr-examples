@@ -1,0 +1,151 @@
+name: Promote (GitOps)
+
+# Promotions are part of the PR review & merge process.
+#
+#   * On a PR that edits deployments/environments.yaml -> post the promotion plan
+#     as a check + PR comment (no changes are made; this is reviewed by humans).
+#   * On merge to main -> apply the changed versions, promoting dev -> pre -> prod,
+#     gated by the `pre` / `prod` GitHub Environment approvals.
+#
+# The PR review (branch protection on main) is the primary gate; the environment
+# approvals add a second confirmation right before anything touches pre/prod.
+
+on:
+  pull_request:
+    paths:
+      - "deployments/environments.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "deployments/environments.yaml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: promote-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Promotion plan
+    runs-on: ubuntu-latest
+    outputs:
+      has_pre: ${{ steps.plan.outputs.has_pre }}
+      has_prod: ${{ steps.plan.outputs.has_prod }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python -m pip install pyyaml
+
+      - name: Resolve baseline ref
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ref=origin/${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute promotion plan
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/reconcile_promotions.py \
+            --old-ref "${{ steps.baseline.outputs.ref }}" \
+            --plan | tee /tmp/plan.md
+          cat /tmp/plan.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment plan on PR
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = "<!-- promotion-plan -->\n" + fs.readFileSync('/tmp/plan.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes('<!-- promotion-plan -->'));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  promote-pre:
+    name: Promote to pre
+    needs: plan
+    if: github.event_name == 'push' && needs.plan.outputs.has_pre == 'true'
+    runs-on: ubuntu-latest
+    environment: pre
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Datatailr CLI
+        uses: ./.github/actions/datatailr-cli
+        with:
+          base-url: ${{ secrets.DATATAILR_BASE_URL }}
+          username: ${{ secrets.DATATAILR_USER_NAME }}
+          password: ${{ secrets.DATATAILR_USER_PASSWORD }}
+
+      - name: Install PyYAML
+        run: python -m pip install pyyaml
+
+      - name: Apply promotions to pre
+        run: |
+          python .github/scripts/reconcile_promotions.py \
+            --old-ref "${{ github.event.before }}" \
+            --apply --target pre
+
+  promote-prod:
+    name: Promote to prod
+    needs: [plan, promote-pre]
+    # Run after pre (a version must reach pre before prod). Skip cleanly when
+    # promote-pre had nothing to do but a prod change still exists.
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      needs.plan.outputs.has_prod == 'true' &&
+      needs.promote-pre.result != 'failure'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Datatailr CLI
+        uses: ./.github/actions/datatailr-cli
+        with:
+          base-url: ${{ secrets.DATATAILR_BASE_URL }}
+          username: ${{ secrets.DATATAILR_USER_NAME }}
+          password: ${{ secrets.DATATAILR_USER_PASSWORD }}
+
+      - name: Install PyYAML
+        run: python -m pip install pyyaml
+
+      - name: Apply promotions to prod
+        run: |
+          python .github/scripts/reconcile_promotions.py \
+            --old-ref "${{ github.event.before }}" \
+            --apply --target prod
