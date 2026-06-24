@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from agent_service import blob_sync, pi_runner, sessions
@@ -32,6 +32,9 @@ from agent_service import blob_sync, pi_runner, sessions
 # Default model if the `agent_model` KV key is not set. Provider-prefixed so pi
 # selects OpenAI without a separate --provider flag.
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "openai/gpt-5.1")
+# Thinking/reasoning level passed to pi (off, minimal, low, medium, high, xhigh).
+# Enables streamed thinking feedback. Set AGENT_THINKING=off to disable.
+AGENT_THINKING = os.environ.get("AGENT_THINKING", "medium")
 # Datatailr secret/KV key names (create the secret in the Secrets Manager UI).
 OPENAI_SECRET_KEY = os.environ.get("OPENAI_SECRET_KEY", "openai_api_key")
 MODEL_KV_KEY = os.environ.get("MODEL_KV_KEY", "agent_model")
@@ -231,6 +234,7 @@ def chat(req: ChatRequest, x_agent_user: Optional[str] = Header(None)) -> dict:
                 model=_config.model,
                 session_name=req.session_name,
                 session_dir=session_dir,
+                thinking=AGENT_THINKING,
             )
         except Exception as exc:  # noqa: BLE001 - surface failures to the client
             raise HTTPException(status_code=500, detail=f"pi run failed: {exc}")
@@ -245,6 +249,62 @@ def chat(req: ChatRequest, x_agent_user: Optional[str] = Header(None)) -> dict:
         "usage": result.usage,
         "user": user,
     }
+
+
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+@app.post("/chat/stream")
+def chat_stream(req: ChatRequest, x_agent_user: Optional[str] = Header(None)):
+    """Stream pi's thinking/text/tool events live as Server-Sent Events."""
+    if not req.message or not req.message.strip():
+        raise HTTPException(status_code=400, detail="message must not be empty")
+    if not os.environ.get("OPENAI_API_KEY") and not _load_openai_key():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"OpenAI API key not configured. Create a secret named "
+                f"'{OPENAI_SECRET_KEY}' in the Datatailr Secrets Manager."
+            ),
+        )
+
+    user = _safe_user(x_agent_user)
+    session_dir = _user_session_dir(user)
+    lock = _lock_for(user, req.session_id)
+
+    def event_stream():
+        lock.acquire()
+        try:
+            for event in pi_runner.stream_pi(
+                message=req.message,
+                session_id=req.session_id,
+                model=_config.model,
+                session_name=req.session_name,
+                session_dir=session_dir,
+                thinking=AGENT_THINKING,
+            ):
+                if event.get("type") == "done":
+                    event["user"] = user
+                yield _sse(event)
+        except Exception as exc:  # noqa: BLE001
+            yield _sse({"type": "error", "detail": f"pi run failed: {exc}"})
+        finally:
+            try:
+                _persist_user_sessions(user)
+                _persist_config()
+            finally:
+                lock.release()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/sessions")

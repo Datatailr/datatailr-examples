@@ -15,7 +15,14 @@ import os
 from typing import Optional
 
 import requests
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import (
+    Flask,
+    Response,
+    jsonify,
+    render_template_string,
+    request,
+    stream_with_context,
+)
 
 # Internal service URL. "Pi Agent Service" normalizes to "pi-agent-service".
 SERVICE_URL = os.environ.get("AGENT_SERVICE_URL", "http://pi-agent-service").rstrip("/")
@@ -86,6 +93,37 @@ def api_chat():
         )
     except requests.RequestException as exc:
         return jsonify({"detail": f"Could not reach agent service: {exc}"}), 502
+
+
+@app.route("/api/chat/stream", methods=["POST"])
+def api_chat_stream():
+    payload = request.get_json(force=True, silent=True) or {}
+    headers = _forward_headers()
+
+    def relay():
+        try:
+            with requests.post(
+                f"{SERVICE_URL}/chat/stream",
+                json=payload,
+                headers=headers,
+                stream=True,
+                timeout=REQUEST_TIMEOUT,
+            ) as resp:
+                for chunk in resp.iter_content(chunk_size=None):
+                    if chunk:
+                        yield chunk
+        except requests.RequestException as exc:
+            yield (
+                "data: "
+                + json.dumps({"type": "error", "detail": f"Could not reach agent service: {exc}"})
+                + "\n\n"
+            ).encode()
+
+    return Response(
+        stream_with_context(relay()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.route("/api/sessions")
@@ -188,6 +226,30 @@ _PAGE = r"""
                      color: #fff; font-weight: 600; cursor: pointer; }
   .composer button:disabled { opacity: .5; cursor: not-allowed; }
   .empty { margin: auto; color: var(--muted); text-align: center; }
+
+  /* Streaming / CLI feel */
+  .msg .thinking { display: none; margin: 2px 0 8px; padding: 6px 10px;
+                   border-left: 2px solid var(--border); background: rgba(255,255,255,.02);
+                   border-radius: 6px; }
+  .msg .thinking.show { display: block; }
+  .msg .th-label { cursor: pointer; color: var(--muted); font-size: 10px;
+                   text-transform: uppercase; letter-spacing: .6px; user-select: none; }
+  .msg .th-body { display: none; white-space: pre-wrap; color: var(--muted);
+                  font-style: italic; font-size: 13px; margin-top: 6px;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .msg .thinking.open .th-body { display: block; }
+  .msg .tools { display: flex; flex-direction: column; gap: 4px; margin: 4px 0; }
+  .msg .tool { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+               color: var(--muted); }
+  .msg .tool .spin { color: var(--accent); animation: pulse 1s ease-in-out infinite; }
+  .msg .tool.done { color: var(--accent-2); }
+  .msg .tool.error { color: #e0607e; }
+  .msg .text { white-space: pre-wrap; }
+  .cursor { display: inline-block; width: 7px; height: 1em; vertical-align: text-bottom;
+            background: var(--accent); margin-left: 1px;
+            animation: blink 1s steps(2, start) infinite; }
+  @keyframes blink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 
   /* Dashboard */
   #dashboard { flex-direction: column; overflow-y: auto; padding: 24px; gap: 20px; }
@@ -343,6 +405,87 @@ function newChat() {
   loadSessions();
 }
 
+// Builds a live-updating assistant message. The service streams normalized
+// events (thinking / text / tool_start / tool_end / done / error) which we
+// render incrementally to mimic the CLI experience.
+function createAssistantStream() {
+  const box = document.getElementById('messages');
+  const empty = box.querySelector('.empty');
+  if (empty) empty.remove();
+  const root = document.createElement('div');
+  root.className = 'msg assistant';
+  root.innerHTML =
+    '<div class="role">assistant</div>' +
+    '<div class="thinking"><span class="th-label">thinking</span><div class="th-body"></div></div>' +
+    '<div class="tools"></div>' +
+    '<div class="text"></div><span class="cursor"></span>';
+  box.appendChild(root);
+  const thinkingEl = root.querySelector('.thinking');
+  const thBody = root.querySelector('.th-body');
+  const thLabel = root.querySelector('.th-label');
+  const toolsEl = root.querySelector('.tools');
+  const textEl = root.querySelector('.text');
+  const cursor = root.querySelector('.cursor');
+  const tools = {};
+  let hasText = false;
+  thLabel.onclick = () => thinkingEl.classList.toggle('open');
+  const scroll = () => { box.scrollTop = box.scrollHeight; };
+
+  return {
+    handle(ev) {
+      switch (ev.type) {
+        case 'session':
+          if (ev.session_id) currentSession = ev.session_id;
+          break;
+        case 'thinking':
+          thinkingEl.classList.add('show', 'open');
+          thBody.textContent += ev.delta || '';
+          scroll();
+          break;
+        case 'text':
+          hasText = true;
+          textEl.textContent += ev.delta || '';
+          scroll();
+          break;
+        case 'tool_start': {
+          const t = document.createElement('div');
+          t.className = 'tool';
+          t.innerHTML = `<span class="spin">●</span> ${esc(ev.name || 'tool')}`;
+          toolsEl.appendChild(t);
+          tools[ev.id || ev.name] = t;
+          scroll();
+          break;
+        }
+        case 'tool_end': {
+          const t = tools[ev.id || ev.name];
+          if (t) {
+            t.classList.add(ev.is_error ? 'error' : 'done');
+            t.innerHTML = `<span>${ev.is_error ? '\u2717' : '\u2713'}</span> ${esc(ev.name || 'tool')}`;
+          }
+          break;
+        }
+        case 'done':
+          if (ev.session_id) currentSession = ev.session_id;
+          if (!hasText && ev.reply) textEl.textContent = ev.reply;
+          break;
+        case 'error':
+          this.fail(ev.detail || 'Request failed');
+          break;
+      }
+    },
+    finish() {
+      cursor.remove();
+      // Collapse thinking once the turn is done, but keep it toggleable.
+      thinkingEl.classList.remove('open');
+    },
+    fail(msg) {
+      cursor.remove();
+      root.querySelector('.role').textContent = 'error';
+      textEl.textContent = msg;
+    },
+  };
+}
+
 async function send() {
   if (streaming) return;
   const input = document.getElementById('input');
@@ -350,27 +493,48 @@ async function send() {
   if (!text) return;
   input.value = '';
   addMessage('user', text);
-  const pending = addMessage('assistant', 'Thinking...');
+  const stream = createAssistantStream();
   streaming = true;
   document.getElementById('send-btn').disabled = true;
   try {
-    const r = await fetch(apiUrl('/api/chat'), {
+    const r = await fetch(apiUrl('/api/chat/stream'), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: text, session_id: currentSession }),
     });
-    const data = await readJson(r);
-    if (!r.ok) {
-      pending.innerHTML = `<div class="role">error</div>${esc(data.detail || 'Request failed')}`;
-    } else {
-      currentSession = data.session_id || currentSession;
-      pending.innerHTML = `<div class="role">assistant</div>${esc(data.reply)}`;
-      loadSessions();
+    if (!r.ok || !r.body) {
+      const data = await readJson(r);
+      stream.fail(data.detail || ('HTTP ' + r.status));
+      return;
     }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // SSE frames are separated by a blank line.
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const payload = frame.split('\n')
+          .filter(l => l.startsWith('data:'))
+          .map(l => l.slice(5).trim())
+          .join('');
+        if (!payload) continue;
+        let ev;
+        try { ev = JSON.parse(payload); } catch { continue; }
+        stream.handle(ev);
+      }
+    }
+    stream.finish();
   } catch (e) {
-    pending.innerHTML = `<div class="role">error</div>${esc(String(e))}`;
+    stream.fail(String(e));
   } finally {
     streaming = false;
     document.getElementById('send-btn').disabled = false;
+    loadSessions();
   }
 }
 
