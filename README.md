@@ -32,16 +32,6 @@ cd datatailr_demo
 python deploy.py
 ```
 
-## Deployment & promotion (CI/CD)
-
-This repo includes GitHub Actions for a GitFlow-style release pipeline. Jobs are
-deployed to `dev`, then promoted up to `pre` and `prod` through the **pull-request
-review and merge process**: you declare the target version in
-`deployments/environments.yaml`, open a PR (which posts a promotion plan), and on
-merge the change is promoted via the remote Datatailr CLI, gated by GitHub
-Environment approvals. See [`docs/gitflow-deployment.md`](docs/gitflow-deployment.md)
-for setup (secrets, branch protection, environments) and step-by-step usage.
-
 ## Contributing
 
 Contributions are welcome.
