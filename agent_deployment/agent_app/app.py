@@ -9,7 +9,10 @@ are no CORS concerns. All history/stats originate from the service parsing its
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+from typing import Optional
 
 import requests
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -18,23 +21,63 @@ from flask import Flask, Response, jsonify, render_template_string, request
 SERVICE_URL = os.environ.get("AGENT_SERVICE_URL", "http://pi-agent-service").rstrip("/")
 REQUEST_TIMEOUT = int(os.environ.get("AGENT_REQUEST_TIMEOUT", "650"))
 
+# Header the Datatailr platform sets on requests to the app, identifying the
+# authenticated browser user (a JSON blob with a "name" field). We forward the
+# resolved username to the service so it can isolate sessions per user.
+USER_HEADER = "x-datatailr-user"
+FORWARD_HEADER = "X-Agent-User"
+
+log = logging.getLogger("agent_app")
 app = Flask(__name__)
 
 
+def username_from_request() -> Optional[str]:
+    """Return the authenticated username from the platform header, or None.
+
+    Reads and parses the ``x-datatailr-user`` header only -- no platform call,
+    so it is safe to invoke on every request.
+    """
+    raw = request.headers.get(USER_HEADER)
+    if not raw:
+        return None
+    try:
+        name = json.loads(raw).get("name")
+    except (ValueError, TypeError, AttributeError):
+        log.warning("could not parse %s header as JSON", USER_HEADER)
+        return None
+    return name or None
+
+
+def _forward_headers() -> dict:
+    """Headers to attach to the proxied service request (carries identity)."""
+    user = username_from_request()
+    return {FORWARD_HEADER: user} if user else {}
+
+
 def _service_get(path: str):
-    resp = requests.get(f"{SERVICE_URL}{path}", timeout=REQUEST_TIMEOUT)
+    resp = requests.get(
+        f"{SERVICE_URL}{path}", headers=_forward_headers(), timeout=REQUEST_TIMEOUT
+    )
     return resp.json(), resp.status_code
 
 
 # --------------------------------------------------------------------------- #
 # API proxy routes
 # --------------------------------------------------------------------------- #
+@app.route("/api/whoami")
+def api_whoami():
+    return jsonify({"user": username_from_request()})
+
+
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     payload = request.get_json(force=True, silent=True) or {}
     try:
         resp = requests.post(
-            f"{SERVICE_URL}/chat", json=payload, timeout=REQUEST_TIMEOUT
+            f"{SERVICE_URL}/chat",
+            json=payload,
+            headers=_forward_headers(),
+            timeout=REQUEST_TIMEOUT,
         )
         return Response(
             resp.content,
@@ -165,6 +208,7 @@ _PAGE = r"""
 <header>
   <span class="dot" id="status-dot"></span>
   <h1>Pi Agent</h1>
+  <span id="whoami" style="font-size:13px;color:var(--muted);"></span>
   <nav>
     <button id="tab-chat" class="active" onclick="showView('chat')">Chat</button>
     <button id="tab-dash" onclick="showView('dashboard')">Dashboard</button>
@@ -232,6 +276,14 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s || 
 async function checkHealth() {
   try { const r = await fetch(apiUrl('/api/sessions')); document.getElementById('status-dot').classList.toggle('ok', r.ok); }
   catch { document.getElementById('status-dot').classList.remove('ok'); }
+}
+
+async function loadWhoami() {
+  try {
+    const r = await fetch(apiUrl('/api/whoami'));
+    const data = await readJson(r);
+    document.getElementById('whoami').textContent = data.user ? ('@' + data.user) : '';
+  } catch (e) { /* ignore */ }
 }
 
 async function loadSessions() {
@@ -376,6 +428,7 @@ async function loadDashboard() {
   }
 }
 
+loadWhoami();
 checkHealth();
 loadSessions();
 setInterval(checkHealth, 15000);

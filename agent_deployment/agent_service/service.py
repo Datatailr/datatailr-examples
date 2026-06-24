@@ -1,28 +1,33 @@
 """FastAPI service that runs the pi coding agent and exposes it over HTTP.
 
 Responsibilities:
-- own the pi runtime and its ~/.pi session store inside this container
-- expose a chat API that drives pi non-interactively
-- expose history/stats endpoints built by parsing the ~/.pi session JSONL
-- persist the session store to Datatailr blob storage across restarts
+- own the pi runtime and the agent config dirs (~/.pi, ~/.agents) in this container
+- run pi non-interactively, isolating sessions per requesting user
+- expose chat + per-user history/stats endpoints (parsed from the session store)
+- persist per-user sessions AND the global config dirs to Datatailr blob storage
+  so all state survives container restarts
 
-The GUI app talks to this service over Datatailr's internal service URL.
+The GUI app authenticates the browser user via the platform's `x-datatailr-user`
+header and forwards the username to this service in the `X-Agent-User` header.
+Sessions are stored under <PI_SESSION_DIR>/<user>/ and mirrored to blob storage
+under agent_sessions/<user>/.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from agent_service import pi_runner, sessions
+from agent_service import blob_sync, pi_runner, sessions
 
 # Default model if the `agent_model` KV key is not set. Provider-prefixed so pi
 # selects OpenAI without a separate --provider flag.
@@ -30,6 +35,18 @@ DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "openai/gpt-5.1")
 # Datatailr secret/KV key names (create the secret in the Secrets Manager UI).
 OPENAI_SECRET_KEY = os.environ.get("OPENAI_SECRET_KEY", "openai_api_key")
 MODEL_KV_KEY = os.environ.get("MODEL_KV_KEY", "agent_model")
+
+# Fallback user when no identity header is present (e.g. local dev).
+DEFAULT_USER = os.environ.get("AGENT_DEFAULT_USER", "shared")
+
+# Blob prefixes.
+SESSIONS_BLOB_PREFIX = os.environ.get("AGENT_SESSIONS_PREFIX", "agent_sessions")
+PI_CONFIG_BLOB_PREFIX = os.environ.get("AGENT_PI_CONFIG_PREFIX", "agent_state/pi")
+AGENTS_BLOB_PREFIX = os.environ.get("AGENT_AGENTS_PREFIX", "agent_state/agents")
+
+# Config sync excludes the per-user sessions tree (persisted separately) so the
+# global config blob never mixes user data.
+_PI_CONFIG_EXCLUDES = {"sessions"}
 
 
 # --------------------------------------------------------------------------- #
@@ -41,13 +58,24 @@ class _Config:
 
 _config = _Config()
 
-# One lock per session id so concurrent requests never write the same file.
+# One lock per (user, session) so concurrent requests never write the same file.
 _session_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 _locks_guard = threading.Lock()
+_USER_RE = re.compile(r"[^A-Za-z0-9_.-]")
 
 
-def _lock_for(session_id: Optional[str]) -> threading.Lock:
-    key = session_id or "__new__"
+def _safe_user(name: Optional[str]) -> str:
+    """Normalize a username into a filesystem/blob-safe token."""
+    cleaned = _USER_RE.sub("_", (name or "").strip())
+    return cleaned or DEFAULT_USER
+
+
+def _user_session_dir(user: str) -> str:
+    return os.path.join(pi_runner.PI_SESSION_DIR, user)
+
+
+def _lock_for(user: str, session_id: Optional[str]) -> threading.Lock:
+    key = f"{user}:{session_id or '__new__'}"
     with _locks_guard:
         return _session_locks[key]
 
@@ -97,19 +125,51 @@ def _write_pi_settings() -> None:
     except OSError:
         pass
 
+
 def _setup_datatailr_skills() -> None:
-    """Setup the Datatailr skills."""
-    from datatailr.sbin.datatailr_cli import setup_skills
-    setup_skills(global_dir=True)
+    """Install the Datatailr skills into the global agent skills dir."""
+    try:
+        from datatailr.sbin.datatailr_cli import setup_skills
+
+        setup_skills(global_dir=True)
+    except Exception:
+        pass
+
+
+def _restore_state() -> None:
+    """Pull global config dirs and all per-user sessions from blob storage."""
+    blob_sync.pull_dir(PI_CONFIG_BLOB_PREFIX, pi_runner.PI_AGENT_DIR)
+    blob_sync.pull_dir(AGENTS_BLOB_PREFIX, pi_runner.AGENTS_DIR)
+    blob_sync.pull_dir(SESSIONS_BLOB_PREFIX, pi_runner.PI_SESSION_DIR)
+
+
+def _persist_config() -> None:
+    """Push the global config dirs (~/.pi sans sessions, and ~/.agents)."""
+    blob_sync.push_dir(
+        pi_runner.PI_AGENT_DIR, PI_CONFIG_BLOB_PREFIX, exclude_dirs=_PI_CONFIG_EXCLUDES
+    )
+    blob_sync.push_dir(pi_runner.AGENTS_DIR, AGENTS_BLOB_PREFIX)
+
+
+def _persist_user_sessions(user: str) -> None:
+    """Push a single user's session store."""
+    blob_sync.push_dir(
+        _user_session_dir(user), f"{SESSIONS_BLOB_PREFIX}/{user}"
+    )
+
 
 def _startup() -> None:
     os.makedirs(pi_runner.PI_WORKSPACE_DIR, exist_ok=True)
     os.makedirs(pi_runner.PI_SESSION_DIR, exist_ok=True)
+    os.makedirs(pi_runner.AGENTS_DIR, exist_ok=True)
     _config.model = _load_model()
     _load_openai_key()
+    # Restore prior state first, then (idempotently) ensure skills/settings, then
+    # persist so the blob reflects the freshly set up config.
+    _restore_state()
     _setup_datatailr_skills()
     _write_pi_settings()
-    sessions.restore_from_blob()
+    _persist_config()
 
 
 @asynccontextmanager
@@ -148,7 +208,7 @@ def index() -> dict:
 
 
 @app.post("/chat")
-def chat(req: ChatRequest) -> dict:
+def chat(req: ChatRequest, x_agent_user: Optional[str] = Header(None)) -> dict:
     if not req.message or not req.message.strip():
         raise HTTPException(status_code=400, detail="message must not be empty")
     if not os.environ.get("OPENAI_API_KEY") and not _load_openai_key():
@@ -160,43 +220,54 @@ def chat(req: ChatRequest) -> dict:
             ),
         )
 
-    with _lock_for(req.session_id):
+    user = _safe_user(x_agent_user)
+    session_dir = _user_session_dir(user)
+
+    with _lock_for(user, req.session_id):
         try:
             result = pi_runner.run_pi(
                 message=req.message,
                 session_id=req.session_id,
                 model=_config.model,
                 session_name=req.session_name,
+                session_dir=session_dir,
             )
         except Exception as exc:  # noqa: BLE001 - surface failures to the client
             raise HTTPException(status_code=500, detail=f"pi run failed: {exc}")
 
-    # Persist updated history so it survives container restarts.
-    sessions.sync_to_blob()
+    # Persist updated history (and any config the agent changed via its tools).
+    _persist_user_sessions(user)
+    _persist_config()
 
     return {
         "session_id": result.session_id,
         "reply": result.reply,
         "usage": result.usage,
+        "user": user,
     }
 
 
 @app.get("/sessions")
-def get_sessions() -> dict:
-    return {"sessions": sessions.list_sessions()}
+def get_sessions(x_agent_user: Optional[str] = Header(None)) -> dict:
+    user = _safe_user(x_agent_user)
+    return {"user": user, "sessions": sessions.list_sessions(_user_session_dir(user))}
 
 
 @app.get("/sessions/{session_id}")
-def get_session(session_id: str) -> dict:
-    transcript = sessions.get_transcript(session_id)
+def get_session(session_id: str, x_agent_user: Optional[str] = Header(None)) -> dict:
+    user = _safe_user(x_agent_user)
+    transcript = sessions.get_transcript(session_id, _user_session_dir(user))
     if transcript is None:
         raise HTTPException(status_code=404, detail="session not found")
     return transcript
 
 
 @app.get("/stats")
-def get_stats() -> dict:
-    return sessions.aggregate_stats()
+def get_stats(x_agent_user: Optional[str] = Header(None)) -> dict:
+    user = _safe_user(x_agent_user)
+    stats = sessions.aggregate_stats(_user_session_dir(user))
+    stats["user"] = user
+    return stats
 
 
 def main(port) -> None:

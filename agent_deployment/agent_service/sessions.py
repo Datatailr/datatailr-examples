@@ -1,12 +1,12 @@
-"""Read and aggregate pi session history from the ~/.pi session store.
+"""Read and aggregate pi session history from a session store directory.
 
 Pi writes each session as a JSONL file (see
 https://pi.dev/docs/latest/session-format): the first line is a `session`
 header, subsequent lines are tree entries. We only need the linear list of
 entries here -- enough to render a transcript and compute activity statistics.
 
-This module also syncs the session store to Datatailr blob storage so history
-survives container restarts.
+All functions take an explicit `session_dir` so the caller can scope reads to a
+single user's session store. Blob persistence lives in `blob_sync`.
 """
 
 from __future__ import annotations
@@ -18,19 +18,14 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from agent_service.pi_runner import PI_SESSION_DIR
-
-# Blob storage prefix under which session files are mirrored.
-BLOB_PREFIX = os.environ.get("AGENT_BLOB_PREFIX", "agent_sessions")
-
 
 # --------------------------------------------------------------------------- #
 # Low-level file parsing
 # --------------------------------------------------------------------------- #
-def _session_files() -> list[str]:
+def _session_files(session_dir: str) -> list[str]:
     """All session JSONL files under the (possibly nested) session dir."""
-    pattern = os.path.join(PI_SESSION_DIR, "**", "*.jsonl")
-    flat = os.path.join(PI_SESSION_DIR, "*.jsonl")
+    pattern = os.path.join(session_dir, "**", "*.jsonl")
+    flat = os.path.join(session_dir, "*.jsonl")
     return sorted(set(glob.glob(pattern, recursive=True)) | set(glob.glob(flat)))
 
 
@@ -132,15 +127,15 @@ def _summarize_session(path: str) -> dict[str, Any]:
     }
 
 
-def list_sessions() -> list[dict[str, Any]]:
+def list_sessions(session_dir: str) -> list[dict[str, Any]]:
     """Summary of every stored session, newest activity first."""
-    summaries = [_summarize_session(p) for p in _session_files()]
+    summaries = [_summarize_session(p) for p in _session_files(session_dir)]
     summaries.sort(key=lambda s: s.get("last_active") or "", reverse=True)
     return summaries
 
 
-def _find_file_for_session(session_id: str) -> Optional[str]:
-    for path in _session_files():
+def _find_file_for_session(session_id: str, session_dir: str) -> Optional[str]:
+    for path in _session_files(session_dir):
         entries = _read_jsonl(path)
         header = next((e for e in entries if e.get("type") == "session"), {})
         if header.get("id") == session_id:
@@ -150,9 +145,9 @@ def _find_file_for_session(session_id: str) -> Optional[str]:
     return None
 
 
-def get_transcript(session_id: str) -> Optional[dict[str, Any]]:
+def get_transcript(session_id: str, session_dir: str) -> Optional[dict[str, Any]]:
     """Linear transcript (user/assistant/tool messages) for one session."""
-    path = _find_file_for_session(session_id)
+    path = _find_file_for_session(session_id, session_dir)
     if not path:
         return None
 
@@ -198,7 +193,7 @@ def get_transcript(session_id: str) -> Optional[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Aggregate statistics across all sessions
 # --------------------------------------------------------------------------- #
-def aggregate_stats() -> dict[str, Any]:
+def aggregate_stats(session_dir: str) -> dict[str, Any]:
     totals = {
         "sessions": 0,
         "messages": 0,
@@ -215,7 +210,7 @@ def aggregate_stats() -> dict[str, Any]:
     model_usage: Counter[str] = Counter()
     activity_by_day: dict[str, int] = defaultdict(int)
 
-    for path in _session_files():
+    for path in _session_files(session_dir):
         entries = _read_jsonl(path)
         if not entries:
             continue
@@ -263,56 +258,3 @@ def aggregate_stats() -> dict[str, Any]:
         ],
         "timeline": timeline,
     }
-
-
-# --------------------------------------------------------------------------- #
-# Blob persistence
-# --------------------------------------------------------------------------- #
-def _blob():
-    """Return a Datatailr Blob client, or None if unavailable (e.g. local)."""
-    try:
-        from datatailr import Blob  # imported lazily; only present on platform
-
-        return Blob()
-    except Exception:
-        return None
-
-
-def restore_from_blob() -> int:
-    """Download any previously persisted session files into the session dir."""
-    blob = _blob()
-    if blob is None:
-        return 0
-    os.makedirs(PI_SESSION_DIR, exist_ok=True)
-    restored = 0
-    try:
-        keys = blob.ls(f"{BLOB_PREFIX}/")
-    except Exception:
-        return 0
-    for key in keys or []:
-        filename = os.path.basename(key)
-        if not filename.endswith(".jsonl"):
-            continue
-        dest = os.path.join(PI_SESSION_DIR, filename)
-        try:
-            blob.get_file(key, dest)
-            restored += 1
-        except Exception:
-            continue
-    return restored
-
-
-def sync_to_blob() -> int:
-    """Upload all current session files to blob storage."""
-    blob = _blob()
-    if blob is None:
-        return 0
-    synced = 0
-    for path in _session_files():
-        filename = os.path.basename(path)
-        try:
-            blob.put_file(f"{BLOB_PREFIX}/{filename}", path)
-            synced += 1
-        except Exception:
-            continue
-    return synced

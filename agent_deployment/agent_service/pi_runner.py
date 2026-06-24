@@ -18,9 +18,12 @@ from typing import Any, Optional
 # Where pi stores its config and sessions inside the container. We pin these so
 # the service always knows where to read history from and can persist it.
 PI_AGENT_DIR = os.environ.get("PI_CODING_AGENT_DIR", os.path.expanduser("~/.pi/agent"))
+# Root for session storage; per-user sessions live in <root>/<user>/.
 PI_SESSION_DIR = os.environ.get(
     "PI_CODING_AGENT_SESSION_DIR", os.path.join(PI_AGENT_DIR, "sessions")
 )
+# Global agent skills directory (~/.agents) that pi also discovers.
+AGENTS_DIR = os.environ.get("AGENTS_DIR", os.path.expanduser("~/.agents"))
 # Directory the agent operates in (full read/write/edit/bash tools act here).
 PI_WORKSPACE_DIR = os.environ.get("PI_WORKSPACE_DIR", "/tmp/agent_workspace")
 
@@ -72,22 +75,25 @@ def run_pi(
     session_id: Optional[str] = None,
     model: Optional[str] = None,
     session_name: Optional[str] = None,
+    session_dir: Optional[str] = None,
 ) -> PiResult:
     """Run pi once with `message` and return the parsed result.
 
-    If `session_id` is given, the conversation continues that session;
-    otherwise pi creates a new one and we capture the new id from the session
-    header event.
+    `session_dir` selects where sessions are stored/read (used to isolate
+    sessions per user). If `session_id` is given, the conversation continues
+    that session; otherwise pi creates a new one and we capture the new id from
+    the session header event.
     """
+    session_dir = session_dir or PI_SESSION_DIR
     os.makedirs(PI_WORKSPACE_DIR, exist_ok=True)
-    os.makedirs(PI_SESSION_DIR, exist_ok=True)
+    os.makedirs(session_dir, exist_ok=True)
 
     argv: list[str] = [
         "pi",
         "--mode",
         "json",
         "--session-dir",
-        PI_SESSION_DIR,
+        session_dir,
         # Trust the (empty) workspace folder so non-interactive runs don't skip
         # resources or stall waiting on a prompt.
         "-a",
