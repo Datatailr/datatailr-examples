@@ -40,6 +40,7 @@ def set_winsize(master_fd: int, rows: int, cols: int) -> None:
 def spawn(
     *,
     session_dir: str,
+    workspace_dir: Optional[str] = None,
     model: Optional[str] = None,
     session_id: Optional[str] = None,
     cols: int = 80,
@@ -47,11 +48,14 @@ def spawn(
 ) -> tuple[subprocess.Popen, int]:
     """Start pi attached to a PTY and return (process, master_fd).
 
-    `session_dir` isolates the user's sessions; `session_id` (optional) resumes
-    an existing conversation. The slave end is closed in the parent after the
-    child inherits it, so reading EOF on the master reliably signals exit.
+    `session_dir` isolates the user's sessions and `workspace_dir` isolates the
+    directory the agent's file/bash tools operate in (defaults to the shared
+    workspace). `session_id` (optional) resumes an existing conversation. The
+    slave end is closed in the parent after the child inherits it, so reading
+    EOF on the master reliably signals exit.
     """
-    os.makedirs(pi_runner.PI_WORKSPACE_DIR, exist_ok=True)
+    workspace_dir = workspace_dir or pi_runner.PI_WORKSPACE_DIR
+    os.makedirs(workspace_dir, exist_ok=True)
     os.makedirs(session_dir, exist_ok=True)
 
     master_fd, slave_fd = pty.openpty()
@@ -72,7 +76,7 @@ def spawn(
 
     proc = subprocess.Popen(
         argv,
-        cwd=pi_runner.PI_WORKSPACE_DIR,
+        cwd=workspace_dir,
         env=env,
         stdin=slave_fd,
         stdout=slave_fd,

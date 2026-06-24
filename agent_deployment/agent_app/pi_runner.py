@@ -127,23 +127,26 @@ def run_pi(
     session_name: Optional[str] = None,
     session_dir: Optional[str] = None,
     thinking: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
 ) -> PiResult:
     """Run pi once with `message` and return the parsed result.
 
-    `session_dir` selects where sessions are stored/read (used to isolate
-    sessions per user). If `session_id` is given, the conversation continues
-    that session; otherwise pi creates a new one and we capture the new id from
-    the session header event.
+    `session_dir` selects where sessions are stored/read and `workspace_dir`
+    selects the directory the agent's tools operate in -- both used to isolate
+    state per user. If `session_id` is given, the conversation continues that
+    session; otherwise pi creates a new one and we capture the new id from the
+    session header event.
     """
     session_dir = session_dir or PI_SESSION_DIR
-    os.makedirs(PI_WORKSPACE_DIR, exist_ok=True)
+    workspace_dir = workspace_dir or PI_WORKSPACE_DIR
+    os.makedirs(workspace_dir, exist_ok=True)
     os.makedirs(session_dir, exist_ok=True)
 
     argv = _build_argv(message, session_id, model, session_name, session_dir, thinking)
 
     proc = subprocess.run(
         argv,
-        cwd=PI_WORKSPACE_DIR,
+        cwd=workspace_dir,
         env=_pi_env(),
         capture_output=True,
         text=True,
@@ -200,6 +203,7 @@ def stream_pi(
     session_name: Optional[str] = None,
     session_dir: Optional[str] = None,
     thinking: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
 ) -> Iterator[dict[str, Any]]:
     """Run pi and yield normalized events as they happen (for live streaming).
 
@@ -213,7 +217,8 @@ def stream_pi(
       {"type": "done", "session_id": str, "reply": str, "usage": dict}  (last)
     """
     session_dir = session_dir or PI_SESSION_DIR
-    os.makedirs(PI_WORKSPACE_DIR, exist_ok=True)
+    workspace_dir = workspace_dir or PI_WORKSPACE_DIR
+    os.makedirs(workspace_dir, exist_ok=True)
     os.makedirs(session_dir, exist_ok=True)
 
     argv = _build_argv(message, session_id, model, session_name, session_dir, thinking)
@@ -225,7 +230,7 @@ def stream_pi(
     err_file = tempfile.TemporaryFile(mode="w+")
     proc = subprocess.Popen(
         argv,
-        cwd=PI_WORKSPACE_DIR,
+        cwd=workspace_dir,
         env=_pi_env(),
         stdout=subprocess.PIPE,
         stderr=err_file,

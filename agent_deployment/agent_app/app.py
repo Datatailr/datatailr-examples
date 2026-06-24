@@ -103,6 +103,15 @@ def _user_session_dir(user: str) -> str:
     return os.path.join(pi_runner.PI_SESSION_DIR, user)
 
 
+def _user_workspace_dir(user: str) -> str:
+    """Per-user working directory for the agent's file/bash/edit tools.
+
+    Isolating this keeps one user's files from being visible to another, since
+    all users' pi processes share this single container.
+    """
+    return os.path.join(pi_runner.PI_WORKSPACE_DIR, user)
+
+
 def _lock_for(user: str, session_id: Optional[str]) -> threading.Lock:
     key = f"{user}:{session_id or '__new__'}"
     with _locks_guard:
@@ -288,6 +297,7 @@ def chat(req: ChatRequest, request: Request) -> dict:
                 session_name=req.session_name,
                 session_dir=session_dir,
                 thinking=AGENT_THINKING,
+                workspace_dir=_user_workspace_dir(user),
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"pi run failed: {exc}")
@@ -327,6 +337,7 @@ def chat_stream(req: ChatRequest, request: Request):
                 session_name=req.session_name,
                 session_dir=session_dir,
                 thinking=AGENT_THINKING,
+                workspace_dir=_user_workspace_dir(user),
             ):
                 if event.get("type") == "done":
                     event["user"] = user
@@ -385,6 +396,7 @@ async def ws_pty(websocket: WebSocket) -> None:
     session_dir = _user_session_dir(user)
     proc, master_fd = pty_runner.spawn(
         session_dir=session_dir,
+        workspace_dir=_user_workspace_dir(user),
         model=_config.model,
         session_id=session_id,
         cols=cols,
