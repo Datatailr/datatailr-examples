@@ -1,29 +1,37 @@
-"""Deploy the pi agent GUI as a Datatailr Flask App.
+"""Deploy the self-contained pi agent as a Datatailr FastAPI App.
+
+This single app runs the `pi` coding agent in-container and serves:
+- an interactive xterm.js terminal wired to a live `pi` PTY over a WebSocket
+- a JSON HTTP API (`/chat`, `/chat/stream`) for programmatic access
+- an activity dashboard sourced from the on-disk `~/.pi` session store
+
+The agent runtime lives in the app (not a separate service) because Datatailr's
+internal service-to-service routing does not forward WebSocket upgrades, whereas
+the public app ingress does -- so the terminal's WebSocket must terminate here.
 
 Run from this directory (with the project venv active so the `dt` CLI is on
-PATH), after the service is deployed:
+PATH):
 
     python deploy_app.py
 """
 
-import agent_app.app as entrypoint
-from datatailr import App, Resources
 from pathlib import Path
 
-requirements_file = Path(__file__).parent / "agent_app" / "requirements.txt"
+import agent_app.app as entrypoint
+from datatailr import App, Resources
+
+_here = Path(__file__).parent
+requirements_file = _here / "agent_app" / "requirements.txt"
+build_script_pre_file = _here / "agent_app" / "build_script_pre.sh"
 
 app = App(
     name="Pi Agent UI",
     entrypoint=entrypoint,
-    framework="flask",
-    resources=Resources(memory="1g", cpu=1),
+    framework="fastapi",
+    resources=Resources(memory="2g", cpu=1),
     python_requirements=str(requirements_file),
-    # Streaming (SSE) responses keep a worker busy for the whole agent turn.
-    # Use threaded workers with no request timeout so long streams aren't killed,
-    # and allow other requests (sessions/stats) to be served concurrently.
-    env_vars={
-        "GUNICORN_CMD_ARGS": "--worker-class gthread --workers 2 --threads 8 --timeout 0",
-    },
+    # Installs Node.js + the pi CLI into the app image.
+    build_script_pre=str(build_script_pre_file),
 )
 
 if __name__ == "__main__":

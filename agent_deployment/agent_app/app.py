@@ -1,50 +1,88 @@
-"""Flask GUI for the pi agent service.
+"""Self-contained pi agent app for Datatailr.
 
-Provides a chat interface and an activity dashboard. The browser talks to this
-app same-origin; the app proxies requests to the internal Datatailr service URL
-(`http://pi-agent-service` by default), so the service stays internal and there
-are no CORS concerns. All history/stats originate from the service parsing its
-~/.pi session store.
+This single FastAPI app owns the whole agent runtime and the UI:
+
+- runs the `pi` coding agent in this container (Node + pi installed via
+  build_script_pre)
+- serves an interactive terminal (xterm.js) wired to a real `pi` PTY over a
+  WebSocket -- the terminal and the WebSocket are local, so the only network
+  hop is browser -> app (which the platform ingress forwards; internal
+  service-to-service WebSocket upgrades are NOT forwarded, which is why the
+  agent runtime lives here rather than in a separate service)
+- exposes a JSON HTTP API (`/chat`, `/chat/stream`) for programmatic access
+- serves an activity dashboard sourced from the on-disk `~/.pi` session store
+- isolates sessions per authenticated user and persists per-user sessions plus
+  the global config dirs (`~/.pi`, `~/.agents`) to Datatailr blob storage so
+  state survives container restarts
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-from typing import Optional
+import re
+import threading
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from typing import Mapping, Optional
 
-import requests
-from flask import (
-    Flask,
-    Response,
-    jsonify,
-    render_template_string,
-    request,
-    stream_with_context,
+from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
 )
+from pydantic import BaseModel
 
-# Internal service URL. "Pi Agent Service" normalizes to "pi-agent-service".
-SERVICE_URL = os.environ.get("AGENT_SERVICE_URL", "http://pi-agent-service").rstrip("/")
-REQUEST_TIMEOUT = int(os.environ.get("AGENT_REQUEST_TIMEOUT", "650"))
+from agent_app import blob_sync, pi_runner, pty_runner, sessions
 
-# Header the Datatailr platform sets on requests to the app, identifying the
-# authenticated browser user (a JSON blob with a "name" field). We forward the
-# resolved username to the service so it can isolate sessions per user.
+# Default model if the `agent_model` KV key is not set. Provider-prefixed so pi
+# selects OpenAI without a separate --provider flag.
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "openai/gpt-5.1")
+# Thinking/reasoning level passed to pi (off, minimal, low, medium, high, xhigh).
+AGENT_THINKING = os.environ.get("AGENT_THINKING", "medium")
+# Datatailr secret/KV key names (create the secret in the Secrets Manager UI).
+OPENAI_SECRET_KEY = os.environ.get("OPENAI_SECRET_KEY", "openai_api_key")
+MODEL_KV_KEY = os.environ.get("MODEL_KV_KEY", "agent_model")
+
+# Fallback user when no identity header is present (e.g. local dev).
+DEFAULT_USER = os.environ.get("AGENT_DEFAULT_USER", "shared")
+
+# Blob prefixes.
+SESSIONS_BLOB_PREFIX = os.environ.get("AGENT_SESSIONS_PREFIX", "agent_sessions")
+PI_CONFIG_BLOB_PREFIX = os.environ.get("AGENT_PI_CONFIG_PREFIX", "agent_state/pi")
+AGENTS_BLOB_PREFIX = os.environ.get("AGENT_AGENTS_PREFIX", "agent_state/agents")
+
+# Config sync excludes the per-user sessions tree (persisted separately).
+_PI_CONFIG_EXCLUDES = {"sessions"}
+
+# Header the Datatailr platform sets on requests, identifying the authenticated
+# browser user (a JSON blob with a "name" field).
 USER_HEADER = "x-datatailr-user"
-FORWARD_HEADER = "X-Agent-User"
 
 log = logging.getLogger("agent_app")
-app = Flask(__name__)
 
 
-def username_from_request() -> Optional[str]:
-    """Return the authenticated username from the platform header, or None.
+# --------------------------------------------------------------------------- #
+# Runtime configuration + identity
+# --------------------------------------------------------------------------- #
+class _Config:
+    model: str = DEFAULT_MODEL
 
-    Reads and parses the ``x-datatailr-user`` header only -- no platform call,
-    so it is safe to invoke on every request.
-    """
-    raw = request.headers.get(USER_HEADER)
+
+_config = _Config()
+
+_session_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+_locks_guard = threading.Lock()
+_USER_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _username(headers: Mapping[str, str]) -> Optional[str]:
+    """Parse the platform identity header into a username, or None."""
+    raw = headers.get(USER_HEADER)
     if not raw:
         return None
     try:
@@ -55,112 +93,360 @@ def username_from_request() -> Optional[str]:
     return name or None
 
 
-def _forward_headers() -> dict:
-    """Headers to attach to the proxied service request (carries identity)."""
-    user = username_from_request()
-    return {FORWARD_HEADER: user} if user else {}
+def _safe_user(name: Optional[str]) -> str:
+    """Normalize a username into a filesystem/blob-safe token."""
+    cleaned = _USER_RE.sub("_", (name or "").strip())
+    return cleaned or DEFAULT_USER
 
 
-def _service_get(path: str):
-    resp = requests.get(
-        f"{SERVICE_URL}{path}", headers=_forward_headers(), timeout=REQUEST_TIMEOUT
-    )
-    return resp.json(), resp.status_code
+def _user_session_dir(user: str) -> str:
+    return os.path.join(pi_runner.PI_SESSION_DIR, user)
+
+
+def _lock_for(user: str, session_id: Optional[str]) -> threading.Lock:
+    key = f"{user}:{session_id or '__new__'}"
+    with _locks_guard:
+        return _session_locks[key]
 
 
 # --------------------------------------------------------------------------- #
-# API proxy routes
+# Datatailr integration (secrets, KV, skills) + blob persistence
 # --------------------------------------------------------------------------- #
-@app.route("/api/whoami")
-def api_whoami():
-    return jsonify({"user": username_from_request()})
-
-
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    payload = request.get_json(force=True, silent=True) or {}
+def _load_openai_key() -> bool:
+    if os.environ.get("OPENAI_API_KEY"):
+        return True
     try:
-        resp = requests.post(
-            f"{SERVICE_URL}/chat",
-            json=payload,
-            headers=_forward_headers(),
-            timeout=REQUEST_TIMEOUT,
+        from datatailr import Secrets
+
+        key = Secrets().get(OPENAI_SECRET_KEY)
+        if key:
+            os.environ["OPENAI_API_KEY"] = key
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _load_model() -> str:
+    try:
+        from datatailr import KV
+
+        value = KV().get(MODEL_KV_KEY)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except Exception:
+        pass
+    return DEFAULT_MODEL
+
+
+def _write_pi_settings() -> None:
+    """Pin pi's default model and skip first-run network calls."""
+    os.makedirs(pi_runner.PI_AGENT_DIR, exist_ok=True)
+    settings_path = os.path.join(pi_runner.PI_AGENT_DIR, "settings.json")
+    provider, _, model_id = _config.model.partition("/")
+    settings = {
+        "defaultProjectTrust": "always",
+        "enableInstallTelemetry": False,
+    }
+    if model_id:
+        settings["model"] = {"provider": provider, "id": model_id}
+    try:
+        with open(settings_path, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2)
+    except OSError:
+        pass
+
+
+def _setup_datatailr_skills() -> None:
+    try:
+        from datatailr.sbin.datatailr_cli import setup_skills
+
+        setup_skills(global_dir=True)
+    except Exception:
+        pass
+
+
+def _restore_state() -> None:
+    blob_sync.pull_dir(PI_CONFIG_BLOB_PREFIX, pi_runner.PI_AGENT_DIR)
+    blob_sync.pull_dir(AGENTS_BLOB_PREFIX, pi_runner.AGENTS_DIR)
+    blob_sync.pull_dir(SESSIONS_BLOB_PREFIX, pi_runner.PI_SESSION_DIR)
+
+
+def _persist_config() -> None:
+    blob_sync.push_dir(
+        pi_runner.PI_AGENT_DIR, PI_CONFIG_BLOB_PREFIX, exclude_dirs=_PI_CONFIG_EXCLUDES
+    )
+    blob_sync.push_dir(pi_runner.AGENTS_DIR, AGENTS_BLOB_PREFIX)
+
+
+def _persist_user_sessions(user: str) -> None:
+    blob_sync.push_dir(_user_session_dir(user), f"{SESSIONS_BLOB_PREFIX}/{user}")
+
+
+def _persist_after_pty(user: str) -> None:
+    try:
+        _persist_user_sessions(user)
+        _persist_config()
+    except Exception:
+        pass
+
+
+def _startup() -> None:
+    os.makedirs(pi_runner.PI_WORKSPACE_DIR, exist_ok=True)
+    os.makedirs(pi_runner.PI_SESSION_DIR, exist_ok=True)
+    os.makedirs(pi_runner.AGENTS_DIR, exist_ok=True)
+    _config.model = _load_model()
+    _load_openai_key()
+    _restore_state()
+    _setup_datatailr_skills()
+    _write_pi_settings()
+    _persist_config()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _startup()
+    yield
+
+
+app = FastAPI(title="Pi Agent", lifespan=lifespan)
+
+
+# --------------------------------------------------------------------------- #
+# Models
+# --------------------------------------------------------------------------- #
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    session_name: Optional[str] = None
+
+
+def _require_key() -> None:
+    if not os.environ.get("OPENAI_API_KEY") and not _load_openai_key():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"OpenAI API key not configured. Create a secret named "
+                f"'{OPENAI_SECRET_KEY}' in the Datatailr Secrets Manager."
+            ),
         )
-        return Response(
-            resp.content,
-            status=resp.status_code,
-            content_type=resp.headers.get("content-type", "application/json"),
-        )
-    except requests.RequestException as exc:
-        return jsonify({"detail": f"Could not reach agent service: {exc}"}), 502
 
 
-@app.route("/api/chat/stream", methods=["POST"])
-def api_chat_stream():
-    payload = request.get_json(force=True, silent=True) or {}
-    headers = _forward_headers()
+# --------------------------------------------------------------------------- #
+# HTTP API
+# --------------------------------------------------------------------------- #
+@app.get("/health", response_class=PlainTextResponse)
+def health() -> str:
+    return "OK\n"
 
-    def relay():
+
+@app.get("/api/whoami")
+def api_whoami(request: Request) -> JSONResponse:
+    return JSONResponse({"user": _username(request.headers)})
+
+
+@app.get("/api/sessions")
+def api_sessions(request: Request) -> JSONResponse:
+    user = _safe_user(_username(request.headers))
+    return JSONResponse(
+        {"user": user, "sessions": sessions.list_sessions(_user_session_dir(user))}
+    )
+
+
+@app.get("/api/sessions/{session_id}")
+def api_session(session_id: str, request: Request) -> JSONResponse:
+    user = _safe_user(_username(request.headers))
+    transcript = sessions.get_transcript(session_id, _user_session_dir(user))
+    if transcript is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return JSONResponse(transcript)
+
+
+@app.get("/api/stats")
+def api_stats(request: Request) -> JSONResponse:
+    user = _safe_user(_username(request.headers))
+    stats = sessions.aggregate_stats(_user_session_dir(user))
+    stats["user"] = user
+    return JSONResponse(stats)
+
+
+@app.post("/chat")
+def chat(req: ChatRequest, request: Request) -> dict:
+    if not req.message or not req.message.strip():
+        raise HTTPException(status_code=400, detail="message must not be empty")
+    _require_key()
+
+    user = _safe_user(_username(request.headers))
+    session_dir = _user_session_dir(user)
+
+    with _lock_for(user, req.session_id):
         try:
-            with requests.post(
-                f"{SERVICE_URL}/chat/stream",
-                json=payload,
-                headers=headers,
-                stream=True,
-                timeout=REQUEST_TIMEOUT,
-            ) as resp:
-                for chunk in resp.iter_content(chunk_size=None):
-                    if chunk:
-                        yield chunk
-        except requests.RequestException as exc:
-            yield (
-                "data: "
-                + json.dumps({"type": "error", "detail": f"Could not reach agent service: {exc}"})
-                + "\n\n"
-            ).encode()
+            result = pi_runner.run_pi(
+                message=req.message,
+                session_id=req.session_id,
+                model=_config.model,
+                session_name=req.session_name,
+                session_dir=session_dir,
+                thinking=AGENT_THINKING,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"pi run failed: {exc}")
 
-    return Response(
-        stream_with_context(relay()),
-        mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    _persist_user_sessions(user)
+    _persist_config()
+    return {
+        "session_id": result.session_id,
+        "reply": result.reply,
+        "usage": result.usage,
+        "user": user,
+    }
+
+
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+@app.post("/chat/stream")
+def chat_stream(req: ChatRequest, request: Request):
+    """Stream pi's thinking/text/tool events as Server-Sent Events."""
+    if not req.message or not req.message.strip():
+        raise HTTPException(status_code=400, detail="message must not be empty")
+    _require_key()
+
+    user = _safe_user(_username(request.headers))
+    session_dir = _user_session_dir(user)
+    lock = _lock_for(user, req.session_id)
+
+    def event_stream():
+        lock.acquire()
+        try:
+            for event in pi_runner.stream_pi(
+                message=req.message,
+                session_id=req.session_id,
+                model=_config.model,
+                session_name=req.session_name,
+                session_dir=session_dir,
+                thinking=AGENT_THINKING,
+            ):
+                if event.get("type") == "done":
+                    event["user"] = user
+                yield _sse(event)
+        except Exception as exc:  # noqa: BLE001
+            yield _sse({"type": "error", "detail": f"pi run failed: {exc}"})
+        finally:
+            try:
+                _persist_user_sessions(user)
+                _persist_config()
+            finally:
+                lock.release()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 
-@app.route("/api/sessions")
-def api_sessions():
+# --------------------------------------------------------------------------- #
+# WebSocket: browser terminal  <->  local pi PTY
+# --------------------------------------------------------------------------- #
+@app.websocket("/ws/pty")
+async def ws_pty(websocket: WebSocket) -> None:
+    """Bridge an interactive `pi` PTY (in this container) to the browser.
+
+    Protocol (client -> server, JSON text frames):
+        {"type": "input",  "data": "<keystrokes>"}
+        {"type": "resize", "cols": <int>, "rows": <int>}
+    Server -> client: raw PTY output as binary frames (fed to xterm.js).
+    """
+    await websocket.accept()
+
+    params = websocket.query_params
+    user = _safe_user(_username(websocket.headers) or params.get("user"))
+    session_id = params.get("session") or None
     try:
-        data, status = _service_get("/sessions")
-        return jsonify(data), status
-    except requests.RequestException as exc:
-        return jsonify({"detail": f"Could not reach agent service: {exc}"}), 502
+        cols = int(params.get("cols", "80"))
+        rows = int(params.get("rows", "24"))
+    except (TypeError, ValueError):
+        cols, rows = 80, 24
 
+    if not os.environ.get("OPENAI_API_KEY") and not _load_openai_key():
+        await websocket.send_bytes(
+            f"\r\n\x1b[31mOpenAI API key not configured. Create a secret named "
+            f"'{OPENAI_SECRET_KEY}'.\x1b[0m\r\n".encode()
+        )
+        await websocket.close()
+        return
 
-@app.route("/api/sessions/<session_id>")
-def api_session(session_id: str):
+    session_dir = _user_session_dir(user)
+    proc, master_fd = pty_runner.spawn(
+        session_dir=session_dir,
+        model=_config.model,
+        session_id=session_id,
+        cols=cols,
+        rows=rows,
+    )
+    loop = asyncio.get_running_loop()
+
+    async def pump_out() -> None:
+        try:
+            while True:
+                data = await loop.run_in_executor(None, pty_runner.read, master_fd)
+                if not data:
+                    break
+                await websocket.send_bytes(data)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def pump_in() -> None:
+        try:
+            while True:
+                msg = await websocket.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                text = msg.get("text")
+                if text is None:
+                    data = msg.get("bytes")
+                    if data:
+                        pty_runner.write(master_fd, data)
+                    continue
+                try:
+                    obj = json.loads(text)
+                except (ValueError, TypeError):
+                    pty_runner.write(master_fd, text.encode())
+                    continue
+                mtype = obj.get("type")
+                if mtype == "input":
+                    pty_runner.write(master_fd, (obj.get("data") or "").encode())
+                elif mtype == "resize":
+                    pty_runner.set_winsize(
+                        master_fd, int(obj.get("rows", 24)), int(obj.get("cols", 80))
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
+    out_task = asyncio.create_task(pump_out())
+    in_task = asyncio.create_task(pump_in())
     try:
-        data, status = _service_get(f"/sessions/{session_id}")
-        return jsonify(data), status
-    except requests.RequestException as exc:
-        return jsonify({"detail": f"Could not reach agent service: {exc}"}), 502
+        await asyncio.wait({out_task, in_task}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (out_task, in_task):
+            task.cancel()
+        pty_runner.terminate(proc, master_fd)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        await loop.run_in_executor(None, _persist_after_pty, user)
 
 
-@app.route("/api/stats")
-def api_stats():
-    try:
-        data, status = _service_get("/stats")
-        return jsonify(data), status
-    except requests.RequestException as exc:
-        return jsonify({"detail": f"Could not reach agent service: {exc}"}), 502
-
-
-@app.route("/health")
-def health():
-    return "OK\n", 200, {"Content-Type": "text/plain"}
-
-
-@app.route("/")
-def index():
-    return render_template_string(_PAGE)
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    return HTMLResponse(_PAGE)
 
 
 # --------------------------------------------------------------------------- #
@@ -173,12 +459,14 @@ _PAGE = r"""
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Pi Agent</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
   :root {
     --bg: #0f1117; --panel: #181b24; --panel-2: #1f232f; --border: #2a2f3d;
     --text: #e6e9ef; --muted: #9aa3b2; --accent: #6d8bff; --accent-2: #38d39f;
-    --user: #243049; --assistant: #1d2330; --tool: #16202a;
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -194,65 +482,19 @@ _PAGE = r"""
   nav button.active { color: var(--text); background: var(--panel-2); border-color: var(--border); }
   main { flex: 1; overflow: hidden; }
   .view { height: 100%; display: none; }
-  .view.active { display: flex; }
+  .view.active { display: flex; flex-direction: column; }
 
-  /* Chat */
-  .sidebar { width: 280px; border-right: 1px solid var(--border); background: var(--panel);
-             display: flex; flex-direction: column; }
-  .sidebar .new { margin: 12px; padding: 10px; border-radius: 8px; border: 1px solid var(--border);
-                  background: var(--accent); color: #fff; cursor: pointer; font-weight: 600; }
-  .sessions { overflow-y: auto; flex: 1; padding: 0 8px 8px; }
-  .session-item { padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; }
-  .session-item:hover { background: var(--panel-2); }
-  .session-item.active { background: var(--panel-2); border: 1px solid var(--border); }
-  .session-item .title { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .session-item .meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
-  .chat-main { flex: 1; display: flex; flex-direction: column; }
-  .messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 14px; }
-  .msg { max-width: 760px; padding: 12px 16px; border-radius: 12px; line-height: 1.5; white-space: pre-wrap;
-         word-wrap: break-word; }
-  .msg.user { align-self: flex-end; background: var(--user); }
-  .msg.assistant { align-self: flex-start; background: var(--assistant); border: 1px solid var(--border); }
-  .msg.tool { align-self: flex-start; background: var(--tool); border: 1px dashed var(--border);
-              font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); max-width: 760px; }
-  .msg .role { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted);
-               margin-bottom: 6px; }
-  .composer { border-top: 1px solid var(--border); padding: 14px 20px; display: flex; gap: 10px;
-              background: var(--panel); }
-  .composer textarea { flex: 1; resize: none; height: 52px; background: var(--panel-2); color: var(--text);
-                       border: 1px solid var(--border); border-radius: 10px; padding: 12px; font-size: 14px;
-                       font-family: inherit; }
-  .composer button { padding: 0 22px; border-radius: 10px; border: none; background: var(--accent);
-                     color: #fff; font-weight: 600; cursor: pointer; }
-  .composer button:disabled { opacity: .5; cursor: not-allowed; }
-  .empty { margin: auto; color: var(--muted); text-align: center; }
-
-  /* Streaming / CLI feel */
-  .msg .thinking { display: none; margin: 2px 0 8px; padding: 6px 10px;
-                   border-left: 2px solid var(--border); background: rgba(255,255,255,.02);
-                   border-radius: 6px; }
-  .msg .thinking.show { display: block; }
-  .msg .th-label { cursor: pointer; color: var(--muted); font-size: 10px;
-                   text-transform: uppercase; letter-spacing: .6px; user-select: none; }
-  .msg .th-body { display: none; white-space: pre-wrap; color: var(--muted);
-                  font-style: italic; font-size: 13px; margin-top: 6px;
-                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .msg .thinking.open .th-body { display: block; }
-  .msg .tools { display: flex; flex-direction: column; gap: 4px; margin: 4px 0; }
-  .msg .tool { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
-               color: var(--muted); }
-  .msg .tool .spin { color: var(--accent); animation: pulse 1s ease-in-out infinite; }
-  .msg .tool.done { color: var(--accent-2); }
-  .msg .tool.error { color: #e0607e; }
-  .msg .text { white-space: pre-wrap; }
-  .cursor { display: inline-block; width: 7px; height: 1em; vertical-align: text-bottom;
-            background: var(--accent); margin-left: 1px;
-            animation: blink 1s steps(2, start) infinite; }
-  @keyframes blink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }
-  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+  /* Terminal */
+  .term-toolbar { display: flex; align-items: center; gap: 10px; padding: 8px 16px;
+                  border-bottom: 1px solid var(--border); background: var(--panel); }
+  .term-toolbar button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+                         border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  .term-toolbar .hint { color: var(--muted); font-size: 12px; margin-left: auto; }
+  #terminal { flex: 1; padding: 8px 10px; background: #0f1117; overflow: hidden; }
+  .xterm .xterm-viewport { background: transparent !important; }
 
   /* Dashboard */
-  #dashboard { flex-direction: column; overflow-y: auto; padding: 24px; gap: 20px; }
+  #dashboard { overflow-y: auto; padding: 24px; gap: 20px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
   .card .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
@@ -263,7 +505,7 @@ _PAGE = r"""
   .chart-box.wide { grid-column: 1 / -1; }
   .refresh { align-self: flex-start; background: var(--panel-2); color: var(--text);
              border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; cursor: pointer; }
-  @media (max-width: 820px) { .charts { grid-template-columns: 1fr; } .sidebar { display: none; } }
+  @media (max-width: 820px) { .charts { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -272,26 +514,18 @@ _PAGE = r"""
   <h1>Pi Agent</h1>
   <span id="whoami" style="font-size:13px;color:var(--muted);"></span>
   <nav>
-    <button id="tab-chat" class="active" onclick="showView('chat')">Chat</button>
+    <button id="tab-term" class="active" onclick="showView('terminal')">Terminal</button>
     <button id="tab-dash" onclick="showView('dashboard')">Dashboard</button>
   </nav>
 </header>
 <main>
-  <section id="chat" class="view active">
-    <aside class="sidebar">
-      <button class="new" onclick="newChat()">+ New chat</button>
-      <div class="sessions" id="session-list"></div>
-    </aside>
-    <div class="chat-main">
-      <div class="messages" id="messages">
-        <div class="empty">Start a conversation with the agent.</div>
-      </div>
-      <div class="composer">
-        <textarea id="input" placeholder="Message the agent..."
-                  onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send();}"></textarea>
-        <button id="send-btn" onclick="send()">Send</button>
-      </div>
+  <section id="terminal-view" class="view active">
+    <div class="term-toolbar">
+      <button onclick="restartSession()">Restart session</button>
+      <button onclick="reconnect()">Reconnect</button>
+      <span class="hint">A live <code>pi</code> session. Type as you would in the CLI.</span>
     </div>
+    <div id="terminal"></div>
   </section>
   <section id="dashboard" class="view">
     <button class="refresh" onclick="loadDashboard()">Refresh</button>
@@ -305,239 +539,99 @@ _PAGE = r"""
 </main>
 
 <script>
-let currentSession = null;
-let streaming = false;
 const charts = {};
+let term, fitAddon, ws, resumeSession = null, currentUser = null;
 
-// Datatailr serves apps behind a URL prefix that the platform strips before
-// the request reaches this app. The browser must therefore include that prefix,
-// which equals the page's own path. Build every API URL relative to it so
-// requests are routed back to this app instead of the platform root.
+// Datatailr serves apps behind a URL prefix that the platform strips before the
+// request reaches this app. The browser must include that prefix (= the page's
+// own path) so requests route back here instead of the platform root.
 const API_BASE = window.location.pathname.replace(/\/+$/, '');
 function apiUrl(p) { return API_BASE + p; }
 
-// Tolerant parser: an empty or non-JSON body (e.g. a proxy/gateway error page)
-// must not crash the UI with "Unexpected end of JSON input".
 async function readJson(r) {
   const text = await r.text();
   if (!text) return {};
-  try { return JSON.parse(text); }
-  catch { return { detail: text.slice(0, 300) }; }
+  try { return JSON.parse(text); } catch { return { detail: text.slice(0, 300) }; }
 }
+
+function setStatus(ok) { document.getElementById('status-dot').classList.toggle('ok', ok); }
 
 function showView(name) {
-  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById(name).classList.add('active');
-  document.getElementById('tab-chat').classList.toggle('active', name === 'chat');
-  document.getElementById('tab-dash').classList.toggle('active', name === 'dashboard');
-  if (name === 'dashboard') loadDashboard();
-}
-
-function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
-
-async function checkHealth() {
-  try { const r = await fetch(apiUrl('/api/sessions')); document.getElementById('status-dot').classList.toggle('ok', r.ok); }
-  catch { document.getElementById('status-dot').classList.remove('ok'); }
+  const isTerm = name === 'terminal';
+  document.getElementById('terminal-view').classList.toggle('active', isTerm);
+  document.getElementById('dashboard').classList.toggle('active', !isTerm);
+  document.getElementById('tab-term').classList.toggle('active', isTerm);
+  document.getElementById('tab-dash').classList.toggle('active', !isTerm);
+  if (isTerm) { setTimeout(fitTerminal, 0); }
+  else { loadDashboard(); }
 }
 
 async function loadWhoami() {
   try {
     const r = await fetch(apiUrl('/api/whoami'));
     const data = await readJson(r);
-    document.getElementById('whoami').textContent = data.user ? ('@' + data.user) : '';
+    currentUser = data.user || null;
+    document.getElementById('whoami').textContent = currentUser ? ('@' + currentUser) : '';
   } catch (e) { /* ignore */ }
 }
 
-async function loadSessions() {
-  try {
-    const r = await fetch(apiUrl('/api/sessions'));
-    const data = await readJson(r);
-    const list = document.getElementById('session-list');
-    list.innerHTML = '';
-    (data.sessions || []).forEach(s => {
-      const div = document.createElement('div');
-      div.className = 'session-item' + (s.id === currentSession ? ' active' : '');
-      div.onclick = () => openSession(s.id);
-      div.innerHTML = `<div class="title">${esc(s.name)}</div>
-        <div class="meta">${s.message_count} msgs · ${s.tokens.toLocaleString()} tok</div>`;
-      list.appendChild(div);
-    });
-  } catch (e) { /* service may be warming up */ }
+// --------------------------- Terminal ---------------------------
+function fitTerminal() {
+  if (!fitAddon) return;
+  try { fitAddon.fit(); sendResize(); } catch (e) { /* container not visible yet */ }
 }
 
-function renderMessages(messages) {
-  const box = document.getElementById('messages');
-  box.innerHTML = '';
-  if (!messages || !messages.length) {
-    box.innerHTML = '<div class="empty">No messages yet.</div>';
-    return;
-  }
-  messages.forEach(m => addMessage(m.role, m.text, m.tool_name));
-  box.scrollTop = box.scrollHeight;
+function wsUrl() {
+  const base = window.location.pathname.replace(/\/+$/, '');
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const cols = term ? term.cols : 80;
+  const rows = term ? term.rows : 24;
+  let url = `${proto}://${location.host}${base}/ws/pty?cols=${cols}&rows=${rows}`;
+  if (currentUser) url += '&user=' + encodeURIComponent(currentUser);
+  if (resumeSession) url += '&session=' + encodeURIComponent(resumeSession);
+  return url;
 }
 
-function addMessage(role, text, toolName) {
-  const box = document.getElementById('messages');
-  const empty = box.querySelector('.empty');
-  if (empty) empty.remove();
-  const div = document.createElement('div');
-  div.className = 'msg ' + role;
-  const label = role === 'tool' ? ('tool: ' + (toolName || '')) : role;
-  div.innerHTML = `<div class="role">${esc(label)}</div>${esc(text)}`;
-  box.appendChild(div);
-  box.scrollTop = box.scrollHeight;
-  return div;
-}
-
-async function openSession(id) {
-  currentSession = id;
-  await loadSessions();
-  try {
-    const r = await fetch(apiUrl('/api/sessions/' + id));
-    const data = await readJson(r);
-    renderMessages(data.messages);
-  } catch (e) { renderMessages([]); }
-}
-
-function newChat() {
-  currentSession = null;
-  document.getElementById('messages').innerHTML = '<div class="empty">Start a conversation with the agent.</div>';
-  loadSessions();
-}
-
-// Builds a live-updating assistant message. The service streams normalized
-// events (thinking / text / tool_start / tool_end / done / error) which we
-// render incrementally to mimic the CLI experience.
-function createAssistantStream() {
-  const box = document.getElementById('messages');
-  const empty = box.querySelector('.empty');
-  if (empty) empty.remove();
-  const root = document.createElement('div');
-  root.className = 'msg assistant';
-  root.innerHTML =
-    '<div class="role">assistant</div>' +
-    '<div class="thinking"><span class="th-label">thinking</span><div class="th-body"></div></div>' +
-    '<div class="tools"></div>' +
-    '<div class="text"></div><span class="cursor"></span>';
-  box.appendChild(root);
-  const thinkingEl = root.querySelector('.thinking');
-  const thBody = root.querySelector('.th-body');
-  const thLabel = root.querySelector('.th-label');
-  const toolsEl = root.querySelector('.tools');
-  const textEl = root.querySelector('.text');
-  const cursor = root.querySelector('.cursor');
-  const tools = {};
-  let hasText = false;
-  thLabel.onclick = () => thinkingEl.classList.toggle('open');
-  const scroll = () => { box.scrollTop = box.scrollHeight; };
-
-  return {
-    handle(ev) {
-      switch (ev.type) {
-        case 'session':
-          if (ev.session_id) currentSession = ev.session_id;
-          break;
-        case 'thinking':
-          thinkingEl.classList.add('show', 'open');
-          thBody.textContent += ev.delta || '';
-          scroll();
-          break;
-        case 'text':
-          hasText = true;
-          textEl.textContent += ev.delta || '';
-          scroll();
-          break;
-        case 'tool_start': {
-          const t = document.createElement('div');
-          t.className = 'tool';
-          t.innerHTML = `<span class="spin">●</span> ${esc(ev.name || 'tool')}`;
-          toolsEl.appendChild(t);
-          tools[ev.id || ev.name] = t;
-          scroll();
-          break;
-        }
-        case 'tool_end': {
-          const t = tools[ev.id || ev.name];
-          if (t) {
-            t.classList.add(ev.is_error ? 'error' : 'done');
-            t.innerHTML = `<span>${ev.is_error ? '\u2717' : '\u2713'}</span> ${esc(ev.name || 'tool')}`;
-          }
-          break;
-        }
-        case 'done':
-          if (ev.session_id) currentSession = ev.session_id;
-          if (!hasText && ev.reply) textEl.textContent = ev.reply;
-          break;
-        case 'error':
-          this.fail(ev.detail || 'Request failed');
-          break;
-      }
-    },
-    finish() {
-      cursor.remove();
-      // Collapse thinking once the turn is done, but keep it toggleable.
-      thinkingEl.classList.remove('open');
-    },
-    fail(msg) {
-      cursor.remove();
-      root.querySelector('.role').textContent = 'error';
-      textEl.textContent = msg;
-    },
+function connect() {
+  if (ws) { try { ws.close(); } catch (e) {} }
+  ws = new WebSocket(wsUrl());
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { setStatus(true); sendResize(); if (term) term.focus(); };
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') term.write(e.data);
+    else term.write(new Uint8Array(e.data));
   };
+  ws.onclose = () => { setStatus(false); if (term) term.write('\r\n\x1b[90m[disconnected — press Reconnect]\x1b[0m\r\n'); };
+  ws.onerror = () => { setStatus(false); };
 }
 
-async function send() {
-  if (streaming) return;
-  const input = document.getElementById('input');
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = '';
-  addMessage('user', text);
-  const stream = createAssistantStream();
-  streaming = true;
-  document.getElementById('send-btn').disabled = true;
-  try {
-    const r = await fetch(apiUrl('/api/chat/stream'), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, session_id: currentSession }),
-    });
-    if (!r.ok || !r.body) {
-      const data = await readJson(r);
-      stream.fail(data.detail || ('HTTP ' + r.status));
-      return;
-    }
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      // SSE frames are separated by a blank line.
-      let idx;
-      while ((idx = buffer.indexOf('\n\n')) >= 0) {
-        const frame = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        const payload = frame.split('\n')
-          .filter(l => l.startsWith('data:'))
-          .map(l => l.slice(5).trim())
-          .join('');
-        if (!payload) continue;
-        let ev;
-        try { ev = JSON.parse(payload); } catch { continue; }
-        stream.handle(ev);
-      }
-    }
-    stream.finish();
-  } catch (e) {
-    stream.fail(String(e));
-  } finally {
-    streaming = false;
-    document.getElementById('send-btn').disabled = false;
-    loadSessions();
+function sendResize() {
+  if (ws && ws.readyState === 1 && term) {
+    ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
   }
 }
 
+function reconnect() { if (term) term.reset(); connect(); }
+function restartSession() { resumeSession = null; reconnect(); }
+
+function initTerminal() {
+  term = new Terminal({
+    cursorBlink: true,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    fontSize: 13,
+    theme: { background: '#0f1117', foreground: '#e6e9ef', cursor: '#6d8bff',
+             selectionBackground: '#33415e' },
+  });
+  fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('terminal'));
+  fitTerminal();
+  term.onData(d => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: d })); });
+  window.addEventListener('resize', fitTerminal);
+  connect();
+}
+
+// --------------------------- Dashboard ---------------------------
 function card(label, value) {
   return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
 }
@@ -592,10 +686,9 @@ async function loadDashboard() {
   }
 }
 
-loadWhoami();
-checkHealth();
-loadSessions();
-setInterval(checkHealth, 15000);
+// Resolve the user first (so the WS carries it as a fallback identity), then
+// boot the terminal.
+(async () => { await loadWhoami(); initTerminal(); })();
 </script>
 </body>
 </html>
@@ -603,4 +696,6 @@ setInterval(checkHealth, 15000);
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8080)
