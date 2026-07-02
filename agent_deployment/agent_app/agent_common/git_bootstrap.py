@@ -90,6 +90,35 @@ def git_token() -> Optional[str]:
     return _secret(GIT_TOKEN_SECRET)
 
 
+def parse_repo_slug(url: Optional[str]) -> Optional[str]:
+    """Extract the ``owner/repo`` slug from a git remote URL.
+
+    Handles the scp-like (``git@github.com:org/repo.git``),
+    ``ssh://git@host[:port]/org/repo(.git)`` and ``https://host/org/repo(.git)``
+    forms. Returns ``None`` if the slug cannot be determined. Used to target the
+    GitHub REST API explicitly (``repos/<slug>/pulls``)."""
+    if not url:
+        return None
+    u = url.strip()
+    if u.endswith(".git"):
+        u = u[:-4]
+    if u.startswith("ssh://"):
+        parts = u[len("ssh://") :].split("/", 1)
+        slug = parts[1] if len(parts) == 2 else ""
+    elif u.startswith(("http://", "https://")):
+        m = re.match(r"^https?://[^/]+/(?P<slug>.+)$", u)
+        slug = m.group("slug") if m else ""
+    else:
+        m = re.match(r"^(?:[^@/]+@)?[^:/]+:(?P<slug>.+)$", u)
+        slug = m.group("slug") if m else ""
+    slug = slug.strip("/")
+    # A valid slug is exactly ``owner/repo`` (two non-empty path segments).
+    segments = [s for s in slug.split("/") if s]
+    if len(segments) >= 2:
+        return "/".join(segments[:2])
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Host-key resolution (for SSH host verification without disabling it)
 # --------------------------------------------------------------------------- #

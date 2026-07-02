@@ -61,6 +61,16 @@ back into this conversation.
 {_repo_line()}
 - Do the small, well-understood edits yourself. Never merge or force-push to
   protected branches — merging is always a human decision.
+- Git and the `gh` CLI are already authenticated for this repo (push over the
+  deploy key; `gh` via the `GH_TOKEN` the platform injects). You never need to
+  run `gh auth login`, and you must never print, echo, or paste the token.
+- When you open a PR yourself, prefer the **REST** API to avoid fine-grained-token
+  GraphQL permission errors, e.g.:
+
+```bash
+gh api --method POST repos/<owner>/<repo>/pulls \\
+  -f title="..." -f head="<work-branch>" -f base="<default-branch>" -f body="..."
+```
 
 ## Delegating to sub-agents
 When work is scoped and self-contained (especially if several pieces can run in

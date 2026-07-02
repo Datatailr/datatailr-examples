@@ -373,12 +373,50 @@ def _gh_available() -> bool:
         return False
 
 
+def _repo_slug(assignment: dict[str, Any], workdir: str) -> Optional[str]:
+    """Resolve the ``owner/repo`` slug from the assignment or the git remote."""
+    slug = git_bootstrap.parse_repo_slug(
+        (assignment.get("git") or {}).get("repo_url") or git_bootstrap.repo_url()
+    )
+    if slug:
+        return slug
+    rem = _git(["remote", "get-url", "origin"], workdir)
+    if rem.returncode == 0:
+        return git_bootstrap.parse_repo_slug(rem.stdout.strip())
+    return None
+
+
+def _pr_ci_state(gh_api, slug: str, sha: Optional[str]) -> str:
+    """Best-effort combined CI status for the PR head commit (REST, no GraphQL)."""
+    if not sha:
+        return "unknown"
+    import json as _json
+
+    resp = gh_api([f"repos/{slug}/commits/{sha}/status"])
+    if resp.returncode != 0 or not resp.stdout.strip():
+        return "unknown"
+    try:
+        data = _json.loads(resp.stdout)
+    except ValueError:
+        return "unknown"
+    if int(data.get("total_count", 0) or 0) == 0:
+        return "none"
+    return {
+        "success": "passing",
+        "pending": "pending",
+        "failure": "failing",
+        "error": "failing",
+    }.get((data.get("state") or "").lower(), "unknown")
+
+
 def _open_or_update_pr(assignment: dict[str, Any], workdir: str) -> Optional[dict[str, Any]]:
     """Open a PR (or record the existing one) for the work branch. Never merge.
 
-    Idempotent: if an open PR already exists for the branch (e.g. a workflow
-    retry pushed more commits), we record ``action="updated"`` instead of
-    opening a duplicate (§10 step 4).
+    Uses the GitHub **REST** API via ``gh api`` rather than the ``gh pr``
+    porcelain: the porcelain relies on GraphQL (``repository.defaultBranchRef``),
+    which a fine-grained PAT often cannot read, whereas ``POST repos/<slug>/pulls``
+    needs only *Pull requests: write* (+ *Contents: read*). Idempotent: an open PR
+    for the branch is recorded as ``action="updated"`` instead of duplicated.
     """
     import json as _json
 
@@ -396,89 +434,78 @@ def _open_or_update_pr(assignment: dict[str, Any], workdir: str) -> Optional[dic
         log.info(f"[{subagent_id}] gh CLI unavailable; skipping PR (branch pushed)")
         return None
 
+    slug = _repo_slug(assignment, workdir)
+    if not slug:
+        log.warning(f"[{subagent_id}] could not resolve owner/repo; skipping PR")
+        return None
+    owner = slug.split("/")[0]
+
     env = dict(os.environ)
     env["GH_TOKEN"] = token  # never logged
 
-    def gh(args: list[str]) -> subprocess.CompletedProcess:
+    def gh_api(args: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["gh", *args], cwd=workdir, capture_output=True, text=True, env=env
+            ["gh", "api", "-H", "Accept: application/vnd.github+json", *args],
+            cwd=workdir, capture_output=True, text=True, env=env,
         )
 
-    existing = gh(
-        [
-            "pr", "list", "--head", work_branch, "--state", "open",
-            "--json", "number,url,title",
-        ]
-    )
-    pr_action = "opened"
-    if existing.returncode == 0 and existing.stdout.strip():
-        try:
-            prs = _json.loads(existing.stdout)
-        except ValueError:
-            prs = []
-        if prs:
-            pr_action = "updated"
+    def _log_gh_error(action: str, err: str) -> None:
+        msg = err.strip()[:400]
+        log.warning(f"[{subagent_id}] {action} failed: {msg}")
+        if "not accessible" in msg.lower() or "403" in msg or "Not Found" in msg:
+            log.warning(
+                f"[{subagent_id}] the git token likely lacks repository access. "
+                "A fine-grained PAT needs 'Pull requests: Read and write' AND "
+                "'Contents: Read-only' on this repo (and, for org repos, the org "
+                "must allow/approve the token)."
+            )
 
-    if pr_action == "opened":
-        body = _pr_body(assignment)
-        created = gh(
+    # 1. Is there already an open PR for this head branch?
+    pr_obj: Optional[dict[str, Any]] = None
+    pr_action = "opened"
+    listed = gh_api([f"repos/{slug}/pulls?head={owner}:{work_branch}&state=open"])
+    if listed.returncode == 0 and listed.stdout.strip():
+        try:
+            arr = _json.loads(listed.stdout)
+        except ValueError:
+            arr = []
+        if arr:
+            pr_obj, pr_action = arr[0], "updated"
+    elif listed.returncode != 0:
+        _log_gh_error("pr lookup", listed.stderr)
+
+    # 2. Create it if none exists (never merge).
+    if pr_obj is None:
+        created = gh_api(
             [
-                "pr", "create", "--base", base_branch, "--head", work_branch,
-                "--title", title, "--body", body,
+                "--method", "POST", f"repos/{slug}/pulls",
+                "-f", f"title={title}",
+                "-f", f"head={work_branch}",
+                "-f", f"base={base_branch}",
+                "-f", f"body={_pr_body(assignment)}",
             ]
         )
-        # gh can exit non-zero because of a *non-fatal* GraphQL metadata warning
-        # (e.g. a fine-grained PAT that lacks read access to
-        # `repository.defaultBranchRef`) even though the PR is created and its
-        # URL is printed to stdout. Only treat it as a real failure when no PR
-        # URL comes back; otherwise it's a benign warning.
-        created_url = next(
-            (ln.strip() for ln in (created.stdout or "").splitlines()
-             if ln.strip().startswith("http")),
-            "",
-        )
-        if created.returncode != 0 and not created_url:
-            log.warning(
-                f"[{subagent_id}] pr create failed: {created.stderr.strip()[:300]}"
-            )
-        elif created.returncode != 0:
-            log.info(
-                f"[{subagent_id}] PR created ({created_url}); ignoring non-fatal "
-                f"gh warning: {created.stderr.strip()[:200]}"
-            )
+        if created.returncode != 0:
+            _log_gh_error("pr create", created.stderr)
+            return {"action": "none", "number": None, "url": None,
+                    "title": title, "ci_state": "unknown"}
+        try:
+            pr_obj = _json.loads(created.stdout)
+        except ValueError:
+            pr_obj = None
 
-    view = gh(
-        [
-            "pr", "view", work_branch,
-            "--json", "number,url,title,state,statusCheckRollup",
-        ]
-    )
-    if view.returncode != 0 or not view.stdout.strip():
-        return {"action": pr_action, "number": None, "url": None, "title": title,
-                "ci_state": "unknown"}
-    try:
-        data = _json.loads(view.stdout)
-    except ValueError:
-        return {"action": pr_action, "number": None, "url": None, "title": title,
-                "ci_state": "unknown"}
+    if not pr_obj:
+        return {"action": pr_action, "number": None, "url": None,
+                "title": title, "ci_state": "unknown"}
 
-    rollup = data.get("statusCheckRollup") or []
-    ci_state = "none"
-    if rollup:
-        states = {(c.get("conclusion") or c.get("state") or "").upper() for c in rollup}
-        if {"FAILURE", "ERROR", "CANCELLED"} & states:
-            ci_state = "failing"
-        elif {"PENDING", "IN_PROGRESS", ""} & states:
-            ci_state = "pending"
-        else:
-            ci_state = "passing"
-
-    log.info(f"[{subagent_id}] PR #{data.get('number')} action={pr_action}")
+    head_sha = (pr_obj.get("head") or {}).get("sha")
+    ci_state = _pr_ci_state(gh_api, slug, head_sha)
+    log.info(f"[{subagent_id}] PR #{pr_obj.get('number')} action={pr_action}")
     return {
         "action": pr_action,
-        "number": data.get("number"),
-        "url": data.get("url"),
-        "title": data.get("title") or title,
+        "number": pr_obj.get("number"),
+        "url": pr_obj.get("html_url") or pr_obj.get("url"),
+        "title": pr_obj.get("title") or title,
         "ci_state": ci_state,
     }
 

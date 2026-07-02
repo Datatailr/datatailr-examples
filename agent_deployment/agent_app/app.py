@@ -230,6 +230,32 @@ def _load_openai_key() -> bool:
     return False
 
 
+def _load_git_token() -> bool:
+    """Expose the git-host API token to pi as ``GH_TOKEN`` (§4).
+
+    The token stored in the Secrets Manager (``agent_git_token``) is what lets
+    the agent open PRs with ``gh`` from its bash tool. Without this the main
+    agent's ``gh`` is unauthenticated ("run gh auth login"). Set once in the app
+    environment so every pi subprocess inherits it. Never logged."""
+    if os.environ.get("GH_TOKEN"):
+        return True
+    try:
+        token = git_bootstrap.git_token()
+    except Exception:
+        token = None
+    if not token:
+        return False
+    os.environ["GH_TOKEN"] = token
+    # Point gh at the repo's host for GitHub Enterprise; defaults to github.com.
+    try:
+        host, _ = git_bootstrap.parse_git_host(git_bootstrap.repo_url())
+        if host and host != "github.com":
+            os.environ.setdefault("GH_HOST", host)
+    except Exception:
+        pass
+    return True
+
+
 def _load_model() -> str:
     try:
         from datatailr import KV
@@ -341,6 +367,7 @@ def _startup() -> None:
     os.makedirs(pi_runner.AGENTS_DIR, exist_ok=True)
     _config.model = _load_model()
     _load_openai_key()
+    _load_git_token()
     _restore_state()
     _setup_datatailr_skills()
     _write_pi_settings()
