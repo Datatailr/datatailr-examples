@@ -38,10 +38,15 @@ from fastapi.responses import (
 from pydantic import BaseModel
 
 from agent_app import blob_sync, pi_runner, pty_runner, sessions
+from agent_app.agent_common import git_bootstrap, orchestration
+from agent_app.coordinator import Coordinator
 
-# Default model if the `agent_model` KV key is not set. Provider-prefixed so pi
-# selects OpenAI without a separate --provider flag.
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "openai/gpt-5.1")
+# Default model if the `agent_model` KV key is not set. Provider-prefixed
+# (`provider/id`); the app splits this into pi's separate --provider/--model
+# flags. Use a model id the installed pi build actually serves under the OpenAI
+# provider -- `gpt-5.1` is not in older builds' OpenAI catalog (it resolves to
+# the azure-openai-responses provider there), whereas `gpt-5-mini` is.
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "openai/gpt-5-mini")
 # Thinking/reasoning level passed to pi (off, minimal, low, medium, high, xhigh).
 AGENT_THINKING = os.environ.get("AGENT_THINKING", "medium")
 # Datatailr secret/KV key names (create the secret in the Secrets Manager UI).
@@ -63,6 +68,13 @@ _PI_CONFIG_EXCLUDES = {"sessions"}
 # browser user (a JSON blob with a "name" field).
 USER_HEADER = "x-datatailr-user"
 
+# Loopback base URL the in-container `spawn_subagent` helper posts to. The pi
+# subprocess runs in the same container as the app, so it reaches the
+# orchestration API over localhost. The port is best-effort resolved from the
+# platform environment; override with SWE_ORCH_URL if needed.
+ORCH_PORT = os.environ.get("DATATAILR_APP_PORT") or os.environ.get("PORT") or "8080"
+ORCH_URL = os.environ.get("SWE_ORCH_URL", f"http://127.0.0.1:{ORCH_PORT}")
+
 log = logging.getLogger("agent_app")
 
 
@@ -78,6 +90,13 @@ _config = _Config()
 _session_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 _locks_guard = threading.Lock()
 _USER_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+# Per-user git workspace bootstrap state (clone once per user, then refresh).
+_repo_ready: set[str] = set()
+_repo_guard = threading.Lock()
+
+# The coordinator owns the sub-agent lifecycle; created at startup.
+_coordinator: Optional[Coordinator] = None
 
 
 def _username(headers: Mapping[str, str]) -> Optional[str]:
@@ -119,6 +138,81 @@ def _lock_for(user: str, session_id: Optional[str]) -> threading.Lock:
 
 
 # --------------------------------------------------------------------------- #
+# Git-aware workspace + orchestration context for pi
+# --------------------------------------------------------------------------- #
+def _ensure_user_repo(user: str) -> None:
+    """Clone the shared repo into this user's workspace on first use (§6.1).
+
+    Best effort: if git is not configured (no SSH key / repo URL), the app
+    still serves pi against an empty workspace, matching prior behavior.
+    """
+    if user in _repo_ready:
+        return
+    with _repo_guard:
+        if user in _repo_ready:
+            return
+        try:
+            git_bootstrap.ensure_workspace_repo(_user_workspace_dir(user))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("git workspace bootstrap failed for %s: %s", user, exc)
+        # Mark ready regardless so we do not retry a failing clone every turn.
+        _repo_ready.add(user)
+
+
+def _pi_extra_env(user: str, session_id: Optional[str], depth: int = 0) -> dict[str, str]:
+    """Env injected into the pi process so the `spawn_subagent` tool can call
+    the orchestration API with the right parent/user context (§6.2)."""
+    return {
+        "SWE_ORCH_URL": ORCH_URL,
+        "SWE_USER": user,
+        "SWE_PARENT_SESSION": session_id or f"{user}-adhoc",
+        "SWE_DEPTH": str(depth),
+    }
+
+
+def _fold_report(entry: dict, result: dict) -> None:
+    """Report sink: inject a synthesized user turn into the parent pi session
+    summarizing a finished sub-agent, so the main agent continues the
+    conversation with the delegated outcome (§7 "folding in", §10)."""
+    user = entry.get("created_by") or DEFAULT_USER
+    session_id = entry.get("session_id")
+    if not session_id or session_id.endswith("-adhoc"):
+        # No resumable parent session to fold into; the UI panel still surfaces
+        # the outcome from the registry.
+        return
+    if not os.environ.get("OPENAI_API_KEY") and not _load_openai_key():
+        return
+
+    pr = (result.get("git") or {}).get("pr") or {}
+    pr_line = f" PR ({pr.get('action')}): {pr.get('url')}." if pr.get("url") else ""
+    message = (
+        f"[orchestrator] Sub-agent {entry.get('subagent_id')} for task "
+        f"\"{entry.get('title')}\" finished with status "
+        f"{result.get('status')}.{pr_line} Summary: {result.get('summary')}. "
+        "Incorporate this outcome and, if appropriate, present the result "
+        "(and any PR link) to the user."
+    )
+    lock = _lock_for(user, session_id)
+    with lock:
+        try:
+            pi_runner.run_pi(
+                message=message,
+                session_id=session_id,
+                model=_config.model,
+                session_dir=_user_session_dir(user),
+                thinking=AGENT_THINKING,
+                workspace_dir=_user_workspace_dir(user),
+                extra_env=_pi_extra_env(user, session_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fold-in for %s failed: %s", entry.get("subagent_id"), exc)
+    try:
+        _persist_user_sessions(user)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # Datatailr integration (secrets, KV, skills) + blob persistence
 # --------------------------------------------------------------------------- #
 def _load_openai_key() -> bool:
@@ -149,16 +243,38 @@ def _load_model() -> str:
 
 
 def _write_pi_settings() -> None:
-    """Pin pi's default model and skip first-run network calls."""
+    """Pin pi's default provider/model so sessions start with a model selected.
+
+    pi's settings.json uses flat top-level ``defaultProvider`` / ``defaultModel``
+    string fields (this is exactly what the interactive ``/model`` command
+    writes via ``setDefaultModelAndProvider``). A nested ``model`` object is not
+    recognized and is silently ignored, which is why pi otherwise starts with no
+    model pinned. We merge into any existing settings so a user's ``/model``
+    choice and other preferences are preserved across restarts.
+    """
     os.makedirs(pi_runner.PI_AGENT_DIR, exist_ok=True)
     settings_path = os.path.join(pi_runner.PI_AGENT_DIR, "settings.json")
-    provider, _, model_id = _config.model.partition("/")
-    settings = {
-        "defaultProjectTrust": "always",
-        "enableInstallTelemetry": False,
-    }
+
+    settings: dict = {}
+    try:
+        with open(settings_path, encoding="utf-8") as fh:
+            existing = json.load(fh)
+        if isinstance(existing, dict):
+            settings = existing
+    except (OSError, ValueError):
+        settings = {}
+
+    settings.setdefault("defaultProjectTrust", "always")
+    provider, model_id = pi_runner.split_model(_config.model)
+    if provider:
+        settings["defaultProvider"] = provider
     if model_id:
-        settings["model"] = {"provider": provider, "id": model_id}
+        settings["defaultModel"] = model_id
+    if AGENT_THINKING and AGENT_THINKING.lower() != "off":
+        settings["defaultThinkingLevel"] = AGENT_THINKING
+    # Drop the legacy nested key we used to write (pi ignores it).
+    settings.pop("model", None)
+
     try:
         with open(settings_path, "w", encoding="utf-8") as fh:
             json.dump(settings, fh, indent=2)
@@ -170,7 +286,7 @@ def _setup_datatailr_skills() -> None:
     try:
         from datatailr.sbin.datatailr_cli import setup_skills
 
-        setup_skills(global_dir=True)
+        setup_skills(global_dir=True, force=True)
     except Exception:
         pass
 
@@ -201,6 +317,7 @@ def _persist_after_pty(user: str) -> None:
 
 
 def _startup() -> None:
+    global _coordinator
     os.makedirs(pi_runner.PI_WORKSPACE_DIR, exist_ok=True)
     os.makedirs(pi_runner.PI_SESSION_DIR, exist_ok=True)
     os.makedirs(pi_runner.AGENTS_DIR, exist_ok=True)
@@ -210,15 +327,24 @@ def _startup() -> None:
     _setup_datatailr_skills()
     _write_pi_settings()
     _persist_config()
+    # Bring up orchestration: the coordinator rehydrates its registry from Blob
+    # and starts the background poller that harvests finished sub-agents.
+    _coordinator = Coordinator(report_sink=_fold_report)
+    _coordinator.refresh_limits()
+    _coordinator.start_poller()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _startup()
-    yield
+    try:
+        yield
+    finally:
+        if _coordinator is not None:
+            _coordinator.stop()
 
 
-app = FastAPI(title="Pi Agent", lifespan=lifespan)
+app = FastAPI(title="SWE Main Agent", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -228,6 +354,35 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     session_name: Optional[str] = None
+
+
+class SubagentBrief(BaseModel):
+    """One sub-agent brief (§9). Only `title` + `instructions` are required."""
+
+    title: str
+    instructions: str
+    definition_of_done: list[str] = []
+    files: list[str] = []
+    context_files: list[str] = []
+    branch: Optional[str] = None
+    budget: Optional[dict] = None
+    may_push: bool = True
+    may_open_pr: bool = True
+
+
+class SpawnRequest(BaseModel):
+    """Body of POST /subagents: one or more briefs plus optional context.
+
+    `parent_id`/`created_by`/`session_id`/`depth` are supplied by the in-pi
+    `spawn_subagent` helper (which has no auth header); browser/API callers are
+    identified by the platform user header instead.
+    """
+
+    briefs: list[SubagentBrief]
+    parent_id: Optional[str] = None
+    created_by: Optional[str] = None
+    session_id: Optional[str] = None
+    depth: int = 0
 
 
 def _require_key() -> None:
@@ -287,6 +442,7 @@ def chat(req: ChatRequest, request: Request) -> dict:
 
     user = _safe_user(_username(request.headers))
     session_dir = _user_session_dir(user)
+    _ensure_user_repo(user)
 
     with _lock_for(user, req.session_id):
         try:
@@ -298,6 +454,7 @@ def chat(req: ChatRequest, request: Request) -> dict:
                 session_dir=session_dir,
                 thinking=AGENT_THINKING,
                 workspace_dir=_user_workspace_dir(user),
+                extra_env=_pi_extra_env(user, req.session_id),
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"pi run failed: {exc}")
@@ -325,6 +482,7 @@ def chat_stream(req: ChatRequest, request: Request):
 
     user = _safe_user(_username(request.headers))
     session_dir = _user_session_dir(user)
+    _ensure_user_repo(user)
     lock = _lock_for(user, req.session_id)
 
     def event_stream():
@@ -338,6 +496,7 @@ def chat_stream(req: ChatRequest, request: Request):
                 session_dir=session_dir,
                 thinking=AGENT_THINKING,
                 workspace_dir=_user_workspace_dir(user),
+                extra_env=_pi_extra_env(user, req.session_id),
             ):
                 if event.get("type") == "done":
                     event["user"] = user
@@ -360,6 +519,81 @@ def chat_stream(req: ChatRequest, request: Request):
             "Connection": "keep-alive",
         },
     )
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration API (sub-agents) -- see specification §6
+# --------------------------------------------------------------------------- #
+def _require_coordinator() -> Coordinator:
+    if _coordinator is None:
+        raise HTTPException(status_code=503, detail="coordinator not initialized")
+    return _coordinator
+
+
+@app.post("/subagents")
+def spawn_subagents(req: SpawnRequest, request: Request) -> JSONResponse:
+    """Spawn one or more sub-agents (§6). Enforces all limits via the
+    coordinator and returns a per-brief result or refusal message."""
+    coord = _require_coordinator()
+    _require_key()
+
+    header_user = _username(request.headers)
+    user = _safe_user(header_user or req.created_by)
+    parent_id = req.parent_id or req.session_id or f"{user}-adhoc"
+
+    results = []
+    for brief in req.briefs:
+        payload = brief.model_dump()
+        # Merge context_files into files if provided separately.
+        if payload.get("context_files") and not payload.get("files"):
+            payload["files"] = payload["context_files"]
+        try:
+            outcome = coord.spawn(
+                parent_id=parent_id,
+                brief=payload,
+                created_by=user,
+                depth=req.depth,
+                session_id=req.session_id or parent_id,
+                request_id=parent_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            outcome = {"refused": True, "reason": "error", "message": str(exc)}
+        results.append(outcome)
+
+    return JSONResponse({"parent_id": parent_id, "user": user, "results": results})
+
+
+@app.get("/subagents")
+def list_subagents(request: Request) -> JSONResponse:
+    coord = _require_coordinator()
+    user = _safe_user(_username(request.headers))
+    return JSONResponse(
+        {"user": user, "subagents": coord.list_children_for_user(user)}
+    )
+
+
+@app.get("/subagents/{subagent_id}")
+def get_subagent(subagent_id: str) -> JSONResponse:
+    coord = _require_coordinator()
+    detail = coord.get_child(subagent_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="sub-agent not found")
+    return JSONResponse(detail)
+
+
+@app.post("/subagents/{subagent_id}/stop")
+def stop_subagent(subagent_id: str) -> JSONResponse:
+    coord = _require_coordinator()
+    return JSONResponse(coord.request_stop(subagent_id))
+
+
+@app.post("/subagents/{subagent_id}/callback")
+def subagent_callback(subagent_id: str) -> JSONResponse:
+    """Low-latency wake-up from the optional callback Service (§10). Blob
+    remains the source of truth; this just nudges an immediate harvest."""
+    coord = _require_coordinator()
+    coord.notify_callback(subagent_id)
+    return JSONResponse({"ok": True})
 
 
 # --------------------------------------------------------------------------- #
@@ -394,6 +628,7 @@ async def ws_pty(websocket: WebSocket) -> None:
         return
 
     session_dir = _user_session_dir(user)
+    _ensure_user_repo(user)
     proc, master_fd = pty_runner.spawn(
         session_dir=session_dir,
         workspace_dir=_user_workspace_dir(user),
@@ -401,6 +636,7 @@ async def ws_pty(websocket: WebSocket) -> None:
         session_id=session_id,
         cols=cols,
         rows=rows,
+        extra_env=_pi_extra_env(user, session_id),
     )
     loop = asyncio.get_running_loop()
 
@@ -470,7 +706,7 @@ _PAGE = r"""
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Pi Agent</title>
+<title>SWE Main Agent</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
@@ -518,16 +754,37 @@ _PAGE = r"""
   .refresh { align-self: flex-start; background: var(--panel-2); color: var(--text);
              border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; cursor: pointer; }
   @media (max-width: 820px) { .charts { grid-template-columns: 1fr; } }
+
+  /* Sub-agents */
+  #subagents { overflow-y: auto; padding: 24px; gap: 16px; }
+  .sub-toolbar { display: flex; align-items: center; gap: 12px; }
+  .sub-toolbar .hint { color: var(--muted); font-size: 12px; }
+  .sub-empty { color: var(--muted); background: var(--panel); border: 1px solid var(--border);
+               border-radius: 12px; padding: 20px; }
+  .sub-table { width: 100%; border-collapse: collapse; background: var(--panel);
+               border: 1px solid var(--border); border-radius: 12px; overflow: hidden; font-size: 13px; }
+  .sub-table th, .sub-table td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .sub-table th { color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: .5px; }
+  .sub-table td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.running, .pill.pending, .pill.launched { background: #2a3350; color: #9db4ff; }
+  .pill.completed, .pill.succeeded { background: #14402f; color: #4fe0a8; }
+  .pill.failed, .pill.failed_after, .pill.timed_out, .pill.out_of_memory { background: #47212b; color: #ff8fa3; }
+  .pill.stopped, .pill.blocked, .pill.expired { background: #4a3b1e; color: #f0c060; }
+  .sub-stop { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+              border-radius: 7px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+  .sub-stop:disabled { opacity: .4; cursor: default; }
 </style>
 </head>
 <body>
 <header>
   <span class="dot" id="status-dot"></span>
-  <h1>Pi Agent</h1>
+  <h1>SWE Main Agent</h1>
   <span id="whoami" style="font-size:13px;color:var(--muted);"></span>
   <nav>
     <button id="tab-term" class="active" onclick="showView('terminal')">Terminal</button>
     <button id="tab-dash" onclick="showView('dashboard')">Dashboard</button>
+    <button id="tab-sub" onclick="showView('subagents')">Sub-agents</button>
   </nav>
 </header>
 <main>
@@ -547,6 +804,22 @@ _PAGE = r"""
       <div class="chart-box"><h3>Tool usage</h3><canvas id="toolChart"></canvas></div>
       <div class="chart-box"><h3>Model usage</h3><canvas id="modelChart"></canvas></div>
     </div>
+  </section>
+  <section id="subagents" class="view">
+    <div class="sub-toolbar">
+      <button class="refresh" onclick="loadSubagents()">Refresh</button>
+      <span class="hint">Delegated sub-agents spawned from your sessions. Auto-refreshes every 10s.</span>
+    </div>
+    <div id="sub-empty" class="sub-empty">No sub-agents yet. The main agent can delegate scoped tasks with <code>spawn_subagent</code>.</div>
+    <table id="sub-table" class="sub-table" style="display:none">
+      <thead>
+        <tr>
+          <th>Sub-agent</th><th>Task</th><th>State</th><th>Status</th>
+          <th>Turns</th><th>Cost</th><th>PR</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="sub-body"></tbody>
+    </table>
   </section>
 </main>
 
@@ -569,13 +842,15 @@ async function readJson(r) {
 function setStatus(ok) { document.getElementById('status-dot').classList.toggle('ok', ok); }
 
 function showView(name) {
-  const isTerm = name === 'terminal';
-  document.getElementById('terminal-view').classList.toggle('active', isTerm);
-  document.getElementById('dashboard').classList.toggle('active', !isTerm);
-  document.getElementById('tab-term').classList.toggle('active', isTerm);
-  document.getElementById('tab-dash').classList.toggle('active', !isTerm);
-  if (isTerm) { setTimeout(fitTerminal, 0); }
-  else { loadDashboard(); }
+  const views = { terminal: 'terminal-view', dashboard: 'dashboard', subagents: 'subagents' };
+  const tabs = { terminal: 'tab-term', dashboard: 'tab-dash', subagents: 'tab-sub' };
+  for (const [key, id] of Object.entries(views)) {
+    document.getElementById(id).classList.toggle('active', key === name);
+    document.getElementById(tabs[key]).classList.toggle('active', key === name);
+  }
+  if (name === 'terminal') { setTimeout(fitTerminal, 0); }
+  else if (name === 'dashboard') { loadDashboard(); }
+  else if (name === 'subagents') { loadSubagents(); }
 }
 
 async function loadWhoami() {
@@ -697,6 +972,69 @@ async function loadDashboard() {
     document.getElementById('cards').innerHTML = card('Status', 'Service unavailable');
   }
 }
+
+// --------------------------- Sub-agents ---------------------------
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function isTerminalState(state) {
+  return ['completed', 'failed', 'failed_after', 'out_of_memory', 'stopped', 'expired']
+    .includes((state || '').toLowerCase());
+}
+
+async function loadSubagents() {
+  let subs = [];
+  try {
+    const r = await fetch(apiUrl('/subagents'));
+    const data = await readJson(r);
+    subs = data.subagents || [];
+  } catch (e) { /* leave empty */ }
+
+  const table = document.getElementById('sub-table');
+  const empty = document.getElementById('sub-empty');
+  const body = document.getElementById('sub-body');
+  if (!subs.length) {
+    table.style.display = 'none';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  table.style.display = 'table';
+
+  subs.sort((a, b) => (b.launched_at || '').localeCompare(a.launched_at || ''));
+  body.innerHTML = subs.map(s => {
+    const state = s.reported ? (s.status || s.state) : s.state;
+    const cls = (state || '').toLowerCase();
+    const pr = s.pr_url ? `<a href="${esc(s.pr_url)}" target="_blank">link</a>` : '—';
+    const cost = '$' + (Number(s.cost) || 0).toFixed(3);
+    const canStop = !s.reported && !isTerminalState(s.state);
+    return `<tr>
+      <td class="mono">${esc(s.subagent_id)}</td>
+      <td>${esc(s.title)}</td>
+      <td><span class="pill ${cls}">${esc(state || 'launched')}</span></td>
+      <td>${esc(s.status || '—')}</td>
+      <td>${esc(s.turns || 0)}</td>
+      <td>${cost}</td>
+      <td>${pr}</td>
+      <td><button class="sub-stop" ${canStop ? '' : 'disabled'}
+           onclick="stopSubagent('${esc(s.subagent_id)}')">Stop</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function stopSubagent(id) {
+  try {
+    await fetch(apiUrl('/subagents/' + encodeURIComponent(id) + '/stop'), { method: 'POST' });
+  } catch (e) { /* ignore */ }
+  setTimeout(loadSubagents, 500);
+}
+
+// Keep the sub-agent panel live while it is visible.
+setInterval(() => {
+  if (document.getElementById('subagents').classList.contains('active')) loadSubagents();
+}, 10000);
 
 // Resolve the user first (so the WS carries it as a fallback identity), then
 // boot the terminal.

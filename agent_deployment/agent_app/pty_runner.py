@@ -45,6 +45,7 @@ def spawn(
     session_id: Optional[str] = None,
     cols: int = 80,
     rows: int = 24,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> tuple[subprocess.Popen, int]:
     """Start pi attached to a PTY and return (process, master_fd).
 
@@ -62,8 +63,11 @@ def spawn(
     _set_winsize(master_fd, rows, cols)
 
     argv: list[str] = ["pi", "--session-dir", session_dir, "-a"]
-    if model:
-        argv += ["--model", model]
+    provider, model_id = pi_runner.split_model(model)
+    if provider:
+        argv += ["--provider", provider]
+    if model_id:
+        argv += ["--model", model_id]
     if session_id:
         argv += ["--session", session_id]
 
@@ -73,6 +77,8 @@ def spawn(
     env["FORCE_COLOR"] = "1"
     env["COLUMNS"] = str(cols)
     env["LINES"] = str(rows)
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items() if v is not None})
 
     proc = subprocess.Popen(
         argv,

@@ -72,6 +72,25 @@ def _extract_text(content: Any) -> str:
     return "".join(parts)
 
 
+def split_model(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Split a ``provider/model`` string into (provider, model_id).
+
+    pi's CLI selects the provider and model with *separate* ``--provider`` /
+    ``--model`` flags; it does not parse a ``provider/model`` slash form. If we
+    pass a slashed value to ``--model`` (or a bare id with no provider), pi
+    falls back to the model's default owner provider -- for ``gpt-5.1`` that is
+    ``azure-openai-responses``, which needs ``AZURE_OPENAI_API_KEY`` rather than
+    the configured ``OPENAI_API_KEY``. So we always split and pass the provider
+    explicitly.
+    """
+    if not model:
+        return None, None
+    provider, sep, model_id = model.partition("/")
+    if sep:
+        return provider or None, model_id or None
+    return None, model
+
+
 def _build_argv(
     message: str,
     session_id: Optional[str],
@@ -90,8 +109,11 @@ def _build_argv(
         # resources or stall waiting on a prompt.
         "-a",
     ]
-    if model:
-        argv += ["--model", model]
+    provider, model_id = split_model(model)
+    if provider:
+        argv += ["--provider", provider]
+    if model_id:
+        argv += ["--model", model_id]
     if thinking and thinking.lower() != "off":
         argv += ["--thinking", thinking]
     if session_id:
@@ -128,6 +150,7 @@ def run_pi(
     session_dir: Optional[str] = None,
     thinking: Optional[str] = None,
     workspace_dir: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> PiResult:
     """Run pi once with `message` and return the parsed result.
 
@@ -144,10 +167,14 @@ def run_pi(
 
     argv = _build_argv(message, session_id, model, session_name, session_dir, thinking)
 
+    env = _pi_env()
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items() if v is not None})
+
     proc = subprocess.run(
         argv,
         cwd=workspace_dir,
-        env=_pi_env(),
+        env=env,
         capture_output=True,
         text=True,
         timeout=PI_TIMEOUT_SECONDS,
@@ -204,6 +231,7 @@ def stream_pi(
     session_dir: Optional[str] = None,
     thinking: Optional[str] = None,
     workspace_dir: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> Iterator[dict[str, Any]]:
     """Run pi and yield normalized events as they happen (for live streaming).
 
@@ -227,11 +255,15 @@ def stream_pi(
     last_reply = ""
     usage_total = _new_usage()
 
+    env = _pi_env()
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items() if v is not None})
+
     err_file = tempfile.TemporaryFile(mode="w+")
     proc = subprocess.Popen(
         argv,
         cwd=workspace_dir,
-        env=_pi_env(),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=err_file,
         text=True,

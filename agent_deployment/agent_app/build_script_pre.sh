@@ -6,6 +6,20 @@ set -euo pipefail
 apt-get update
 apt-get install -y --no-install-recommends curl ca-certificates
 
+# Git + SSH client so every agent (main and sub) can clone/push the shared repo
+# over SSH using the deploy key from the Secrets Manager (specification §5).
+apt-get install -y --no-install-recommends git openssh-client
+
+# GitHub CLI, used by sub-agents to open/update PRs via the API token. Installed
+# from the official apt repo; PR support degrades gracefully if this is absent.
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+  -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+  > /etc/apt/sources.list.d/github-cli.list
+apt-get update
+apt-get install -y --no-install-recommends gh
+
 # Node.js LTS from NodeSource (provides node + npm).
 curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
 apt-get install -y --no-install-recommends nodejs
@@ -21,8 +35,19 @@ ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 # Pi coding agent CLI, installed globally so `pi` is on PATH at runtime.
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 
+# Expose the `spawn_subagent` delegation helper on PATH so the main agent's pi
+# can call it from its bash tool (specification §6.2). The app package is
+# extracted to the site-packages path below and is importable by name.
+cat > /usr/local/bin/spawn_subagent <<'EOF'
+#!/usr/bin/env bash
+exec python -m agent_app.spawn_tool "$@"
+EOF
+chmod +x /usr/local/bin/spawn_subagent
+
 # Sanity check the install during the build.
 node --version
 pi --version
 fd --version
 rg --version
+git --version
+gh --version || true
