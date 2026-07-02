@@ -38,7 +38,7 @@ from fastapi.responses import (
 from pydantic import BaseModel
 
 from agent_app import blob_sync, pi_runner, pty_runner, sessions
-from agent_app.agent_common import git_bootstrap, orchestration
+from agent_app.agent_common import briefing, git_bootstrap, orchestration
 from agent_app.coordinator import Coordinator
 
 # Default model if the `agent_model` KV key is not set. Provider-prefixed
@@ -282,6 +282,24 @@ def _write_pi_settings() -> None:
         pass
 
 
+def _write_agent_instructions() -> None:
+    """Write the main-agent operating brief to ``~/.pi/agent/AGENTS.md`` (§6).
+
+    pi appends this global context file to the system prompt of *every* session
+    (interactive terminal and headless ``/chat`` alike), which is what makes the
+    running agent aware that it is the SWE Main Agent: the repo it works on, how
+    to delegate via ``spawn_subagent``, and how to monitor sub-agents. We
+    regenerate it on each startup so it reflects the live repo URL and limits.
+    """
+    os.makedirs(pi_runner.PI_AGENT_DIR, exist_ok=True)
+    path = os.path.join(pi_runner.PI_AGENT_DIR, "AGENTS.md")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(briefing.build_main_agent_instructions())
+    except OSError as exc:
+        log.warning("could not write agent instructions: %s", exc)
+
+
 def _setup_datatailr_skills() -> None:
     try:
         from datatailr.sbin.datatailr_cli import setup_skills
@@ -326,7 +344,13 @@ def _startup() -> None:
     _restore_state()
     _setup_datatailr_skills()
     _write_pi_settings()
+    _write_agent_instructions()
     _persist_config()
+    # Clone the shared repo into the default workspace up front so the agent's
+    # working directory is already a checkout on the default branch before the
+    # first session connects -- matching what the operating brief tells pi
+    # (§6.1). Per-user workspaces are still cloned lazily on first use.
+    _ensure_user_repo(DEFAULT_USER)
     # Bring up orchestration: the coordinator rehydrates its registry from Blob
     # and starts the background poller that harvests finished sub-agents.
     _coordinator = Coordinator(report_sink=_fold_report)
@@ -564,11 +588,25 @@ def spawn_subagents(req: SpawnRequest, request: Request) -> JSONResponse:
 
 
 @app.get("/subagents")
-def list_subagents(request: Request) -> JSONResponse:
+def list_subagents(
+    request: Request,
+    parent_id: Optional[str] = None,
+    user: Optional[str] = None,
+) -> JSONResponse:
+    """List sub-agents and their live state.
+
+    Browser/API callers are identified by the platform user header. The
+    in-container ``check_subagents`` helper has no header, so it scopes the
+    query to its originating session via the ``parent_id`` (falling back to
+    ``user``) query params instead."""
     coord = _require_coordinator()
-    user = _safe_user(_username(request.headers))
+    if parent_id:
+        return JSONResponse(
+            {"parent_id": parent_id, "subagents": coord.list_children(parent_id)}
+        )
+    resolved = _safe_user(_username(request.headers) or user)
     return JSONResponse(
-        {"user": user, "subagents": coord.list_children_for_user(user)}
+        {"user": resolved, "subagents": coord.list_children_for_user(resolved)}
     )
 
 

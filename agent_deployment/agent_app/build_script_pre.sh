@@ -44,6 +44,14 @@ exec python -m agent_app.spawn_tool "$@"
 EOF
 chmod +x /usr/local/bin/spawn_subagent
 
+# Expose the `check_subagents` monitoring helper on PATH so pi can inspect the
+# sub-agents it spawned on demand (specification §6, §13).
+cat > /usr/local/bin/check_subagents <<'EOF'
+#!/usr/bin/env bash
+exec python -m agent_app.monitor_tool "$@"
+EOF
+chmod +x /usr/local/bin/check_subagents
+
 # Sanity check the install during the build.
 node --version
 pi --version
