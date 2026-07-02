@@ -253,6 +253,9 @@ class Coordinator:
             "wall_clock_s": _parse_duration(assignment["budget"]["wall_clock"]),
             "status": None,
             "pr_url": None,
+            "pr_error": None,
+            "summary": None,
+            "warnings": [],
             "cost": 0.0,
             "turns": 0,
         }
@@ -515,6 +518,9 @@ class Coordinator:
             entry["cost"] = float((result.get("usage") or {}).get("cost", 0.0) or 0.0)
             pr = (result.get("git") or {}).get("pr")
             entry["pr_url"] = pr.get("url") if isinstance(pr, dict) else None
+            entry["pr_error"] = pr.get("error") if isinstance(pr, dict) else None
+            entry["summary"] = result.get("summary")
+            entry["warnings"] = result.get("warnings") or []
             entry["reported_at"] = _now_iso()
             # Free the dedup slot now the assignment is complete.
             self._dedup.pop(entry.get("dedup_hash", ""), None)

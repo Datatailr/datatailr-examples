@@ -265,12 +265,16 @@ def _commit_and_push(
     )
     commit = _git(["commit", "-m", commit_msg], workdir)
     if commit.returncode != 0:
-        log.warning(f"[{subagent_id}] commit failed: {commit.stderr.strip()[:300]}")
+        err = f"commit failed: {commit.stderr.strip()[:300]}"
+        log.error(f"[{subagent_id}] {err}")
+        git_info["error"] = err
         return git_info
 
     push = _git(["push", "-u", "origin", work_branch], workdir)
     if push.returncode != 0:
-        log.warning(f"[{subagent_id}] push failed: {push.stderr.strip()[:300]}")
+        err = f"push failed: {push.stderr.strip()[:300]}"
+        log.error(f"[{subagent_id}] {err}")
+        git_info["error"] = err
         return git_info
 
     git_info["pushed"] = True
@@ -426,22 +430,30 @@ def _open_or_update_pr(assignment: dict[str, Any], workdir: str) -> Optional[dic
     base_branch = git_spec.get("base_branch")
     title = _short_title(assignment.get("task", {}).get("title", "change"))
 
+    def _skip(reason: str, *, level: str = "warning") -> dict[str, Any]:
+        getattr(log, level)(f"[{subagent_id}] PR skipped: {reason} (branch pushed)")
+        return {"action": "none", "number": None, "url": None,
+                "title": title, "ci_state": "unknown", "error": reason}
+
     token = git_bootstrap.git_token()
     if not token:
-        log.info(f"[{subagent_id}] no git token; skipping PR (branch pushed)")
-        return None
+        return _skip("no git token configured (secret 'agent_git_token')")
     if not _gh_available():
-        log.info(f"[{subagent_id}] gh CLI unavailable; skipping PR (branch pushed)")
-        return None
+        return _skip("gh CLI unavailable in the sub-agent image")
 
     slug = _repo_slug(assignment, workdir)
     if not slug:
-        log.warning(f"[{subagent_id}] could not resolve owner/repo; skipping PR")
-        return None
+        return _skip("could not resolve owner/repo from the git remote")
     owner = slug.split("/")[0]
 
     env = dict(os.environ)
     env["GH_TOKEN"] = token  # never logged
+    # Point gh at the repo host for GitHub Enterprise (defaults to github.com).
+    host, _ = git_bootstrap.parse_git_host(
+        (git_spec.get("repo_url") or git_bootstrap.repo_url())
+    )
+    if host and host != "github.com":
+        env["GH_HOST"] = host
 
     def gh_api(args: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -449,16 +461,21 @@ def _open_or_update_pr(assignment: dict[str, Any], workdir: str) -> Optional[dic
             cwd=workdir, capture_output=True, text=True, env=env,
         )
 
-    def _log_gh_error(action: str, err: str) -> None:
-        msg = err.strip()[:400]
-        log.warning(f"[{subagent_id}] {action} failed: {msg}")
-        if "not accessible" in msg.lower() or "403" in msg or "Not Found" in msg:
-            log.warning(
-                f"[{subagent_id}] the git token likely lacks repository access. "
-                "A fine-grained PAT needs 'Pull requests: Read and write' AND "
-                "'Contents: Read-only' on this repo (and, for org repos, the org "
-                "must allow/approve the token)."
+    def _gh_error(action: str, proc: subprocess.CompletedProcess) -> str:
+        """Log and return a human-readable error for a failed gh call."""
+        msg = (proc.stderr or proc.stdout or "").strip()[:400] or f"exit {proc.returncode}"
+        full = f"{action} failed: {msg}"
+        log.error(f"[{subagent_id}] {full}")
+        lower = msg.lower()
+        if "not accessible" in lower or "403" in msg or "not found" in lower or "422" in msg:
+            hint = (
+                "the git token likely lacks repository access. A fine-grained PAT "
+                "needs 'Contents: Read' AND 'Pull requests: Read and write' on this "
+                "repo (and, for org repos, the org must approve the token)."
             )
+            log.error(f"[{subagent_id}] {hint}")
+            full = f"{full} — {hint}"
+        return full
 
     # 1. Is there already an open PR for this head branch?
     pr_obj: Optional[dict[str, Any]] = None
@@ -472,7 +489,8 @@ def _open_or_update_pr(assignment: dict[str, Any], workdir: str) -> Optional[dic
         if arr:
             pr_obj, pr_action = arr[0], "updated"
     elif listed.returncode != 0:
-        _log_gh_error("pr lookup", listed.stderr)
+        # A lookup failure is not fatal (we still try to create), but record it.
+        _gh_error("pr lookup", listed)
 
     # 2. Create it if none exists (never merge).
     if pr_obj is None:
@@ -486,9 +504,9 @@ def _open_or_update_pr(assignment: dict[str, Any], workdir: str) -> Optional[dic
             ]
         )
         if created.returncode != 0:
-            _log_gh_error("pr create", created.stderr)
+            err = _gh_error("pr create", created)
             return {"action": "none", "number": None, "url": None,
-                    "title": title, "ci_state": "unknown"}
+                    "title": title, "ci_state": "unknown", "error": err}
         try:
             pr_obj = _json.loads(created.stdout)
         except ValueError:
@@ -496,7 +514,8 @@ def _open_or_update_pr(assignment: dict[str, Any], workdir: str) -> Optional[dic
 
     if not pr_obj:
         return {"action": pr_action, "number": None, "url": None,
-                "title": title, "ci_state": "unknown"}
+                "title": title, "ci_state": "unknown",
+                "error": "PR API returned no pull-request object"}
 
     head_sha = (pr_obj.get("head") or {}).get("sha")
     ci_state = _pr_ci_state(gh_api, slug, head_sha)
@@ -577,10 +596,16 @@ def _run(subagent_id: str) -> dict[str, Any]:
     reason: Optional[str] = None
     loop_out: dict[str, Any] = {}
     git_info: dict[str, Any] = {"pushed": False, "pr": None}
+    # Collected human-readable problems, surfaced in result.json (and thus in
+    # the UI panel / check_subagents / fold-in) so failures are never silent.
+    warnings: list[str] = []
 
     if not _load_openai_key():
         status, reason = "failed", "missing_openai_key"
         loop_out = {"final_reply": "", "usage": pi_runner._new_usage(), "turns": 0}
+        warnings.append(
+            "OpenAI API key not configured (secret 'openai_api_key'); pi did not run."
+        )
     else:
         model = _resolve_model()
         try:
@@ -592,7 +617,23 @@ def _run(subagent_id: str) -> dict[str, Any]:
         except git_bootstrap.GitBootstrapError as exc:
             status, reason = "failed", f"git_bootstrap_failed: {exc}"
             loop_out = {"final_reply": "", "usage": pi_runner._new_usage(), "turns": 0}
+            warnings.append(f"git bootstrap failed: {exc}")
         else:
+            # Load the git API token into the environment now (GH_TOKEN) so gh is
+            # authenticated for both our PR code and any gh usage by pi. Preflight
+            # it when a PR is expected so a missing/inaccessible token is loud at
+            # the start of the run rather than only surfacing at push/PR time.
+            gh_ready = git_bootstrap.configure_gh_auth()
+            if gh_ready:
+                log.info(f"[{subagent_id}] gh authenticated via '{git_bootstrap.GIT_TOKEN_SECRET}' secret")
+            elif git_spec.get("may_open_pr"):
+                log.error(
+                    f"[{subagent_id}] git API token unavailable: secret "
+                    f"'{git_bootstrap.GIT_TOKEN_SECRET}' is missing or not accessible "
+                    "to this job. The sub-agent will still commit/push, but PR "
+                    "creation will be skipped. Grant the job's identity read access "
+                    "to that secret in this environment (dev/pre/prod)."
+                )
             loop_out = _run_pi_loop(assignment, WORKDIR, model)
             status = loop_out["status"]
             reason = loop_out["reason"]
@@ -602,7 +643,23 @@ def _run(subagent_id: str) -> dict[str, Any]:
                 log.error(f"[{subagent_id}] git persistence failed: {exc}")
                 git_info = {"pushed": False, "branch": git_spec.get("work_branch"),
                             "base_branch": git_spec.get("base_branch"),
-                            "commits": [], "pr": None}
+                            "commits": [], "pr": None,
+                            "error": f"git persistence crashed: {exc}"}
+
+    # Fold git/PR problems into the warnings list.
+    if git_info.get("error"):
+        warnings.append(git_info["error"])
+    pr_info = git_info.get("pr")
+    if isinstance(pr_info, dict) and pr_info.get("error"):
+        warnings.append(pr_info["error"])
+    elif (
+        git_spec.get("may_open_pr")
+        and git_info.get("pushed")
+        and not (isinstance(pr_info, dict) and pr_info.get("url"))
+    ):
+        warnings.append("branch pushed but no pull request was created")
+    if reason and status != "succeeded":
+        warnings.append(f"pi loop ended: {reason}")
 
     artifacts = _archive_session_logs(subagent_id, SESSION_DIR)
     summary = _summarize(status, reason, git_info, loop_out.get("turns", 0))
@@ -611,6 +668,7 @@ def _run(subagent_id: str) -> dict[str, Any]:
         "status": status,
         "reason": reason,
         "summary": summary,
+        "warnings": warnings,
         "final_reply": loop_out.get("final_reply", ""),
         "done_checklist": _build_done_checklist(assignment, status),
         "git": git_info,
@@ -619,6 +677,9 @@ def _run(subagent_id: str) -> dict[str, Any]:
         "children": [],
         "artifacts": artifacts,
     }
+    if warnings:
+        log.warning(f"[{subagent_id}] completed with {len(warnings)} warning(s): "
+                    + " | ".join(warnings))
     orchestration.put_json(orchestration.result_key(subagent_id), result)
     _notify_callback(subagent_id, result)
     log.info(
@@ -665,8 +726,12 @@ def _summarize(status: str, reason: Optional[str], git_info: dict, turns: int) -
     parts.append(f"turns={turns}")
     if git_info.get("pushed"):
         parts.append(f"pushed {git_info.get('branch')}")
-    if pr and pr.get("url"):
+    if git_info.get("error"):
+        parts.append(f"git FAILED ({git_info.get('error')})")
+    if isinstance(pr, dict) and pr.get("url"):
         parts.append(f"PR {pr.get('action')} {pr.get('url')}")
+    elif isinstance(pr, dict) and pr.get("error"):
+        parts.append(f"PR FAILED ({pr.get('error')})")
     return "; ".join(parts)
 
 

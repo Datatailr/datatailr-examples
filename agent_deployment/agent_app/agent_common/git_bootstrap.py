@@ -46,11 +46,25 @@ class GitBootstrapError(RuntimeError):
 # Config access (lazy Datatailr imports; tolerant off-platform)
 # --------------------------------------------------------------------------- #
 def _secret(key: str) -> Optional[str]:
+    """Read a Datatailr secret. Never logs the value; logs *why* on failure.
+
+    A blank/absent secret returns ``None`` quietly, but an exception (typically a
+    missing ACL grant for the identity the job runs as, or being off-platform) is
+    logged at WARNING so token-load failures inside a sub-agent are diagnosable
+    rather than silently indistinguishable from "not configured".
+    """
     try:
         from datatailr import Secrets
 
-        return Secrets().get(key)
-    except Exception:
+        value = Secrets().get(key)
+        return value or None
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "could not read secret %r: %s: %s "
+            "(is the secret defined in this environment and its ACL granted to "
+            "the identity running this job?)",
+            key, type(exc).__name__, exc,
+        )
         return None
 
 
@@ -88,6 +102,28 @@ def default_branch() -> str:
 def git_token() -> Optional[str]:
     """The git-host API token used to open PRs. Never log the return value."""
     return _secret(GIT_TOKEN_SECRET)
+
+
+def configure_gh_auth() -> bool:
+    """Load the git API token into the process env so ``gh`` is authenticated.
+
+    Sets ``GH_TOKEN`` (and ``GH_HOST`` for GitHub Enterprise) on ``os.environ``
+    so every ``gh``/``gh api`` subprocess -- both our own PR code and any ``gh``
+    usage by pi -- is authenticated without an interactive ``gh auth login``.
+    Both the main App (at startup) and each sub-agent (before its pi loop) call
+    this so the two paths load the token identically. Returns ``True`` when a
+    token was loaded. Never logs the token value.
+    """
+    token = git_token()
+    if not token:
+        return False
+    os.environ["GH_TOKEN"] = token
+    # gh must never block a headless job on an interactive auth prompt.
+    os.environ.setdefault("GH_PROMPT_DISABLED", "1")
+    host, _ = parse_git_host(repo_url())
+    if host and host != "github.com":
+        os.environ["GH_HOST"] = host
+    return True
 
 
 def parse_repo_slug(url: Optional[str]) -> Optional[str]:

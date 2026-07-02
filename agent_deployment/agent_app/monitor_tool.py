@@ -60,6 +60,24 @@ def _fmt_table(subs: list[dict]) -> str:
         )
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     lines = ["  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)) for row in rows]
+
+    # Surface problems (PR failures, warnings) beneath the table so they are
+    # never silent -- a pushed branch with no PR, a failed clone, etc.
+    notes: list[str] = []
+    for s in subs:
+        sid = str(s.get("subagent_id", ""))[-28:]
+        problems: list[str] = []
+        if s.get("pr_error"):
+            problems.append(str(s["pr_error"]))
+        for w in s.get("warnings") or []:
+            if str(w) not in problems:
+                problems.append(str(w))
+        for p in problems:
+            notes.append(f"  ! {sid}: {p}")
+    if notes:
+        lines.append("")
+        lines.append("Warnings / errors:")
+        lines.extend(notes)
     return "\n".join(lines)
 
 

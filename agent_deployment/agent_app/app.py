@@ -184,13 +184,23 @@ def _fold_report(entry: dict, result: dict) -> None:
         return
 
     pr = (result.get("git") or {}).get("pr") or {}
-    pr_line = f" PR ({pr.get('action')}): {pr.get('url')}." if pr.get("url") else ""
+    if pr.get("url"):
+        pr_line = f" PR ({pr.get('action')}): {pr.get('url')}."
+    elif pr.get("error"):
+        pr_line = f" PR was NOT created: {pr.get('error')}."
+    else:
+        pr_line = ""
+    warnings = result.get("warnings") or []
+    warn_line = ""
+    if warnings:
+        warn_line = " Warnings: " + " | ".join(str(w) for w in warnings) + "."
     message = (
         f"[orchestrator] Sub-agent {entry.get('subagent_id')} for task "
         f"\"{entry.get('title')}\" finished with status "
-        f"{result.get('status')}.{pr_line} Summary: {result.get('summary')}. "
+        f"{result.get('status')}.{pr_line}{warn_line} Summary: {result.get('summary')}. "
         "Incorporate this outcome and, if appropriate, present the result "
-        "(and any PR link) to the user."
+        "(and any PR link) to the user. If a PR was not created or there were "
+        "warnings, tell the user what went wrong."
     )
     lock = _lock_for(user, session_id)
     with lock:
@@ -235,25 +245,22 @@ def _load_git_token() -> bool:
 
     The token stored in the Secrets Manager (``agent_git_token``) is what lets
     the agent open PRs with ``gh`` from its bash tool. Without this the main
-    agent's ``gh`` is unauthenticated ("run gh auth login"). Set once in the app
-    environment so every pi subprocess inherits it. Never logged."""
+    agent's ``gh`` is unauthenticated ("run gh auth login"). Delegates to the
+    shared :func:`git_bootstrap.configure_gh_auth` so the App and every sub-agent
+    load the token identically. Never logged."""
     if os.environ.get("GH_TOKEN"):
         return True
     try:
-        token = git_bootstrap.git_token()
-    except Exception:
-        token = None
-    if not token:
-        return False
-    os.environ["GH_TOKEN"] = token
-    # Point gh at the repo's host for GitHub Enterprise; defaults to github.com.
-    try:
-        host, _ = git_bootstrap.parse_git_host(git_bootstrap.repo_url())
-        if host and host != "github.com":
-            os.environ.setdefault("GH_HOST", host)
-    except Exception:
-        pass
-    return True
+        ok = git_bootstrap.configure_gh_auth()
+    except Exception:  # noqa: BLE001
+        ok = False
+    if not ok:
+        log.warning(
+            "git API token unavailable: secret '%s' is missing or not accessible; "
+            "gh will be unauthenticated until it is configured",
+            git_bootstrap.GIT_TOKEN_SECRET,
+        )
+    return ok
 
 
 def _load_model() -> str:
