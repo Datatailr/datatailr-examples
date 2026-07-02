@@ -11,6 +11,7 @@ the coordinator can harvest it either from Blob or via ``wf.result(...)`` (§10)
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from typing import Any, Optional
@@ -28,6 +29,10 @@ log = DatatailrLogger(__name__).get_logger()
 DONE_SENTINEL = "<<<PI_TASK_COMPLETE>>>"
 
 WORKDIR = os.environ.get("SUBAGENT_WORKDIR", "/tmp/subagent_repo")
+# pi's session store MUST live outside the repo checkout, otherwise its
+# transcript files land in the working tree and get swept into the commit/PR by
+# ``git add -A``. Keep it as a sibling and archive it to Blob afterwards (§4).
+SESSION_DIR = os.environ.get("SUBAGENT_SESSION_DIR", "/tmp/subagent_sessions")
 OPENAI_SECRET_KEY = os.environ.get("OPENAI_SECRET_KEY", "openai_api_key")
 MODEL_KV_KEY = os.environ.get("MODEL_KV_KEY", "agent_model")
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "openai/gpt-5-mini")
@@ -130,7 +135,9 @@ def _run_pi_loop(
     reason: Optional[str] = "no_progress"
 
     prompt = _build_prompt(assignment)
-    session_dir = os.path.join(workdir, ".pi_sessions")
+    # Session store lives outside ``workdir`` so it never enters the repo tree.
+    session_dir = SESSION_DIR
+    os.makedirs(session_dir, exist_ok=True)
 
     while turns < max_turns:
         # Cooperative stop: the coordinator can set a stop flag between turns.
@@ -248,10 +255,13 @@ def _commit_and_push(
         return git_info
 
     _git(["add", "-A"], workdir)
+    ref = _run_reference(subagent_id)
+    run_trailer = f" ({ref['run_id']})" if ref["run_id"] else ""
     commit_msg = (
-        f"agent({subagent_id}): {title}\n\n"
-        f"Assignment: {subagent_id}\n"
-        f"Automated change by the SWE sub-agent. Review required; do not auto-merge."
+        f"{_short_title(title)}\n\n"
+        f"Automated change by the SWE sub-agent. Review required; do not auto-merge.\n\n"
+        f"Sub-agent: {subagent_id}\n"
+        f"Workflow-Run: {ref['job_name'] or 'unknown'}{run_trailer}\n"
     )
     commit = _git(["commit", "-m", commit_msg], workdir)
     if commit.returncode != 0:
@@ -273,6 +283,82 @@ def _commit_and_push(
         git_info["pr"] = _open_or_update_pr(assignment, workdir)
 
     return git_info
+
+
+# --------------------------------------------------------------------------- #
+# PR title / description composition (§10 step 4)
+# --------------------------------------------------------------------------- #
+# Strip a leading conventional "agent:" / "agent(...):" prefix the brief may add.
+_AGENT_PREFIX_RE = re.compile(r"^\s*agent(?:\([^)]*\))?:\s*", re.IGNORECASE)
+
+
+def _short_title(raw: str, limit: int = 68) -> str:
+    """A concise, single-line PR/commit title from a (possibly long) task title.
+
+    Collapses whitespace, drops a redundant ``agent:`` prefix, and truncates at a
+    word boundary so the title stays short and readable -- the full detail lives
+    in the description instead."""
+    text = " ".join((raw or "").split())
+    text = _AGENT_PREFIX_RE.sub("", text)
+    if not text:
+        return "Automated change"
+    if len(text) <= limit:
+        return text
+    clipped = text[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:-([{")
+    return (clipped or text[:limit].rstrip()) + "\u2026"
+
+
+def _run_reference(subagent_id: str) -> dict[str, str]:
+    """Identifiers of the batch run executing this sub-agent, for the PR footer.
+
+    ``DATATAILR_JOB_NAME`` is the unique workflow display name (it embeds the
+    sub-agent id) and ``DATATAILR_BATCH_RUN_ID`` is the concrete run id -- both
+    are set in the task container by the platform (see datatailr batch runner)."""
+    return {
+        "subagent_id": subagent_id,
+        "job_name": os.environ.get("DATATAILR_JOB_NAME", ""),
+        "run_id": os.environ.get("DATATAILR_BATCH_RUN_ID", ""),
+        "environment": os.environ.get("DATATAILR_JOB_ENVIRONMENT", ""),
+    }
+
+
+def _pr_body(assignment: dict[str, Any]) -> str:
+    """A clear, structured PR description with an automated-sub-agent footer."""
+    task = assignment.get("task", {})
+    git_spec = assignment.get("git", {})
+    subagent_id = assignment["subagent_id"]
+    instructions = (task.get("instructions") or "").strip()
+    dod = task.get("definition_of_done") or []
+    ref = _run_reference(subagent_id)
+
+    sections: list[str] = []
+    summary = _short_title(task.get("title") or "", limit=120) or "Automated change."
+    sections.append(f"## Summary\n\n{summary}\n")
+
+    if instructions:
+        sections.append(f"## Task\n\n{instructions}\n")
+
+    if dod:
+        checklist = "\n".join(f"- [ ] {item}" for item in dod)
+        sections.append(f"## Definition of done\n\n{checklist}\n")
+
+    run_line = f"`{ref['job_name']}`" if ref["job_name"] else "(unknown workflow)"
+    if ref["run_id"]:
+        run_line += f", run `{ref['run_id']}`"
+    if ref["environment"]:
+        run_line += f" ({ref['environment']})"
+    footer = (
+        "---\n\n"
+        "### Automated sub-agent PR\n\n"
+        "This pull request was opened automatically by an SWE **sub-agent**. "
+        "Please review carefully before merging \u2014 **do not auto-merge**.\n\n"
+        f"- **Sub-agent:** `{subagent_id}`\n"
+        f"- **Workflow run:** {run_line}\n"
+        f"- **Branch:** `{git_spec.get('work_branch')}` \u2192 "
+        f"`{git_spec.get('base_branch')}`\n"
+    )
+    sections.append(footer)
+    return "\n".join(sections)
 
 
 def _gh_available() -> bool:
@@ -300,7 +386,7 @@ def _open_or_update_pr(assignment: dict[str, Any], workdir: str) -> Optional[dic
     subagent_id = assignment["subagent_id"]
     work_branch = git_spec.get("work_branch")
     base_branch = git_spec.get("base_branch")
-    title = f"agent: {assignment.get('task', {}).get('title', 'change')}"
+    title = _short_title(assignment.get("task", {}).get("title", "change"))
 
     token = git_bootstrap.git_token()
     if not token:
@@ -334,23 +420,31 @@ def _open_or_update_pr(assignment: dict[str, Any], workdir: str) -> Optional[dic
             pr_action = "updated"
 
     if pr_action == "opened":
-        body = (
-            f"Automated change by SWE sub-agent `{subagent_id}`.\n\n"
-            "Definition of done:\n"
-            + "\n".join(
-                f"- {d}" for d in assignment.get("task", {}).get("definition_of_done", [])
-            )
-            + "\n\n**Do not auto-merge** -- human review required."
-        )
+        body = _pr_body(assignment)
         created = gh(
             [
                 "pr", "create", "--base", base_branch, "--head", work_branch,
                 "--title", title, "--body", body,
             ]
         )
-        if created.returncode != 0:
+        # gh can exit non-zero because of a *non-fatal* GraphQL metadata warning
+        # (e.g. a fine-grained PAT that lacks read access to
+        # `repository.defaultBranchRef`) even though the PR is created and its
+        # URL is printed to stdout. Only treat it as a real failure when no PR
+        # URL comes back; otherwise it's a benign warning.
+        created_url = next(
+            (ln.strip() for ln in (created.stdout or "").splitlines()
+             if ln.strip().startswith("http")),
+            "",
+        )
+        if created.returncode != 0 and not created_url:
             log.warning(
                 f"[{subagent_id}] pr create failed: {created.stderr.strip()[:300]}"
+            )
+        elif created.returncode != 0:
+            log.info(
+                f"[{subagent_id}] PR created ({created_url}); ignoring non-fatal "
+                f"gh warning: {created.stderr.strip()[:200]}"
             )
 
     view = gh(
@@ -398,6 +492,35 @@ def _build_done_checklist(assignment: dict[str, Any], status: str) -> list[dict[
         {"item": item, "met": met}
         for item in assignment.get("task", {}).get("definition_of_done", [])
     ]
+
+
+def _archive_session_logs(subagent_id: str, session_dir: str) -> list[str]:
+    """Upload pi's run transcript(s) to Blob under ``agent_runs/<id>/logs/`` (§4).
+
+    This is the audit/monitoring trail of what the sub-agent actually did -- the
+    same transcript that must NOT be committed into the repo. Returns the list
+    of Blob keys written, recorded in ``result.artifacts`` so the coordinator /
+    UI can retrieve them later. Best effort: failures never fail the task.
+    """
+    keys: list[str] = []
+    if not os.path.isdir(session_dir):
+        return keys
+    for root, _dirs, files in os.walk(session_dir):
+        for fname in files:
+            if not fname.endswith(".jsonl"):
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                continue
+            key = f"{orchestration.logs_prefix(subagent_id)}/{fname}"
+            if orchestration.put_bytes(key, data):
+                keys.append(key)
+    if keys:
+        log.info(f"[{subagent_id}] archived {len(keys)} session transcript(s) to Blob")
+    return keys
 
 
 def _run(subagent_id: str) -> dict[str, Any]:
@@ -454,6 +577,7 @@ def _run(subagent_id: str) -> dict[str, Any]:
                             "base_branch": git_spec.get("base_branch"),
                             "commits": [], "pr": None}
 
+    artifacts = _archive_session_logs(subagent_id, SESSION_DIR)
     summary = _summarize(status, reason, git_info, loop_out.get("turns", 0))
     result = {
         "subagent_id": subagent_id,
@@ -466,7 +590,7 @@ def _run(subagent_id: str) -> dict[str, Any]:
         "usage": loop_out.get("usage", pi_runner._new_usage()),
         "turns": loop_out.get("turns", 0),
         "children": [],
-        "artifacts": [],
+        "artifacts": artifacts,
     }
     orchestration.put_json(orchestration.result_key(subagent_id), result)
     _notify_callback(subagent_id, result)

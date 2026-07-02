@@ -184,6 +184,18 @@ def put_json(key: str, obj: Any, blob=None) -> bool:
         return False
 
 
+def put_bytes(key: str, data: bytes, blob=None) -> bool:
+    """Store raw bytes at ``key`` (used for log/transcript artifacts, §4)."""
+    blob = blob or blob_client()
+    if blob is None:
+        return False
+    try:
+        blob.put(key, data if isinstance(data, bytes) else str(data).encode("utf-8"))
+        return True
+    except Exception:
+        return False
+
+
 def get_json(key: str, blob=None) -> Optional[Any]:
     blob = blob or blob_client()
     if blob is None:
