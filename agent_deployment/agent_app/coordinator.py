@@ -372,6 +372,23 @@ class Coordinator:
                 self._wf_cache[key] = wf
         return wf
 
+    @staticmethod
+    def _run_sort_key(run: dict) -> float:
+        """Epoch-seconds sort key that never mixes naive/aware datetimes.
+
+        ``Workflow.runs()`` returns *naive* ``start_time`` datetimes (from
+        ``datetime.fromtimestamp``) for started runs and ``0`` for not-yet-started
+        ones. Comparing those against a tz-aware fallback (as the old key did)
+        raises ``TypeError`` once a workflow has more than one run (e.g. a retry),
+        which would abort the whole poll cycle. Normalizing to a float avoids that.
+        """
+        st = run.get("start_time")
+        if isinstance(st, datetime):
+            return st.timestamp()
+        if isinstance(st, (int, float)):
+            return float(st)
+        return 0.0
+
     def _latest_run(self, wf) -> Optional[dict]:
         try:
             runs = wf.runs(refresh=True) or []
@@ -379,11 +396,7 @@ class Coordinator:
             return None
         if not runs:
             return None
-        return max(
-            runs,
-            key=lambda r: r.get("start_time")
-            or datetime.min.replace(tzinfo=timezone.utc),
-        )
+        return max(runs, key=self._run_sort_key)
 
     # ------------------------------------------------------------------ #
     # Track & harvest (§7)
@@ -415,7 +428,14 @@ class Coordinator:
                 if not c.get("reported")
             ]
         for entry in pending:
-            self._refresh_and_maybe_report(entry["subagent_id"])
+            # Isolate per-child failures so one bad handle cannot starve the
+            # rest of the cycle (the whole cycle is retried on the next poll).
+            try:
+                self._refresh_and_maybe_report(entry["subagent_id"])
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "harvest of %s failed: %s", entry.get("subagent_id"), exc
+                )
 
     def _refresh_and_maybe_report(self, subagent_id: str) -> None:
         with self._lock:

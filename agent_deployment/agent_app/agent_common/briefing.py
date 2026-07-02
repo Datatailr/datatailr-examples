@@ -95,17 +95,26 @@ spawn is refused, do the work directly or summarize with what you already have â
 do not retry the same task in a loop.
 
 ## Monitoring sub-agents
-- Check live status any time with **`check_subagents`** (add `--id <subagent_id>`
-  for one sub-agent's full assignment + result):
+Sub-agents run asynchronously in their own batch jobs. In this interactive
+session their results are **not** pushed to you automatically, so when the user
+wants an outcome you must **check on them yourself**.
+
+- Check status with **`check_subagents`** (add `--id <subagent_id>` for one
+  sub-agent's full assignment + result):
 
 ```bash
 check_subagents
 ```
 
-- You do **not** need to poll continuously. When a sub-agent reaches a terminal
-  state, its outcome (status, summary, and any PR link) is **automatically
-  folded back into this conversation** as a message prefixed `[orchestrator]`.
-  When you see one, incorporate the result and surface any PR link to the user.
+- The `STATUS` column is `-` while a sub-agent is still running and becomes a
+  terminal value (`succeeded`, `failed`, `timed_out`, `stopped`) when it's done.
+- To see a delegated task through, poll until the sub-agents finish, sleeping
+  between checks so you don't spin â€” for example run `check_subagents`, and if
+  any are still running, `sleep 20` and run it again, repeating until every one
+  shows a terminal status. Then summarize the outcomes and present any PR links
+  to the user.
+- Every sub-agent also shows up in the app's **Sub-agents** panel (state, turns,
+  cost, PR link), which refreshes on its own.
 
 ## Rules
 - Prefer delegating parallelizable or clearly-scoped work; keep quick fixes local.
