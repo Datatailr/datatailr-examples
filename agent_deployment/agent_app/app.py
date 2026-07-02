@@ -995,7 +995,7 @@ function card(label, value) {
   return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
 }
 
-function drawChart(id, type, labels, values, label) {
+function drawChart(id, type, labels, values, label, extraOptions) {
   if (charts[id]) charts[id].destroy();
   const ctx = document.getElementById(id);
   charts[id] = new Chart(ctx, {
@@ -1010,14 +1010,14 @@ function drawChart(id, type, labels, values, label) {
         borderColor: '#6d8bff', borderWidth: 2, tension: 0.3, fill: false,
       }],
     },
-    options: {
+    options: Object.assign({
       responsive: true,
       plugins: { legend: { display: type === 'doughnut', labels: { color: '#9aa3b2' } } },
       scales: type === 'doughnut' ? {} : {
         x: { ticks: { color: '#9aa3b2' }, grid: { color: '#2a2f3d' } },
         y: { ticks: { color: '#9aa3b2' }, grid: { color: '#2a2f3d' } },
       },
-    },
+    }, extraOptions || {}),
   });
 }
 
@@ -1035,7 +1035,8 @@ async function loadDashboard() {
       card('Est. cost', '$' + (t.cost || 0).toFixed(4));
 
     const tl = s.timeline || [];
-    drawChart('timelineChart', 'line', tl.map(d => d.date), tl.map(d => d.messages), 'Messages');
+    drawChart('timelineChart', 'line', tl.map(d => d.date), tl.map(d => d.messages), 'Messages',
+      { aspectRatio: 6 });
     const tools = s.tool_usage || [];
     drawChart('toolChart', 'bar', tools.map(d => d.tool), tools.map(d => d.count), 'Calls');
     const models = s.model_usage || [];
