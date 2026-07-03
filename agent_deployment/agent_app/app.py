@@ -26,6 +26,7 @@ import re
 import threading
 from collections import defaultdict
 from contextlib import asynccontextmanager
+import subprocess
 from typing import Mapping, Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
@@ -168,7 +169,6 @@ def _pi_extra_env(user: str, session_id: Optional[str], depth: int = 0) -> dict[
         "SWE_PARENT_SESSION": session_id or f"{user}-adhoc",
         "SWE_DEPTH": str(depth),
     }
-
 
 def _fold_report(entry: dict, result: dict) -> None:
     """Report sink: inject a synthesized user turn into the parent pi session
@@ -315,6 +315,41 @@ def _write_pi_settings() -> None:
         pass
 
 
+def _write_pi_keybindings() -> None:
+    """Write chat-style Enter keybindings to ``~/.pi/agent/keybindings.json``.
+
+    In the composer we want Enter to insert a newline and Ctrl/Cmd+Enter to
+    submit, but menus and approval prompts should still confirm on a plain
+    Enter. pi routes those two behaviours through *different* actions:
+    ``tui.input.submit`` (message composer) versus ``tui.select.confirm``
+    (overlays/lists). So we move submit onto ``ctrl+enter`` and add ``enter`` to
+    ``tui.input.newLine`` while leaving ``tui.select.confirm`` untouched. The
+    browser terminal maps Ctrl/Cmd+Enter to pi's ``ctrl+enter`` (CSI-u code
+    ``\\x1b[13;5u``); see ``initTerminal()`` in the page. We merge into any
+    existing bindings so other customizations survive restarts.
+    """
+    os.makedirs(pi_runner.PI_AGENT_DIR, exist_ok=True)
+    path = os.path.join(pi_runner.PI_AGENT_DIR, "keybindings.json")
+
+    bindings: dict = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            existing = json.load(fh)
+        if isinstance(existing, dict):
+            bindings = existing
+    except (OSError, ValueError):
+        bindings = {}
+
+    bindings["tui.input.submit"] = ["ctrl+enter"]
+    bindings["tui.input.newLine"] = ["enter", "shift+enter", "ctrl+j"]
+
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(bindings, fh, indent=2)
+    except OSError as exc:
+        log.warning("could not write pi keybindings: %s", exc)
+
+
 def _write_agent_instructions() -> None:
     """Write the main-agent operating brief to ``~/.pi/agent/AGENTS.md`` (§6).
 
@@ -341,6 +376,18 @@ def _setup_datatailr_skills() -> None:
     except Exception:
         pass
 
+
+def _try_install_superpowers() -> None:
+    """Install Superpowers for pi"""
+
+    try:
+        log.info("Installing Superpowers for pi")
+        result = subprocess.run(["pi", "install", "git:github.com/obra/superpowers"], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"Superpowers installation failed: {result.stderr}")
+        log.info(result.stdout)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Superpowers installation failed: %s", exc)
 
 def _restore_state() -> None:
     blob_sync.pull_dir(PI_CONFIG_BLOB_PREFIX, pi_runner.PI_AGENT_DIR)
@@ -378,6 +425,7 @@ def _startup() -> None:
     _restore_state()
     _setup_datatailr_skills()
     _write_pi_settings()
+    _write_pi_keybindings()
     _write_agent_instructions()
     _persist_config()
     # Clone the shared repo into the default workspace up front so the agent's
@@ -385,6 +433,7 @@ def _startup() -> None:
     # first session connects -- matching what the operating brief tells pi
     # (§6.1). Per-user workspaces are still cloned lazily on first use.
     _ensure_user_repo(DEFAULT_USER)
+    _try_install_superpowers()
     # Bring up orchestration: the coordinator rehydrates its registry from Blob
     # and starts the background poller that harvests finished sub-agents.
     _coordinator = Coordinator(report_sink=_fold_report)
@@ -810,6 +859,9 @@ _PAGE = r"""
   .term-toolbar button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
                          border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
   .term-toolbar .hint { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .term-toolbar .hint kbd { background: var(--panel-2); border: 1px solid var(--border);
+                            border-radius: 5px; padding: 1px 5px; font-size: 11px;
+                            font-family: ui-monospace, Menlo, monospace; color: var(--text); }
   #terminal { flex: 1; padding: 8px 10px; background: #0f1117; overflow: hidden; }
   .xterm .xterm-viewport { background: transparent !important; }
 
@@ -864,7 +916,7 @@ _PAGE = r"""
     <div class="term-toolbar">
       <button onclick="restartSession()">Restart session</button>
       <button onclick="reconnect()">Reconnect</button>
-      <span class="hint">A live <code>pi</code> session. Type as you would in the CLI.</span>
+      <span class="hint">Live <code>pi</code> session. <kbd>Enter</kbd> = newline · <kbd>⌘/Ctrl</kbd>+<kbd>Enter</kbd> = send</span>
     </div>
     <div id="terminal"></div>
   </section>
@@ -985,6 +1037,21 @@ function initTerminal() {
   term.loadAddon(fitAddon);
   term.open(document.getElementById('terminal'));
   fitTerminal();
+  // Chat-style Enter handling. Ctrl/Cmd+Enter submits; plain Enter inserts a
+  // newline while composing but still confirms menus/approval prompts. The
+  // context-awareness lives in pi: keybindings.json rebinds tui.input.submit to
+  // ctrl+enter and adds enter to tui.input.newLine, while tui.select.confirm
+  // stays on enter (so overlays keep confirming on Enter). Browsers collapse
+  // modifiers into a bare \r, so the only rewrite we need here is turning
+  // Ctrl/Cmd+Enter into pi's ctrl+enter code (CSI-u \x1b[13;5u). Everything
+  // else (plain Enter -> \r, Alt+Enter -> \x1b\r for follow-up) passes through.
+  term.attachCustomKeyEventHandler(e => {
+    if (e.key !== 'Enter' || !(e.ctrlKey || e.metaKey)) return true;
+    if (e.type === 'keydown' && ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'input', data: '\x1b[13;5u' }));
+    }
+    return false;
+  });
   term.onData(d => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data: d })); });
   window.addEventListener('resize', fitTerminal);
   connect();
