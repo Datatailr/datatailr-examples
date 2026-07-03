@@ -307,7 +307,7 @@ def _write_pi_settings() -> None:
         settings["defaultThinkingLevel"] = AGENT_THINKING
     # Drop the legacy nested key we used to write (pi ignores it).
     settings.pop("model", None)
-
+    settings['quietStartup'] = True
     try:
         with open(settings_path, "w", encoding="utf-8") as fh:
             json.dump(settings, fh, indent=2)

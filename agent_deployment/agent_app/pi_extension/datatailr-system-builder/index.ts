@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseDtSystemArgs } from "./commands.ts";
+import { registerStartupHeader } from "./header.ts";
 import { runNewSystemFlow } from "./orchestrator.ts";
 import type { CommandRunner } from "./shell.ts";
 
@@ -43,5 +44,6 @@ export function registerDatatailrSystemBuilder(pi: ExtensionAPI): void {
 }
 
 export default function activate(pi: ExtensionAPI): void {
+  registerStartupHeader(pi);
   registerDatatailrSystemBuilder(pi);
 }
