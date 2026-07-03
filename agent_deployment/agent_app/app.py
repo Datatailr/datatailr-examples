@@ -389,6 +389,30 @@ def _try_install_superpowers() -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("Superpowers installation failed: %s", exc)
 
+
+def _install_datatailr_extension() -> None:
+    """Install the bundled ``datatailr-system-builder`` pi package.
+
+    The package ships inside this app package (``pi_extension/``) so it is
+    baked into the image; installing from the local path means no network is
+    needed at runtime. Its only dependency (``@earendil-works/pi-coding-agent``)
+    is a peer dep provided by pi itself, so the offline ``npm install`` that
+    ``pi install`` runs has nothing to fetch. This registers the ``/dt-system``
+    command plus its skills and prompts for every session.
+    """
+    ext_dir = os.path.join(os.path.dirname(__file__), "pi_extension")
+    try:
+        log.info("Installing datatailr-system-builder pi extension from %s", ext_dir)
+        result = subprocess.run(
+            ["pi", "install", ext_dir], capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise Exception(result.stderr)
+        log.info(result.stdout)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("datatailr-system-builder installation failed: %s", exc)
+
+
 def _restore_state() -> None:
     blob_sync.pull_dir(PI_CONFIG_BLOB_PREFIX, pi_runner.PI_AGENT_DIR)
     blob_sync.pull_dir(AGENTS_BLOB_PREFIX, pi_runner.AGENTS_DIR)
@@ -434,6 +458,7 @@ def _startup() -> None:
     # (§6.1). Per-user workspaces are still cloned lazily on first use.
     _ensure_user_repo(DEFAULT_USER)
     _try_install_superpowers()
+    _install_datatailr_extension()
     # Bring up orchestration: the coordinator rehydrates its registry from Blob
     # and starts the background poller that harvests finished sub-agents.
     _coordinator = Coordinator(report_sink=_fold_report)
