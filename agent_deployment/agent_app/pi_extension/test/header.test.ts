@@ -37,9 +37,9 @@ test("buildHeaderLines renders both ASCII logos on the same rows when wide", () 
   const text = plain(wide);
   assert.ok(text.includes("█"), "expected ASCII block art in the header");
   assert.ok(text.includes("datatailr × pi coding agent"), "expected the datatailr/pi tagline");
-  // A row that contains both the last banner column glyph and the mascot leg
-  // confirms the two logos share a line.
-  const combined = wide.find((l) => l.includes("██") && l.includes("  ██  ██"));
+  // A row that contains both the figlet wordmark and the pi mascot confirms
+  // the two logos share a line.
+  const combined = wide.find((l) => l.includes("| (_| |") && l.includes("  ██  ██"));
   assert.ok(combined, "expected a row with the Datatailr banner and pi mascot side by side");
 });
 

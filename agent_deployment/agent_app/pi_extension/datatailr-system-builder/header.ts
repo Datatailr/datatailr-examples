@@ -6,7 +6,7 @@ import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 /**
  * Startup header for the Datatailr pi package.
  *
- * Replaces pi's built-in header with side-by-side ASCII logos for Datatailr and
+ * Replaces pi's built-in header with the datatailr figlet wordmark beside the pi
  * pi plus a live inventory of everything pi loaded for the session: skills,
  * extensions, prompt templates, and context files. The rendering lives in the
  * pure `buildHeaderLines` function so it can be unit tested without a TUI.
@@ -54,31 +54,17 @@ const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", 
 // pi env var for the agent config dir (see config.ts: `${APP_NAME}_CODING_AGENT_DIR`).
 const ENV_AGENT_DIR = "PI_CODING_AGENT_DIR";
 
-// "DATATAILR" rendered in the ANSI Shadow figlet style. Each glyph is six rows
-// of equal width so the columns can be concatenated without misalignment.
-const DATATAILR_GLYPHS: Record<string, string[]> = {
-  D: ["██████╗ ", "██╔══██╗", "██║  ██║", "██║  ██║", "██████╔╝", "╚═════╝ "],
-  A: [" █████╗ ", "██╔══██╗", "███████║", "██╔══██║", "██║  ██║", "╚═╝  ╚═╝"],
-  T: ["████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ██║   ", "   ╚═╝   "],
-  I: ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
-  L: ["██╗     ", "██║     ", "██║     ", "██║     ", "███████╗", "╚══════╝"],
-  R: ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██║  ██║", "╚═╝  ╚═╝"],
-};
+// "datatailr" figlet wordmark (slant/standard style).
+const DATATAILR_BANNER = [
+  "     _       _         _        _ _                       _ ",
+  "  __| | __ _| |_ __ _ | |_ __ _(_) |_ __            _ __ (_)",
+  " / _` |/ _` | __/ _` || __/ _` | | | '__|  _____   | '_ \\| |",
+  "| (_| | (_| | || (_| || || (_| | | | |    |_____|  | |_) | |",
+  " \\__,_|\\__,_|\\__\\__,_(_)__\\__,_|_|_|_|             | .__/|_|",
+  "                                                   |_|      ",
+];
 
-const DATATAILR_WORD = "DATATAILR";
-
-/** Assemble the multi-line "DATATAILR" wordmark from its per-letter glyphs. */
-function datatailrBanner(): string[] {
-  const rows = DATATAILR_GLYPHS.D.length;
-  const lines: string[] = [];
-  for (let row = 0; row < rows; row++) {
-    lines.push([...DATATAILR_WORD].map((ch) => DATATAILR_GLYPHS[ch][row]).join(""));
-  }
-  return lines;
-}
-
-const DATATAILR_BANNER = datatailrBanner();
-const DATATAILR_BANNER_WIDTH = DATATAILR_BANNER[0].length;
+const DATATAILR_BANNER_WIDTH = Math.max(...DATATAILR_BANNER.map((l) => l.length));
 
 // The pi mascot: a blocky "pi" glyph that mirrors pi's own startup art.
 function piMascot(): string[] {
@@ -103,9 +89,9 @@ const PI_MASCOT_WIDTH = Math.max(...PI_MASCOT.map((l) => l.length));
 function logoLines(width: number): string[] {
   const sideBySideWidth = INDENT.length + DATATAILR_BANNER_WIDTH + LOGO_GAP.length + PI_MASCOT_WIDTH;
   if (width >= sideBySideWidth) {
-    // Pad the mascot to the banner height so the rows line up.
+    // Top-align the shorter pi mascot with the figlet wordmark.
     const pad = DATATAILR_BANNER.length - PI_MASCOT.length;
-    const mascot = [...Array(Math.max(0, pad)).fill(""), ...PI_MASCOT];
+    const mascot = [...PI_MASCOT, ...Array(Math.max(0, pad)).fill("")];
     return DATATAILR_BANNER.map((line, i) => `${line}${LOGO_GAP}${mascot[i] ?? ""}`);
   }
   if (width >= INDENT.length + DATATAILR_BANNER_WIDTH) {
