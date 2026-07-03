@@ -6,10 +6,10 @@ import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 /**
  * Startup header for the Datatailr pi package.
  *
- * Replaces pi's built-in header with the datatailr figlet wordmark beside the pi
- * pi plus a live inventory of everything pi loaded for the session: skills,
- * extensions, prompt templates, and context files. The rendering lives in the
- * pure `buildHeaderLines` function so it can be unit tested without a TUI.
+ * Replaces pi's built-in header with the datatailr figlet wordmark plus a live
+ * inventory of everything pi loaded for the session: skills, extensions, prompt
+ * templates, and context files. The rendering lives in the pure
+ * `buildHeaderLines` function so it can be unit tested without a TUI.
  */
 
 /** Minimal shape of a slash command as returned by `pi.getCommands()`. */
@@ -43,7 +43,6 @@ export interface HeaderTheme {
 const INDENT = "  ";
 const LABEL_WIDTH = 14;
 const SEPARATOR = " · ";
-const LOGO_GAP = "   ";
 
 /** This header ships inside this package, so the package is always loaded. */
 const SELF_EXTENSION = "datatailr-system-builder";
@@ -66,36 +65,10 @@ const DATATAILR_BANNER = [
 
 const DATATAILR_BANNER_WIDTH = Math.max(...DATATAILR_BANNER.map((l) => l.length));
 
-// The pi mascot: a blocky "pi" glyph that mirrors pi's own startup art.
-function piMascot(): string[] {
-  const eye = "█▌";
-  return [
-    `  ${eye} ${eye}`,
-    ` ${"█".repeat(14)}`,
-    `  ██  ██`,
-    `  ██  ██`,
-    `  ██  ██`,
-  ];
-}
-
-const PI_MASCOT = piMascot();
-const PI_MASCOT_WIDTH = Math.max(...PI_MASCOT.map((l) => l.length));
-
-/**
- * Build the (uncolored) logo lines. When the terminal is wide enough the
- * Datatailr wordmark and the pi mascot sit side by side on the same rows;
- * otherwise they stack, and on very narrow terminals a compact wordmark is used.
- */
+/** Logo lines: full figlet wordmark, or a compact fallback on narrow terminals. */
 function logoLines(width: number): string[] {
-  const sideBySideWidth = INDENT.length + DATATAILR_BANNER_WIDTH + LOGO_GAP.length + PI_MASCOT_WIDTH;
-  if (width >= sideBySideWidth) {
-    // Top-align the shorter pi mascot with the figlet wordmark.
-    const pad = DATATAILR_BANNER.length - PI_MASCOT.length;
-    const mascot = [...PI_MASCOT, ...Array(Math.max(0, pad)).fill("")];
-    return DATATAILR_BANNER.map((line, i) => `${line}${LOGO_GAP}${mascot[i] ?? ""}`);
-  }
   if (width >= INDENT.length + DATATAILR_BANNER_WIDTH) {
-    return [...DATATAILR_BANNER, "", ...PI_MASCOT];
+    return [...DATATAILR_BANNER];
   }
   return ["≋ datatailr × pi"];
 }
@@ -185,7 +158,7 @@ export function buildHeaderLines(data: HeaderData, theme: HeaderTheme, width: nu
 
   const lines: string[] = [""];
 
-  // --- Logos (Datatailr + pi on the same rows when width allows) ---------
+  // --- Logo --------------------------------------------------------------
   for (const line of logoLines(width)) {
     lines.push(accent(INDENT + line));
   }

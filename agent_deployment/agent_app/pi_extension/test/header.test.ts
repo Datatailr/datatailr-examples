@@ -32,15 +32,11 @@ const sampleData: HeaderData = {
   ],
 };
 
-test("buildHeaderLines renders both ASCII logos on the same rows when wide", () => {
+test("buildHeaderLines renders the figlet wordmark when wide", () => {
   const wide = buildHeaderLines(sampleData, theme, 120);
   const text = plain(wide);
-  assert.ok(text.includes("█"), "expected ASCII block art in the header");
+  assert.ok(text.includes("__| |"), "expected figlet wordmark in the header");
   assert.ok(text.includes("datatailr × pi coding agent"), "expected the datatailr/pi tagline");
-  // A row that contains both the figlet wordmark and the pi mascot confirms
-  // the two logos share a line.
-  const combined = wide.find((l) => l.includes("| (_| |") && l.includes("  ██  ██"));
-  assert.ok(combined, "expected a row with the Datatailr banner and pi mascot side by side");
 });
 
 test("buildHeaderLines lists loaded resources with counts", () => {
