@@ -190,6 +190,48 @@ def get_transcript(session_id: str, session_dir: str) -> Optional[dict[str, Any]
     return {"session": summary, "messages": messages}
 
 
+def _extract_file_from_tool_input(inp: Any) -> Optional[str]:
+    """Best-effort path from a pi tool-call input object."""
+    if not isinstance(inp, dict):
+        return None
+    for key in ("path", "filePath", "file_path"):
+        val = inp.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def session_context(session_id: str, session_dir: str) -> Optional[dict[str, Any]]:
+    """Files referenced by tool calls in one session plus usage summary."""
+    path = _find_file_for_session(session_id, session_dir)
+    if not path:
+        return None
+
+    entries = _read_jsonl(path)
+    summary = _summarize_session(path)
+    files_seen: dict[str, int] = {}
+    tool_calls = 0
+
+    for entry in entries:
+        if entry.get("type") != "message":
+            continue
+        msg = entry.get("message") or {}
+        if msg.get("role") != "assistant" or not isinstance(msg.get("content"), list):
+            continue
+        for block in msg["content"]:
+            if not isinstance(block, dict) or block.get("type") != "toolCall":
+                continue
+            tool_calls += 1
+            fpath = _extract_file_from_tool_input(block.get("input"))
+            if fpath:
+                files_seen[fpath] = files_seen.get(fpath, 0) + 1
+
+    files = [
+        {"path": p, "references": c} for p, c in sorted(files_seen.items())
+    ]
+    return {"summary": summary, "files": files, "tool_calls": tool_calls}
+
+
 # --------------------------------------------------------------------------- #
 # Aggregate statistics across all sessions
 # --------------------------------------------------------------------------- #

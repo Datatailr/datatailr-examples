@@ -27,7 +27,7 @@ import threading
 from collections import defaultdict
 from contextlib import asynccontextmanager
 import subprocess
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import (
@@ -308,6 +308,7 @@ def _write_pi_settings() -> None:
     # Drop the legacy nested key we used to write (pi ignores it).
     settings.pop("model", None)
     settings['quietStartup'] = True
+    
     try:
         with open(settings_path, "w", encoding="utf-8") as fh:
             json.dump(settings, fh, indent=2)
@@ -502,6 +503,11 @@ class SubagentBrief(BaseModel):
     may_open_pr: bool = True
 
 
+class FileWriteRequest(BaseModel):
+    path: str
+    content: str
+
+
 class SpawnRequest(BaseModel):
     """Body of POST /subagents: one or more briefs plus optional context.
 
@@ -526,6 +532,99 @@ def _require_key() -> None:
                 f"'{OPENAI_SECRET_KEY}' in the Datatailr Secrets Manager."
             ),
         )
+
+
+# Max file size served/edited via the workspace browser (bytes).
+_MAX_FILE_BYTES = int(os.environ.get("AGENT_MAX_FILE_BYTES", str(1024 * 1024)))
+
+
+def _resolve_ws_path(user: str, relpath: str) -> str:
+    """Resolve ``relpath`` under the user's workspace; reject traversal."""
+    root = os.path.realpath(_user_workspace_dir(user))
+    os.makedirs(root, exist_ok=True)
+    cleaned = (relpath or "").strip().lstrip("/")
+    if cleaned in ("", "."):
+        target = root
+    else:
+        target = os.path.realpath(os.path.join(root, cleaned))
+    try:
+        if os.path.commonpath([root, target]) != root:
+            raise HTTPException(status_code=400, detail="path escapes workspace")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid path") from exc
+    return target
+
+
+def _read_text_file(path: str) -> dict:
+    """Read a workspace file for the browser; detect binary / oversize."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="file not found") from exc
+    if size > _MAX_FILE_BYTES:
+        return {"path": path, "binary": True, "oversized": True, "size": size}
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="file not found") from exc
+    if b"\x00" in raw:
+        return {"path": path, "binary": True, "oversized": False, "size": size}
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"path": path, "binary": True, "oversized": False, "size": size}
+    return {"path": path, "binary": False, "size": size, "content": content}
+
+
+def _discover_skills() -> list[str]:
+    skills: list[str] = []
+    agents_dir = pi_runner.AGENTS_DIR
+    if not os.path.isdir(agents_dir):
+        return skills
+    for root, _dirs, files in os.walk(agents_dir):
+        if "SKILL.md" in files:
+            rel = os.path.relpath(root, agents_dir)
+            skills.append(rel if rel != "." else os.path.basename(root))
+    return sorted(set(skills))
+
+
+def _discover_extensions() -> list[dict[str, Any]]:
+    ext_dir = os.path.join(os.path.dirname(__file__), "pi_extension")
+    bundled = os.path.isdir(ext_dir)
+    superpowers = False
+    agents_dir = pi_runner.AGENTS_DIR
+    if os.path.isdir(agents_dir):
+        for root, _dirs, files in os.walk(agents_dir):
+            base = os.path.basename(root).lower()
+            if "superpowers" in base or (
+                "SKILL.md" in files and "superpowers" in root.lower()
+            ):
+                superpowers = True
+                break
+    return [
+        {"name": "datatailr-system-builder", "installed": bundled},
+        {"name": "superpowers", "installed": superpowers},
+    ]
+
+
+def _read_agents_md() -> str:
+    path = os.path.join(pi_runner.PI_AGENT_DIR, "AGENTS.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def _read_pi_settings() -> dict:
+    path = os.path.join(pi_runner.PI_AGENT_DIR, "settings.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 # --------------------------------------------------------------------------- #
@@ -564,6 +663,104 @@ def api_stats(request: Request) -> JSONResponse:
     stats = sessions.aggregate_stats(_user_session_dir(user))
     stats["user"] = user
     return JSONResponse(stats)
+
+
+@app.get("/api/files")
+def api_files_list(request: Request, path: str = "") -> JSONResponse:
+    """List a directory in the user's agent workspace."""
+    user = _safe_user(_username(request.headers))
+    _ensure_user_repo(user)
+    target = _resolve_ws_path(user, path)
+    if not os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="directory not found")
+    cleaned = (path or "").strip().lstrip("/")
+    parent = os.path.dirname(cleaned) if cleaned else None
+    entries: list[dict[str, Any]] = []
+    try:
+        names = sorted(os.listdir(target))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    for name in names:
+        if name == ".git":
+            continue
+        full = os.path.join(target, name)
+        rel = os.path.join(cleaned, name) if cleaned else name
+        if os.path.isdir(full):
+            entries.append({"name": name, "type": "dir", "path": rel.replace("\\", "/")})
+        elif os.path.isfile(full):
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            entries.append(
+                {"name": name, "type": "file", "path": rel.replace("\\", "/"), "size": size}
+            )
+    entries.sort(key=lambda e: (0 if e["type"] == "dir" else 1, e["name"].lower()))
+    return JSONResponse({"path": cleaned, "parent": parent, "entries": entries})
+
+
+@app.get("/api/files/raw")
+def api_files_raw(request: Request, path: str) -> JSONResponse:
+    """Return one workspace file's text content."""
+    if not path or not path.strip():
+        raise HTTPException(status_code=400, detail="path required")
+    user = _safe_user(_username(request.headers))
+    _ensure_user_repo(user)
+    target = _resolve_ws_path(user, path)
+    if not os.path.isfile(target):
+        raise HTTPException(status_code=404, detail="file not found")
+    payload = _read_text_file(target)
+    payload["path"] = path.strip().lstrip("/")
+    return JSONResponse(payload)
+
+
+@app.put("/api/files")
+def api_files_write(req: FileWriteRequest, request: Request) -> JSONResponse:
+    """Write text content to a workspace file."""
+    if not req.path or not req.path.strip():
+        raise HTTPException(status_code=400, detail="path required")
+    user = _safe_user(_username(request.headers))
+    _ensure_user_repo(user)
+    target = _resolve_ws_path(user, req.path)
+    if os.path.isdir(target):
+        raise HTTPException(status_code=400, detail="path is a directory")
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    data = req.content.encode("utf-8")
+    if len(data) > _MAX_FILE_BYTES:
+        raise HTTPException(status_code=400, detail="content exceeds size limit")
+    try:
+        with open(target, "wb") as fh:
+            fh.write(data)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return JSONResponse({"ok": True, "size": len(data)})
+
+
+@app.get("/api/context")
+def api_context(request: Request) -> JSONResponse:
+    """Global agent context: brief, skills, extensions, settings."""
+    user = _safe_user(_username(request.headers))
+    return JSONResponse(
+        {
+            "user": user,
+            "model": _config.model,
+            "thinking": AGENT_THINKING,
+            "agents_md": _read_agents_md(),
+            "skills": _discover_skills(),
+            "extensions": _discover_extensions(),
+            "settings": _read_pi_settings(),
+        }
+    )
+
+
+@app.get("/api/sessions/{session_id}/context")
+def api_session_context(session_id: str, request: Request) -> JSONResponse:
+    user = _safe_user(_username(request.headers))
+    ctx = sessions.session_context(session_id, _user_session_dir(user))
+    if ctx is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return JSONResponse(ctx)
 
 
 @app.post("/chat")
@@ -725,6 +922,29 @@ def get_subagent(subagent_id: str) -> JSONResponse:
     if detail is None:
         raise HTTPException(status_code=404, detail="sub-agent not found")
     return JSONResponse(detail)
+
+
+@app.get("/api/subagents/{subagent_id}/artifact")
+def get_subagent_artifact(
+    subagent_id: str, request: Request, key: str
+) -> JSONResponse:
+    """Fetch an archived sub-agent transcript from Blob."""
+    if not key or not key.startswith(orchestration.logs_prefix(subagent_id)):
+        raise HTTPException(status_code=400, detail="invalid artifact key")
+    blob = orchestration.blob_client()
+    if blob is None:
+        raise HTTPException(status_code=503, detail="blob storage unavailable")
+    try:
+        raw = blob.get(key)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail="artifact not found") from exc
+    if raw is None:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        text = str(raw)
+    return JSONResponse({"key": key, "content": text})
 
 
 @app.post("/subagents/{subagent_id}/stop")
@@ -923,6 +1143,80 @@ _PAGE = r"""
   .sub-stop { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
               border-radius: 7px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
   .sub-stop:disabled { opacity: .4; cursor: default; }
+  .sub-table tbody tr.sub-row { cursor: pointer; }
+  .sub-table tbody tr.sub-row:hover { background: var(--panel-2); }
+
+  /* Files browser */
+  #files-view { flex-direction: row; overflow: hidden; }
+  .files-sidebar { width: 320px; min-width: 240px; border-right: 1px solid var(--border);
+                   background: var(--panel); display: flex; flex-direction: column; }
+  .files-toolbar { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+  .files-breadcrumb { padding: 8px 12px; font-size: 12px; color: var(--muted);
+                      border-bottom: 1px solid var(--border); font-family: ui-monospace, Menlo, monospace; }
+  .files-breadcrumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .files-list { flex: 1; overflow-y: auto; }
+  .files-item { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer;
+                font-size: 13px; border-bottom: 1px solid transparent; }
+  .files-item:hover { background: var(--panel-2); }
+  .files-item.active { background: var(--panel-2); border-color: var(--border); }
+  .files-item .icon { opacity: .7; width: 16px; text-align: center; }
+  .files-item .size { margin-left: auto; color: var(--muted); font-size: 11px; }
+  .files-editor { flex: 1; display: flex; flex-direction: column; background: var(--bg); min-width: 0; }
+  .files-editor-toolbar { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+                          border-bottom: 1px solid var(--border); background: var(--panel); }
+  .files-editor-toolbar .path { font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+                                color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .files-editor textarea { flex: 1; resize: none; border: none; padding: 14px; background: var(--bg);
+                           color: var(--text); font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+                           line-height: 1.5; outline: none; }
+  .files-notice { flex: 1; display: flex; align-items: center; justify-content: center;
+                  color: var(--muted); font-size: 14px; padding: 24px; text-align: center; }
+
+  /* Context view */
+  #context-view { overflow-y: auto; padding: 24px; gap: 20px; }
+  .ctx-section { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+                 padding: 16px; }
+  .ctx-section h3 { margin: 0 0 12px; font-size: 14px; font-weight: 600; }
+  .ctx-pre { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+             padding: 12px; font-size: 12px; line-height: 1.5; overflow: auto; max-height: 320px;
+             white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; margin: 0; }
+  .ctx-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .ctx-tag { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+             padding: 4px 10px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+  .ctx-select { background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+                border-radius: 8px; padding: 8px 12px; font-size: 13px; min-width: 280px; }
+  .ctx-files { list-style: none; padding: 0; margin: 8px 0 0; }
+  .ctx-files li { padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px;
+                  font-family: ui-monospace, Menlo, monospace; }
+  .ctx-files li:last-child { border-bottom: none; }
+
+  /* Sub-agent detail drawer */
+  .sub-drawer-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 90; }
+  .sub-drawer-backdrop.open { display: block; }
+  .sub-drawer { position: fixed; top: 0; right: 0; width: min(520px, 95vw); height: 100vh;
+                background: var(--panel); border-left: 1px solid var(--border); z-index: 100;
+                transform: translateX(100%); transition: transform .2s ease; display: flex;
+                flex-direction: column; overflow: hidden; }
+  .sub-drawer.open { transform: translateX(0); }
+  .sub-drawer-header { display: flex; align-items: center; gap: 10px; padding: 14px 16px;
+                       border-bottom: 1px solid var(--border); }
+  .sub-drawer-header h2 { margin: 0; font-size: 15px; flex: 1; }
+  .sub-drawer-close { background: transparent; border: 1px solid var(--border); color: var(--text);
+                      border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  .sub-drawer-body { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+  .sub-detail-block { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+                      padding: 12px; }
+  .sub-detail-block h4 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+                         letter-spacing: .5px; color: var(--muted); }
+  .sub-detail-block p, .sub-detail-block pre { margin: 0; font-size: 13px; line-height: 1.5; }
+  .sub-detail-block pre { white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; }
+  .sub-dod { list-style: none; padding: 0; margin: 0; }
+  .sub-dod li { padding: 4px 0; font-size: 13px; }
+  .sub-dod li.met { color: var(--accent-2); }
+  .sub-dod li.unmet { color: var(--muted); }
+  .sub-warn { color: #ff8fa3; font-size: 13px; margin: 4px 0; }
+  .sub-artifact { display: block; color: var(--accent); cursor: pointer; font-size: 12px;
+                  font-family: ui-monospace, Menlo, monospace; margin: 4px 0; }
 </style>
 </head>
 <body>
@@ -932,6 +1226,8 @@ _PAGE = r"""
   <span id="whoami" style="font-size:13px;color:var(--muted);"></span>
   <nav>
     <button id="tab-term" class="active" onclick="showView('terminal')">Terminal</button>
+    <button id="tab-files" onclick="showView('files')">Files</button>
+    <button id="tab-ctx" onclick="showView('context')">Context</button>
     <button id="tab-dash" onclick="showView('dashboard')">Dashboard</button>
     <button id="tab-sub" onclick="showView('subagents')">Sub-agents</button>
   </nav>
@@ -944,6 +1240,45 @@ _PAGE = r"""
       <span class="hint">Live <code>pi</code> session. <kbd>Enter</kbd> = newline · <kbd>⌘/Ctrl</kbd>+<kbd>Enter</kbd> = send</span>
     </div>
     <div id="terminal"></div>
+  </section>
+  <section id="files-view" class="view">
+    <div class="files-sidebar">
+      <div class="files-toolbar">
+        <button class="refresh" onclick="loadFiles('')">Root</button>
+        <button class="refresh" onclick="loadFiles(currentDir)">Refresh</button>
+      </div>
+      <div class="files-breadcrumb" id="files-breadcrumb"></div>
+      <div class="files-list" id="files-list"></div>
+    </div>
+    <div class="files-editor">
+      <div class="files-editor-toolbar">
+        <span class="path" id="file-path-label">Select a file to edit</span>
+        <button class="refresh" id="file-save-btn" onclick="saveFile()" disabled>Save</button>
+      </div>
+      <div class="files-notice" id="file-notice">Browse your agent workspace on the left.</div>
+      <textarea id="file-editor" style="display:none"></textarea>
+    </div>
+  </section>
+  <section id="context-view" class="view">
+    <button class="refresh" onclick="loadContext()">Refresh</button>
+    <div class="cards" id="ctx-cards"></div>
+    <div class="ctx-section">
+      <h3>Operating brief (AGENTS.md)</h3>
+      <pre class="ctx-pre" id="ctx-agents-md"></pre>
+    </div>
+    <div class="ctx-section">
+      <h3>Skills &amp; extensions</h3>
+      <div id="ctx-skills-ext"></div>
+    </div>
+    <div class="ctx-section">
+      <h3>Session context</h3>
+      <select class="ctx-select" id="ctx-session-select" onchange="loadSessionContext(this.value)">
+        <option value="">Select a session…</option>
+      </select>
+      <div id="ctx-session-detail" style="margin-top:12px;color:var(--muted);font-size:13px;">
+        Choose a session to see files referenced by tool calls and token usage.
+      </div>
+    </div>
   </section>
   <section id="dashboard" class="view">
     <button class="refresh" onclick="loadDashboard()">Refresh</button>
@@ -971,10 +1306,19 @@ _PAGE = r"""
     </table>
   </section>
 </main>
+<div class="sub-drawer-backdrop" id="sub-drawer-backdrop" onclick="closeSubagentDetail()"></div>
+<aside class="sub-drawer" id="sub-drawer">
+  <div class="sub-drawer-header">
+    <h2 id="sub-drawer-title">Sub-agent</h2>
+    <button class="sub-drawer-close" onclick="closeSubagentDetail()">Close</button>
+  </div>
+  <div class="sub-drawer-body" id="sub-drawer-body"></div>
+</aside>
 
 <script>
 const charts = {};
 let term, fitAddon, ws, resumeSession = null, currentUser = null;
+let currentDir = '', currentFile = null, fileDirty = false;
 
 // Datatailr serves apps behind a URL prefix that the platform strips before the
 // request reaches this app. The browser must include that prefix (= the page's
@@ -991,13 +1335,21 @@ async function readJson(r) {
 function setStatus(ok) { document.getElementById('status-dot').classList.toggle('ok', ok); }
 
 function showView(name) {
-  const views = { terminal: 'terminal-view', dashboard: 'dashboard', subagents: 'subagents' };
-  const tabs = { terminal: 'tab-term', dashboard: 'tab-dash', subagents: 'tab-sub' };
+  const views = {
+    terminal: 'terminal-view', files: 'files-view', context: 'context-view',
+    dashboard: 'dashboard', subagents: 'subagents',
+  };
+  const tabs = {
+    terminal: 'tab-term', files: 'tab-files', context: 'tab-ctx',
+    dashboard: 'tab-dash', subagents: 'tab-sub',
+  };
   for (const [key, id] of Object.entries(views)) {
     document.getElementById(id).classList.toggle('active', key === name);
     document.getElementById(tabs[key]).classList.toggle('active', key === name);
   }
   if (name === 'terminal') { setTimeout(fitTerminal, 0); }
+  else if (name === 'files') { loadFiles(currentDir || ''); }
+  else if (name === 'context') { loadContext(); }
   else if (name === 'dashboard') { loadDashboard(); }
   else if (name === 'subagents') { loadSubagents(); }
 }
@@ -1138,6 +1490,184 @@ async function loadDashboard() {
   }
 }
 
+// --------------------------- Files browser ---------------------------
+function formatSize(n) {
+  if (n == null || n < 0) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function renderBreadcrumb(path) {
+  const el = document.getElementById('files-breadcrumb');
+  const parts = (path || '').split('/').filter(Boolean);
+  let html = '<a onclick="loadFiles(\'\')">/</a>';
+  let acc = '';
+  for (const p of parts) {
+    acc = acc ? acc + '/' + p : p;
+    const target = acc;
+    html += ' / <a onclick="loadFiles(\'' + esc(target).replace(/'/g, "\\'") + '\')">' + esc(p) + '</a>';
+  }
+  el.innerHTML = html;
+}
+
+async function loadFiles(path) {
+  currentDir = path || '';
+  try {
+    const q = currentDir ? '?path=' + encodeURIComponent(currentDir) : '';
+    const r = await fetch(apiUrl('/api/files' + q));
+    const data = await readJson(r);
+    if (!r.ok) throw new Error(data.detail || 'list failed');
+    renderBreadcrumb(data.path || '');
+    const list = document.getElementById('files-list');
+    const entries = data.entries || [];
+    if (!entries.length) {
+      list.innerHTML = '<div class="files-notice" style="padding:16px">Empty directory</div>';
+      return;
+    }
+    list.innerHTML = entries.map(e => {
+      const icon = e.type === 'dir' ? '📁' : '📄';
+      const size = e.type === 'file' ? formatSize(e.size) : '';
+      const active = e.type === 'file' && e.path === currentFile ? ' active' : '';
+      const fn = e.type === 'dir'
+        ? 'loadFiles(\'' + esc(e.path).replace(/'/g, "\\'") + '\')'
+        : 'openFile(\'' + esc(e.path).replace(/'/g, "\\'") + '\')';
+      return `<div class="files-item${active}" onclick="${fn}">
+        <span class="icon">${icon}</span><span>${esc(e.name)}</span>
+        <span class="size">${size}</span></div>`;
+    }).join('');
+  } catch (e) {
+    document.getElementById('files-list').innerHTML =
+      '<div class="files-notice" style="padding:16px">Could not list files</div>';
+  }
+}
+
+async function openFile(path) {
+  currentFile = path;
+  const notice = document.getElementById('file-notice');
+  const editor = document.getElementById('file-editor');
+  const saveBtn = document.getElementById('file-save-btn');
+  document.getElementById('file-path-label').textContent = path;
+  fileDirty = false;
+  saveBtn.disabled = true;
+  try {
+    const r = await fetch(apiUrl('/api/files/raw?path=' + encodeURIComponent(path)));
+    const data = await readJson(r);
+    if (!r.ok) throw new Error(data.detail || 'read failed');
+    if (data.binary) {
+      notice.style.display = 'flex';
+      notice.textContent = data.oversized
+        ? 'File too large to edit (' + formatSize(data.size) + ').'
+        : 'Binary file — not editable in the browser.';
+      editor.style.display = 'none';
+      return;
+    }
+    notice.style.display = 'none';
+    editor.style.display = 'block';
+    editor.value = data.content || '';
+    saveBtn.disabled = false;
+    loadFiles(currentDir);
+  } catch (e) {
+    notice.style.display = 'flex';
+    notice.textContent = 'Could not open file.';
+    editor.style.display = 'none';
+  }
+}
+
+async function saveFile() {
+  if (!currentFile) return;
+  const editor = document.getElementById('file-editor');
+  const saveBtn = document.getElementById('file-save-btn');
+  saveBtn.disabled = true;
+  try {
+    const r = await fetch(apiUrl('/api/files'), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: currentFile, content: editor.value }),
+    });
+    const data = await readJson(r);
+    if (!r.ok) throw new Error(data.detail || 'save failed');
+    fileDirty = false;
+  } catch (e) {
+    alert('Save failed: ' + (e.message || e));
+  } finally {
+    saveBtn.disabled = !currentFile;
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const ed = document.getElementById('file-editor');
+  if (ed) ed.addEventListener('input', () => { fileDirty = true; });
+});
+
+// --------------------------- Context ---------------------------
+async function loadContext() {
+  try {
+    const [ctxR, sessR] = await Promise.all([
+      fetch(apiUrl('/api/context')),
+      fetch(apiUrl('/api/sessions')),
+    ]);
+    const ctx = await readJson(ctxR);
+    const sess = await readJson(sessR);
+    document.getElementById('ctx-cards').innerHTML =
+      card('Model', esc(ctx.model || '—')) +
+      card('Thinking', esc(ctx.thinking || '—')) +
+      card('Skills', (ctx.skills || []).length) +
+      card('Extensions', (ctx.extensions || []).filter(e => e.installed).length);
+    document.getElementById('ctx-agents-md').textContent =
+      ctx.agents_md || '(AGENTS.md not found)';
+    const skills = (ctx.skills || []).map(s =>
+      `<span class="ctx-tag">${esc(s)}</span>`).join('') || '<span style="color:var(--muted)">None</span>';
+    const exts = (ctx.extensions || []).map(e =>
+      `<span class="ctx-tag">${esc(e.name)}${e.installed ? '' : ' (not installed)'}</span>`).join('');
+    document.getElementById('ctx-skills-ext').innerHTML =
+      '<div style="margin-bottom:8px"><strong style="font-size:12px;color:var(--muted)">Skills</strong></div>' +
+      '<div class="ctx-tags">' + skills + '</div>' +
+      '<div style="margin:12px 0 8px"><strong style="font-size:12px;color:var(--muted)">Extensions</strong></div>' +
+      '<div class="ctx-tags">' + exts + '</div>';
+    const sel = document.getElementById('ctx-session-select');
+    const prev = sel.value;
+    const sessions = sess.sessions || [];
+    sel.innerHTML = '<option value="">Select a session…</option>' +
+      sessions.map(s => `<option value="${esc(s.id)}">${esc(s.name)} (${esc(s.message_count)} msgs)</option>`).join('');
+    if (prev) sel.value = prev;
+    if (sel.value) loadSessionContext(sel.value);
+  } catch (e) {
+    document.getElementById('ctx-cards').innerHTML = card('Status', 'Unavailable');
+  }
+}
+
+async function loadSessionContext(sessionId) {
+  const el = document.getElementById('ctx-session-detail');
+  if (!sessionId) {
+    el.innerHTML = 'Choose a session to see files referenced by tool calls and token usage.';
+    return;
+  }
+  el.innerHTML = 'Loading…';
+  try {
+    const r = await fetch(apiUrl('/api/sessions/' + encodeURIComponent(sessionId) + '/context'));
+    const data = await readJson(r);
+    if (!r.ok) throw new Error(data.detail || 'not found');
+    const s = data.summary || {};
+    const files = data.files || [];
+    let html = '<div class="cards" style="margin-bottom:12px">' +
+      card('Messages', s.message_count || 0) +
+      card('Tokens', (s.tokens || 0).toLocaleString()) +
+      card('Cost', '$' + (s.cost || 0).toFixed(4)) +
+      card('Tool calls', data.tool_calls || 0) + '</div>';
+    if (files.length) {
+      html += '<ul class="ctx-files">' + files.map(f =>
+        `<li>${esc(f.path)} <span style="color:var(--muted)">(${f.references} ref${f.references !== 1 ? 's' : ''})</span></li>`
+      ).join('') + '</ul>';
+    } else {
+      html += '<p style="color:var(--muted);margin:8px 0 0">No file paths recorded in tool calls.</p>';
+    }
+    el.innerHTML = html;
+  } catch (e) {
+    el.textContent = 'Could not load session context.';
+  }
+}
+
 // --------------------------- Sub-agents ---------------------------
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"]/g, c =>
@@ -1172,11 +1702,12 @@ async function loadSubagents() {
   body.innerHTML = subs.map(s => {
     const state = s.reported ? (s.status || s.state) : s.state;
     const cls = (state || '').toLowerCase();
-    const pr = s.pr_url ? `<a href="${esc(s.pr_url)}" target="_blank">link</a>` : '—';
+    const pr = s.pr_url ? `<a href="${esc(s.pr_url)}" target="_blank" onclick="event.stopPropagation()">link</a>` : '—';
     const cost = '$' + (Number(s.cost) || 0).toFixed(3);
     const canStop = !s.reported && !isTerminalState(s.state);
-    return `<tr>
-      <td class="mono">${esc(s.subagent_id)}</td>
+    const sid = esc(s.subagent_id);
+    return `<tr class="sub-row" onclick="showSubagentDetail('${sid}')">
+      <td class="mono">${sid}</td>
       <td>${esc(s.title)}</td>
       <td><span class="pill ${cls}">${esc(state || 'launched')}</span></td>
       <td>${esc(s.status || '—')}</td>
@@ -1184,9 +1715,119 @@ async function loadSubagents() {
       <td>${cost}</td>
       <td>${pr}</td>
       <td><button class="sub-stop" ${canStop ? '' : 'disabled'}
-           onclick="stopSubagent('${esc(s.subagent_id)}')">Stop</button></td>
+           onclick="event.stopPropagation(); stopSubagent('${sid}')">Stop</button></td>
     </tr>`;
   }).join('');
+}
+
+function closeSubagentDetail() {
+  document.getElementById('sub-drawer').classList.remove('open');
+  document.getElementById('sub-drawer-backdrop').classList.remove('open');
+}
+
+async function showSubagentDetail(id) {
+  const drawer = document.getElementById('sub-drawer');
+  const backdrop = document.getElementById('sub-drawer-backdrop');
+  const body = document.getElementById('sub-drawer-body');
+  document.getElementById('sub-drawer-title').textContent = id;
+  body.innerHTML = '<p style="color:var(--muted)">Loading…</p>';
+  drawer.classList.add('open');
+  backdrop.classList.add('open');
+  try {
+    const r = await fetch(apiUrl('/subagents/' + encodeURIComponent(id)));
+    const data = await readJson(r);
+    if (!r.ok) throw new Error(data.detail || 'not found');
+    const entry = data.entry || {};
+    const assign = data.assignment || {};
+    const result = data.result || {};
+    const task = assign.task || {};
+    const git = assign.git || {};
+    const gitResult = result.git || {};
+    const pr = gitResult.pr || {};
+    const prInfo = {
+      url: entry.pr_url || pr.url,
+      action: pr.action,
+      ci_state: pr.ci_state,
+      error: entry.pr_error || pr.error,
+    };
+    const usage = result.usage || {};
+    const dod = result.done_checklist || (task.definition_of_done || []).map(item =>
+      ({ item, met: result.status === 'succeeded' }));
+    const warnings = result.warnings || entry.warnings || [];
+    const artifacts = result.artifacts || [];
+
+    let html = '';
+    html += `<div class="sub-detail-block"><h4>Identity</h4>
+      <p><strong>Parent:</strong> ${esc(entry.parent_id)}<br>
+      <strong>Depth:</strong> ${esc(entry.depth)} · <strong>By:</strong> ${esc(entry.created_by)}<br>
+      <strong>Launched:</strong> ${esc(entry.launched_at || '—')}<br>
+      <strong>Reported:</strong> ${esc(entry.reported_at || '—')}</p></div>`;
+
+    html += `<div class="sub-detail-block"><h4>Task</h4>
+      <p><strong>${esc(task.title || entry.title)}</strong></p>
+      <pre>${esc(task.instructions || '')}</pre></div>`;
+
+    if (dod.length) {
+      html += `<div class="sub-detail-block"><h4>Definition of done</h4><ul class="sub-dod">` +
+        dod.map(d => `<li class="${d.met ? 'met' : 'unmet'}">${d.met ? '✓' : '○'} ${esc(d.item)}</li>`).join('') +
+        '</ul></div>';
+    }
+
+    const focus = task.context_files || [];
+    if (focus.length) {
+      html += `<div class="sub-detail-block"><h4>Focus files</h4><pre>${esc(focus.join('\n'))}</pre></div>`;
+    }
+
+    html += `<div class="sub-detail-block"><h4>Git / PR</h4>
+      <p>Branch <code>${esc(git.work_branch)}</code> → <code>${esc(git.base_branch)}</code><br>
+      Push: ${git.may_push !== false ? 'yes' : 'no'} · PR: ${git.may_open_pr !== false ? 'yes' : 'no'}<br>`;
+    if (prInfo.url) html += `<a href="${esc(prInfo.url)}" target="_blank">${esc(prInfo.url)}</a>`;
+    else if (prInfo.error) html += `<span class="sub-warn">${esc(prInfo.error)}</span>`;
+    else html += '—';
+    if (prInfo.ci_state) html += `<br>CI: ${esc(prInfo.ci_state)}`;
+    html += '</p></div>';
+
+    html += `<div class="sub-detail-block"><h4>Outcome</h4>
+      <p><span class="pill ${esc((result.status || entry.status || '').toLowerCase())}">${esc(result.status || entry.status || '—')}</span>
+      ${result.reason ? ' · ' + esc(result.reason) : ''}</p>
+      <p style="margin-top:8px">${esc(result.summary || entry.summary || '')}</p>`;
+    if (result.final_reply) html += `<pre style="margin-top:8px">${esc(result.final_reply)}</pre>`;
+    if (warnings.length) html += warnings.map(w => `<p class="sub-warn">${esc(w)}</p>`).join('');
+    html += '</div>';
+
+    html += `<div class="sub-detail-block"><h4>Usage</h4>
+      <p>Turns: ${esc(result.turns ?? entry.turns ?? 0)} ·
+      Cost: $${(Number(usage.cost ?? entry.cost) || 0).toFixed(4)} ·
+      Tokens: ${(usage.totalTokens || 0).toLocaleString()}</p></div>`;
+
+    if (artifacts.length) {
+      html += `<div class="sub-detail-block"><h4>Transcripts</h4>`;
+      for (const key of artifacts) {
+        const k = esc(key);
+        html += `<span class="sub-artifact" onclick="loadSubagentArtifact('${esc(id)}', '${k.replace(/'/g, "\\'")}')">${k}</span>`;
+      }
+      html += '<pre id="sub-artifact-content" style="margin-top:8px;display:none;max-height:200px;overflow:auto"></pre></div>';
+    }
+
+    body.innerHTML = html;
+  } catch (e) {
+    body.innerHTML = '<p class="sub-warn">Could not load sub-agent details.</p>';
+  }
+}
+
+async function loadSubagentArtifact(id, key) {
+  const pre = document.getElementById('sub-artifact-content');
+  if (!pre) return;
+  pre.style.display = 'block';
+  pre.textContent = 'Loading transcript…';
+  try {
+    const r = await fetch(apiUrl('/api/subagents/' + encodeURIComponent(id) + '/artifact?key=' + encodeURIComponent(key)));
+    const data = await readJson(r);
+    if (!r.ok) throw new Error(data.detail || 'fetch failed');
+    pre.textContent = data.content || '(empty)';
+  } catch (e) {
+    pre.textContent = 'Could not load artifact.';
+  }
 }
 
 async function stopSubagent(id) {
