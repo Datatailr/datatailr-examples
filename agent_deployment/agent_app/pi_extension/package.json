@@ -7,7 +7,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "pi": {
-    "extensions": ["./src/index.ts"],
+    "extensions": ["./datatailr-system-builder/index.ts"],
     "skills": ["./skills"],
     "prompts": ["./prompts"]
   }

@@ -9,8 +9,8 @@ import {
   saveManifest,
   slugifySystemName,
   stateFilePath,
-} from "../src/state.ts";
-import type { SystemSpec } from "../src/types.ts";
+} from "../datatailr-system-builder/state.ts";
+import type { SystemSpec } from "../datatailr-system-builder/types.ts";
 
 test("slugifySystemName normalizes user-facing names", () => {
   assert.equal(slugifySystemName("My Data Platform"), "my_data_platform");

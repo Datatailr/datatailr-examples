@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildDeployInvocation, buildJobGetArgs, buildLogReadArgs } from "../src/datatailr.ts";
-import type { ComponentSpec } from "../src/types.ts";
+import { buildDeployInvocation, buildJobGetArgs, buildLogReadArgs } from "../datatailr-system-builder/datatailr.ts";
+import type { ComponentSpec } from "../datatailr-system-builder/types.ts";
 
 const appComponent: ComponentSpec = {
   kind: "app",

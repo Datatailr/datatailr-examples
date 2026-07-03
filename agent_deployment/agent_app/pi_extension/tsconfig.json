@@ -9,5 +9,5 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["extensions/**/*.ts", "src/**/*.ts", "test/**/*.ts"]
+  "include": ["extensions/**/*.ts", "datatailr-system-builder/**/*.ts", "test/**/*.ts"]
 }

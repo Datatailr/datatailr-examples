@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildComponentFiles, defaultComponentSpec, scaffoldSystem } from "../src/scaffold.ts";
-import type { SystemSpec } from "../src/types.ts";
+import { buildComponentFiles, defaultComponentSpec, scaffoldSystem } from "../datatailr-system-builder/scaffold.ts";
+import type { SystemSpec } from "../datatailr-system-builder/types.ts";
 
 test("buildComponentFiles emits Flask app and service, workflow, and excel layouts", () => {
   const appFiles = buildComponentFiles(defaultComponentSpec("market_data", "app"));

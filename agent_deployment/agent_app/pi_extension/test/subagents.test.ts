@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildSpawnSubagentArgs, buildSubagentTasks, checkSubagents } from "../src/subagents.ts";
-import type { CommandRunner } from "../src/shell.ts";
-import type { SystemSpec } from "../src/types.ts";
+import { buildSpawnSubagentArgs, buildSubagentTasks, checkSubagents } from "../datatailr-system-builder/subagents.ts";
+import type { CommandRunner } from "../datatailr-system-builder/shell.ts";
+import type { SystemSpec } from "../datatailr-system-builder/types.ts";
 
 test("buildSubagentTasks creates one focused task per component", () => {
   const spec: SystemSpec = {

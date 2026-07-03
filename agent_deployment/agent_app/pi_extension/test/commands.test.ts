@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseDtSystemArgs } from "../src/commands.ts";
+import { parseDtSystemArgs } from "../datatailr-system-builder/commands.ts";
 
 test("parseDtSystemArgs defaults to new when no args are provided", () => {
   assert.deepEqual(parseDtSystemArgs(""), { action: "new" });
