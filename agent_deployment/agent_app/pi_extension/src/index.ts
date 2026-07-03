@@ -41,3 +41,7 @@ export function registerDatatailrSystemBuilder(pi: ExtensionAPI): void {
     },
   });
 }
+
+export default function activate(pi: ExtensionAPI): void {
+  registerDatatailrSystemBuilder(pi);
+}
