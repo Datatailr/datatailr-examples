@@ -1,0 +1,6 @@
+{
+    "name": "Live Trading System",
+    "description": "End-to-end algorithmic trading desk demo: seven ZMQ services stream market data through a five-stage pipeline, a FastAPI dashboard shows live topology and DuckDB-backed history, and scheduled workflows warm up and reconcile via the same message bus with Parquet persistence in blob storage.",
+    "tags": ["services", "workflows", "zmq", "fastapi", "dashboard", "algorithmic trading", "protobuf", "duckdb", "parquet", "blob storage", "kv", "schedules", "demo"],
+    "author": "Datatailr"
+}
