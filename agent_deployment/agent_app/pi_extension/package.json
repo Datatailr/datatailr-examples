@@ -1,0 +1,14 @@
+{
+  "name": "datatailr-system-builder",
+  "version": "0.1.0",
+  "description": "Pi package for building Datatailr systems with a guided workflow.",
+  "keywords": ["pi-package"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./datatailr-system-builder/index.ts"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"]
+  }
+}

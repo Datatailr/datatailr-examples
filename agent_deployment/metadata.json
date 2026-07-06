@@ -1,0 +1,6 @@
+{
+    "name": "SWE Agent Deployment",
+    "description": "Template for deploying a complete software-development agent on Datatailr: a long-running main agent that runs the pi coding agent in-container, launches parallel sub-agents as batch workflows, and has full knowledge of the Datatailr platform.",
+    "tags": ["agent", "agentic", "coding agent", "pi", "sub-agents", "orchestration", "software development", "fastapi", "app", "workflows", "template"],
+    "author": "Datatailr"
+}
