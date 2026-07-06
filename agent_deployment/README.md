@@ -1,4 +1,5 @@
 # SWE Agent Deployment on Datatailr
+![](./screenshot.png)
 
 A template for deploying a **complete software-development agent** on the
 Datatailr platform. It ships a long-running **main agent** that users talk to,
