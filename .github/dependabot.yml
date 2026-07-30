@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # The wildcard picks up every directory that contains a manifest for the
+  # ecosystem, so new example projects are covered without editing this file.
+  - package-ecosystem: "pip"
+    directories:
+      - "**/*"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      pip-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "npm"
+    directories:
+      - "**/*"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
