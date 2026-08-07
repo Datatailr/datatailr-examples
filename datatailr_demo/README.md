@@ -9,7 +9,7 @@ Each component can be deployed independently and used as a starting point for re
 ## What this demo includes
 
 1. **Simple Service**  
-   A Flask-based service that accepts requests and returns responses.
+   A FastAPI service with auto-generated OpenAPI docs (`/docs`, `/redoc`).
 2. **Simple Workflow**  
    A workflow/pipeline example for fetching and processing data.
 3. **Excel Add-in**  
