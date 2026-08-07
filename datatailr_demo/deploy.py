@@ -62,12 +62,12 @@ def simple_app(framework: str = "streamlit"):
 
 
 def simple_service():
-    from services.flask_service import main
+    from services.fastapi_service import main
 
     service = Service(
         name="Simple Service",
         entrypoint=main,
-        python_requirements=["flask"],
+        python_requirements=["fastapi", "uvicorn"],
     )
     return service
 
