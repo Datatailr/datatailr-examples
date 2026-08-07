@@ -67,7 +67,7 @@ def simple_service():
     service = Service(
         name="Simple Service",
         entrypoint=main,
-        python_requirements=["fastapi", "uvicorn"],
+        python_requirements=["fastapi", "uvicorn", "pydantic"],
     )
     return service
 
