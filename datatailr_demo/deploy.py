@@ -136,7 +136,7 @@ def deploy_service():
 def deploy_excel_addin():
     addin = simple_excel_addin()
     print(CYAN("Deploying excel add-in..."))
-    addin.run()
+    addin.save()
 
 
 def deploy_dag_generator(num_tasks: int):
