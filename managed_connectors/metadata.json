@@ -1,0 +1,6 @@
+{
+  "name": "Managed Connectors",
+  "description": "Deploy an administrator-managed connector gateway and configuration app, with a portable Agent Skill for building runtime data-aware apps and workflows.",
+  "tags": ["connectors", "app", "service", "agent skill", "slack", "hubspot", "github", "gmail", "outlook", "zoom", "ai"],
+  "author": "Datatailr"
+}
