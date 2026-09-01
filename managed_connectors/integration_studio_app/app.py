@@ -42,17 +42,6 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
 
 
-def _platform_origin() -> str:
-    value = (
-        os.environ.get("INTEGRATION_STUDIO_PLATFORM_URL")
-        or os.environ.get("DATATAILR_DOMAIN")
-        or "http://localhost:5000"
-    ).strip().rstrip("/")
-    if "://" not in value:
-        value = "https://" + value
-    return value
-
-
 ADMIN_USERS = {
     name.strip()
     for name in os.environ.get("INTEGRATION_STUDIO_ADMINS", "").split(",")
@@ -60,13 +49,32 @@ ADMIN_USERS = {
 }
 DEPLOY_ENVIRONMENT = os.environ.get("DATATAILR_JOB_ENVIRONMENT", "dev")
 APP_JOB_NAME = os.environ.get("DATATAILR_JOB_NAME", "integration-studio")
-PUBLIC_PLATFORM_URL = _platform_origin()
-PUBLIC_APP_URL = os.environ.get(
-    "INTEGRATION_STUDIO_PUBLIC_URL",
-    f"{PUBLIC_PLATFORM_URL}/job/{DEPLOY_ENVIRONMENT}/{APP_JOB_NAME}",
-).rstrip("/")
 LIVE_ONLY_SOURCES = {"gmail", "outlook", "zoom"}
 LIVE_SHARED_SOURCES = {"github"}
+
+
+def _public_app_url() -> str:
+    """Return this installation's browser-facing app URL for the request.
+
+    Some platform versions expose ``DATATAILR_DOMAIN`` as an internal service
+    name rather than the installation hostname. The authenticated proxy already
+    forwards the public host and scheme, so use those values unless an explicit
+    deployment override was supplied.
+    """
+    configured = os.environ.get("INTEGRATION_STUDIO_PUBLIC_URL", "").strip()
+    if configured:
+        return configured.rstrip("/")
+    host = request.headers.get("X-Forwarded-Host", request.host).split(",", 1)[0].strip()
+    forwarded_scheme = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+    hostname = host.rsplit(":", 1)[0].strip("[]").casefold()
+    local_host = hostname in {"localhost", "127.0.0.1", "::1"}
+    scheme = forwarded_scheme or (request.scheme if local_host else "https")
+    # Datatailr terminates TLS before the job proxy. Older installations may
+    # forward the scheme of the internal hop (http) rather than the browser
+    # scheme, so normalize public installation hosts back to HTTPS.
+    if not local_host and scheme == "http":
+        scheme = "https"
+    return f"{scheme}://{host}/job/{DEPLOY_ENVIRONMENT}/{APP_JOB_NAME}"
 
 
 def _current_user() -> User:
@@ -281,8 +289,8 @@ def bootstrap():
             "personal_settings": public_personal_settings(state, user.name),
             "connector_access": _connector_access(user),
             "oauth_callbacks": {
-                "outlook": PUBLIC_APP_URL + "/oauth/outlook/callback",
-                "zoom": PUBLIC_APP_URL + "/oauth/zoom/callback",
+                "outlook": _public_app_url() + "/oauth/outlook/callback",
+                "zoom": _public_app_url() + "/oauth/zoom/callback",
             },
         }
     )
@@ -471,7 +479,7 @@ def oauth_start(provider: str):
     if not cfg.get("client_id") or not cfg.get("client_secret"):
         raise ProviderError(f"An administrator must configure the {provider.title()} application first")
     state_token = secrets.token_urlsafe(32)
-    redirect_uri = cfg.get("redirect_uri") or f"{PUBLIC_APP_URL}/oauth/{provider}/callback"
+    redirect_uri = cfg.get("redirect_uri") or f"{_public_app_url()}/oauth/{provider}/callback"
 
     def mutate(state: dict[str, Any]) -> None:
         state["oauth_states"][state_token] = {
@@ -500,13 +508,13 @@ def oauth_callback(provider: str):
     state_token = request.args.get("state", "")
     code = request.args.get("code", "")
     if not state_token or not code:
-        return redirect(PUBLIC_APP_URL + "/?oauth=failed")
+        return redirect(_public_app_url() + "/?oauth=failed")
     state_data = read_state()
     oauth_state = state_data["oauth_states"].get(state_token)
     if not oauth_state or oauth_state.get("provider") != provider:
-        return redirect(PUBLIC_APP_URL + "/?oauth=invalid_state")
+        return redirect(_public_app_url() + "/?oauth=invalid_state")
     if datetime.fromisoformat(oauth_state["expires_at"]) < datetime.now(UTC):
-        return redirect(PUBLIC_APP_URL + "/?oauth=expired")
+        return redirect(_public_app_url() + "/?oauth=expired")
     cfg = state_data["settings"][provider]
     token = exchange_oauth_code(
         provider,
@@ -529,7 +537,7 @@ def oauth_callback(provider: str):
         operation="connect", status="succeeded",
         metadata={"surface": "integration-studio", "data_mode": "live", "connected": True},
     )
-    return redirect(PUBLIC_APP_URL + "/?oauth=connected")
+    return redirect(_public_app_url() + "/?oauth=connected")
 
 
 @app.post("/api/disconnect/<provider>")
