@@ -33,5 +33,3 @@ The skill source is [`skills/datatailr-connectors`](skills/datatailr-connectors)
 - Connector audit events are visible only to platform administrators; personal connector events contain operational metadata only.
 
 The OpenAPI contract is served by Connector Gateway at `/job/<environment>/connector-gateway/openapi.json`.
-
-See [INGESTION_ARCHITECTURE.md](INGESTION_ARCHITECTURE.md) for the shared-source indexing design.
