@@ -21,7 +21,7 @@
       </span>
       <span class="brand-text">
         <strong>Integration Studio</strong>
-        <small>Datatailr</small>
+        <small data-platform-template="{platform}">Datatailr</small>
       </span>
     </div>
 
@@ -75,7 +75,7 @@
 
       <p class="banner">
         Gmail and Outlook messages plus Zoom AI Companion summaries and transcripts are fetched live only when requested and are never indexed or stored.
-        Gmail app passwords and delegated Outlook/Zoom OAuth tokens remain isolated under your Datatailr username and are never returned by the API.
+        <span data-platform-template="Gmail app passwords and delegated Outlook/Zoom OAuth tokens remain isolated under your {platform} username and are never returned by the API.">Gmail app passwords and delegated Outlook/Zoom OAuth tokens remain isolated under your Datatailr username and are never returned by the API.</span>
       </p>
 
       <div id="personal-connections" class="personal-connections"></div>
@@ -86,7 +86,7 @@
       <header class="bar">
         <div class="bar-title">
           <h1 id="skills-title">Managed connector skills</h1>
-          <p class="bar-sub">Build data-aware Datatailr apps without exposing credentials or company data to the coding agent.</p>
+          <p class="bar-sub" data-platform-template="Build data-aware {platform} apps without exposing credentials or company data to the coding agent.">Build data-aware Datatailr apps without exposing credentials or company data to the coding agent.</p>
         </div>
       </header>
 
@@ -95,7 +95,7 @@
           <span class="pill" data-on="true">Install once per project</span>
           <h2>Add the connector skill, then describe the outcome.</h2>
           <p>
-            The skill is distributed with the Managed Connectors example rather than built into your Datatailr installation. Add it to your coding
+            The skill is distributed with the Managed Connectors example rather than built into your <span data-platform-template="{platform}">Datatailr</span> installation. Add it to your coding
             project before starting a new agent chat. The agent receives schemas, synthetic examples, and deployment
             instructions—not connector credentials or live company data. Real data is fetched only by the deployed
             app or workflow at runtime.
@@ -132,23 +132,23 @@
           <div class="skills-grid">
             <article class="skill-card">
               <h3>Slack bug dashboard</h3>
-              <pre><code>Create a shared Datatailr app that reads #bug-reports and shows a dashboard of the 20 most recent bugs.</code></pre>
-              <button class="btn btn-quiet" type="button" data-copy="Create a shared Datatailr app that reads #bug-reports and shows a dashboard of the 20 most recent bugs.">Copy prompt</button>
+              <pre><code data-platform-template="Create a shared {platform} app that reads #bug-reports and shows a dashboard of the 20 most recent bugs.">Create a shared Datatailr app that reads #bug-reports and shows a dashboard of the 20 most recent bugs.</code></pre>
+              <button class="btn btn-quiet" type="button" data-copy="Create a shared Datatailr app that reads #bug-reports and shows a dashboard of the 20 most recent bugs." data-copy-template="Create a shared {platform} app that reads #bug-reports and shows a dashboard of the 20 most recent bugs.">Copy prompt</button>
             </article>
             <article class="skill-card">
               <h3>HubSpot-to-Slack automation</h3>
-              <pre><code>Create a scheduled Datatailr workflow that notifies #sales-updates in Slack whenever a HubSpot deal changes.</code></pre>
-              <button class="btn btn-quiet" type="button" data-copy="Create a scheduled Datatailr workflow that notifies #sales-updates in Slack whenever a HubSpot deal changes.">Copy prompt</button>
+              <pre><code data-platform-template="Create a scheduled {platform} workflow that notifies #sales-updates in Slack whenever a HubSpot deal changes.">Create a scheduled Datatailr workflow that notifies #sales-updates in Slack whenever a HubSpot deal changes.</code></pre>
+              <button class="btn btn-quiet" type="button" data-copy="Create a scheduled Datatailr workflow that notifies #sales-updates in Slack whenever a HubSpot deal changes." data-copy-template="Create a scheduled {platform} workflow that notifies #sales-updates in Slack whenever a HubSpot deal changes.">Copy prompt</button>
             </article>
             <article class="skill-card">
               <h3>HubSpot activity outlook</h3>
-              <pre><code>Create a shared Datatailr dashboard of upcoming HubSpot demos, discovery meetings, calls, and tasks for the next 14 days. Group them by owner and show associated companies and deals.</code></pre>
-              <button class="btn btn-quiet" type="button" data-copy="Create a shared Datatailr dashboard of upcoming HubSpot demos, discovery meetings, calls, and tasks for the next 14 days. Group them by owner and show associated companies and deals.">Copy prompt</button>
+              <pre><code data-platform-template="Create a shared {platform} dashboard of upcoming HubSpot demos, discovery meetings, calls, and tasks for the next 14 days. Group them by owner and show associated companies and deals.">Create a shared Datatailr dashboard of upcoming HubSpot demos, discovery meetings, calls, and tasks for the next 14 days. Group them by owner and show associated companies and deals.</code></pre>
+              <button class="btn btn-quiet" type="button" data-copy="Create a shared Datatailr dashboard of upcoming HubSpot demos, discovery meetings, calls, and tasks for the next 14 days. Group them by owner and show associated companies and deals." data-copy-template="Create a shared {platform} dashboard of upcoming HubSpot demos, discovery meetings, calls, and tasks for the next 14 days. Group them by owner and show associated companies and deals.">Copy prompt</button>
             </article>
             <article class="skill-card">
               <h3>Personal calendar dashboard</h3>
-              <pre><code>Create a shared Datatailr app that reads each viewer's Outlook calendar at runtime and shows their upcoming meetings and available focus time.</code></pre>
-              <button class="btn btn-quiet" type="button" data-copy="Create a shared Datatailr app that reads each viewer's Outlook calendar at runtime and shows their upcoming meetings and available focus time.">Copy prompt</button>
+              <pre><code data-platform-template="Create a shared {platform} app that reads each viewer's Outlook calendar at runtime and shows their upcoming meetings and available focus time.">Create a shared Datatailr app that reads each viewer's Outlook calendar at runtime and shows their upcoming meetings and available focus time.</code></pre>
+              <button class="btn btn-quiet" type="button" data-copy="Create a shared Datatailr app that reads each viewer's Outlook calendar at runtime and shows their upcoming meetings and available focus time." data-copy-template="Create a shared {platform} app that reads each viewer's Outlook calendar at runtime and shows their upcoming meetings and available focus time.">Copy prompt</button>
             </article>
           </div>
         </section>
@@ -269,6 +269,6 @@
   </main>
 </div>
 
-<script src="static/app.js?v=managed-connectors-v2"></script>
+<script src="static/app.js?v=managed-connectors-v3"></script>
 </body>
 </html>

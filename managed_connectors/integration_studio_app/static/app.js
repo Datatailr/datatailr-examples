@@ -8,6 +8,7 @@
 const BASE = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
 
 const state = {
+  platformName: 'Datatailr',
   user: null,
   sources: [],
   settings: null,
@@ -52,6 +53,30 @@ async function api(path, options = {}) {
   const data = await response.json().catch(() => ({ error: `Request failed (${response.status})` }));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
+}
+
+async function loadBranding() {
+  let platformName = 'Datatailr';
+  try {
+    const response = await fetch('/branding.json', { cache: 'no-cache' });
+    if (response.ok) {
+      const branding = await response.json();
+      const configuredName = typeof branding.platformName === 'string'
+        ? branding.platformName.trim()
+        : '';
+      if (configuredName) platformName = configuredName;
+    }
+  } catch {
+    // Match the platform GUI: keep the baked-in Datatailr fallback.
+  }
+  state.platformName = platformName;
+  $$('[data-platform-template]').forEach((node) => {
+    node.textContent = node.dataset.platformTemplate.replaceAll('{platform}', platformName);
+  });
+  $$('[data-copy-template]').forEach((node) => {
+    node.dataset.copy = node.dataset.copyTemplate.replaceAll('{platform}', platformName);
+  });
+  document.title = `Integration Studio | ${platformName}`;
 }
 
 function busy(button, isBusy) {
@@ -551,4 +576,4 @@ if (oauthResult) {
   history.replaceState(null, '', location.pathname);
 }
 
-load().catch((error) => toast(error.message, true));
+Promise.all([loadBranding(), load()]).catch((error) => toast(error.message, true));
