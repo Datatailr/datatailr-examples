@@ -12,13 +12,12 @@ It is intended to include two types of content:
 - provide starter projects you can copy and adapt
 - create a shared public library of examples maintained by both Datatailr and the community
 
-## Example packages
+## Current example package
 
-Selected packages in this repository include:
+The main package in this repository is:
 - `datatailr_demo/` - deployment-ready examples covering services, pipelines, dashboards, and Excel add-ins
-- `managed_connectors/` - an administrator-managed connector gateway and configuration app, plus an Agent Skill for building runtime data-aware apps and workflows
 
-See each package's README for deployment commands and component-level documentation.
+See `datatailr_demo/README.md` for detailed commands and component-level documentation.
 
 ## How to use this repo
 
