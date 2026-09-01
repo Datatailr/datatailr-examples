@@ -9,21 +9,16 @@ Usage::
 
 from __future__ import annotations
 
-import os
 import sys
 
 import integration_studio_app.app as studio_entrypoint
 from connector_gateway_service.app import main as gateway_main
-from cryptography.fernet import Fernet
-from datatailr import ACL, App, Group, Permission, Resources, Secrets, Service, User
+from datatailr import ACL, App, Group, Permission, Resources, Service, User
 
 
 APP_NAME = "integration-studio"
 SERVICE_NAME = "connector-gateway"
 APP_SECTION = "AI & Integrations"
-MASTER_SECRET = os.environ.get(
-    "INTEGRATION_STUDIO_MASTER_SECRET", "integration-studio/master-key"
-)
 
 
 def _deployment_identity() -> tuple[User, Group]:
@@ -42,19 +37,7 @@ def _acl(owner: User, all_users: Group) -> ACL:
     )
 
 
-def _check_master_secret() -> None:
-    try:
-        value = Secrets().get(MASTER_SECRET).strip().encode()
-        Fernet(value)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Create a valid Fernet key named '{MASTER_SECRET}' in "
-            "Datatailr Secrets Manager before deploying."
-        ) from exc
-
-
 def deploy_service() -> None:
-    _check_master_secret()
     owner, all_users = _deployment_identity()
     gateway = Service(
         name=SERVICE_NAME,
@@ -62,10 +45,7 @@ def deploy_service() -> None:
         run_as=owner,
         resources=Resources(memory="1g", cpu=1),
         python_requirements=["flask", "requests", "cryptography"],
-        env_vars={
-            "CONNECTOR_GATEWAY_ADMINS": owner.name,
-            "INTEGRATION_STUDIO_MASTER_SECRET": MASTER_SECRET,
-        },
+        env_vars={"CONNECTOR_GATEWAY_ADMINS": owner.name},
         acl=_acl(owner, all_users),
     )
     gateway.app_section = APP_SECTION
@@ -73,7 +53,6 @@ def deploy_service() -> None:
 
 
 def deploy_app() -> None:
-    _check_master_secret()
     owner, all_users = _deployment_identity()
     studio = App(
         name=APP_NAME,
@@ -87,10 +66,7 @@ def deploy_app() -> None:
             "requests",
             "cryptography",
         ],
-        env_vars={
-            "INTEGRATION_STUDIO_ADMINS": owner.name,
-            "INTEGRATION_STUDIO_MASTER_SECRET": MASTER_SECRET,
-        },
+        env_vars={"INTEGRATION_STUDIO_ADMINS": owner.name},
         acl=_acl(owner, all_users),
         app_section=APP_SECTION,
     )

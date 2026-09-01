@@ -8,14 +8,6 @@ This template deploys two Datatailr components together:
 
 The installer becomes the deployment owner and an Integration Studio administrator. The `dtusers` group can access both jobs, while platform `admin` members can configure shared connectors and view connector audit events.
 
-## Prerequisite
-
-Create an encrypted secret named `integration-studio/master-key` in Datatailr Secrets Manager. Its value must be a Fernet key. Generate one locally without saving it in this project:
-
-```bash
-python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
-```
-
 ## Deploy
 
 Run from this directory as the Datatailr administrator who should own the installation:
@@ -37,7 +29,7 @@ The skill source is [`skills/datatailr-connectors`](skills/datatailr-connectors)
 - Slack and HubSpot are administrator-managed shared sources indexed under `/mnt/integration-studio/knowledge`.
 - GitHub Organization is administrator-managed, fetched live, and limited to repositories selected for the installed GitHub App.
 - Gmail, Outlook Mail and Calendar, and Zoom are personal and fetched live for the signed-in user. Their source records are not stored.
-- Connector settings and delegated credentials are encrypted with `integration-studio/master-key` before being written under `/mnt/integration-studio`.
+- Connector settings and delegated credentials are written to an owner-only `0600` state file under `/mnt/integration-studio`. They are not encrypted at rest in this simplified example and are never returned by the API.
 - Connector audit events are visible only to platform administrators; personal connector events contain operational metadata only.
 
 The OpenAPI contract is served by Connector Gateway at `/job/<environment>/connector-gateway/openapi.json`.

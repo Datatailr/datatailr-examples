@@ -9,12 +9,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Callable
 
-from cryptography.fernet import Fernet, InvalidToken
-from datatailr import Secrets
-
-
-STATE_PATH = Path(os.environ.get("INTEGRATION_STUDIO_STATE", "/mnt/integration-studio/state.enc"))
-MASTER_SECRET = os.environ.get("INTEGRATION_STUDIO_MASTER_SECRET", "integration-studio/master-key")
+STATE_PATH = Path(os.environ.get("INTEGRATION_STUDIO_STATE", "/mnt/integration-studio/state.json"))
 _LOCK = threading.RLock()
 
 
@@ -87,11 +82,6 @@ def _empty_state() -> dict[str, Any]:
     }
 
 
-def _cipher() -> Fernet:
-    key = Secrets().get(MASTER_SECRET).strip().encode()
-    return Fernet(key)
-
-
 def _merge_defaults(state: dict[str, Any]) -> dict[str, Any]:
     baseline = _empty_state()
     for key in ("users", "oauth_states", "audit"):
@@ -132,7 +122,7 @@ def _merge_defaults(state: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict) or value.get("provider") not in {"gmail", "github_personal"}
     }
     # These used to gate administrator-managed connectors independently from
-    # the app ACL. Ignore and discard them when reading older encrypted state.
+    # the app ACL. Ignore and discard them when reading older state.
     for provider in ("slack", "hubspot", "github"):
         baseline["settings"][provider].pop("allowed_groups", None)
     return baseline
@@ -143,10 +133,12 @@ def read_state() -> dict[str, Any]:
         if not STATE_PATH.exists():
             return _empty_state()
         try:
-            raw = _cipher().decrypt(STATE_PATH.read_bytes())
-            return _merge_defaults(json.loads(raw.decode()))
-        except (InvalidToken, json.JSONDecodeError) as exc:
-            raise RuntimeError("Integration Studio state is unreadable or has been tampered with") from exc
+            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Integration Studio state is unreadable") from exc
+        if not isinstance(state, dict):
+            raise RuntimeError("Integration Studio state must be a JSON object")
+        return _merge_defaults(state)
 
 
 def write_state(state: dict[str, Any]) -> None:
@@ -154,8 +146,10 @@ def write_state(state: dict[str, Any]) -> None:
         previous = STATE_PATH.stat() if STATE_PATH.exists() else None
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         temp = STATE_PATH.with_suffix(".tmp")
-        payload = json.dumps(state, separators=(",", ":"), sort_keys=True).encode()
-        temp.write_bytes(_cipher().encrypt(payload))
+        temp.write_text(
+            json.dumps(state, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
         os.chmod(temp, 0o600)
         # Normal requests run as the job user. Preserve that owner if a
         # privileged maintenance command updates state through this function;

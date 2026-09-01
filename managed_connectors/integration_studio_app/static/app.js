@@ -139,10 +139,10 @@ function renderPersonalConnections() {
     body.append(
       el('p', { class: 'personal-status', text: status }),
       el('p', { class: 'note', text: id === 'gmail'
-        ? 'Live-only: message data is discarded after the request. Your app password is encrypted for your username and removed when you disconnect.'
+        ? 'Live-only: message data is discarded after the request. Your app password is isolated under your username and removed when you disconnect.'
         : id === 'outlook'
-          ? 'Live-only: email and calendar records are held in request memory and are never written to persistent connector storage. Your delegated OAuth tokens are encrypted and isolated to your username.'
-          : 'Live-only: AI Companion summaries, retained transcripts, and recording metadata are held in request memory and never written to persistent connector storage. Your delegated OAuth tokens are encrypted and isolated to your username.' }),
+          ? 'Live-only: email and calendar records are held in request memory and are never written to persistent connector storage. Your delegated OAuth tokens are isolated to your username.'
+          : 'Live-only: AI Companion summaries, retained transcripts, and recording metadata are held in request memory and never written to persistent connector storage. Your delegated OAuth tokens are isolated to your username.' }),
     );
 
     const actions = oauth
@@ -237,7 +237,7 @@ const CONNECTORS = {
     fields: [
       ['app_id', 'GitHub App ID', 'text'],
       ['installation_id', 'Installation ID', 'text', 'Find this numeric ID in the installation URL or through the GitHub App installations API.'],
-      ['private_key', 'Private key (.pem)', 'textarea', 'Paste the complete PEM private key. It is encrypted at rest and never returned by the API.'],
+      ['private_key', 'Private key (.pem)', 'textarea', 'Paste the complete PEM private key. It is stored in the owner-only connector state file and never returned by the API.'],
       ['base_url', 'API base URL', 'url', 'Use https://api.github.com for GitHub.com.'],
     ],
   },

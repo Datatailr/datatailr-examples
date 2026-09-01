@@ -7,12 +7,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from cryptography.fernet import Fernet, InvalidToken
-from datatailr import Secrets
-
-
-STATE_PATH = Path(os.environ.get("INTEGRATION_STUDIO_STATE", "/mnt/integration-studio/state.enc"))
-MASTER_SECRET = os.environ.get("INTEGRATION_STUDIO_MASTER_SECRET", "integration-studio/master-key")
+STATE_PATH = Path(os.environ.get("INTEGRATION_STUDIO_STATE", "/mnt/integration-studio/state.json"))
 _LOCK = threading.RLock()
 
 
@@ -20,11 +15,9 @@ def read_connector_state() -> dict[str, Any]:
     if not STATE_PATH.exists():
         return {}
     try:
-        key = Secrets().get(MASTER_SECRET).strip().encode()
-        payload = Fernet(key).decrypt(STATE_PATH.read_bytes())
-        state = json.loads(payload.decode())
-    except (InvalidToken, json.JSONDecodeError) as exc:
-        raise RuntimeError("Connector configuration is unreadable or has been tampered with") from exc
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Connector configuration is unreadable") from exc
     if not isinstance(state, dict):
         return {}
     return state
@@ -54,7 +47,7 @@ def personal_connector(state: dict[str, Any], user: str, provider: str) -> tuple
 
 
 def update_personal_token(user: str, provider: str, token: dict[str, Any]) -> None:
-    """Persist only a rotated delegated token back into encrypted state.
+    """Persist only a rotated delegated token back into owner-only state.
 
     Zoom refresh tokens rotate, so the latest token must replace the previous
     one. The write is atomic and preserves the mounted state's runtime owner.
@@ -70,11 +63,12 @@ def update_personal_token(user: str, provider: str, token: dict[str, Any]) -> No
             try:
                 state = read_connector_state()
                 state.setdefault("users", {}).setdefault(user, {}).setdefault("tokens", {})[provider] = dict(token)
-                key = Secrets().get(MASTER_SECRET).strip().encode()
-                payload = json.dumps(state, separators=(",", ":"), sort_keys=True).encode()
                 previous = STATE_PATH.stat() if STATE_PATH.exists() else None
                 temp = STATE_PATH.with_suffix(".gateway.tmp")
-                temp.write_bytes(Fernet(key).encrypt(payload))
+                temp.write_text(
+                    json.dumps(state, separators=(",", ":"), sort_keys=True),
+                    encoding="utf-8",
+                )
                 os.chmod(temp, 0o600)
                 if previous is not None and os.geteuid() == 0:
                     os.chown(temp, previous.st_uid, previous.st_gid)

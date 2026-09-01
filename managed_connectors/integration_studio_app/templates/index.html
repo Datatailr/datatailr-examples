@@ -75,7 +75,7 @@
 
       <p class="banner">
         Gmail and Outlook messages plus Zoom AI Companion summaries and transcripts are fetched live only when requested and are never indexed or stored.
-        Gmail app passwords and delegated Outlook/Zoom OAuth tokens remain encrypted under your Datatailr username.
+        Gmail app passwords and delegated Outlook/Zoom OAuth tokens remain isolated under your Datatailr username and are never returned by the API.
       </p>
 
       <div id="personal-connections" class="personal-connections"></div>
@@ -202,8 +202,8 @@
       </header>
 
       <p class="banner">
-        Shared secrets are encrypted with a master key held in Datatailr secure KV and are never returned
-        by the API. Gmail is configured privately by each user. Outlook and Zoom OAuth applications are configured
+        Shared credentials are stored in the app owner's protected state file and are never returned by the API.
+        Gmail is configured privately by each user. Outlook and Zoom OAuth applications are configured
         once here; each user's delegated tokens remain private to that user. GitHub uses one administrator-installed
         organization app and only sees repositories selected for that installation.
       </p>

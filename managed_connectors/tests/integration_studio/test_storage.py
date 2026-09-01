@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from integration_studio_app import storage
 
@@ -123,15 +123,12 @@ class StateOwnershipTest(unittest.TestCase):
 
     def test_privileged_write_preserves_existing_runtime_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.enc"
-            state_path.write_bytes(b"previous")
+            state_path = Path(directory) / "state.json"
+            state_path.write_text("{}", encoding="utf-8")
             previous = state_path.stat()
-            cipher = Mock()
-            cipher.encrypt.return_value = b"encrypted"
 
             with (
                 patch.object(storage, "STATE_PATH", state_path),
-                patch.object(storage, "_cipher", return_value=cipher),
                 patch.object(storage.os, "geteuid", return_value=0),
                 patch.object(storage.os, "chown") as chown,
             ):
@@ -140,7 +137,10 @@ class StateOwnershipTest(unittest.TestCase):
             chown.assert_called_once_with(
                 state_path.with_suffix(".tmp"), previous.st_uid, previous.st_gid
             )
-            self.assertEqual(state_path.read_bytes(), b"encrypted")
+            self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                storage.read_state()["settings"], storage.DEFAULT_SETTINGS
+            )
 
 
 if __name__ == "__main__":

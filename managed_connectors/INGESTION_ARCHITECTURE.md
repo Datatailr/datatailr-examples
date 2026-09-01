@@ -12,7 +12,7 @@ The trial installation's PostgreSQL container is Sonic control-plane infrastruct
 2. The connector normalizes each shared provider object into a stable document ID, content, citation reference, source timestamp, and metadata.
 3. SQLite upserts changed documents transactionally and updates FTS5. Checkpoints are not advanced yet.
 4. Provider checkpoints advance only after the authoritative write succeeds. A failed run is retryable and idempotent.
-5. At query time, the gateway applies the requested capability's filters, ordering, and row limits to the shared records. GitHub requests use a short-lived installation token; Gmail uses the signed-in user's encrypted app password; Outlook and Zoom use the signed-in user's OAuth token. Live results remain only in request memory.
+5. At query time, the gateway applies the requested capability's filters, ordering, and row limits to the shared records. GitHub requests use a short-lived installation token; Gmail uses the signed-in user's stored app password; Outlook and Zoom use the signed-in user's OAuth token. Live results remain only in request memory.
 6. Personal connector results are returned to the requesting job and discarded; they are never passed to the shared index or audit payloads.
 
 ## Connector checkpoints
@@ -27,7 +27,7 @@ The trial installation's PostgreSQL container is Sonic control-plane infrastruct
 
 ## Security invariants
 
-- The GitHub App private key, Gmail addresses/app passwords, administrator-managed OAuth application secrets, and per-user OAuth tokens remain in the encrypted state file; they are never written to the index.
+- The GitHub App private key, Gmail addresses/app passwords, administrator-managed OAuth application secrets, and per-user OAuth tokens remain in an owner-only `0600` state file; they are never written to the index or returned by the app API. This simplified template does not encrypt that state file at rest.
 - GitHub result rows and personal connector content exist only in request memory and are never indexed, embedded, cached, or written to audit storage.
 - Slack and HubSpot documents are workspace-shared and use the outer app/service ACL, not source ACL principals.
 - A failed shared-source read does not erase previously indexed content.
