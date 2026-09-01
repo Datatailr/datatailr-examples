@@ -72,7 +72,7 @@ LIVE_SHARED_SOURCES = {"github"}
 def _current_user() -> User:
     user = User.from_request(request)
     if user is None or not user.name:
-        raise PermissionError("No authenticated Sonic user was forwarded to the app")
+        raise PermissionError("No authenticated Datatailr user was forwarded to the app")
     return user
 
 

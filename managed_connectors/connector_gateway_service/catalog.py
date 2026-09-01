@@ -320,7 +320,7 @@ CAPABILITIES: dict[str, dict[str, Any]] = {
 
 SYNTHETIC_EXAMPLES = {
     "slack.threads.recent": [
-        {"id": "synthetic-1", "channel": "sonic-bug-report", "text": "Synthetic: export button remains disabled after refresh", "updated_at": "2026-01-01T12:00:00Z", "reply_count": 4, "ref": "slack://synthetic/1"}
+        {"id": "synthetic-1", "channel": "bug-reports", "text": "Synthetic: export button remains disabled after refresh", "updated_at": "2026-01-01T12:00:00Z", "reply_count": 4, "ref": "slack://synthetic/1"}
     ],
     "hubspot.objects.recent": [
         {"id": "synthetic-deal-1", "object_type": "deals", "title": "Synthetic renewal", "properties": {"dealname": "Synthetic renewal", "dealstage": "proposal", "amount": "25000"}, "updated_at": "2026-01-01T13:00:00Z", "ref": "hubspot://deals/synthetic-deal-1"}

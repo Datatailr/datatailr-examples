@@ -37,7 +37,7 @@ Build the requested Datatailr app or workflow directly. Do not ask the user to d
 - Use a Service only when the result needs a reusable API.
 - Split a dashboard and notification automation into separate App and Workflow jobs.
 
-For “create an app which reads `#sonic-bug-report` and creates a dashboard of the 20 recent bugs,” build an App whose server calls `slack.threads.recent` with `channel="sonic-bug-report"` and `limit=20` on page load or refresh.
+For “create an app which reads `#bug-reports` and creates a dashboard of the 20 recent bugs,” build an App whose server calls `slack.threads.recent` with `channel="bug-reports"` and `limit=20` on page load or refresh.
 
 For “notify users on Slack when there’s an update on HubSpot,” build a scheduled Workflow that stores a successful checkpoint, calls `hubspot.objects.recent` with `modified_after=<checkpoint>`, and posts through `slack.messages.post` using one stable key per HubSpot object update. Advance the checkpoint only after all intended posts succeed.
 

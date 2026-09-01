@@ -15,7 +15,7 @@ Returns rows with `id`, `channel`, `text`, `updated_at`, `reply_count`, and `ref
 Synthetic row:
 
 ```json
-{"id":"synthetic-1","channel":"sonic-bug-report","text":"Synthetic: export button remains disabled after refresh","updated_at":"2026-01-01T12:00:00Z","reply_count":4,"ref":"slack://synthetic/1"}
+{"id":"synthetic-1","channel":"bug-reports","text":"Synthetic: export button remains disabled after refresh","updated_at":"2026-01-01T12:00:00Z","reply_count":4,"ref":"slack://synthetic/1"}
 ```
 
 ### `slack.threads.search`
