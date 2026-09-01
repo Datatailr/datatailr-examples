@@ -1,0 +1,1 @@
+"""Integration Studio sample application."""

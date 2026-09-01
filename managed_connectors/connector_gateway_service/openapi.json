@@ -1,0 +1,841 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Datatailr Connector Gateway API",
+    "version": "3.0.0",
+    "description": "Runtime access to indexed administrator-managed Slack and HubSpot data, live administrator-managed GitHub App data, and live-only per-user Gmail, Outlook Mail and Calendar, and Zoom data, plus approved connector actions. GitHub uses short-lived installation tokens and selected-repository permissions. GitHub and personal connector result rows are never persisted or written to the audit log."
+  },
+  "servers": [
+    {
+      "url": ".",
+      "description": "The connector-gateway job route in the current Datatailr environment"
+    }
+  ],
+  "security": [
+    {
+      "DatatailrSignedIdentity": []
+    }
+  ],
+  "tags": [
+    {"name": "Discovery"},
+    {"name": "Queries"},
+    {"name": "Actions"},
+    {"name": "Operations"},
+    {"name": "Administration"}
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Check gateway health",
+        "tags": ["Operations"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Gateway is running",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Health"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenApiDocument",
+        "summary": "Get this OpenAPI document",
+        "tags": ["Discovery"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1 document",
+            "content": {
+              "application/json": {
+                "schema": {"type": "object"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/capabilities": {
+      "get": {
+        "operationId": "listCapabilities",
+        "summary": "List supported connector capabilities and synthetic examples",
+        "tags": ["Discovery"],
+        "responses": {
+          "200": {
+            "description": "Capability catalog",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/CapabilityCatalog"}
+              }
+            }
+          },
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "429": {"$ref": "#/components/responses/RateLimited"}
+        }
+      }
+    },
+    "/v1/connections": {
+      "get": {
+        "operationId": "listConnections",
+        "summary": "List configured connectors and data availability",
+        "tags": ["Discovery"],
+        "responses": {
+          "200": {
+            "description": "Connector availability for the signed Datatailr user",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/ConnectionsResponse"}
+              }
+            }
+          },
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "429": {"$ref": "#/components/responses/RateLimited"}
+        }
+      }
+    },
+    "/v1/query": {
+      "post": {
+        "operationId": "runConnectorQuery",
+        "summary": "Execute one bounded connector query",
+        "description": "Slack and HubSpot use the administrator-managed workspace dataset. GitHub is fetched live through the administrator-installed GitHub App. Gmail, Outlook Mail and Calendar, and Zoom are fetched live for the signed-in request. GitHub rows and personal records, events, availability, and transcripts are never written to the audit database or knowledge index; the audit log stores only bounded operational metadata.",
+        "tags": ["Queries"],
+        "parameters": [
+          {"$ref": "#/components/parameters/ConnectorClientMarker"}
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/QueryRequest"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Query result",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/QueryResponse"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "403": {"$ref": "#/components/responses/Forbidden"},
+          "409": {"$ref": "#/components/responses/NotConfigured"},
+          "429": {"$ref": "#/components/responses/RateLimited"},
+          "500": {"$ref": "#/components/responses/InternalError"},
+          "502": {"$ref": "#/components/responses/UpstreamError"}
+        }
+      }
+    },
+    "/v1/actions": {
+      "post": {
+        "operationId": "runConnectorAction",
+        "summary": "Execute one approved connector action",
+        "description": "Supports idempotent Slack message posting and bounded in-memory document uploads to a bot-joined channel.",
+        "tags": ["Actions"],
+        "parameters": [
+          {"$ref": "#/components/parameters/ConnectorClientMarker"}
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/ActionRequest"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Action result or prior result for a duplicate idempotency key",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/SlackActionResult"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "403": {"$ref": "#/components/responses/Forbidden"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "409": {"$ref": "#/components/responses/NotConfigured"},
+          "429": {"$ref": "#/components/responses/RateLimited"},
+          "502": {"$ref": "#/components/responses/UpstreamError"}
+        }
+      }
+    },
+    "/v1/admin/audit": {
+      "get": {
+        "operationId": "listConnectorAuditEvents",
+        "summary": "List connector audit events",
+        "description": "Available only to signed Datatailr platform administrators. Gmail, Outlook, and Zoom entries contain operational metadata only and never contain searches, addresses, subjects, bodies, transcripts, result rows, prompts, credentials, or model responses.",
+        "tags": ["Administration"],
+        "parameters": [
+          {"name": "connector", "in": "query", "schema": {"type": "string", "enum": ["slack", "hubspot", "github", "gmail", "outlook", "zoom"]}},
+          {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["succeeded", "failed", "duplicate", "skipped", "requested"]}},
+          {"name": "user", "in": "query", "schema": {"type": "string", "maxLength": 200}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200}}
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest matching connector events",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuditResponse"}}}
+          },
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "403": {"$ref": "#/components/responses/Forbidden"},
+          "429": {"$ref": "#/components/responses/RateLimited"}
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "DatatailrSignedIdentity": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Datatailr-User",
+        "description": "Signed identity injected by the Datatailr proxy. Clients must authenticate to Datatailr and must not construct this header themselves."
+      }
+    },
+    "parameters": {
+      "ConnectorClientMarker": {
+        "name": "X-Datatailr-Connector-Client",
+        "in": "header",
+        "required": true,
+        "description": "Fixed same-origin client marker required for request bodies.",
+        "schema": {"type": "string", "const": "1"}
+      }
+    },
+    "responses": {
+      "BadRequest": {"description": "Invalid capability or parameters", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "Unauthorized": {"description": "Signed Datatailr identity is missing", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "Forbidden": {"description": "Service access or request-marker check failed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "NotFound": {"description": "Requested Slack channel is not in the bot-fetched shared data", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "NotConfigured": {"description": "Connector is not configured", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "RateLimited": {"description": "Per-user gateway rate limit exceeded", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "InternalError": {"description": "Gateway query failed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "UpstreamError": {"description": "Upstream provider request failed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {"error": {"type": "string"}},
+        "additionalProperties": false
+      },
+      "Health": {
+        "type": "object",
+        "required": ["status", "service", "version"],
+        "properties": {
+          "status": {"type": "string", "const": "ok"},
+          "service": {"type": "string", "const": "connector-gateway"},
+          "version": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "CapabilityCatalog": {
+        "type": "object",
+        "required": ["capabilities", "synthetic_examples"],
+        "properties": {
+          "capabilities": {"type": "object", "additionalProperties": {"type": "object"}},
+          "synthetic_examples": {"type": "object", "additionalProperties": true}
+        },
+        "additionalProperties": false
+      },
+      "Connection": {
+        "type": "object",
+        "required": ["source", "configured", "available_documents", "authorized_documents", "read_available", "data_mode", "actions", "required_action_scopes", "features"],
+        "properties": {
+          "source": {"type": "string", "enum": ["slack", "hubspot", "github", "gmail", "outlook", "zoom"]},
+          "configured": {"type": "boolean"},
+          "available_documents": {"type": "integer", "minimum": 0},
+          "authorized_documents": {"type": "integer", "minimum": 0, "deprecated": true, "description": "Compatibility alias for available_documents."},
+          "read_available": {"type": "boolean"},
+          "data_mode": {"type": "string", "enum": ["indexed", "live"], "description": "Whether records are read from the shared index or fetched from the provider only for the current request."},
+          "actions": {"type": "array", "items": {"type": "string", "enum": ["slack.messages.post", "slack.files.upload"]}},
+          "required_action_scopes": {"type": "array", "items": {"type": "string"}},
+          "features": {"type": "object", "additionalProperties": {"type": "boolean"}, "description": "Per-connector feature availability. GitHub reports repository, issue, pull request, commit, and file reads; Outlook reports mail and calendar; Zoom reports AI Companion access."}
+        },
+        "additionalProperties": false
+      },
+      "ConnectionsResponse": {
+        "type": "object",
+        "required": ["connections", "user"],
+        "properties": {
+          "connections": {"type": "array", "items": {"$ref": "#/components/schemas/Connection"}},
+          "user": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "SlackRecentParameters": {
+        "type": "object",
+        "required": ["channel"],
+        "properties": {
+          "channel": {"type": "string", "maxLength": 80, "pattern": "^#?[A-Za-z0-9_-]+$"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
+        },
+        "additionalProperties": false
+      },
+      "SlackSearchParameters": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": {"type": "string", "minLength": 1, "maxLength": 200},
+          "channel": {"type": "string", "maxLength": 80, "pattern": "^#?[A-Za-z0-9_-]+$"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
+        },
+        "additionalProperties": false
+      },
+      "HubSpotRecentParameters": {
+        "type": "object",
+        "required": ["object_type"],
+        "properties": {
+          "object_type": {"type": "string", "enum": ["companies", "contacts", "deals", "tickets", "calls", "meetings", "notes", "tasks"]},
+          "modified_after": {"type": "string", "format": "date-time"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+        },
+        "additionalProperties": false
+      },
+      "HubSpotActivitiesRecentParameters": {
+        "type": "object",
+        "properties": {
+          "activity_types": {"type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true, "default": ["calls", "meetings", "notes", "tasks"], "items": {"type": "string", "enum": ["calls", "meetings", "notes", "tasks"]}},
+          "query": {"type": "string", "maxLength": 200},
+          "modified_after": {"type": "string", "format": "date-time"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+        },
+        "additionalProperties": false
+      },
+      "HubSpotActivitiesUpcomingParameters": {
+        "type": "object",
+        "properties": {
+          "days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 14},
+          "activity_types": {"type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true, "default": ["calls", "meetings", "tasks"], "items": {"type": "string", "enum": ["calls", "meetings", "notes", "tasks"]}},
+          "query": {"type": "string", "maxLength": 200},
+          "owner_id": {"type": "string", "maxLength": 100},
+          "association_type": {"type": "string", "enum": ["contacts", "companies", "deals", "tickets"]},
+          "association_id": {"type": "string", "maxLength": 100},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+        },
+        "dependentRequired": {
+          "association_type": ["association_id"],
+          "association_id": ["association_type"]
+        },
+        "additionalProperties": false
+      },
+      "GitHubRepositoryListParameters": {
+        "type": "object",
+        "properties": {
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}
+        },
+        "additionalProperties": false
+      },
+      "GitHubIssueParameters": {
+        "type": "object",
+        "required": ["repository"],
+        "properties": {
+          "repository": {"type": "string", "maxLength": 200, "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+          "state": {"type": "string", "enum": ["open", "closed", "all"], "default": "open"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+          "max_characters": {"type": "integer", "minimum": 500, "maximum": 20000, "default": 8000}
+        },
+        "additionalProperties": false
+      },
+      "GitHubCommitParameters": {
+        "type": "object",
+        "required": ["repository"],
+        "properties": {
+          "repository": {"type": "string", "maxLength": 200, "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+          "ref": {"type": "string", "maxLength": 200},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+          "max_characters": {"type": "integer", "minimum": 100, "maximum": 10000, "default": 2000}
+        },
+        "additionalProperties": false
+      },
+      "GitHubFileParameters": {
+        "type": "object",
+        "required": ["repository", "path"],
+        "properties": {
+          "repository": {"type": "string", "maxLength": 200, "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+          "path": {"type": "string", "minLength": 1, "maxLength": 500},
+          "ref": {"type": "string", "maxLength": 200},
+          "max_characters": {"type": "integer", "minimum": 500, "maximum": 50000, "default": 20000}
+        },
+        "additionalProperties": false
+      },
+      "MessageSearchParameters": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string", "maxLength": 200},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
+        },
+        "additionalProperties": false
+      },
+      "OutlookCalendarRangeParameters": {
+        "type": "object",
+        "required": ["start", "end"],
+        "properties": {
+          "start": {"type": "string", "format": "date-time", "description": "Inclusive range start with a timezone offset."},
+          "end": {"type": "string", "format": "date-time", "description": "Exclusive range end with a timezone offset; at most 62 days after start."},
+          "time_zone": {"type": "string", "minLength": 1, "maxLength": 100, "default": "UTC", "description": "Microsoft Graph-supported Windows timezone name, for example UTC or India Standard Time."},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
+        },
+        "additionalProperties": false
+      },
+      "OutlookCalendarUpcomingParameters": {
+        "type": "object",
+        "properties": {
+          "days": {"type": "integer", "minimum": 1, "maximum": 62, "default": 14},
+          "time_zone": {"type": "string", "minLength": 1, "maxLength": 100, "default": "UTC", "description": "Microsoft Graph-supported Windows timezone name."},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
+        },
+        "additionalProperties": false
+      },
+      "OutlookAvailabilityParameters": {
+        "type": "object",
+        "required": ["schedules", "start", "end"],
+        "properties": {
+          "schedules": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "string", "format": "email", "maxLength": 254}},
+          "start": {"type": "string", "format": "date-time", "description": "Inclusive range start with a timezone offset."},
+          "end": {"type": "string", "format": "date-time", "description": "Exclusive range end with a timezone offset; at most 62 days after start."},
+          "time_zone": {"type": "string", "minLength": 1, "maxLength": 100, "default": "UTC", "description": "Microsoft Graph-supported Windows timezone name."},
+          "interval_minutes": {"type": "integer", "minimum": 5, "maximum": 1440, "default": 30}
+        },
+        "additionalProperties": false
+      },
+      "ZoomRecentParameters": {
+        "type": "object",
+        "properties": {
+          "days": {"type": "integer", "minimum": 1, "maximum": 30, "default": 30},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
+        },
+        "additionalProperties": false
+      },
+      "ZoomAiCompanionParameters": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string", "maxLength": 200},
+          "days": {"type": "integer", "minimum": 1, "maximum": 180, "default": 30},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 10},
+          "max_characters": {"type": "integer", "minimum": 1000, "maximum": 20000, "default": 12000}
+        },
+        "additionalProperties": false
+      },
+      "ZoomTranscriptGetParameters": {
+        "type": "object",
+        "required": ["meeting_id"],
+        "properties": {
+          "meeting_id": {"type": "string", "minLength": 1, "maxLength": 200},
+          "max_characters": {"type": "integer", "minimum": 1000, "maximum": 50000, "default": 20000}
+        },
+        "additionalProperties": false
+      },
+      "ZoomTranscriptSearchParameters": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string", "maxLength": 200},
+          "days": {"type": "integer", "minimum": 1, "maximum": 30, "default": 30},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 10},
+          "max_characters": {"type": "integer", "minimum": 1000, "maximum": 20000, "default": 12000}
+        },
+        "additionalProperties": false
+      },
+      "QueryRequest": {
+        "oneOf": [
+          {"$ref": "#/components/schemas/SlackRecentQuery"},
+          {"$ref": "#/components/schemas/SlackSearchQuery"},
+          {"$ref": "#/components/schemas/HubSpotRecentQuery"},
+          {"$ref": "#/components/schemas/HubSpotDealsSummaryQuery"},
+          {"$ref": "#/components/schemas/HubSpotActivitiesRecentQuery"},
+          {"$ref": "#/components/schemas/HubSpotActivitiesUpcomingQuery"},
+          {"$ref": "#/components/schemas/GitHubRepositoriesQuery"},
+          {"$ref": "#/components/schemas/GitHubIssuesQuery"},
+          {"$ref": "#/components/schemas/GitHubPullRequestsQuery"},
+          {"$ref": "#/components/schemas/GitHubCommitsQuery"},
+          {"$ref": "#/components/schemas/GitHubFileQuery"},
+          {"$ref": "#/components/schemas/GmailRecentQuery"},
+          {"$ref": "#/components/schemas/OutlookRecentQuery"},
+          {"$ref": "#/components/schemas/OutlookCalendarRangeQuery"},
+          {"$ref": "#/components/schemas/OutlookCalendarUpcomingQuery"},
+          {"$ref": "#/components/schemas/OutlookAvailabilityQuery"},
+          {"$ref": "#/components/schemas/ZoomRecentQuery"},
+          {"$ref": "#/components/schemas/ZoomAiCompanionQuery"},
+          {"$ref": "#/components/schemas/ZoomTranscriptGetQuery"},
+          {"$ref": "#/components/schemas/ZoomTranscriptSearchQuery"}
+        ],
+        "discriminator": {
+          "propertyName": "capability",
+          "mapping": {
+            "slack.threads.recent": "#/components/schemas/SlackRecentQuery",
+            "slack.threads.search": "#/components/schemas/SlackSearchQuery",
+            "hubspot.objects.recent": "#/components/schemas/HubSpotRecentQuery",
+            "hubspot.deals.summary": "#/components/schemas/HubSpotDealsSummaryQuery",
+            "hubspot.activities.recent": "#/components/schemas/HubSpotActivitiesRecentQuery",
+            "hubspot.activities.upcoming": "#/components/schemas/HubSpotActivitiesUpcomingQuery",
+            "github.repositories.list": "#/components/schemas/GitHubRepositoriesQuery",
+            "github.issues.recent": "#/components/schemas/GitHubIssuesQuery",
+            "github.pull_requests.recent": "#/components/schemas/GitHubPullRequestsQuery",
+            "github.commits.recent": "#/components/schemas/GitHubCommitsQuery",
+            "github.repository.file": "#/components/schemas/GitHubFileQuery",
+            "gmail.messages.recent": "#/components/schemas/GmailRecentQuery",
+            "outlook.messages.recent": "#/components/schemas/OutlookRecentQuery",
+            "outlook.calendar.events.range": "#/components/schemas/OutlookCalendarRangeQuery",
+            "outlook.calendar.events.upcoming": "#/components/schemas/OutlookCalendarUpcomingQuery",
+            "outlook.calendar.availability": "#/components/schemas/OutlookAvailabilityQuery",
+            "zoom.recordings.recent": "#/components/schemas/ZoomRecentQuery",
+            "zoom.ai_companion.recent": "#/components/schemas/ZoomAiCompanionQuery",
+            "zoom.transcripts.get": "#/components/schemas/ZoomTranscriptGetQuery",
+            "zoom.transcripts.search": "#/components/schemas/ZoomTranscriptSearchQuery"
+          }
+        }
+      },
+      "SlackRecentQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "slack.threads.recent"}, "parameters": {"$ref": "#/components/schemas/SlackRecentParameters"}}, "additionalProperties": false},
+      "SlackSearchQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "slack.threads.search"}, "parameters": {"$ref": "#/components/schemas/SlackSearchParameters"}}, "additionalProperties": false},
+      "HubSpotRecentQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "hubspot.objects.recent"}, "parameters": {"$ref": "#/components/schemas/HubSpotRecentParameters"}}, "additionalProperties": false},
+      "HubSpotDealsSummaryQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "hubspot.deals.summary"}, "parameters": {"type": "object", "maxProperties": 0}}, "additionalProperties": false},
+      "HubSpotActivitiesRecentQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "hubspot.activities.recent"}, "parameters": {"$ref": "#/components/schemas/HubSpotActivitiesRecentParameters"}}, "additionalProperties": false},
+      "HubSpotActivitiesUpcomingQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "hubspot.activities.upcoming"}, "parameters": {"$ref": "#/components/schemas/HubSpotActivitiesUpcomingParameters"}}, "additionalProperties": false},
+      "GitHubRepositoriesQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "github.repositories.list"}, "parameters": {"$ref": "#/components/schemas/GitHubRepositoryListParameters"}}, "additionalProperties": false},
+      "GitHubIssuesQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "github.issues.recent"}, "parameters": {"$ref": "#/components/schemas/GitHubIssueParameters"}}, "additionalProperties": false},
+      "GitHubPullRequestsQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "github.pull_requests.recent"}, "parameters": {"$ref": "#/components/schemas/GitHubIssueParameters"}}, "additionalProperties": false},
+      "GitHubCommitsQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "github.commits.recent"}, "parameters": {"$ref": "#/components/schemas/GitHubCommitParameters"}}, "additionalProperties": false},
+      "GitHubFileQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "github.repository.file"}, "parameters": {"$ref": "#/components/schemas/GitHubFileParameters"}}, "additionalProperties": false},
+      "GmailRecentQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "gmail.messages.recent"}, "parameters": {"$ref": "#/components/schemas/MessageSearchParameters"}}, "additionalProperties": false},
+      "OutlookRecentQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "outlook.messages.recent"}, "parameters": {"$ref": "#/components/schemas/MessageSearchParameters"}}, "additionalProperties": false},
+      "OutlookCalendarRangeQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "outlook.calendar.events.range"}, "parameters": {"$ref": "#/components/schemas/OutlookCalendarRangeParameters"}}, "additionalProperties": false},
+      "OutlookCalendarUpcomingQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "outlook.calendar.events.upcoming"}, "parameters": {"$ref": "#/components/schemas/OutlookCalendarUpcomingParameters"}}, "additionalProperties": false},
+      "OutlookAvailabilityQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "outlook.calendar.availability"}, "parameters": {"$ref": "#/components/schemas/OutlookAvailabilityParameters"}}, "additionalProperties": false},
+      "ZoomRecentQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "zoom.recordings.recent"}, "parameters": {"$ref": "#/components/schemas/ZoomRecentParameters"}}, "additionalProperties": false},
+      "ZoomAiCompanionQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "zoom.ai_companion.recent"}, "parameters": {"$ref": "#/components/schemas/ZoomAiCompanionParameters"}}, "additionalProperties": false},
+      "ZoomTranscriptGetQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "zoom.transcripts.get"}, "parameters": {"$ref": "#/components/schemas/ZoomTranscriptGetParameters"}}, "additionalProperties": false},
+      "ZoomTranscriptSearchQuery": {"type": "object", "required": ["capability", "parameters"], "properties": {"capability": {"const": "zoom.transcripts.search"}, "parameters": {"$ref": "#/components/schemas/ZoomTranscriptSearchParameters"}}, "additionalProperties": false},
+      "SlackThread": {
+        "type": "object",
+        "required": ["id", "channel", "text", "updated_at", "reply_count", "ref"],
+        "properties": {
+          "id": {"type": "string"}, "channel": {"type": "string"}, "text": {"type": "string"},
+          "updated_at": {"type": "string", "format": "date-time"}, "reply_count": {"type": "integer", "minimum": 0}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "HubSpotObject": {
+        "type": "object",
+        "required": ["id", "object_type", "title", "properties", "updated_at", "ref"],
+        "properties": {
+          "id": {"type": "string"}, "object_type": {"type": "string", "enum": ["companies", "contacts", "deals", "tickets", "calls", "meetings", "notes", "tasks"]},
+          "title": {"type": "string"}, "properties": {"type": "object", "additionalProperties": {"type": "string"}},
+          "updated_at": {"type": "string", "format": "date-time"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "HubSpotActivityAssociations": {
+        "type": "object",
+        "required": ["contacts", "companies", "deals", "tickets"],
+        "properties": {
+          "contacts": {"type": "array", "items": {"type": "string"}},
+          "companies": {"type": "array", "items": {"type": "string"}},
+          "deals": {"type": "array", "items": {"type": "string"}},
+          "tickets": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      },
+      "HubSpotActivity": {
+        "type": "object",
+        "required": ["id", "activity_type", "title", "text", "timestamp", "start_time", "end_time", "status", "outcome", "owner_id", "associations", "properties", "updated_at", "ref"],
+        "properties": {
+          "id": {"type": "string"},
+          "activity_type": {"type": "string", "enum": ["calls", "meetings", "notes", "tasks"]},
+          "title": {"type": "string"}, "text": {"type": "string"},
+          "timestamp": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"},
+          "status": {"type": "string"}, "outcome": {"type": "string"}, "owner_id": {"type": "string"},
+          "associations": {"$ref": "#/components/schemas/HubSpotActivityAssociations"},
+          "properties": {"type": "object", "additionalProperties": {"type": "string"}},
+          "updated_at": {"type": "string"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "GitHubActor": {
+        "type": "object",
+        "required": ["login", "avatar_url"],
+        "properties": {"login": {"type": "string"}, "avatar_url": {"type": "string"}},
+        "additionalProperties": false
+      },
+      "GitHubRepository": {
+        "type": "object",
+        "required": ["id", "name", "full_name", "private", "description", "default_branch", "updated_at", "ref"],
+        "properties": {
+          "id": {"type": "string"}, "name": {"type": "string"}, "full_name": {"type": "string"},
+          "private": {"type": "boolean"}, "description": {"type": "string"}, "default_branch": {"type": "string"},
+          "updated_at": {"type": "string"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "GitHubIssue": {
+        "type": "object",
+        "required": ["id", "number", "repository", "title", "body", "state", "author", "labels", "comments", "created_at", "updated_at", "ref"],
+        "properties": {
+          "id": {"type": "string"}, "number": {"type": "integer"}, "repository": {"type": "string"},
+          "title": {"type": "string"}, "body": {"type": "string"}, "state": {"type": "string"},
+          "author": {"$ref": "#/components/schemas/GitHubActor"}, "labels": {"type": "array", "items": {"type": "string"}},
+          "comments": {"type": "integer", "minimum": 0}, "created_at": {"type": "string"},
+          "updated_at": {"type": "string"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "GitHubPullRequest": {
+        "type": "object",
+        "required": ["id", "number", "repository", "title", "body", "state", "draft", "author", "head", "base", "created_at", "updated_at", "ref"],
+        "properties": {
+          "id": {"type": "string"}, "number": {"type": "integer"}, "repository": {"type": "string"},
+          "title": {"type": "string"}, "body": {"type": "string"}, "state": {"type": "string"}, "draft": {"type": "boolean"},
+          "author": {"$ref": "#/components/schemas/GitHubActor"}, "head": {"type": "string"}, "base": {"type": "string"},
+          "created_at": {"type": "string"}, "updated_at": {"type": "string"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "GitHubCommit": {
+        "type": "object",
+        "required": ["sha", "repository", "message", "author", "authored_at", "ref"],
+        "properties": {
+          "sha": {"type": "string"}, "repository": {"type": "string"}, "message": {"type": "string"},
+          "author": {"$ref": "#/components/schemas/GitHubActor"}, "authored_at": {"type": "string"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "GitHubFile": {
+        "type": "object",
+        "required": ["repository", "path", "sha", "text", "truncated", "ref"],
+        "properties": {
+          "repository": {"type": "string"}, "path": {"type": "string"}, "sha": {"type": "string"},
+          "text": {"type": "string"}, "truncated": {"type": "boolean"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "Message": {
+        "type": "object",
+        "required": ["id", "title", "text", "updated_at", "ref"],
+        "properties": {
+          "id": {"type": "string"}, "title": {"type": "string"}, "text": {"type": "string"},
+          "updated_at": {"type": "string", "format": "date-time"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "GraphDateTime": {
+        "type": "object",
+        "properties": {"dateTime": {"type": "string"}, "timeZone": {"type": "string"}},
+        "additionalProperties": true
+      },
+      "OutlookPerson": {
+        "type": "object",
+        "required": ["name", "address"],
+        "properties": {"name": {"type": "string"}, "address": {"type": "string"}},
+        "additionalProperties": false
+      },
+      "OutlookAttendee": {
+        "type": "object",
+        "required": ["name", "address", "type", "response"],
+        "properties": {"name": {"type": "string"}, "address": {"type": "string"}, "type": {"type": "string"}, "response": {"type": "string"}},
+        "additionalProperties": false
+      },
+      "OutlookCalendarEvent": {
+        "type": "object",
+        "required": ["id", "title", "start", "end", "is_all_day", "location", "organizer", "attendees", "response_status", "online_meeting_url", "ref"],
+        "properties": {
+          "id": {"type": "string"}, "title": {"type": "string"},
+          "start": {"$ref": "#/components/schemas/GraphDateTime"}, "end": {"$ref": "#/components/schemas/GraphDateTime"},
+          "is_all_day": {"type": "boolean"}, "location": {"type": "string"},
+          "organizer": {"$ref": "#/components/schemas/OutlookPerson"},
+          "attendees": {"type": "array", "items": {"$ref": "#/components/schemas/OutlookAttendee"}},
+          "response_status": {"type": "string"}, "online_meeting_url": {"type": "string"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "OutlookScheduleItem": {
+        "type": "object",
+        "required": ["status", "start", "end", "is_private"],
+        "properties": {"status": {"type": "string"}, "start": {"$ref": "#/components/schemas/GraphDateTime"}, "end": {"$ref": "#/components/schemas/GraphDateTime"}, "is_private": {"type": "boolean"}},
+        "additionalProperties": false
+      },
+      "OutlookSchedule": {
+        "type": "object",
+        "required": ["schedule_id", "availability_view", "schedule_items"],
+        "properties": {"schedule_id": {"type": "string"}, "availability_view": {"type": "string"}, "schedule_items": {"type": "array", "items": {"$ref": "#/components/schemas/OutlookScheduleItem"}}},
+        "additionalProperties": false
+      },
+      "ZoomRecording": {
+        "type": "object",
+        "required": ["id", "meeting_id", "topic", "start_time", "duration", "transcript_available", "ref"],
+        "properties": {
+          "id": {"type": "string"}, "meeting_id": {"type": "string"}, "topic": {"type": "string"},
+          "start_time": {"type": "string"}, "duration": {"type": "integer", "minimum": 0},
+          "transcript_available": {"type": "boolean"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "ZoomTranscript": {
+        "type": "object",
+        "required": ["meeting_id", "topic", "start_time", "text", "ref"],
+        "properties": {
+          "meeting_id": {"type": "string"}, "topic": {"type": "string"},
+          "start_time": {"type": "string"}, "text": {"type": "string"}, "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "ZoomAiCompanionMeeting": {
+        "type": "object",
+        "required": ["meeting_id", "topic", "start_time", "summary", "next_steps", "transcript_text", "transcript_available", "ref"],
+        "properties": {
+          "meeting_id": {"type": "string"}, "topic": {"type": "string"},
+          "start_time": {"type": "string"}, "summary": {"type": "string"},
+          "next_steps": {"type": "array", "items": {"type": "string"}},
+          "transcript_text": {"type": "string"}, "transcript_available": {"type": "boolean"},
+          "ref": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "DealStageSummary": {
+        "type": "object",
+        "required": ["stage", "deal_count", "total_amount"],
+        "properties": {"stage": {"type": "string"}, "deal_count": {"type": "integer", "minimum": 0}, "total_amount": {"type": "number"}},
+        "additionalProperties": false
+      },
+      "DealSummary": {
+        "type": "object",
+        "required": ["total_deals", "total_amount", "open_deals", "closed_won", "by_stage", "latest_update"],
+        "properties": {
+          "total_deals": {"type": "integer", "minimum": 0}, "total_amount": {"type": "number"},
+          "open_deals": {"type": "integer", "minimum": 0}, "closed_won": {"type": "integer", "minimum": 0},
+          "by_stage": {"type": "array", "items": {"$ref": "#/components/schemas/DealStageSummary"}},
+          "latest_update": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "QueryResponse": {
+        "type": "object",
+        "required": ["capability", "data"],
+        "properties": {
+          "capability": {"type": "string", "enum": ["slack.threads.recent", "slack.threads.search", "hubspot.objects.recent", "hubspot.deals.summary", "hubspot.activities.recent", "hubspot.activities.upcoming", "github.repositories.list", "github.issues.recent", "github.pull_requests.recent", "github.commits.recent", "github.repository.file", "gmail.messages.recent", "outlook.messages.recent", "outlook.calendar.events.range", "outlook.calendar.events.upcoming", "outlook.calendar.availability", "zoom.recordings.recent", "zoom.ai_companion.recent", "zoom.transcripts.get", "zoom.transcripts.search"]},
+          "data": {
+            "anyOf": [
+              {"type": "array", "items": {"$ref": "#/components/schemas/SlackThread"}},
+              {"type": "array", "items": {"$ref": "#/components/schemas/HubSpotObject"}},
+              {"$ref": "#/components/schemas/DealSummary"},
+              {"type": "array", "items": {"$ref": "#/components/schemas/HubSpotActivity"}},
+              {"type": "array", "items": {"$ref": "#/components/schemas/GitHubRepository"}},
+              {"type": "array", "items": {"$ref": "#/components/schemas/GitHubIssue"}},
+              {"type": "array", "items": {"$ref": "#/components/schemas/GitHubPullRequest"}},
+              {"type": "array", "items": {"$ref": "#/components/schemas/GitHubCommit"}},
+              {"$ref": "#/components/schemas/GitHubFile"},
+              {"type": "array", "items": {"$ref": "#/components/schemas/Message"}},
+              {"type": "array", "items": {"$ref": "#/components/schemas/OutlookCalendarEvent"}},
+              {"type": "array", "items": {"$ref": "#/components/schemas/OutlookSchedule"}},
+              {"type": "array", "items": {"$ref": "#/components/schemas/ZoomRecording"}},
+              {"type": "array", "items": {"$ref": "#/components/schemas/ZoomAiCompanionMeeting"}},
+              {"$ref": "#/components/schemas/ZoomTranscript"},
+              {"type": "array", "items": {"$ref": "#/components/schemas/ZoomTranscript"}}
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "SlackPostParameters": {
+        "type": "object",
+        "required": ["channel", "text", "idempotency_key"],
+        "properties": {
+          "channel": {"type": "string", "maxLength": 80, "pattern": "^#?[A-Za-z0-9_-]+$"},
+          "text": {"type": "string", "minLength": 1, "maxLength": 4000},
+          "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[A-Za-z0-9._:/-]+$"},
+          "dry_run": {"type": "boolean", "default": false}
+        },
+        "additionalProperties": false
+      },
+      "SlackFileUploadParameters": {
+        "type": "object",
+        "required": ["channel", "filename", "content_base64", "idempotency_key"],
+        "properties": {
+          "channel": {"type": "string", "maxLength": 80, "pattern": "^#?[A-Za-z0-9_-]+$"},
+          "filename": {"type": "string", "minLength": 1, "maxLength": 255, "description": "A plain filename without a path."},
+          "content_base64": {"type": "string", "contentEncoding": "base64", "maxLength": 6990508, "description": "Document bytes encoded as base64; decoded content is limited to 5 MiB and is not persisted."},
+          "title": {"type": "string", "maxLength": 255},
+          "initial_comment": {"type": "string", "maxLength": 2000},
+          "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[A-Za-z0-9._:/-]+$"},
+          "dry_run": {"type": "boolean", "default": false}
+        },
+        "additionalProperties": false
+      },
+      "ActionRequest": {
+        "oneOf": [
+          {"$ref": "#/components/schemas/SlackPostActionRequest"},
+          {"$ref": "#/components/schemas/SlackFileUploadActionRequest"}
+        ],
+        "discriminator": {
+          "propertyName": "capability",
+          "mapping": {
+            "slack.messages.post": "#/components/schemas/SlackPostActionRequest",
+            "slack.files.upload": "#/components/schemas/SlackFileUploadActionRequest"
+          }
+        }
+      },
+      "SlackPostActionRequest": {
+        "type": "object",
+        "required": ["capability", "parameters"],
+        "properties": {
+          "capability": {"const": "slack.messages.post"},
+          "parameters": {"$ref": "#/components/schemas/SlackPostParameters"}
+        },
+        "additionalProperties": false
+      },
+      "SlackFileUploadActionRequest": {
+        "type": "object",
+        "required": ["capability", "parameters"],
+        "properties": {
+          "capability": {"const": "slack.files.upload"},
+          "parameters": {"$ref": "#/components/schemas/SlackFileUploadParameters"}
+        },
+        "additionalProperties": false
+      },
+      "SlackActionResult": {
+        "type": "object",
+        "required": ["ok", "duplicate"],
+        "properties": {
+          "ok": {"type": "boolean"}, "duplicate": {"type": "boolean"}, "dry_run": {"type": "boolean"},
+          "channel": {"type": "string"}, "timestamp": {"type": "string"}, "file_id": {"type": "string"}, "filename": {"type": "string"}, "status": {"type": "string"}, "error": {"type": "string"}
+        },
+        "additionalProperties": true
+      },
+      "AuditEvent": {
+        "type": "object",
+        "required": ["id", "at", "user", "connector", "capability", "operation", "status", "metadata", "metadata_only"],
+        "properties": {
+          "id": {"type": "integer"},
+          "at": {"type": "string", "format": "date-time"},
+          "user": {"type": "string"},
+          "connector": {"type": "string", "enum": ["slack", "hubspot", "github", "gmail", "outlook", "zoom"]},
+          "capability": {"type": "string"},
+          "operation": {"type": "string"},
+          "status": {"type": "string"},
+          "result_count": {"type": ["integer", "null"], "minimum": 0},
+          "duration_ms": {"type": ["integer", "null"], "minimum": 0},
+          "metadata": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean", "null"]}},
+          "metadata_only": {"type": "boolean"}
+        },
+        "additionalProperties": false
+      },
+      "AuditResponse": {
+        "type": "object",
+        "required": ["events", "privacy"],
+        "properties": {
+          "events": {"type": "array", "items": {"$ref": "#/components/schemas/AuditEvent"}},
+          "privacy": {"type": "object", "additionalProperties": true}
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

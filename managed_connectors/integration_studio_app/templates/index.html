@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Integration Studio</title>
+  <link rel="stylesheet" href="static/style.css?v=github-org-only-v1">
+</head>
+<body>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<div class="shell">
+  <aside class="rail">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+          <path d="M6 4v6a3 3 0 0 0 3 3h6a3 3 0 0 1 3 3v4"/>
+          <circle cx="6" cy="4" r="2.2" fill="currentColor" stroke="none"/>
+          <circle cx="18" cy="20" r="2.2"/>
+        </svg>
+      </span>
+      <span class="brand-text">
+        <strong>Integration Studio</strong>
+        <small data-platform-template="{platform}">Datatailr</small>
+      </span>
+    </div>
+
+    <nav aria-label="Sections">
+      <button class="nav-item is-active" data-view="connections" type="button">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+          <path d="M5.2 5.8 3.4 4a2 2 0 0 1 2.8-2.8L8 3M10.8 10.2l1.8 1.8a2 2 0 1 1-2.8 2.8L8 13"/>
+          <path d="m6 10 4-4"/>
+        </svg>
+        <span>Connections</span>
+      </button>
+      <button class="nav-item" data-view="skills" type="button">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+          <path d="m8 1.7.8 2.4 2.5.1-2 1.5.7 2.4L8 6.7 6 8.1l.7-2.4-2-1.5 2.5-.1z"/>
+          <path d="M3 10.5h10M3 13.5h7"/>
+        </svg>
+        <span>Agent Skills</span>
+      </button>
+      <button class="nav-item admin-only" data-view="admin" type="button" hidden>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+          <path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/>
+          <circle cx="6" cy="4.5" r="1.6" fill="var(--surface)"/>
+          <circle cx="10.5" cy="8" r="1.6" fill="var(--surface)"/>
+          <circle cx="5" cy="11.5" r="1.6" fill="var(--surface)"/>
+        </svg>
+        <span>Admin</span>
+      </button>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="who">
+        <span class="who-avatar" id="avatar">·</span>
+        <span class="who-text">
+          <strong id="username">Loading</strong>
+          <small id="role"></small>
+        </span>
+      </div>
+    </div>
+  </aside>
+
+  <main class="workspace">
+
+    <!-- ───────────────────────── CONNECTIONS ──────────────────────── -->
+    <section id="view-connections" class="view is-active" aria-labelledby="connections-title">
+      <header class="bar">
+        <div class="bar-title">
+          <h1 id="connections-title">Your connections</h1>
+          <p class="bar-sub">Connect your personal Gmail, Outlook, and Zoom data. OAuth application setup is handled once by an administrator.</p>
+        </div>
+      </header>
+
+      <p class="banner">
+        Gmail and Outlook messages plus Zoom AI Companion summaries and transcripts are fetched live only when requested and are never indexed or stored.
+        <span data-platform-template="Gmail app passwords and delegated Outlook/Zoom OAuth tokens remain isolated under your {platform} username and are never returned by the API.">Gmail app passwords and delegated Outlook/Zoom OAuth tokens remain isolated under your Datatailr username and are never returned by the API.</span>
+      </p>
+
+      <div id="personal-connections" class="personal-connections"></div>
+    </section>
+
+    <!-- ───────────────────────── AGENT SKILLS ─────────────────────── -->
+    <section id="view-skills" class="view" aria-labelledby="skills-title">
+      <header class="bar">
+        <div class="bar-title">
+          <h1 id="skills-title">Managed connector skills</h1>
+          <p class="bar-sub" data-platform-template="Build data-aware {platform} apps without exposing credentials or company data to the coding agent.">Build data-aware Datatailr apps without exposing credentials or company data to the coding agent.</p>
+        </div>
+      </header>
+
+      <div class="skills-content">
+        <section class="skill-hero">
+          <span class="pill" data-on="true">Install once per project</span>
+          <h2>Add the connector skill, then describe the outcome.</h2>
+          <p>
+            The skill is distributed with the Managed Connectors example rather than built into your <span data-platform-template="{platform}">Datatailr</span> installation. Add it to your coding
+            project before starting a new agent chat. The agent receives schemas, synthetic examples, and deployment
+            instructions—not connector credentials or live company data. Real data is fetched only by the deployed
+            app or workflow at runtime.
+          </p>
+        </section>
+
+        <section class="skills-section" aria-labelledby="install-skill-title">
+          <div class="skills-section-head">
+            <div>
+              <h2 id="install-skill-title">Add the skill with your coding agent</h2>
+              <p>Paste this once at the beginning of a project. The agent can install the public skill itself.</p>
+            </div>
+          </div>
+          <article class="skill-card skill-bootstrap-card">
+            <h3>Bootstrap prompt</h3>
+            <pre><code>Install the datatailr-connectors Agent Skill from https://github.com/Datatailr/datatailr-examples/tree/main/managed_connectors/skills/datatailr-connectors into this project's supported skills directory. Read its SKILL.md, preserve all references and scripts, and use it for the app or workflow I ask you to build. Do not query live connector data while authoring.</code></pre>
+            <button class="btn btn-primary" type="button" data-copy="Install the datatailr-connectors Agent Skill from https://github.com/Datatailr/datatailr-examples/tree/main/managed_connectors/skills/datatailr-connectors into this project's supported skills directory. Read its SKILL.md, preserve all references and scripts, and use it for the app or workflow I ask you to build. Do not query live connector data while authoring.">Copy bootstrap prompt</button>
+          </article>
+          <div class="skill-steps">
+            <div><span>1</span><p><strong>Open your project in a coding agent.</strong> Claude Code, Codex, and other Agent Skills-compatible tools can load a project skill.</p></div>
+            <div><span>2</span><p><strong>Paste the bootstrap prompt.</strong> Review the skill files the agent adds before continuing.</p></div>
+            <div><span>3</span><p><strong>Start a fresh chat and describe the app.</strong> The deployed job—not the coding agent—reads connector data at runtime.</p></div>
+          </div>
+          <p class="note">Claude Code project location: <code>.claude/skills/datatailr-connectors/</code>. Agent Skills-compatible tools may use a different project skills directory.</p>
+        </section>
+
+        <section class="skills-section" aria-labelledby="prompt-examples-title">
+          <div class="skills-section-head">
+            <div>
+              <h2 id="prompt-examples-title">Try a prompt</h2>
+              <p>Use Claude Code, Codex, Cursor, Copilot, or another skill-compatible coding agent.</p>
+            </div>
+          </div>
+          <div class="skills-grid">
+            <article class="skill-card">
+              <h3>Slack bug dashboard</h3>
+              <pre><code data-platform-template="Create a shared {platform} app that reads #bug-reports and shows a dashboard of the 20 most recent bugs.">Create a shared Datatailr app that reads #bug-reports and shows a dashboard of the 20 most recent bugs.</code></pre>
+              <button class="btn btn-quiet" type="button" data-copy="Create a shared Datatailr app that reads #bug-reports and shows a dashboard of the 20 most recent bugs." data-copy-template="Create a shared {platform} app that reads #bug-reports and shows a dashboard of the 20 most recent bugs.">Copy prompt</button>
+            </article>
+            <article class="skill-card">
+              <h3>HubSpot-to-Slack automation</h3>
+              <pre><code data-platform-template="Create a scheduled {platform} workflow that notifies #sales-updates in Slack whenever a HubSpot deal changes.">Create a scheduled Datatailr workflow that notifies #sales-updates in Slack whenever a HubSpot deal changes.</code></pre>
+              <button class="btn btn-quiet" type="button" data-copy="Create a scheduled Datatailr workflow that notifies #sales-updates in Slack whenever a HubSpot deal changes." data-copy-template="Create a scheduled {platform} workflow that notifies #sales-updates in Slack whenever a HubSpot deal changes.">Copy prompt</button>
+            </article>
+            <article class="skill-card">
+              <h3>HubSpot activity outlook</h3>
+              <pre><code data-platform-template="Create a shared {platform} dashboard of upcoming HubSpot demos, discovery meetings, calls, and tasks for the next 14 days. Group them by owner and show associated companies and deals.">Create a shared Datatailr dashboard of upcoming HubSpot demos, discovery meetings, calls, and tasks for the next 14 days. Group them by owner and show associated companies and deals.</code></pre>
+              <button class="btn btn-quiet" type="button" data-copy="Create a shared Datatailr dashboard of upcoming HubSpot demos, discovery meetings, calls, and tasks for the next 14 days. Group them by owner and show associated companies and deals." data-copy-template="Create a shared {platform} dashboard of upcoming HubSpot demos, discovery meetings, calls, and tasks for the next 14 days. Group them by owner and show associated companies and deals.">Copy prompt</button>
+            </article>
+            <article class="skill-card">
+              <h3>Personal calendar dashboard</h3>
+              <pre><code data-platform-template="Create a shared {platform} app that reads each viewer's Outlook calendar at runtime and shows their upcoming meetings and available focus time.">Create a shared Datatailr app that reads each viewer's Outlook calendar at runtime and shows their upcoming meetings and available focus time.</code></pre>
+              <button class="btn btn-quiet" type="button" data-copy="Create a shared Datatailr app that reads each viewer's Outlook calendar at runtime and shows their upcoming meetings and available focus time." data-copy-template="Create a shared {platform} app that reads each viewer's Outlook calendar at runtime and shows their upcoming meetings and available focus time.">Copy prompt</button>
+            </article>
+          </div>
+        </section>
+
+        <section class="skills-section skill-contract" aria-labelledby="contract-title">
+          <div class="skills-section-head">
+            <div>
+              <h2 id="contract-title">What generated jobs can use</h2>
+              <p>The gateway exposes narrow, audited capabilities rather than provider tokens or arbitrary API access.</p>
+            </div>
+          </div>
+          <div class="contract-grid">
+            <div><strong>Read</strong><span>Slack channels and threads</span><span>HubSpot CRM records and activities</span><span>GitHub repositories, issues, pull requests, commits, and text files</span><span>Gmail</span><span>Outlook Mail and Calendar</span><span>Zoom AI Companion summaries and retained transcripts</span></div>
+            <div><strong>Act</strong><span>Send Slack notifications</span><span>Run scheduled workflows</span></div>
+            <div><strong>Protected</strong><span>App access controls</span><span>Runtime-only data</span><span>Audited actions</span></div>
+          </div>
+          <p class="note">
+            Slack, HubSpot, and GitHub Organization are shared from administrator-managed credentials to users allowed into the app.
+            GitHub content is fetched live through short-lived installation tokens and is not added to the knowledge index.
+            Gmail, Outlook, and Zoom are fetched live for the signed-in user and never written to the knowledge index.
+          </p>
+        </section>
+
+        <section class="skills-section" aria-labelledby="local-skills-title">
+          <div class="skills-section-head">
+            <div>
+              <h2 id="local-skills-title">What the project receives</h2>
+              <p>The complete skill is versioned beside this example and can be reviewed before use.</p>
+            </div>
+          </div>
+          <div class="skill-steps">
+            <div><span>1</span><p><strong>Instructions.</strong><code>SKILL.md</code> defines the runtime-only data boundary and deployment workflow.</p></div>
+            <div><span>2</span><p><strong>API contract.</strong><code>references/api.md</code> provides capabilities, parameters, result fields, and synthetic examples.</p></div>
+            <div><span>3</span><p><strong>Runtime clients.</strong><code>scripts/connector_client.py</code> and <code>connector_client.js</code> call the gateway without exposing credentials.</p></div>
+          </div>
+          <p class="note">Gateway schema: <code>/job/{{ deploy_environment }}/connector-gateway/openapi.json</code></p>
+        </section>
+      </div>
+    </section>
+
+    <!-- ──────────────────────────── ADMIN ──────────────────────────── -->
+    <section id="view-admin" class="view" aria-labelledby="admin-title">
+      <header class="bar">
+        <div class="bar-title">
+          <h1 id="admin-title">Admin</h1>
+          <p class="bar-sub">Shared connector credentials and personal OAuth applications for this workspace.</p>
+        </div>
+        <div class="bar-actions">
+          <button id="save-settings" class="btn btn-primary" type="button">Save changes</button>
+        </div>
+      </header>
+
+      <p class="banner">
+        Shared credentials are stored in the app owner's protected state file and are never returned by the API.
+        Gmail is configured privately by each user. Outlook and Zoom OAuth applications are configured
+        once here; each user's delegated tokens remain private to that user. GitHub uses one administrator-installed
+        organization app and only sees repositories selected for that installation.
+      </p>
+
+      <div id="settings-root"></div>
+
+      <section class="audit-panel" aria-labelledby="connector-audit-title">
+        <div class="audit-head">
+          <div>
+            <h2 id="connector-audit-title">Connector audit log</h2>
+            <p>Operational access history across Integration Studio, generated apps, services, and workflows.</p>
+          </div>
+          <button id="refresh-audit" class="btn btn-quiet" type="button">Refresh</button>
+        </div>
+
+        <p class="audit-privacy">
+          Gmail, Outlook, and Zoom entries contain metadata only. Searches, addresses, subjects, message bodies,
+          transcript content, result rows, prompts, credentials, and model responses are never written to this log.
+        </p>
+
+        <div class="audit-filters" aria-label="Audit filters">
+          <label>Connector
+            <select id="audit-connector">
+              <option value="">All connectors</option>
+              <option value="slack">Slack</option>
+              <option value="hubspot">HubSpot</option>
+              <option value="github">GitHub</option>
+              <option value="gmail">Gmail</option>
+              <option value="outlook">Outlook</option>
+              <option value="zoom">Zoom</option>
+            </select>
+          </label>
+          <label>Status
+            <select id="audit-status">
+              <option value="">All statuses</option>
+              <option value="succeeded">Succeeded</option>
+              <option value="failed">Failed</option>
+              <option value="duplicate">Duplicate</option>
+              <option value="requested">Requested</option>
+              <option value="skipped">Skipped</option>
+            </select>
+          </label>
+          <label>User
+            <input id="audit-user" type="text" maxlength="200" placeholder="All users" autocomplete="off">
+          </label>
+          <button id="apply-audit-filters" class="btn" type="button">Apply filters</button>
+        </div>
+
+        <div class="audit-table-wrap">
+          <table class="audit-table">
+            <thead><tr>
+              <th>Time</th><th>User</th><th>Connector</th><th>Operation</th>
+              <th>Status</th><th>Results</th><th>Duration</th><th>Metadata</th>
+            </tr></thead>
+            <tbody id="audit-rows">
+              <tr><td colspan="8" class="audit-empty">Open Admin to load connector activity.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+  </main>
+</div>
+
+<script src="static/app.js?v=managed-connectors-v3"></script>
+</body>
+</html>
