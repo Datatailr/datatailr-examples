@@ -139,6 +139,7 @@ def function_with_args_and_varargs(rundate, *args):
 
 @task()
 def get_data() -> dict:
+    logger.info("Getting data")
     return {"a": 1, "b": 2, "c": 3}
 
 
