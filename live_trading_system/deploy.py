@@ -95,7 +95,7 @@ def _service(
     *,
     extra_env: dict | None = None,
     memory: str = "512m",
-    cpu: float = 1,
+    cpu: float = 0.25,
 ) -> Service:
     env_vars = {
         "NODE_NAME": name,
@@ -190,7 +190,7 @@ def deploy_notification_bus() -> None:
         NOTIFICATION_BUS_NAME,
         role="notification-bus",
         memory="256m",
-        cpu=0.5,
+        cpu=0.25,
     ).run()
 
 
@@ -205,7 +205,7 @@ def deploy_persistence_sink() -> None:
             "FLUSH_MAX_BUFFER": "200",
         },
         memory="512m",
-        cpu=0.5,
+        cpu=0.25,
     ).run()
 
 
