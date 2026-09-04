@@ -1,6 +1,6 @@
 # Live Trading System
 
-![Live Trading System Dashboard](./screenshot.gif)
+![Live Trading System Dashboard](./preview.gif)
 
 An end-to-end Datatailr demo built around a simulated algorithmic-trading
 desk. **Seven long-running ZMQ services** stream market data through a
