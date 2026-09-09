@@ -1,0 +1,6 @@
+interface:
+  display_name: "Datatailr Connectors"
+  short_description: "Build app-protected tools with managed connectors"
+  default_prompt: "Use $datatailr-connectors to build an app that reads managed Slack, HubSpot, GitHub, mail, Outlook Calendar, or Zoom data at runtime."
+policy:
+  allow_implicit_invocation: true
