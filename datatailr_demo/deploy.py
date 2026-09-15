@@ -91,7 +91,16 @@ def notebook(voila=True):
     path_to_notebook = Path(__file__).parent / "notebooks" / "demo_notebook.ipynb"
     assert path_to_notebook.exists(), f"Notebook not found: {path_to_notebook}"
 
-    python_requirements=["jupyter", "pandas", "perspective-python", "jupyterlab_widgets", "pyarrow", "networkx", "ipycytoscape", "bqplot"]
+    python_requirements=["jupyter",
+                         "pandas",
+                         "perspective-python",
+                         "jupyterlab_widgets",
+                         "pyarrow",
+                         "networkx",
+                         "ipycytoscape",
+                         "bqplot",
+                         "tornado<6.5.9",
+                         "anywidget",]
     if voila:
         python_requirements += ['voila']
     framework = "voila" if voila else "jupyter"
