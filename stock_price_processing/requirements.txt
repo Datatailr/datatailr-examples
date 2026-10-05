@@ -7,4 +7,4 @@ csp
 requests
 pandas
 pyarrow
-duckdb>=1.5.5
+duckdb>=1.5.6
