@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+pydantic>=2
+pyarrow
+duckdb
+pytz

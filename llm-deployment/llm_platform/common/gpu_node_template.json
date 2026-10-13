@@ -1,0 +1,9 @@
+[
+	{
+		"type": "Standard_NC4as_T4_v3",
+		"node_class": "gpu",
+		"environment": "dev",
+		"num_instances": 1,
+        "disk_size": 100
+	}
+]

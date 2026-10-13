@@ -1,0 +1,3 @@
+# vLLM itself is installed at first start into a venv on the node's /mnt disk
+# (see main.py); the image only needs the installer.
+uv

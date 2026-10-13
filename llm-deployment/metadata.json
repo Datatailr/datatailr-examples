@@ -1,0 +1,6 @@
+{
+    "name": "LLM Deployment Platform",
+    "description": "Deploy, manage and observe self-hosted LLMs on Datatailr: a React + FastAPI admin app that orchestrates GPU nodes and vLLM services, an OpenAI-compatible gateway with per-request logging, and DuckDB analytics over the logs.",
+    "tags": ["llm", "vllm", "gpu", "gateway", "openai", "observability", "duckdb", "react", "fastapi", "app", "service", "template"],
+    "author": "Datatailr"
+}
