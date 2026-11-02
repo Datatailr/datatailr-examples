@@ -422,7 +422,7 @@ def create_app(store: TextStore | None = None, runner: Runner | None = None,
             elif isinstance(result, BaseException):
                 raise result
             else:
-                found.append(result)
+                found.append({**result, "prices": [round(p, 2) for p in result["price"]]})
         return {"curves": found, "errors": errors}
 
     @app.post("/api/stack/preview")
