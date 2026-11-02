@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+requests
+numpy
+pandas
+tzdata
