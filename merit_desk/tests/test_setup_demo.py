@@ -13,6 +13,8 @@ def test_setup_creates_the_groups_budgets_and_variables(cluster, capsys):
     out = capsys.readouterr().out
     assert "desk_webhook_url" in out and "Secret Keys Manager" in out
     assert "current environment only" in out
+    # A promotion copies the tasks as built in dev, so pre and prod variables do not steer it.
+    assert "promoted from dev keeps the values that its dev deploy read" in out
 
 
 def test_setup_can_run_again(cluster, capsys):

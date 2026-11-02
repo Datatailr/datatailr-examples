@@ -82,8 +82,8 @@ def main(argv: list[str] | None = None) -> None:
     ensure_budget("Trading", args.trading_desk)
     for key, default in VARIABLES.items():
         ensure_variable(key, default)
-    print("It wrote the variables of the current environment only. Pre and prod have their own:")
-    print("set them the same way, from that environment.")
+    print("It wrote the variables of the current environment only. Pre and prod have their own.")
+    print("A workflow promoted from dev keeps the values that its dev deploy read.")
     print(f"Next: create the secret {SECRET} in the Secret Keys Manager, in each environment.")
     print("The SDK cannot create secrets. Without it, the daily curve skips the chat message.")
 

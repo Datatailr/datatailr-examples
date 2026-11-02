@@ -30,7 +30,7 @@ Two more workflows run beside the daily curve. The strategy sweep backtests a we
 | Merit Desk Run `<label>` `<6 characters>` | Workflow, one for each click, made by the app | Computes one scenario or one backtest and writes the result into its run record. The app removes the workflow about 10 minutes after the run ends |
 | Merit Desk Tools | Excel add-in | Gives the prices as Excel functions |
 
-Datatailr rejects schedules on Sundays in this release, so the sweep runs on Saturdays.
+The Datatailr release that ships with SDK 0.2.7 rejects schedules on Sundays, so the sweep runs on Saturdays. The same release stores each schedule in UTC. So the London times here and on the Jobs page are right only while London is on GMT. That is from late October to late March. A later release fixes this.
 
 Every job carries the prefix "Merit Desk": the workflows, the services, the app and the add-in. The host name of a service comes from its name, so a plain name such as "Market Feed" could replace the job of another template on the same cluster. The text below uses short role names, such as the Daily Curve, the Pricing API and the Market Feed.
 
@@ -170,7 +170,15 @@ On a laptop, the Backtest page says that no sweep has run, because the sweep doe
 
 ### Prepare the cluster once
 
-An administrator prepares the cluster once. Activate the Python environment where you installed the requirements, and run `datatailr login --device`. It logs you in through the browser. It also installs the `dt` command for that SDK. The `dt` command is the Datatailr command-line tool that the SDK calls. The deploy needs a `dt` that matches the SDK version: an older one lacks `job cron`, so it cannot save a scheduled workflow. Plain `datatailr login` only saves the settings. In that case, run `datatailr setup-cli` to install `dt`. Then run this command from the repository root:
+An administrator prepares the cluster once. The deploy uses the Datatailr SDK, the `datatailr` Python package. The SDK calls `dt`, the Datatailr command-line tool. The `dt` must match the SDK version. An older `dt` lacks `job cron`, so it cannot save a scheduled workflow.
+
+Activate the Python environment where you installed `merit_desk/requirements-dev.txt`. Then log in through the browser. This also installs the matching `dt`:
+
+```bash
+datatailr login --device
+```
+
+If you logged in with plain `datatailr login`, which only saves the settings, run `datatailr setup-cli` to install `dt`. Then run this command from the repository root:
 
 ```bash
 python merit_desk/admin/setup_demo.py --research 500 --trading-desk 300
@@ -179,13 +187,13 @@ python merit_desk/admin/setup_demo.py --research 500 --trading-desk 300
 The amounts are in USD. The script does four things:
 
 - It creates the groups `research`, `trading_desk` and `platform`. Group names cannot contain spaces.
-- It creates the budgets "Research" and "Trading". The budget names are one word each, because the SDK cannot pass a name with a space from inside a container in this release. The "Research" budget has `prevent_overflow` on. Once the spending of the current month reaches the amount, the scheduler stops the running and pending jobs of that budget within about a minute. It also removes their scheduled runs.
+- It creates the budgets "Research" and "Trading". The budget names are one word each, because SDK 0.2.7 cannot pass a name with a space from inside a container. The "Research" budget has `prevent_overflow` on. Once the spending of the current month reaches the amount, the scheduler stops the running and pending jobs of that budget within about a minute. It also removes their scheduled runs.
 - It sets the variables `markets` to `GB,DE,FR` and `sweep_size` to `small`, but only if they have no value yet.
 - It prints a reminder about the secret, which is described below.
 
 You must run `setup_demo.py` before the first deploy, because the deploy looks up the budgets "Trading" and "Research" by name. The daily curve, the services, the app, the run workflows of the app and the add-in use "Trading". The sweep and the training use "Research".
 
-You can run the script again. It leaves a group or a budget that exists as it is. It also keeps a variable that already has a value, so a run does not undo `sweep_size=full` or a changed market list. The script writes the variables of the current environment only, because dev, pre and prod each have their own variables. You set the variables of pre and prod the same way, from that environment.
+You can run the script again. It leaves a group or a budget that exists as it is. It also keeps a variable that already has a value, so a run does not undo `sweep_size=full` or a changed market list. The script writes the variables of the current environment only, because dev, pre and prod each have their own variables. You can set the variables of pre and prod the same way, from that environment. They do not change a workflow that you promote from dev. That workflow keeps the values that its dev deploy read.
 
 ### Variables
 
@@ -196,7 +204,7 @@ Two variables control the workflows:
 | `markets` | A comma list of market codes, for example `GB,DE` | `GB,DE,FR` | The daily curve |
 | `sweep_size` | `small` (24 backtests) or `full` (342 backtests) | `small` | The strategy sweep |
 
-A workflow reads a variable at the time it builds its graph of tasks. As a result, a change applies at the next deploy or the next instant run. It does not apply at the next scheduled run. To change a variable, use the SDK, the `datatailr` Python package:
+A workflow reads a variable at the time it builds its graph of tasks. As a result, a change applies at the next deploy or the next instant run. It does not apply at the next scheduled run. To change a variable, use the SDK:
 
 ```python
 from datatailr import KV
@@ -218,7 +226,7 @@ The demand training needs a GPU node, a machine with a GPU. An administrator sta
 
 ### Deploy the jobs
 
-With the Python environment of the requirements active, log in with `datatailr login --device`, as described above. Then run one of these commands from the repository root. The script deploys to the dev environment, which is the SDK default.
+Log in from the same Python environment, as described above. Then run one of these commands from the repository root. The script deploys to the dev environment, which is the SDK default.
 
 ```bash
 python merit_desk/deploy.py workflows   # Daily Curve and Strategy Sweep
@@ -231,7 +239,9 @@ python merit_desk/deploy.py all         # Everything except demand training (the
 
 The target `all` deploys everything except demand training. Deploy the training with `training`, after an administrator starts a GPU node. The training has no schedule, so Datatailr starts one run at deploy, and that run waits for the GPU node.
 
-You get pre and prod by promoting jobs from dev. The command `dt job promote <job> <version> dev` copies the job to pre, and does not start it. You start a service or an app there with `dt job start <job> -e pre`. If a workflow has a schedule, it runs on that schedule. Pre and prod need their own variables. `setup_demo.py` prints a reminder about this, and "Prepare the cluster once" tells how to set them.
+You get pre by promoting a version from dev, and prod by promoting it from pre. The command `dt job promote <job> <version> dev` copies the job to pre. The command `dt job promote <job> <version> pre` copies it to prod. The command `dt job versions <job>` lists the versions in dev, and `dt job versions <job> -e pre` lists them in pre. Datatailr refuses to promote a job unless it was deployed from a clean checkout whose commit is on the remote. A promotion does not start a service or an app. You start one there with `dt job start <job> -e pre` (or `-e prod`). If a workflow has a schedule, it runs on that schedule.
+
+A promotion copies the job and its tasks as they were built in dev. A workflow builds its graph of tasks at a deploy or an instant run. It reads `markets` and `sweep_size` at that time only. So a promoted workflow keeps the values that its dev deploy read. The variables of pre and prod do not change it. To change the values in pre or prod, change the variable in dev, deploy again and promote the new version.
 
 The app appears as "Merit Desk" in the "Trading" section of the launcher. If you type the app's address, keep the slash at the end (`.../job/dev/merit-desk/`). Without it, the platform shows its own "Page not found". Before the first daily curve, the Pricing API answers "No curve yet", and the Curves page shows that message. To make the first curve at once, run the notebook `01_instant_run.ipynb`, which the next section describes.
 
@@ -254,7 +264,7 @@ Before you run a notebook:
 - The Market Feed simulates the live prices. It moves each price a little every second, around the front-month price of the newest curve. Before the first curve exists, it uses the stack price at the normal temperature of the day. The demo uses no real market prices. The top bar of the app shows these prices and says that they are simulated.
 - Demand and prices come from the stack model. The history for the backtests and the training is made up.
 - In an Excel formula, write the month of `curve_price` as text, for example `"2027-01"`. A month typed into a cell can become a date.
-- On the platform, each "Run as job" is a Datatailr job, and Datatailr starts a container for it. When a node was free, a run took 19 seconds from the click to the result in a test on a cluster. When the cluster first had to start a node, a run took about 3 minutes. Waiting for the node took 2 minutes 9 seconds of that time. The app needed about 20 seconds to build and save the workflow. Starting the container and running the task took about 25 seconds, and the task itself took 6 seconds. All the runs of the app use the budget "Trading".
+- On the platform, each "Run as job" is a Datatailr job, and Datatailr starts a container for it. When a node was free, a run took 19 seconds from the click to the result in a test on a cluster. Another run took about 3 minutes from the click to the result, because the cluster first had to start a node. In that run, the platform needed about 20 seconds to accept the run. Then the run waited 2 minutes 9 seconds for a node. Starting the container and running a 6-second task took about 25 seconds. All the runs of the app use the budget "Trading".
 - At most three runs are in progress at a time, for the whole app. A fourth click gets this message: "Three runs are in progress. Wait for one to finish." The "Run now" buttons on the Jobs page do not count.
 - A run that you start with "Run as job" fails as timed out when it shows no change for 15 minutes. The app follows a run that you start with "Run now" for up to six hours.
 - The app keeps the workflow of a run for about 10 minutes after the run ends, so that you can still see it in Datatailr. Then it removes the workflow, whether the run succeeded or failed. The app waits until the platform also shows the run as ended. If the platform still shows the run as running 15 minutes after the app saw it end, the app stops it and removes it. When the app starts, it removes the leftover run workflows that are older than one hour. It also takes up again the runs that were not finished.

@@ -84,7 +84,9 @@ def workflow_arguments(monkeypatch, module: str) -> dict:
 def test_each_workflow_has_its_name_budget_version_and_requirements(
         monkeypatch, tmp_path, module, name, budget, requirements):
     monkeypatch.chdir(tmp_path)  # not the repository root
-    given = workflow_arguments(monkeypatch, module)
+    # The local leaves out the Schedule: pytest -l would repr it on a failure, and its repr
+    # calls the platform.
+    given = {k: v for k, v in workflow_arguments(monkeypatch, module).items() if k != "schedule"}
     assert given["name"] == name
     assert given["budget"] == budget
     assert given["python_version"] == "3.12"

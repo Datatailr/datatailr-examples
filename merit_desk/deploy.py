@@ -4,7 +4,7 @@ Run it from the repository root, with one target:
 
     python merit_desk/deploy.py workflows   # Daily Curve and Strategy Sweep
     python merit_desk/deploy.py training    # Demand Training, which needs a GPU node
-    python merit_desk/deploy.py services    # Merit Desk Pricing API and Market Feed
+    python merit_desk/deploy.py services    # Merit Desk Pricing API and Merit Desk Market Feed
     python merit_desk/deploy.py app         # Merit Desk, the FastAPI desk app
     python merit_desk/deploy.py excel       # Merit Desk Tools, the Excel add-in
     python merit_desk/deploy.py all         # everything except demand training (the default)
@@ -23,8 +23,8 @@ from datatailr import App, ExcelAddin, Resources, Service
 
 ROOT = Path(__file__).parent
 SECTION = "Trading"  # the launcher section for the app, the services and the add-in
-# A budget name has no space. SDK 0.2.7 quotes an argument with a space, and the dt inside a
-# container keeps the quotes.
+# A budget name has no space and no quote mark. SDK 0.2.7 puts literal quotes around an argument
+# with a space or a quote mark, and the dt inside a container keeps them.
 BUDGET = "Trading"
 
 

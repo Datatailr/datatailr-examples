@@ -29,8 +29,8 @@ def summarize(results: list) -> dict:
 
 @workflow(
     name="Merit Desk Strategy Sweep",
-    # The platform rejects Sunday schedules in this release (it writes Sunday as day 7).
-    # So the sweep runs on Saturday.
+    # The Datatailr release that ships with SDK 0.2.7 rejects Sunday schedules (it writes
+    # Sunday as day 7). So the sweep runs on Saturday.
     schedule=Schedule(at_hours=[2], at_minutes=[0], weekdays=["Sat"], timezone="Europe/London"),
     budget="Research",
     python_version="3.12",
