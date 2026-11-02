@@ -50,7 +50,7 @@ DE = Market(
     stack=StackConfig(
         base_demand_gw=50.0, heating_gw_per_c=1.4, cooling_gw_per_c=0.6,
         plants=(Plant("Renewables", 20, 5), Plant("Lignite", 15, 45), Plant("Coal", 10, 70),
-                Plant("CCGT", 15, 90), Plant("Peaker", 8, 170)),
+                Plant("CCGT", 15, 110), Plant("Peaker", 8, 170)),
     ),
     normal_mean_c=9.5,
     normal_amplitude_c=9.0,
