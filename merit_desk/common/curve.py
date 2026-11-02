@@ -76,6 +76,8 @@ def build_curve(market: Market | str, forecast: Forecast, today: date, *,
     """
     if isinstance(market, str):
         market = get_market(market)
+    if market.code == "FR":
+        raise ValueError("No stack configuration for FR")
     months, prices = _month_prices(market, forecast, today, stack or market.stack)
     return Curve(market.code, today, forecast.source, months, prices)
 
