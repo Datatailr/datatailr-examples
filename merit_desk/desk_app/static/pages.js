@@ -155,7 +155,7 @@ page('curves', (() => {
       chart = monthChart($('curves-chart'));
       chart.options.plugins.legend.display = false;  // the check boxes above are the legend
       $('curves-toggles').replaceChildren(...MARKETS.map(code => el('label', {},
-        el('input', {type: 'checkbox', checked: true,
+        el('input', {type: 'checkbox', checked: true, 'aria-label': `Show ${code} curve`,
                      onchange: event => toggle(code, event.target.checked)}),
         el('span', {class: 'swatch', style: `background:${COLORS[code]}`}), code)));
       $('curves-reload').addEventListener('click', load);
@@ -295,10 +295,12 @@ page('merit', (() => {
   }
 
   function plantRow(plant) {
-    const field = (name, max) => el('input', {type: 'number', min: 0, max, step: 'any',
-      value: plant[name], 'data-plant': plant.name, 'data-field': name, 'data-own': plant[name]});
-    return el('tr', {}, el('td', {text: plant.name}), el('td', {}, field('capacity_gw', 200)),
-              el('td', {}, field('cost_eur_mwh', 1000)));
+    const field = (name, max, label) => el('input', {type: 'number', min: 0, max, step: 'any',
+      value: plant[name], 'aria-label': `${plant.name} ${label}`,
+      'data-plant': plant.name, 'data-field': name, 'data-own': plant[name]});
+    return el('tr', {}, el('td', {text: plant.name}),
+              el('td', {}, field('capacity_gw', 200, 'capacity in GW')),
+              el('td', {}, field('cost_eur_mwh', 1000, 'cost in EUR/MWh')));
   }
 
   async function loadMarket() {

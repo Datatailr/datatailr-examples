@@ -144,3 +144,25 @@ def test_the_page_uses_every_api_route_of_the_app():
     paths = script_api_paths()
     for route in api_routes(create_app()):
         assert any(route.path_regex.match(path) for path in paths), route.path
+
+
+def created_inputs() -> list[str]:
+    """The properties of each input that the scripts create, such as el('input', {...})."""
+    return [props for text in page_scripts().values()
+            for props in re.findall(r"el\('input', \{(.*?)\}\)", text, re.S)]
+
+
+def test_every_input_the_scripts_create_has_an_accessible_name():
+    """The market check boxes and the plant fields are made in script. A reader that does not
+    follow a wrapping label names a check box by its value, "on", so each input says its own."""
+    inputs = created_inputs()
+    assert len(inputs) >= 2  # the market check box and the plant field
+    for props in inputs:
+        assert "'aria-label'" in props, props
+
+
+def test_a_check_box_is_named_by_its_market_and_a_plant_field_by_its_plant_and_unit():
+    pages = page_scripts()["pages.js"]
+    assert re.search(r"'aria-label': `[^`]*\$\{code\}[^`]*`", pages)
+    assert re.search(r"'aria-label': `[^`]*\$\{plant\.name\}[^`]*`", pages)
+    assert "capacity in GW" in pages and "cost in EUR/MWh" in pages

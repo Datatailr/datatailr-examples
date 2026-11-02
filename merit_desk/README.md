@@ -170,7 +170,7 @@ On a laptop, the Backtest page says that no sweep has run, because the sweep doe
 
 ### Prepare the cluster once
 
-An administrator prepares the cluster once. Log in with `datatailr login`. Run it from the Python environment where you installed the requirements, because the login installs a `dt` command that must match that SDK version. Then run this command from the repository root:
+An administrator prepares the cluster once. Activate the Python environment where you installed the requirements, and run `datatailr login --device`. It logs you in through the browser. It also installs the `dt` command for that SDK. The `dt` command is the Datatailr command-line tool that the SDK calls. The deploy needs a `dt` that matches the SDK version: an older one lacks `job cron`, so it cannot save a scheduled workflow. Plain `datatailr login` only saves the settings. In that case, run `datatailr setup-cli` to install `dt`. Then run this command from the repository root:
 
 ```bash
 python merit_desk/admin/setup_demo.py --research 500 --trading-desk 300
@@ -218,7 +218,7 @@ The demand training needs a GPU node, a machine with a GPU. An administrator sta
 
 ### Deploy the jobs
 
-Log in with `datatailr login`. Run it from the Python environment where you installed the requirements, because the login installs a `dt` command that must match that SDK version. Then run one of these commands from the repository root. The script deploys to the dev environment, which is the SDK default. You get pre and prod by promoting jobs from dev.
+With the Python environment of the requirements active, log in with `datatailr login --device`, as described above. Then run one of these commands from the repository root. The script deploys to the dev environment, which is the SDK default.
 
 ```bash
 python merit_desk/deploy.py workflows   # Daily Curve and Strategy Sweep
@@ -230,6 +230,8 @@ python merit_desk/deploy.py all         # Everything except demand training (the
 ```
 
 The target `all` deploys everything except demand training. Deploy the training with `training`, after an administrator starts a GPU node. The training has no schedule, so Datatailr starts one run at deploy, and that run waits for the GPU node.
+
+You get pre and prod by promoting jobs from dev. The command `dt job promote <job> <version> dev` copies the job to pre, and does not start it. You start a service or an app there with `dt job start <job> -e pre`. If a workflow has a schedule, it runs on that schedule. Pre and prod need their own variables. `setup_demo.py` prints a reminder about this, and "Prepare the cluster once" tells how to set them.
 
 The app appears as "Merit Desk" in the "Trading" section of the launcher. If you type the app's address, keep the slash at the end (`.../job/dev/merit-desk/`). Without it, the platform shows its own "Page not found". Before the first daily curve, the Pricing API answers "No curve yet", and the Curves page shows that message. To make the first curve at once, run the notebook `01_instant_run.ipynb`, which the next section describes.
 
@@ -252,7 +254,7 @@ Before you run a notebook:
 - The Market Feed simulates the live prices. It moves each price a little every second, around the front-month price of the newest curve. Before the first curve exists, it uses the stack price at the normal temperature of the day. The demo uses no real market prices. The top bar of the app shows these prices and says that they are simulated.
 - Demand and prices come from the stack model. The history for the backtests and the training is made up.
 - In an Excel formula, write the month of `curve_price` as text, for example `"2027-01"`. A month typed into a cell can become a date.
-- On the platform, each "Run as job" is a Datatailr job, and a run takes about 10 to 30 seconds, because Datatailr starts a container for it. All the runs of the app use the budget "Trading".
+- On the platform, each "Run as job" is a Datatailr job, and Datatailr starts a container for it. When a node was free, a run took 19 seconds in a test on a cluster. When the cluster first had to start a node, a run took about 3 minutes. Of that time, 2 minutes 9 seconds was waiting and 6 seconds was work. All the runs of the app use the budget "Trading".
 - At most three runs are in progress at a time, for the whole app. A fourth click gets this message: "Three runs are in progress. Wait for one to finish." The "Run now" buttons on the Jobs page do not count.
 - A run that you start with "Run as job" fails as timed out when it shows no change for 15 minutes. The app follows a run that you start with "Run now" for up to six hours.
 - The app keeps the workflow of a run for about 10 minutes after the run ends, so that you can still see it in Datatailr. Then it removes the workflow, whether the run succeeded or failed. The app waits until the platform also shows the run as ended. If the platform still shows the run as running 15 minutes after the app saw it end, the app stops it and removes it. When the app starts, it removes the leftover run workflows that are older than one hour. It also takes up again the runs that were not finished.
@@ -264,11 +266,13 @@ In Excel, the add-in gives you three functions: `stack_price(market, temp_c)`, `
 
 ## Data
 
-The temperatures come from the ECMWF open data, from IFS HRES, the high-resolution forecast model of ECMWF. The desk uses the 2 m temperature only. The app shows this credit in its footer:
+The temperatures come from the ECMWF open data, from IFS HRES, the high-resolution forecast model of ECMWF. The desk uses the 2 m temperature only. The app shows two things in its footer. The first is this credit:
 
 > Temperature forecasts: based on data and products of the European Centre for Medium-Range Weather Forecasts (ECMWF), licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). Modified: daily mean 2 m temperature at one grid point per city.
 
-Use this copyright line, with the year of the forecast run:
+The second is the line "© European Centre for Medium-Range Weather Forecasts (ECMWF)." and the link "ECMWF terms of use", which opens the ECMWF terms in a new tab. The footer line has no year.
+
+The ECMWF copyright line has the year of the forecast run:
 
 © <year of the forecast run> European Centre for Medium-Range Weather Forecasts (ECMWF)
 

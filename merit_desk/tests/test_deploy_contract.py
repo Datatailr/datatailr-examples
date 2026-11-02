@@ -115,8 +115,8 @@ def test_no_workflow_is_scheduled_on_a_sunday(monkeypatch, module):
     assert "Sun" not in weekdays
 
 
-def test_no_budget_name_has_a_space(monkeypatch, deployed, offline_sdk, cluster):
-    """SDK 0.2.7 quotes an argument with a space, and the dt inside a container keeps the quotes."""
+def test_no_budget_name_has_a_space_or_quote(monkeypatch, deployed, offline_sdk, cluster):
+    """A space, a double quote, a single quote: the SDK quotes them all. See BUDGET in deploy.py."""
     d.deploy_services()
     d.deploy_app()
     d.deploy_excel()
@@ -125,6 +125,6 @@ def test_no_budget_name_has_a_space(monkeypatch, deployed, offline_sdk, cluster)
         names.append(workflow_arguments(monkeypatch, module)["budget"])
     names.append(build_run_workflow(new_run("job", "x", {}, None), "dev").budget.name)
     setup_demo.main(["--research", "500", "--trading-desk", "300"])
-    names += cluster.budgets  # the names that setup_demo creates
+    names += list(cluster.budgets)  # the names that setup_demo creates
     assert len(names) == 10, f"expected 10 budget names, found {names}"
-    assert [name for name in names if " " in name] == []
+    assert [name for name in names if any(mark in name for mark in " \"'")] == []
