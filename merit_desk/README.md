@@ -179,11 +179,11 @@ python merit_desk/admin/setup_demo.py --research 500 --trading-desk 300
 The amounts are in USD. The script does four things:
 
 - It creates the groups `research`, `trading_desk` and `platform`. Group names cannot contain spaces.
-- It creates the budgets "Research" and "Trading desk". The "Research" budget has `prevent_overflow` on. Once the spending of the current month reaches the amount, the scheduler stops the running and pending jobs of that budget within about a minute. It also removes their scheduled runs.
+- It creates the budgets "Research" and "Trading". The budget names are one word each, because the SDK cannot pass a name with a space from inside a container in this release. The "Research" budget has `prevent_overflow` on. Once the spending of the current month reaches the amount, the scheduler stops the running and pending jobs of that budget within about a minute. It also removes their scheduled runs.
 - It sets the variables `markets` to `GB,DE,FR` and `sweep_size` to `small`, but only if they have no value yet.
 - It prints a reminder about the secret, which is described below.
 
-You must run `setup_demo.py` before the first deploy, because the deploy looks up the budgets "Trading desk" and "Research" by name. The daily curve, the services, the app, the run workflows of the app and the add-in use "Trading desk". The sweep and the training use "Research".
+You must run `setup_demo.py` before the first deploy, because the deploy looks up the budgets "Trading" and "Research" by name. The daily curve, the services, the app, the run workflows of the app and the add-in use "Trading". The sweep and the training use "Research".
 
 You can run the script again. It leaves a group or a budget that exists as it is. It also keeps a variable that already has a value, so a run does not undo `sweep_size=full` or a changed market list. The script writes the variables of the current environment only, because dev, pre and prod each have their own variables. You set the variables of pre and prod the same way, from that environment.
 
@@ -252,7 +252,7 @@ Before you run a notebook:
 - The Market Feed simulates the live prices. It moves each price a little every second, around the front-month price of the newest curve. Before the first curve exists, it uses the stack price at the normal temperature of the day. The demo uses no real market prices. The top bar of the app shows these prices and says that they are simulated.
 - Demand and prices come from the stack model. The history for the backtests and the training is made up.
 - In an Excel formula, write the month of `curve_price` as text, for example `"2027-01"`. A month typed into a cell can become a date.
-- On the platform, each "Run as job" is a Datatailr job, and a run takes about 10 to 30 seconds, because Datatailr starts a container for it. All the runs of the app use the budget "Trading desk".
+- On the platform, each "Run as job" is a Datatailr job, and a run takes about 10 to 30 seconds, because Datatailr starts a container for it. All the runs of the app use the budget "Trading".
 - At most three runs are in progress at a time, for the whole app. A fourth click gets this message: "Three runs are in progress. Wait for one to finish." The "Run now" buttons on the Jobs page do not count.
 - A run that you start with "Run as job" fails as timed out when it shows no change for 15 minutes. The app follows a run that you start with "Run now" for up to six hours.
 - The app keeps the workflow of a run for about 10 minutes after the run ends, so that you can still see it in Datatailr. Then it removes the workflow, whether the run succeeded or failed. The app waits until the platform also shows the run as ended. If the platform still shows the run as running 15 minutes after the app saw it end, the app stops it and removes it. When the app starts, it removes the leftover run workflows that are older than one hour. It also takes up again the runs that were not finished.

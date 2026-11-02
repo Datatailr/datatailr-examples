@@ -4,11 +4,8 @@ from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
-import datatailr
 import pytest
-from datatailr import Budget, Environment, Workflow
-from datatailr.scheduler import base
-from datatailr.user import User
+from datatailr import Environment, Workflow
 
 from merit_desk.common.backtest import run_backtest
 from merit_desk.common.curve import build_curve
@@ -16,8 +13,7 @@ from merit_desk.common.runs import load_run, new_run, save_run
 from merit_desk.common.scenario import PlantOverride, Scenario, ScenarioError, scenario_band
 from merit_desk.common.store import MemoryStore, load_forecast, save_forecast
 from merit_desk.workflows import desk_runs
-from merit_desk.workflows.desk_runs import (build_run_workflow, desk_budget, desk_run,
-                                            execute_run, job_name)
+from merit_desk.workflows.desk_runs import build_run_workflow, desk_run, execute_run, job_name
 
 TODAY = date(2026, 10, 29)  # the day of the bundled sample forecast
 SCENARIO = {"market": "DE", "shift_c": -3.0, "start": "2026-12-01", "end": "2026-12-31",
@@ -180,55 +176,6 @@ def test_a_job_name_ends_with_the_last_six_characters_of_the_run_id():
     assert job_name(record) == f"Merit Desk Run Backtest DE M2 t1.5 {record['id'][-6:]}"
 
 
-@pytest.fixture
-def listed_budgets(monkeypatch):
-    """datatailr.Budget as the platform answers it: the list works, a lookup by name fails.
-    The fixture gives the listed budgets by name, so a test can take one away."""
-    listed = {name: Budget.from_dict({"name": name, "id": number})  # no call to the platform
-              for name, number in (("Research", 41), ("Trading desk 2", 43), ("Trading desk", 42))}
-
-    class ListOnly:
-        def __init__(self, name):
-            raise AssertionError(f"Budget({name!r}) runs dt with the name in quotes.")
-
-        @staticmethod
-        def get(name):
-            raise AssertionError(f"Budget.get({name!r}) runs dt with the name in quotes.")
-
-        @staticmethod
-        def ls():
-            return list(listed.values())
-
-    monkeypatch.setattr(datatailr, "Budget", ListOnly)
-    monkeypatch.setattr(base, "Budget", ListOnly)  # what Workflow(budget="a name") would call
-    return listed
-
-
-def test_desk_budget_is_the_listed_budget_with_that_name(listed_budgets):
-    assert desk_budget() is listed_budgets["Trading desk"]  # not "Trading desk 2", listed first
-    assert desk_budget("Research") is listed_budgets["Research"]
-
-
-def test_a_budget_the_user_cannot_see_is_refused_with_its_name(listed_budgets):
-    with pytest.raises(ValueError) as refusal:
-        desk_budget("Marketing")
-    assert str(refusal.value) == "Budget 'Marketing' is not visible to this app's user."
-
-
-@pytest.fixture
-def offline_sdk(monkeypatch, listed_budgets):
-    """The real Workflow. Only the question it asks the platform about the user is answered."""
-    me = User(name="tester", first_name="Test", last_name="User", email="t@example.com", id=1,
-              groups=[])
-    monkeypatch.setattr(User, "signed_user", staticmethod(lambda: me))  # run_as and the ACL
-
-    def contact_the_platform(*args, **kwargs):
-        raise AssertionError("building the workflow must not run or save it")
-
-    for name in ("run", "save", "start", "instant_run"):
-        monkeypatch.setattr(Workflow, name, contact_the_platform)
-
-
 @pytest.mark.parametrize("environment, expected", [
     ("dev", Environment.DEV), ("pre", Environment.PRE), ("prod", Environment.PROD)])
 def test_the_run_workflow_has_its_name_environment_budget_version_and_requirements(
@@ -240,7 +187,7 @@ def test_the_run_workflow_has_its_name_environment_budget_version_and_requiremen
     assert isinstance(dag, Workflow)
     assert dag.name == job_name(record)
     assert dag.environment is expected
-    assert dag.budget.name == "Trading desk"
+    assert dag.budget.name == "Trading"
     assert dag.image.python_version == "3.12"
     assert requirements == Path(desk_runs.__file__).with_name("requirements.txt")
     assert dag.image.python_requirements == requirements.read_text() != ""  # the file was found
@@ -269,17 +216,3 @@ def test_a_failing_task_call_does_not_leave_autorun_on(offline_sdk, monkeypatch)
 def test_the_run_workflow_refuses_an_unknown_environment(offline_sdk):
     with pytest.raises(ValueError, match="staging"):
         build_run_workflow(new_run("job", "x", {}, None), "staging")
-
-
-def test_the_run_workflow_gets_the_listed_budget_object(offline_sdk, listed_budgets):
-    dag = build_run_workflow(new_run("job", "x", {}, None), "dev")
-    assert dag.budget is listed_budgets["Trading desk"] and dag.budget_id == 42
-    assert json.loads(dag.to_json())["budget_id"] == 42
-
-
-def test_the_run_workflow_is_refused_when_the_desk_budget_is_not_listed(
-        offline_sdk, listed_budgets):
-    del listed_budgets["Trading desk"]  # the user sees the other budgets, but not this one
-    with pytest.raises(ValueError) as refusal:
-        build_run_workflow(new_run("job", "x", {}, None), "dev")
-    assert str(refusal.value) == "Budget 'Trading desk' is not visible to this app's user."

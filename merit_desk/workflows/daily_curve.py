@@ -44,7 +44,7 @@ def notify_desk(summary: str) -> None:
         weekdays=["Mon", "Tue", "Wed", "Thu", "Fri"],
         timezone="Europe/London",
     ),
-    budget="Trading desk",
+    budget="Trading",
     python_version="3.12",
     python_requirements=REQUIREMENTS,
 )

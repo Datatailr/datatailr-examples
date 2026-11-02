@@ -9,6 +9,9 @@ import pytest
 from datatailr import Resources
 
 import merit_desk.deploy as d
+from merit_desk.admin import setup_demo
+from merit_desk.common.runs import new_run
+from merit_desk.workflows.desk_runs import build_run_workflow
 
 WORKFLOWS = Path(__file__).parents[1] / "workflows"
 
@@ -40,7 +43,7 @@ def test_each_job_has_its_name_budget_section_version_and_requirements(deployed,
     deploy()
     assert [job["name"] for job in deployed] == names
     for job in deployed:
-        assert job["budget"] == "Trading desk"
+        assert job["budget"] == "Trading"
         assert job["app_section"] == "Trading"
         assert job["python_version"] == "3.12"
         assert Path(job["python_requirements"]).is_file()  # a relative path fails from here
@@ -74,7 +77,7 @@ def workflow_arguments(monkeypatch, module: str) -> dict:
 
 
 @pytest.mark.parametrize("module, name, budget, requirements", [
-    ("daily_curve", "Merit Desk Daily Curve", "Trading desk", "requirements.txt"),
+    ("daily_curve", "Merit Desk Daily Curve", "Trading", "requirements.txt"),
     ("strategy_sweep", "Merit Desk Strategy Sweep", "Research", "requirements.txt"),
     ("demand_training", "Merit Desk Demand Training", "Research", "training-requirements.txt"),
 ])
@@ -110,3 +113,18 @@ def test_no_workflow_is_scheduled_on_a_sunday(monkeypatch, module):
     weekdays = list(getattr(workflow_arguments(monkeypatch, module).get("schedule"),
                             "weekdays", None) or [])
     assert "Sun" not in weekdays
+
+
+def test_no_budget_name_has_a_space(monkeypatch, deployed, offline_sdk, cluster):
+    """SDK 0.2.7 quotes an argument with a space, and the dt inside a container keeps the quotes."""
+    d.deploy_services()
+    d.deploy_app()
+    d.deploy_excel()
+    names = [job["budget"] for job in deployed]
+    for module in ("daily_curve", "strategy_sweep", "demand_training"):
+        names.append(workflow_arguments(monkeypatch, module)["budget"])
+    names.append(build_run_workflow(new_run("job", "x", {}, None), "dev").budget.name)
+    setup_demo.main(["--research", "500", "--trading-desk", "300"])
+    names += cluster.budgets  # the names that setup_demo creates
+    assert len(names) == 10, f"expected 10 budget names, found {names}"
+    assert [name for name in names if " " in name] == []

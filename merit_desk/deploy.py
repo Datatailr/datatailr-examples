@@ -12,7 +12,7 @@ Run it from the repository root, with one target:
 "all" deploys everything except demand training. Deploy that with "training", after an
 administrator starts a GPU node. The workflow has no schedule, so it runs once at deploy.
 
-The budgets "Trading desk" and "Research" must exist first.
+The budgets "Trading" and "Research" must exist first.
 An administrator creates them with merit_desk/admin/setup_demo.py.
 """
 
@@ -23,7 +23,9 @@ from datatailr import App, ExcelAddin, Resources, Service
 
 ROOT = Path(__file__).parent
 SECTION = "Trading"  # the launcher section for the app, the services and the add-in
-BUDGET = "Trading desk"
+# A budget name has no space. SDK 0.2.7 quotes an argument with a space, and the dt inside a
+# container keeps the quotes.
+BUDGET = "Trading"
 
 
 def requirements(folder: str) -> str:

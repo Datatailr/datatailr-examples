@@ -73,13 +73,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--research", type=usd_amount, required=True,
                         help="amount of the budget 'Research', in USD")
     parser.add_argument("--trading-desk", type=usd_amount, required=True,
-                        help="amount of the budget 'Trading desk', in USD")
+                        help="amount of the budget 'Trading', in USD")
     args = parser.parse_args(argv)
 
     for name in GROUPS:
         ensure_group(name)
     ensure_budget("Research", args.research, prevent_overflow=True)
-    ensure_budget("Trading desk", args.trading_desk)
+    ensure_budget("Trading", args.trading_desk)
     for key, default in VARIABLES.items():
         ensure_variable(key, default)
     print("It wrote the variables of the current environment only. Pre and prod have their own:")
