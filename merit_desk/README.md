@@ -170,7 +170,7 @@ On a laptop, the Backtest page says that no sweep has run, because the sweep doe
 
 ### Prepare the cluster once
 
-An administrator prepares the cluster once. Log in with `datatailr login`, then run this command from the repository root:
+An administrator prepares the cluster once. Log in with `datatailr login`. Run it from the Python environment where you installed the requirements, because the login installs a `dt` command that must match that SDK version. Then run this command from the repository root:
 
 ```bash
 python merit_desk/admin/setup_demo.py --research 500 --trading-desk 300
@@ -218,7 +218,7 @@ The demand training needs a GPU node, a machine with a GPU. An administrator sta
 
 ### Deploy the jobs
 
-Log in with `datatailr login`. Then run one of these commands from the repository root. The script deploys to the dev environment, which is the SDK default. You get pre and prod by promoting jobs from dev.
+Log in with `datatailr login`. Run it from the Python environment where you installed the requirements, because the login installs a `dt` command that must match that SDK version. Then run one of these commands from the repository root. The script deploys to the dev environment, which is the SDK default. You get pre and prod by promoting jobs from dev.
 
 ```bash
 python merit_desk/deploy.py workflows   # Daily Curve and Strategy Sweep
@@ -231,7 +231,7 @@ python merit_desk/deploy.py all         # Everything except demand training (the
 
 The target `all` deploys everything except demand training. Deploy the training with `training`, after an administrator starts a GPU node. The training has no schedule, so Datatailr starts one run at deploy, and that run waits for the GPU node.
 
-The app appears as "Merit Desk" in the "Trading" section of the launcher. Before the first daily curve, the Pricing API answers "No curve yet", and the Curves page shows that message. To make the first curve at once, run the notebook `01_instant_run.ipynb`, which the next section describes.
+The app appears as "Merit Desk" in the "Trading" section of the launcher. If you type the app's address, keep the slash at the end (`.../job/dev/merit-desk/`). Without it, the platform shows its own "Page not found". Before the first daily curve, the Pricing API answers "No curve yet", and the Curves page shows that message. To make the first curve at once, run the notebook `01_instant_run.ipynb`, which the next section describes.
 
 ### The notebooks
 

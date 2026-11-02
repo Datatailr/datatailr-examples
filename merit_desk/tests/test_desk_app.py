@@ -738,7 +738,9 @@ def test_the_local_runner_gives_jobs_with_no_last_run(memory_store):
         (None, None, False)] * 2
 
 
-def test_a_desk_job_start_is_202_with_a_job_record(memory_store):
+def test_a_desk_job_start_is_202_with_a_job_record(monkeypatch, memory_store):
+    known_user = staticmethod(lambda request: SimpleNamespace(name="denis"))  # no dt user get
+    monkeypatch.setattr(datatailr.User, "from_request", known_user)
     runner = FakeRunner()
     header = {"x-datatailr-user": json.dumps({"name": "denis"})}
     with make_client(memory_store, runner) as client:
@@ -746,7 +748,7 @@ def test_a_desk_job_start_is_202_with_a_job_record(memory_store):
     record = response.json()
     assert response.status_code == 202 and runner.desk_started == ["Merit Desk Strategy Sweep"]
     assert record["kind"] == "job" and record["status"] == "running"
-    assert record["job_name"] == "Merit Desk Strategy Sweep"
+    assert record["job_name"] == "Merit Desk Strategy Sweep" and record["started_by"] == "denis"
     assert list_runs(memory_store)[0]["id"] == record["id"]
 
 

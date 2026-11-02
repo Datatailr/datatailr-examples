@@ -76,6 +76,18 @@ def job_name(record: dict) -> str:
     return f"{RUN_PREFIX}{record['label']} {record['id'][-6:]}"
 
 
+def desk_budget(name: str = "Trading desk"):
+    """The budget with this name, from the list of budgets this user can see."""
+    # Budget("Trading desk") sends the name to dt in double quotes, and the dt inside a container
+    # reads the quotes as part of the name. Budget.ls() sends no name, so a space does no harm.
+    from datatailr import Budget
+
+    for budget in Budget.ls():
+        if budget.name == name:
+            return budget
+    raise ValueError(f"Budget '{name}' is not visible to this app's user.")
+
+
 def build_run_workflow(record: dict, environment: str) -> Workflow:
     """The workflow of one click, built like @workflow does. It saves and runs nothing."""
     dag = Workflow(
@@ -83,7 +95,7 @@ def build_run_workflow(record: dict, environment: str) -> Workflow:
         environment=Environment(environment.lower()),
         python_version="3.12",
         python_requirements=REQUIREMENTS,
-        budget="Trading desk",
+        budget=desk_budget(),
     )
     dag.set_autorun(False)
     with dag:

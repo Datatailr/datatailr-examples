@@ -105,6 +105,8 @@ def test_every_job_name_starts_with_merit_desk(monkeypatch, deployed):
 @pytest.mark.parametrize("module", ["daily_curve", "strategy_sweep", "demand_training"])
 def test_no_workflow_is_scheduled_on_a_sunday(monkeypatch, module):
     """The platform writes Sunday as day 7 and then rejects it, so the sweep runs on Saturdays."""
-    schedule = workflow_arguments(monkeypatch, module).get("schedule")  # no schedule: no weekdays
-    weekdays = getattr(schedule, "weekdays", None) or []  # str(schedule) would call the platform
+    # No schedule means no weekdays. No local holds the Schedule: pytest -l would repr it on a
+    # failure, and its repr calls the platform.
+    weekdays = list(getattr(workflow_arguments(monkeypatch, module).get("schedule"),
+                            "weekdays", None) or [])
     assert "Sun" not in weekdays
