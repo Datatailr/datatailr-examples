@@ -1,5 +1,0 @@
-fastapi
-uvicorn
-numpy
-requests
-tzdata

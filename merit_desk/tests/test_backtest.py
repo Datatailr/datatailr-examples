@@ -20,8 +20,6 @@ from merit_desk.common.climate import normal_temp
 from merit_desk.common.history import FORECAST_NOISE_C, synthetic_history
 from merit_desk.common.markets import get_market
 from merit_desk.common.stack import price, stack_price
-from merit_desk.common.store import latest_backtest_summary
-from merit_desk.workflows import strategy_sweep
 
 DE = get_market("DE")
 COST = TRADING_COST_EUR_PER_MWH * HOURS_PER_DAY  # EUR for one entry or one exit of 1 MW
@@ -200,20 +198,3 @@ def test_task_names_are_unique_and_readable():
     assert len(set(names)) == len(names) and "bt_DE_M2_t15" in names
     assert all(name.replace("_", "").isalnum() for name in names)  # no dots or spaces
     assert task_name("GB", 6, 0.75) == "bt_GB_M6_t7p5"
-
-
-def test_backtest_task_runs_a_single_grid_point():
-    assert strategy_sweep.backtest("FR", 1, 2.0) == run_backtest("FR", 1, 2.0)
-
-
-def test_summarize_saves_every_result_and_returns_the_top_ten(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)  # the local store is the folder .merit_desk_data here
-    monkeypatch.setenv("MERIT_DESK_STORE", "local")
-    results = [{"name": f"bt_{i}", "total_pnl_eur": float(i)} for i in range(12)]
-
-    summary = strategy_sweep.summarize(results)
-
-    assert date.fromisoformat(summary["as_of"])
-    assert summary["size"] == 12 and summary["results"] == results
-    assert [r["total_pnl_eur"] for r in summary["top"]] == [11.0 - i for i in range(10)]
-    assert latest_backtest_summary() == summary

@@ -1,7 +1,3 @@
-import json
-import subprocess
-import sys
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -15,8 +11,6 @@ from merit_desk.common.demand_model import (
 )
 from merit_desk.common.history import synthetic_history
 from merit_desk.common.markets import get_market
-from merit_desk.common.store import env_prefix
-from merit_desk.workflows import demand_training
 
 
 def de_history(years: int) -> pd.DataFrame:
@@ -93,45 +87,3 @@ def test_search_is_five_fold():
 def test_search_leaves_n_jobs_unset_so_the_notebook_sizes_the_pool():
     # n_jobs=-1 gives the Datatailr backend 4 workers, not the 16 of parallel_backend(n_jobs=16)
     assert sklearn_search().n_jobs is None
-
-
-def test_training_workflow_imports_without_torch_or_scikit_learn():
-    code = ("import sys; sys.modules['torch'] = sys.modules['sklearn'] = None; "
-            "import merit_desk.workflows.demand_training")  # None makes an import fail
-    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-    assert done.returncode == 0, done.stderr
-
-
-def test_prepare_data_sends_plain_lists_between_containers():
-    data = demand_training.prepare_data("DE")
-    X, y = features(de_history(5))
-    assert data["market"] == "DE"
-    assert json.loads(json.dumps(data)) == data  # no numpy or pandas objects
-    np.testing.assert_allclose(data["X"], X)
-    np.testing.assert_allclose(data["y"], y)
-
-
-def test_demand_training_tasks_chain_from_data_to_a_blob_key(monkeypatch):
-    pytest.importorskip("torch")
-    saved = {}
-    monkeypatch.setattr(demand_training, "save_model", saved.__setitem__)
-
-    data = demand_training.prepare_data("DE")
-    model = demand_training.train_demand_model(data)
-    key = demand_training.save_demand_model(model)
-
-    assert saved == {"demand-DE.pt": model}
-    assert key == f"{env_prefix()}models/demand-DE.pt"
-    X, y = np.array(data["X"]), np.array(data["y"])
-    assert evaluate_torch_model(model, X, y) < 1.5
-
-
-def test_training_task_prints_the_device_and_the_in_sample_error(capsys):
-    torch = pytest.importorskip("torch")
-    data = demand_training.prepare_data("DE")
-    model = demand_training.train_demand_model(data)
-    rmse = evaluate_torch_model(model, np.array(data["X"]), np.array(data["y"]))
-    printed = capsys.readouterr().out.splitlines()  # the task wrapper logs to stdout as well
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    assert f"Training on {device}." in printed
-    assert f"In-sample RMSE: {rmse:.2f} GW" in printed
