@@ -32,9 +32,9 @@ def deployed(monkeypatch, tmp_path) -> list[dict]:
 
 
 @pytest.mark.parametrize("deploy, names", [
-    (d.deploy_services, ["Pricing API", "Market Feed"]),
+    (d.deploy_services, ["Merit Desk Pricing API", "Merit Desk Market Feed"]),
     (d.deploy_app, ["Merit Desk"]),
-    (d.deploy_excel, ["Desk Tools"]),
+    (d.deploy_excel, ["Merit Desk Tools"]),
 ])
 def test_each_job_has_its_name_budget_section_version_and_requirements(deployed, deploy, names):
     deploy()
@@ -87,3 +87,16 @@ def test_each_workflow_has_its_name_budget_version_and_requirements(
     assert given["python_version"] == "3.12"
     assert Path(given["python_requirements"]).is_file()
     assert Path(given["python_requirements"]).name == requirements
+
+
+def test_every_job_name_starts_with_merit_desk(monkeypatch, deployed):
+    """The jobs share a cluster with other templates: a plain "Market Feed" replaced theirs."""
+    d.deploy_services()
+    d.deploy_app()
+    d.deploy_excel()
+    names = [job["name"] for job in deployed]
+    for module in ("daily_curve", "strategy_sweep", "demand_training"):
+        names.append(workflow_arguments(monkeypatch, module)["name"])
+    assert len(names) == 7
+    job_names = [name.lower().replace(" ", "-") for name in names]  # how Datatailr names a job
+    assert [name for name in job_names if not name.startswith("merit-desk")] == []

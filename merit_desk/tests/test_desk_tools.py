@@ -74,8 +74,8 @@ def test_live_price_once_uses_market_feed(monkeypatch):
 
 
 def test_the_services_are_called_by_their_names_on_the_platform():
-    assert desk_tools.PRICING_API == "http://pricing-api"
-    assert desk_tools.MARKET_FEED == "http://market-feed"
+    assert desk_tools.PRICING_API == "http://merit-desk-pricing-api"
+    assert desk_tools.MARKET_FEED == "http://merit-desk-market-feed"
 
 
 @pytest.mark.parametrize("status, detail", [

@@ -15,7 +15,7 @@ NO_CURVE = "No curve yet. The daily curve workflow has not run."
 
 def create_app(store: TextStore | None = None) -> FastAPI:
     store = default_store() if store is None else store
-    app = FastAPI(title="Pricing API")
+    app = FastAPI(title="Merit Desk Pricing API")
 
     def market_or_404(code: str) -> Market:
         try:

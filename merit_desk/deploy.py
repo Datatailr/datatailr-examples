@@ -4,9 +4,9 @@ Run it from the repository root, with one target:
 
     python merit_desk/deploy.py workflows   # Daily Curve and Strategy Sweep
     python merit_desk/deploy.py training    # Demand Training, which needs a GPU node
-    python merit_desk/deploy.py services    # Pricing API and Market Feed
+    python merit_desk/deploy.py services    # Merit Desk Pricing API and Market Feed
     python merit_desk/deploy.py app         # Merit Desk, the FastAPI desk app
-    python merit_desk/deploy.py excel       # Desk Tools, the Excel add-in
+    python merit_desk/deploy.py excel       # Merit Desk Tools, the Excel add-in
     python merit_desk/deploy.py all         # everything except demand training (the default)
 
 "all" deploys everything except demand training. Deploy that with "training", after an
@@ -48,7 +48,7 @@ def deploy_services():
     from merit_desk.services import market_feed, pricing_api
 
     Service(
-        name="Pricing API",  # other jobs reach it at http://pricing-api
+        name="Merit Desk Pricing API",  # other jobs reach it at http://merit-desk-pricing-api
         entrypoint=pricing_api.main,
         resources=Resources(memory="1g", cpu=0.5),
         python_version="3.12",
@@ -57,7 +57,7 @@ def deploy_services():
         budget=BUDGET,
     ).run()
     Service(
-        name="Market Feed",  # http://market-feed
+        name="Merit Desk Market Feed",  # http://merit-desk-market-feed
         entrypoint=market_feed.main,
         resources=Resources(memory="512m", cpu=0.25),
         python_version="3.12",
@@ -86,7 +86,7 @@ def deploy_excel():
     from merit_desk.excel.desk_tools import main
 
     ExcelAddin(
-        name="Desk Tools",
+        name="Merit Desk Tools",
         entrypoint=main,
         python_version="3.12",
         python_requirements=requirements("excel"),

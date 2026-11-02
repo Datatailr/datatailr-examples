@@ -1,4 +1,4 @@
-"""Desk Tools: the desk's power prices as Excel functions, written in Python."""
+"""Merit Desk Tools: the desk's power prices as Excel functions, written in Python."""
 
 import time
 
@@ -8,10 +8,10 @@ from datatailr.excel import Addin, Queue
 from merit_desk.common import stack
 from merit_desk.common.markets import get_market
 
-PRICING_API = "http://pricing-api"
-MARKET_FEED = "http://market-feed"
+PRICING_API = "http://merit-desk-pricing-api"
+MARKET_FEED = "http://merit-desk-market-feed"
 
-addin = Addin("Desk Tools", "Power prices for the trading desk")
+addin = Addin("Merit Desk Tools", "Power prices for the trading desk")
 
 
 def stack_price_for(market: str, temp_c: float) -> float:

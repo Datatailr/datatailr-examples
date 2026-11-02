@@ -1218,8 +1218,8 @@ def without_service_urls(monkeypatch):
 
 
 def test_urls_default_to_the_service_names_on_the_platform(without_service_urls):
-    assert desk_client.PRICING_API_URL == "http://pricing-api"
-    assert desk_client.MARKET_FEED_URL == "http://market-feed"
+    assert desk_client.PRICING_API_URL == "http://merit-desk-pricing-api"
+    assert desk_client.MARKET_FEED_URL == "http://merit-desk-market-feed"
 
 
 def test_client_raises_service_unavailable(monkeypatch):

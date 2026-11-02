@@ -24,11 +24,13 @@ Two more workflows run beside the daily curve. The strategy sweep backtests a we
 | Merit Desk Daily Curve | Workflow, weekdays 07:00 London | Downloads the forecast, prices each market in parallel, saves the curves, posts the summary |
 | Merit Desk Strategy Sweep | Workflow, Sundays 02:00 London | Runs one backtest task for each combination of market, tenor and threshold, then ranks them |
 | Merit Desk Demand Training | Workflow, no schedule | Trains a demand model on a GPU and saves it |
-| Pricing API | Service, `http://pricing-api` | Gives the newest curve over HTTP, and the stack price for a temperature |
-| Market Feed | Service, `http://market-feed` | Serves simulated live prices |
+| Merit Desk Pricing API | Service, `http://merit-desk-pricing-api` | Gives the newest curve over HTTP, and the stack price for a temperature |
+| Merit Desk Market Feed | Service, `http://merit-desk-market-feed` | Serves simulated live prices |
 | Merit Desk | App (FastAPI) | Shows the curves, the live prices, the merit order and the newest sweep. Runs scenarios and backtests as jobs. Starts the Daily Curve and the Strategy Sweep |
 | Merit Desk Run `<label>` `<6 characters>` | Workflow, one for each click, made by the app | Computes one scenario or one backtest and writes the result into its run record. The app removes the workflow about 10 minutes after the run ends |
-| Desk Tools | Excel add-in | Gives the prices as Excel functions |
+| Merit Desk Tools | Excel add-in | Gives the prices as Excel functions |
+
+Every job name starts with "Merit Desk". The host name of a service comes from its name, so a plain name such as "Market Feed" could replace the job of another template on the same cluster. The text below calls the two services the Pricing API and the Market Feed.
 
 A tenor is how many months ahead a contract delivers. A threshold is how much colder than normal the forecast must be, in degrees Celsius, before the rule buys.
 
@@ -47,8 +49,8 @@ Blob storage <------ Strategy Sweep (Sundays 02:00)   writes the backtest result
      ^        <------ Demand Training (no schedule)   writes the trained model
      |        <------ Merit Desk Run (one per click)   writes its run record
      |
-     +--> Pricing API --+--> Merit Desk (app) --> creates and removes the Merit Desk Run workflows
-     +--> Market Feed --+--> Desk Tools (Excel)
+     +--> Merit Desk Pricing API --+--> Merit Desk (app) --> creates and removes the Merit Desk Run workflows
+     +--> Merit Desk Market Feed --+--> Merit Desk Tools (Excel)
 ```
 
 The Merit Desk app also reads the newest forecast, the backtest results and the run records from blob storage. On the Jobs page, it starts the Daily Curve and the Strategy Sweep. Other jobs reach a service by its host name. The host name is the service name in lower case, with hyphens for spaces.
@@ -219,9 +221,9 @@ Log in with `datatailr login`. Then run one of these commands from the repositor
 ```bash
 python merit_desk/deploy.py workflows   # Daily Curve and Strategy Sweep
 python merit_desk/deploy.py training    # Demand Training, which needs a GPU node
-python merit_desk/deploy.py services    # Pricing API and Market Feed
+python merit_desk/deploy.py services    # Merit Desk Pricing API and Market Feed
 python merit_desk/deploy.py app         # Merit Desk, the FastAPI desk app
-python merit_desk/deploy.py excel       # Desk Tools
+python merit_desk/deploy.py excel       # Merit Desk Tools
 python merit_desk/deploy.py all         # Everything except demand training (the default)
 ```
 

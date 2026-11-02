@@ -84,7 +84,7 @@ def create_app(store: TextStore | None = None, seed: int = 42,
         stop.set()
         thread.join(timeout=5)
 
-    app = FastAPI(title="Market Feed", lifespan=lifespan)
+    app = FastAPI(title="Merit Desk Market Feed", lifespan=lifespan)
 
     @app.get("/health")
     def health() -> dict:

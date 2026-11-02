@@ -4,3 +4,4 @@ requests
 numpy
 pandas
 tzdata
+pydantic

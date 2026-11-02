@@ -95,7 +95,7 @@ def test_curve_month_404():
 
 
 def test_pricing_api_is_titled():
-    assert pricing_api.create_app(MemoryStore()).title == "Pricing API"
+    assert pricing_api.create_app(MemoryStore()).title == "Merit Desk Pricing API"
 
 
 # Market Feed
@@ -170,7 +170,7 @@ def test_feed_unknown_market_404():
 
 def test_feed_health_and_title():
     app = market_feed.create_app(MemoryStore())
-    assert app.title == "Market Feed"
+    assert app.title == "Merit Desk Market Feed"
     assert TestClient(app).get("/health").json() == {"status": "ok"}
 
 

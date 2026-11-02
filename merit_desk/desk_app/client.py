@@ -4,8 +4,8 @@ import os
 
 import requests
 
-PRICING_API_URL = os.environ.get("PRICING_API_URL", "http://pricing-api")
-MARKET_FEED_URL = os.environ.get("MARKET_FEED_URL", "http://market-feed")
+PRICING_API_URL = os.environ.get("PRICING_API_URL", "http://merit-desk-pricing-api")
+MARKET_FEED_URL = os.environ.get("MARKET_FEED_URL", "http://merit-desk-market-feed")
 
 
 class ServiceUnavailable(Exception):
