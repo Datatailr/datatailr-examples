@@ -30,7 +30,7 @@ Two more workflows run beside the daily curve. The strategy sweep backtests a we
 | Merit Desk Run `<label>` `<6 characters>` | Workflow, one for each click, made by the app | Computes one scenario or one backtest and writes the result into its run record. The app removes the workflow about 10 minutes after the run ends |
 | Merit Desk Tools | Excel add-in | Gives the prices as Excel functions |
 
-The Datatailr release that ships with SDK 0.2.7 rejects schedules on Sundays, so the sweep runs on Saturdays. The same release stores each schedule in UTC. So the London times here and on the Jobs page are right only while London is on GMT. That is from late October to late March. A later release fixes this.
+The Datatailr release that ships with SDK 0.2.7 rejects schedules on Sundays, so the sweep runs on Saturdays. The same release stores each schedule in UTC. So the London times here and on the Jobs page are right only while London is on GMT. That is from late October to late March. From late March to late October, each run starts one hour later in London time.
 
 Every job carries the prefix "Merit Desk": the workflows, the services, the app and the add-in. The host name of a service comes from its name, so a plain name such as "Market Feed" could replace the job of another template on the same cluster. The text below uses short role names, such as the Daily Curve, the Pricing API and the Market Feed.
 
