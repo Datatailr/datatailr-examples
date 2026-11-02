@@ -1,6 +1,7 @@
 import html
 import re
 import warnings
+from datetime import date
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -11,7 +12,8 @@ with warnings.catch_warnings():
     warnings.filterwarnings("ignore", message=r"Using `httpx` with `starlette\.testclient`")
     from fastapi.testclient import TestClient
 
-from merit_desk.common.weather import CREDIT
+from merit_desk.common.store import SAMPLE_FORECAST
+from merit_desk.common.weather import CREDIT, Forecast
 from merit_desk.desk_app.app import create_app
 
 STATIC = Path(__file__).parents[1] / "desk_app" / "static"
@@ -44,6 +46,14 @@ class Tags(HTMLParser):
     def handle_data(self, data):
         if self._link is not None:
             self._link += data
+
+
+def footer_year(page: str) -> str:
+    """The year in the copyright line of the footer."""
+    found = re.search(r'© <span id="credit-year">(\d{4})</span> European Centre for '
+                      r"Medium-Range Weather Forecasts \(ECMWF\)\.", page)
+    assert found, "the footer has no copyright line with a year"
+    return found.group(1)
 
 
 @pytest.fixture(scope="module")
@@ -88,7 +98,7 @@ def test_the_page_has_its_title_the_menu_the_price_label_and_the_forecast_credit
     assert Tags(page).menu == MENU
     assert "Simulated prices" in page
     assert html.escape(CREDIT) in page
-    assert "© European Centre for Medium-Range Weather Forecasts (ECMWF)." in page
+    assert footer_year(page).isdigit()
     assert f'href="{ECMWF_TERMS}"' in page
     assert "{{" not in page  # every placeholder is filled
 
@@ -166,3 +176,23 @@ def test_a_check_box_is_named_by_its_market_and_a_plant_field_by_its_plant_and_u
     assert re.search(r"'aria-label': `[^`]*\$\{code\}[^`]*`", pages)
     assert re.search(r"'aria-label': `[^`]*\$\{plant\.name\}[^`]*`", pages)
     assert "capacity in GW" in pages and "cost in EUR/MWh" in pages
+
+
+def test_the_footer_shows_the_year_in_london_each_time_the_page_is_served(monkeypatch):
+    """Until a curve gives the year of its forecast run, the footer has the current year."""
+    client = TestClient(create_app())
+    for today in (date(2031, 12, 31), date(2032, 1, 1)):
+        monkeypatch.setattr("merit_desk.desk_app.app.london_today", lambda today=today: today)
+        page = client.get("/").text
+        assert footer_year(page) == str(today.year)
+        assert "{{" not in page
+
+
+def test_the_curves_page_takes_the_footer_year_from_the_forecast_run_of_a_curve():
+    """The source of a curve says "..., run 2026-10-29 00z". The page reads the year from it."""
+    pages = page_scripts()["pages.js"]
+    assert "$('credit-year').textContent" in pages
+    pattern = re.search(r"const RUN_YEAR = /(.*)/;", pages).group(1)
+    source = Forecast.from_json(SAMPLE_FORECAST.read_text(encoding="utf-8")).source
+    assert re.search(pattern, source).group(1) == "2026"
+    assert not re.search(pattern, "ECMWF IFS HRES open data")  # no run: the current year stays

@@ -111,6 +111,8 @@ function runState(note, record, waiting) {
 // ---- Curves: the newest curve of each market, from the Pricing API
 
 page('curves', (() => {
+  const RUN_YEAR = /\brun (\d{4})-\d{2}-\d{2}/;  // the source of a curve ends "run 2026-11-02 00z"
+  const currentYear = $('credit-year').textContent;  // the server wrote it into the footer
   let chart;
   let curves = [];
   const hidden = new Set();
@@ -125,7 +127,14 @@ page('curves', (() => {
       curves = [];
       $('curves-errors').textContent = error.message;
     }
+    showCreditYear();
     draw();
+  }
+
+  /** The copyright line in the footer has the year of the newest forecast run, else this year. */
+  function showCreditYear() {
+    const years = curves.map(c => RUN_YEAR.exec(c.source)?.[1]).filter(Boolean).map(Number);
+    $('credit-year').textContent = years.length ? Math.max(...years) : currentYear;
   }
 
   function draw() {

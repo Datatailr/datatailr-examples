@@ -54,7 +54,8 @@ MAX_OVERRIDES = 10  # a stack has five plants
 FORECAST_SECONDS = 60.0  # how long the previews reuse the forecast they read
 KEEP_ENDED = 500  # summaries of ended runs that the run list keeps
 STATIC = pathlib.Path(__file__).with_name("static")
-ECMWF_NOTICE = ("© European Centre for Medium-Range Weather Forecasts (ECMWF). "
+ECMWF_NOTICE = ('© <span id="credit-year">{{year}}</span> European Centre for Medium-Range '
+                'Weather Forecasts (ECMWF). '
                 '<a href="https://apps.ecmwf.int/datasets/licences/general/" target="_blank" '
                 'rel="noopener">ECMWF terms of use</a>')
 
@@ -255,8 +256,9 @@ class Cached(Generic[T]):
 
 
 def page_html() -> str:
-    """The page, with the forecast credit and the ECMWF notice in its footer. Its {{base}} is
-    filled for each request."""
+    """The page, with the forecast credit and the ECMWF notice in its footer. Its {{base}} and
+    {{year}} are filled for each request. The Curves page then puts the year of the forecast run
+    in place of {{year}}."""
     page = (STATIC / "index.html").read_text(encoding="utf-8")
     return page.replace("{{credit}}", html.escape(CREDIT)).replace("{{notice}}", ECMWF_NOTICE)
 
@@ -395,7 +397,8 @@ def create_app(store: TextStore | None = None, runner: Runner | None = None,
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request) -> str:
         # the platform serves the app under /job/<env>/<name>: the page's links start there
-        return page.replace("{{base}}", html.escape(request.scope.get("root_path", "")) + "/")
+        root = html.escape(request.scope.get("root_path", ""))
+        return page.replace("{{base}}", root + "/").replace("{{year}}", str(london_today().year))
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 

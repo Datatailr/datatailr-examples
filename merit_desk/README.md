@@ -254,7 +254,7 @@ Before you run a notebook:
 - The Market Feed simulates the live prices. It moves each price a little every second, around the front-month price of the newest curve. Before the first curve exists, it uses the stack price at the normal temperature of the day. The demo uses no real market prices. The top bar of the app shows these prices and says that they are simulated.
 - Demand and prices come from the stack model. The history for the backtests and the training is made up.
 - In an Excel formula, write the month of `curve_price` as text, for example `"2027-01"`. A month typed into a cell can become a date.
-- On the platform, each "Run as job" is a Datatailr job, and Datatailr starts a container for it. When a node was free, a run took 19 seconds in a test on a cluster. When the cluster first had to start a node, a run took about 3 minutes. Of that time, 2 minutes 9 seconds was waiting and 6 seconds was work. All the runs of the app use the budget "Trading".
+- On the platform, each "Run as job" is a Datatailr job, and Datatailr starts a container for it. When a node was free, a run took 19 seconds from the click to the result in a test on a cluster. When the cluster first had to start a node, a run took about 3 minutes. Waiting for the node took 2 minutes 9 seconds of that time. The app needed about 20 seconds to build and save the workflow. Starting the container and running the task took about 25 seconds, and the task itself took 6 seconds. All the runs of the app use the budget "Trading".
 - At most three runs are in progress at a time, for the whole app. A fourth click gets this message: "Three runs are in progress. Wait for one to finish." The "Run now" buttons on the Jobs page do not count.
 - A run that you start with "Run as job" fails as timed out when it shows no change for 15 minutes. The app follows a run that you start with "Run now" for up to six hours.
 - The app keeps the workflow of a run for about 10 minutes after the run ends, so that you can still see it in Datatailr. Then it removes the workflow, whether the run succeeded or failed. The app waits until the platform also shows the run as ended. If the platform still shows the run as running 15 minutes after the app saw it end, the app stops it and removes it. When the app starts, it removes the leftover run workflows that are older than one hour. It also takes up again the runs that were not finished.
@@ -270,11 +270,11 @@ The temperatures come from the ECMWF open data, from IFS HRES, the high-resoluti
 
 > Temperature forecasts: based on data and products of the European Centre for Medium-Range Weather Forecasts (ECMWF), licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). Modified: daily mean 2 m temperature at one grid point per city.
 
-The second is the line "© European Centre for Medium-Range Weather Forecasts (ECMWF)." and the link "ECMWF terms of use", which opens the ECMWF terms in a new tab. The footer line has no year.
-
-The ECMWF copyright line has the year of the forecast run:
+The second is the copyright line that ECMWF asks for, with the year of the forecast run, and the link "ECMWF terms of use". The link opens the ECMWF terms in a new tab. The line has this form:
 
 © <year of the forecast run> European Centre for Medium-Range Weather Forecasts (ECMWF)
+
+In the footer, the year is the year of the forecast run of the newest curve. The Curves page shows that run, for example as "run 2026-11-02 00z". Before the app knows a curve, the footer shows the current year in London.
 
 The sample forecast in this repository is the run of 2026-10-29 00z. For it, the line reads: © 2026 European Centre for Medium-Range Weather Forecasts (ECMWF).
 
