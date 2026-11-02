@@ -22,7 +22,7 @@ Two more workflows run beside the daily curve. The strategy sweep backtests a we
 | Job | Kind | What it does |
 | --- | --- | --- |
 | Merit Desk Daily Curve | Workflow, weekdays 07:00 London | Downloads the forecast, prices each market in parallel, saves the curves, posts the summary |
-| Merit Desk Strategy Sweep | Workflow, Sundays 02:00 London | Runs one backtest task for each combination of market, tenor and threshold, then ranks them |
+| Merit Desk Strategy Sweep | Workflow, Saturdays 02:00 London | Runs one backtest task for each combination of market, tenor and threshold, then ranks them |
 | Merit Desk Demand Training | Workflow, no schedule | Trains a demand model on a GPU and saves it |
 | Merit Desk Pricing API | Service, `http://merit-desk-pricing-api` | Gives the newest curve over HTTP, and the stack price for a temperature |
 | Merit Desk Market Feed | Service, `http://merit-desk-market-feed` | Serves simulated live prices |
@@ -30,7 +30,9 @@ Two more workflows run beside the daily curve. The strategy sweep backtests a we
 | Merit Desk Run `<label>` `<6 characters>` | Workflow, one for each click, made by the app | Computes one scenario or one backtest and writes the result into its run record. The app removes the workflow about 10 minutes after the run ends |
 | Merit Desk Tools | Excel add-in | Gives the prices as Excel functions |
 
-Every job name starts with "Merit Desk". The host name of a service comes from its name, so a plain name such as "Market Feed" could replace the job of another template on the same cluster. The text below calls the two services the Pricing API and the Market Feed.
+Datatailr rejects schedules on Sundays in this release, so the sweep runs on Saturdays.
+
+Every job carries the prefix "Merit Desk": the workflows, the services, the app and the add-in. The host name of a service comes from its name, so a plain name such as "Market Feed" could replace the job of another template on the same cluster. The text below uses short role names, such as the Daily Curve, the Pricing API and the Market Feed.
 
 A tenor is how many months ahead a contract delivers. A threshold is how much colder than normal the forecast must be, in degrees Celsius, before the rule buys.
 
@@ -45,7 +47,7 @@ ECMWF open data
 Daily Curve (weekdays 07:00) ------------> desk chat (summary)
      |  curves
      v
-Blob storage <------ Strategy Sweep (Sundays 02:00)   writes the backtest results
+Blob storage <------ Strategy Sweep (Saturdays 02:00) writes the backtest results
      ^        <------ Demand Training (no schedule)   writes the trained model
      |        <------ Merit Desk Run (one per click)   writes its run record
      |
@@ -221,7 +223,7 @@ Log in with `datatailr login`. Then run one of these commands from the repositor
 ```bash
 python merit_desk/deploy.py workflows   # Daily Curve and Strategy Sweep
 python merit_desk/deploy.py training    # Demand Training, which needs a GPU node
-python merit_desk/deploy.py services    # Merit Desk Pricing API and Market Feed
+python merit_desk/deploy.py services    # Merit Desk Pricing API and Merit Desk Market Feed
 python merit_desk/deploy.py app         # Merit Desk, the FastAPI desk app
 python merit_desk/deploy.py excel       # Merit Desk Tools
 python merit_desk/deploy.py all         # Everything except demand training (the default)

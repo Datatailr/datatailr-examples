@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 DESK_JOBS = {
     "daily-curve": {"name": "Merit Desk Daily Curve", "schedule": "Weekdays 07:00 London"},
-    "strategy-sweep": {"name": "Merit Desk Strategy Sweep", "schedule": "Sundays 02:00 London"},
+    "strategy-sweep": {"name": "Merit Desk Strategy Sweep", "schedule": "Saturdays 02:00 London"},
 }
 CLICK_KINDS = ("scenario", "backtest")  # what a click starts. Only these count against the cap
 STALE_AFTER = timedelta(hours=1)  # a run job older than this was left behind by an old app

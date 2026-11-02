@@ -29,7 +29,8 @@ def summarize(results: list) -> dict:
 
 @workflow(
     name="Merit Desk Strategy Sweep",
-    schedule=Schedule(at_hours=[2], at_minutes=[0], weekdays=["Sun"], timezone="Europe/London"),
+    # The platform rejects Sunday schedules in this release (it writes Sunday as day 7), so Saturday
+    schedule=Schedule(at_hours=[2], at_minutes=[0], weekdays=["Sat"], timezone="Europe/London"),
     budget="Research",
     python_version="3.12",
     python_requirements=REQUIREMENTS,

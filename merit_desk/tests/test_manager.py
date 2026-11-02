@@ -647,7 +647,7 @@ def test_a_fresh_run_is_not_timed_out_with_the_default_clock(store, runner):
 def test_the_desk_jobs_are_the_two_deployed_workflows():
     assert DESK_JOBS == {
         "daily-curve": {"name": DAILY, "schedule": "Weekdays 07:00 London"},
-        "strategy-sweep": {"name": SWEEP, "schedule": "Sundays 02:00 London"},
+        "strategy-sweep": {"name": SWEEP, "schedule": "Saturdays 02:00 London"},
     }
 
 

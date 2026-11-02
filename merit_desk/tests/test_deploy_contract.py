@@ -97,6 +97,14 @@ def test_every_job_name_starts_with_merit_desk(monkeypatch, deployed):
     names = [job["name"] for job in deployed]
     for module in ("daily_curve", "strategy_sweep", "demand_training"):
         names.append(workflow_arguments(monkeypatch, module)["name"])
-    assert len(names) == 7
+    assert len(names) == 7, f"expected 7 jobs, found {names}"
     job_names = [name.lower().replace(" ", "-") for name in names]  # how Datatailr names a job
-    assert [name for name in job_names if not name.startswith("merit-desk")] == []
+    assert [n for n in job_names if n != "merit-desk" and not n.startswith("merit-desk-")] == []
+
+
+@pytest.mark.parametrize("module", ["daily_curve", "strategy_sweep", "demand_training"])
+def test_no_workflow_is_scheduled_on_a_sunday(monkeypatch, module):
+    """The platform writes Sunday as day 7 and then rejects it, so the sweep runs on Saturdays."""
+    schedule = workflow_arguments(monkeypatch, module).get("schedule")  # no schedule: no weekdays
+    weekdays = getattr(schedule, "weekdays", None) or []  # str(schedule) would call the platform
+    assert "Sun" not in weekdays
