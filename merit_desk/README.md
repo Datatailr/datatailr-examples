@@ -254,7 +254,7 @@ The two notebooks in `merit_desk/notebooks/` use the platform. Run them on a Dat
 
 Before you run a notebook:
 
-- Build the workstation image from `merit_desk/requirements-dev.txt`. The "Pricing Research" workstation image is built from that file. The file lists `cloudpickle`. In Jupyter, an instant run sends its tasks with cloudpickle, and the SDK raises an error if the image does not list it.
+- Build the workstation image from `merit_desk/requirements-dev.txt`. The "Pricing Research" workstation image is built from that file. The file lists `cloudpickle`. In Jupyter, an instant run sends its tasks with cloudpickle, and the SDK raises an error if the image does not list it. The file also asks for SDK 0.2.7 or later, because a workstation image otherwise keeps the older SDK it ships with. The joblib notebook needs `websockets` and `ipywidgets` in the image, because its workers connect over websockets and load calls that refer to IPython.
 - You need no path setup. The first cell of each notebook puts the repository root on `sys.path`, so the notebook finds the `merit_desk` package.
 
 ## Things to know

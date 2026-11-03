@@ -52,3 +52,11 @@ def test_instant_run_notebook_shows_the_run_and_waits_before_it_asks_for_a_resul
 def test_dev_requirements_list_cloudpickle_for_an_instant_run_from_a_notebook():
     names = (ROOT / "merit_desk" / "requirements-dev.txt").read_text(encoding="utf-8").split()
     assert "cloudpickle" in names
+
+
+def test_dev_requirements_give_the_workstation_what_the_joblib_notebook_needs():
+    # The workstation image keeps its own older SDK for a bare "datatailr", the joblib
+    # workers need websockets, and they unpickle calls that refer to IPython (ipywidgets).
+    names = (ROOT / "merit_desk" / "requirements-dev.txt").read_text(encoding="utf-8").split()
+    assert "datatailr>=0.2.7" in names
+    assert "websockets" in names and "ipywidgets" in names
