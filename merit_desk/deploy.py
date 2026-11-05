@@ -90,6 +90,7 @@ def deploy_excel():
     ExcelAddin(
         name="Merit Desk Tools",
         entrypoint=main,
+        resources=Resources(memory="4g", cpu=1),  # the default 128 MB is too small for the stack model's imports
         python_version="3.12",
         python_requirements=requirements("excel"),
         app_section=SECTION,

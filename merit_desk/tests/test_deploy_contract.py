@@ -60,6 +60,13 @@ def test_the_app_is_a_fastapi_app_served_from_the_desk_app_module(deployed):
     assert requirements.name == "requirements.txt"
 
 
+def test_the_excel_addin_has_room_for_the_stack_model(deployed):
+    """With the default 128 MB, the add-in was killed while it imported the stack model."""
+    d.deploy_excel()
+    (addin,) = deployed
+    assert addin["resources"] == Resources(memory="4g", cpu=1)
+
+
 def workflow_arguments(monkeypatch, module: str) -> dict:
     """The arguments that a workflow module gives to @workflow. The module is loaded as a copy."""
     given = {}
