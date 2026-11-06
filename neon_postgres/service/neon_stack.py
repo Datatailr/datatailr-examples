@@ -77,7 +77,11 @@ class NeonConfig:
 
     @classmethod
     def from_env(cls) -> "NeonConfig":
-        env = os.environ
+        # The platform stores a job's env_vars with a DATATAILR_JOB_ENV_ prefix; accept both spellings.
+        env = {
+            key.removeprefix("DATATAILR_JOB_ENV_"): value
+            for key, value in sorted(os.environ.items(), key=lambda item: item[0].startswith("DATATAILR_JOB_ENV_"))
+        }
         return cls(
             bin_dir=env.get("NEON_BIN_DIR", cls.bin_dir),
             pg_version=int(env.get("NEON_PG_VERSION", cls.pg_version)),

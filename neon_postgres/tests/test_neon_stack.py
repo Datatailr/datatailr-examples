@@ -116,3 +116,12 @@ def test_core_limit_shim_is_used_only_when_needed(tmp_path):
     cfg.setrlimit_shim.write_bytes(b"")
     assert compute_ctl_preload(cfg, 0) == str(cfg.setrlimit_shim)
     assert compute_ctl_preload(cfg, resource.RLIM_INFINITY) is None
+
+
+def test_config_accepts_the_platform_env_prefix(monkeypatch):
+    monkeypatch.delenv("NEON_PG_PASSWORD", raising=False)
+    monkeypatch.setenv("DATATAILR_JOB_ENV_NEON_PG_PASSWORD", "from-platform")
+    monkeypatch.setenv("DATATAILR_JOB_ENV_NEON_BUCKET", "db2")
+    cfg = NeonConfig.from_env()
+    assert cfg.pg_password == "from-platform"
+    assert cfg.bucket == "db2"

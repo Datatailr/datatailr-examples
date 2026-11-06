@@ -136,7 +136,13 @@ connections, and `/` returns the tenant, timeline and generation.
 ## Connecting from another job
 
 Other jobs in the same environment reach Postgres by the service hostname on
-port 5432. The hostname is the service name in lowercase with hyphens:
+port 5432. The hostname is the service name in lowercase with hyphens. The
+user is `cloud_admin` and the password is the `NEON_PG_PASSWORD` value from
+the deploy, `cloud_admin` if you did not set one. To read it back later:
+
+```bash
+dt job get neon-postgres --json | grep NEON_PG_PASSWORD
+```
 
 ```python
 import psycopg
@@ -145,7 +151,7 @@ with psycopg.connect(
     host="neon-postgres",
     port=5432,
     user="cloud_admin",
-    password="change-me",
+    password="cloud_admin",  # the NEON_PG_PASSWORD you deployed with
     dbname="postgres",
 ) as conn:
     conn.execute("CREATE TABLE IF NOT EXISTS t(id int primary key, v text)")
