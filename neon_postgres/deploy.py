@@ -1,12 +1,13 @@
 """Deploy the Neon Postgres service on Datatailr.
 
 Usage:
-    python deploy.py
+    NEON_BUCKET=my-database NEON_PG_PASSWORD='a-long-random-password' python deploy.py
 
 Environment variables read at deploy time and passed to the service:
+    NEON_BUCKET        directory in blob storage that holds this database (required;
+                       every database needs its own)
     NEON_PG_PASSWORD   password of the Postgres superuser; set it, the default
                        cloud_admin is public knowledge
-    NEON_BUCKET        directory in blob storage that holds the database (default: neon)
 """
 
 from __future__ import annotations
@@ -32,6 +33,12 @@ DEFAULT_PASSWORD = "cloud_admin"
 
 
 def deploy() -> None:
+    bucket = os.environ.get("NEON_BUCKET", "").strip("/ ")
+    if not bucket:
+        raise SystemExit(
+            "NEON_BUCKET is not set. Choose the blob storage directory that holds this database, "
+            "for example: NEON_BUCKET=my-database python deploy.py"
+        )
     password = os.environ.get("NEON_PG_PASSWORD", DEFAULT_PASSWORD)
     if password == DEFAULT_PASSWORD:
         print(
@@ -40,7 +47,7 @@ def deploy() -> None:
                 "default from the README, and every job in the environment can reach port 5432."
             )
         )
-    print(CYAN("Deploying the Neon Postgres service..."))
+    print(CYAN(f"Deploying the Neon Postgres service with its data in blob storage under {bucket}/ ..."))
     service = Service(
         name="Neon Postgres",
         entrypoint=main,
@@ -49,7 +56,7 @@ def deploy() -> None:
         build_script_pre=BUILD_SCRIPT_PRE,
         env_vars={
             "NEON_PG_PASSWORD": password,
-            "NEON_BUCKET": os.environ.get("NEON_BUCKET", "neon"),
+            "NEON_BUCKET": bucket,
             # Upload WAL and layers at most one minute after they are written.
             "NEON_PARTIAL_BACKUP_TIMEOUT": "1m",
             "NEON_CHECKPOINT_TIMEOUT": "1m",

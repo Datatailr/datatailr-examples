@@ -108,20 +108,26 @@ safekeepers on separate machines, which a Datatailr service cannot provide.
 | Variable | Default | Meaning |
 |---|---|---|
 | `NEON_PG_PASSWORD` | `cloud_admin` | Password of the `cloud_admin` superuser. Set your own, see Deployment. |
-| `NEON_BUCKET` | `neon` | Directory in blob storage that holds this database |
+| `NEON_BUCKET` | none, required | Directory in blob storage that holds this database |
 | `NEON_PG_PORT` | `5432` | Postgres port |
 | `NEON_SHARED_BUFFERS` | `256MB` | Postgres `shared_buffers` |
 | `NEON_MAX_CONNECTIONS` | `100` | Postgres `max_connections` |
 | `S3_GATEWAY_CONCURRENCY` | `8` | How many `dt blob` calls run at the same time |
 | `NEON_STORAGE_BACKEND` | `datatailr` | `local` stores objects in a directory instead |
 
-Two databases must use different `NEON_BUCKET` values.
+Two databases must use different `NEON_BUCKET` values. The deploy script
+refuses to run without one.
 
 ## Deployment
 
 The image build downloads about 2 GB of Neon images with
 [crane](https://github.com/google/go-containerregistry) and copies the
 binaries into `/opt/neon`. Expect the first build to take several minutes.
+
+Choose the blob storage directory for the database with `NEON_BUCKET`. All of
+the database's objects land under that directory, and no other job should
+write there. The name is yours to pick, for example the name of the project
+that owns the data.
 
 Set a password before you deploy. `NEON_PG_PASSWORD` becomes the password of
 the `cloud_admin` superuser, and every job in the environment can reach the
@@ -133,7 +139,7 @@ other users with access to the job can read it.
 From this directory, run:
 
 ```bash
-NEON_PG_PASSWORD='a-long-random-password' python deploy.py
+NEON_BUCKET=my-database NEON_PG_PASSWORD='a-long-random-password' python deploy.py
 ```
 
 The service appears on the platform as **Neon Postgres**. Its status API is
@@ -169,10 +175,10 @@ with psycopg.connect(
 Clients outside the platform cannot connect: the platform ingress carries HTTP
 only.
 
-To see what the database writes, list the bucket:
+To see what the database writes, list its directory in blob storage:
 
 ```bash
-dt blob ls neon/ -r
+dt blob ls my-database/ -r
 ```
 
 ## Running locally with Docker
