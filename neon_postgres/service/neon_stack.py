@@ -123,11 +123,19 @@ class TenantState:
         try:
             backend.download(bucket, STATE_KEY, path)
             with open(path) as handle:
-                data = json.load(handle)
+                content = handle.read()
         except NotFound:
             return None
         finally:
             os.unlink(path)
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as exc:
+            # Never start a new tenant over an unreadable state file: that would orphan the data.
+            raise RuntimeError(
+                f"{bucket}/{STATE_KEY} exists but is not valid JSON ({len(content)} bytes: {content[:80]!r}); "
+                "fix or remove it before starting the service"
+            ) from exc
         return cls(data["tenant_id"], data.get("timeline_id"), int(data["generation"]))
 
     def save(self, backend: Backend, bucket: str) -> None:

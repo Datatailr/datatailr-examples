@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+
+import pytest
 from pathlib import Path
 
 from neon_postgres.s3_gateway.backends import MemoryBackend
@@ -91,3 +93,12 @@ def test_config_from_env(monkeypatch):
     assert cfg.checkpoint_distance == 1024
     assert cfg.pg_dir == Path("/opt/neon/v17")
 
+
+
+def test_unreadable_state_file_is_an_error_not_a_new_tenant(tmp_path):
+    backend = MemoryBackend()
+    bad = tmp_path / "bad"
+    bad.write_text("")
+    backend.upload("neon", STATE_KEY, str(bad))
+    with pytest.raises(RuntimeError, match="not valid JSON"):
+        TenantState.load(backend, "neon")

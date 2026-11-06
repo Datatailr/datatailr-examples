@@ -35,17 +35,22 @@ class FakeBlob:
             handle.write(self.objects[name])
 
     def exists(self, name):
-        return name in self.objects
+        # Deliberately unusable: the real CLI answer is plain text and the backend
+        # must not depend on it.
+        return "false"
 
     def delete(self, name):
         if name not in self.objects:
             raise RuntimeError("dt blob rm: object not found")
         del self.objects[name]
 
+    qualified = False  # when True, names come back as blob://<bucket>/<path> like some CLI versions
+
     def ls(self, prefix, recursive=False, filter_by="", limit=-1, offset=0):
         assert recursive, "the backend always lists recursively"
+        fmt = "blob://acme-user-data/{}" if self.qualified else "{}"
         return [
-            {"name": name, "size": len(data), "last_modified": 1_700_000_000, "is_file": True}
+            {"name": fmt.format(name), "size": len(data), "last_modified": 1_700_000_000, "is_file": True}
             for name, data in self.objects.items()
             if name.startswith(prefix)
         ]
@@ -123,3 +128,14 @@ def test_datatailr_backend_detects_missing_object_behind_an_empty_download(tmp_p
     backend.upload("neon", "empty", str(empty))
     backend.download("neon", "empty", str(tmp_path / "out"))
     assert (tmp_path / "out").read_bytes() == b""
+
+
+def test_datatailr_backend_accepts_fully_qualified_listing_names(tmp_path):
+    blob = FakeBlob()
+    blob.qualified = True
+    backend = DatatailrBlobBackend(blob=blob, concurrency=1)
+    src = tmp_path / "src"
+    src.write_bytes(b"data")
+    backend.upload("neon", "a/b", str(src))
+    assert backend.stat("neon", "a/b").size == 4
+    assert [item.key for item in backend.list("neon", "a/")] == ["a/b"]

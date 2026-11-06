@@ -16,6 +16,7 @@ Three implementations:
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import threading
@@ -23,6 +24,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+log = logging.getLogger("s3_gateway.backends")
 
 
 class NotFound(Exception):
@@ -158,7 +161,7 @@ class DatatailrBlobBackend:
     """Objects live at ``<bucket>/<key>`` in the user's Datatailr blob storage.
 
     ``blob`` is a ``datatailr.Blob`` instance (or anything with the same
-    ``put_file`` / ``get_file`` / ``exists`` / ``delete`` / ``ls`` methods).
+    ``put_file`` / ``get_file`` / ``delete`` / ``ls`` methods).
     Each call runs the ``dt`` CLI, so ``concurrency`` bounds how many run at once.
     """
 
@@ -174,6 +177,17 @@ class DatatailrBlobBackend:
     def _name(bucket: str, key: str) -> str:
         return f"{bucket}/{key}"
 
+    @staticmethod
+    def _key_of(entry_name: str, bucket: str) -> str | None:
+        """The key of a listing entry, whether the CLI reports ``bucket/key`` or a longer path."""
+        marker = f"{bucket}/"
+        if entry_name.startswith(marker):
+            return entry_name[len(marker):]
+        idx = entry_name.find(f"/{marker}")
+        if idx >= 0:
+            return entry_name[idx + 1 + len(marker):]
+        return None
+
     def upload(self, bucket: str, key: str, src_path: str) -> None:
         with self._gate:
             self._blob.put_file(self._name(bucket, key), src_path)
@@ -182,25 +196,33 @@ class DatatailrBlobBackend:
         """Download to ``dst_path``.
 
         Depending on the cloud provider, ``dt blob cp`` of a missing object either
-        fails or silently writes an empty file, so both outcomes are checked
-        against ``exists`` before they are reported as NotFound.
+        fails or silently writes an empty file. Both outcomes are checked against
+        the structured listing (not ``exists``, whose plain-text answer is easy to
+        misread) before they are reported as NotFound.
         """
         name = self._name(bucket, key)
         with self._gate:
             try:
                 self._blob.get_file(name, dst_path)
-                failed = os.path.getsize(dst_path) == 0
-            except Exception:
-                failed = True
-            if failed and not self._blob.exists(name):
-                raise NotFound(key)
+                error = None
+            except Exception as exc:
+                error = exc
+        size = os.path.getsize(dst_path) if os.path.exists(dst_path) else 0
+        if error is None and size > 0:
+            return
+        info = self.stat(bucket, key)
+        if info is None:
+            raise NotFound(key)
+        if error is not None:
+            raise error
+        log.warning("downloaded %s as %d bytes while the listing reports %d bytes", name, size, info.size)
 
     def stat(self, bucket: str, key: str) -> ObjectInfo | None:
         name = self._name(bucket, key)
         with self._gate:
             entries = self._blob.ls(name, recursive=True)
         for entry in entries:
-            if entry.get("name") == name and entry.get("is_file", True):
+            if self._key_of(entry.get("name", ""), bucket) == key and entry.get("is_file", True):
                 return ObjectInfo(key, int(entry["size"]), float(entry["last_modified"]))
         return None
 
@@ -208,11 +230,11 @@ class DatatailrBlobBackend:
         base = f"{bucket}/"
         with self._gate:
             entries = self._blob.ls(base + _directory_of(prefix), recursive=True)
-        items = [
-            ObjectInfo(entry["name"][len(base):], int(entry["size"]), float(entry["last_modified"]))
-            for entry in entries
-            if entry.get("is_file", True) and entry["name"].startswith(base)
-        ]
+        items = []
+        for entry in entries:
+            entry_key = self._key_of(entry.get("name", ""), bucket)
+            if entry_key is not None and entry.get("is_file", True):
+                items.append(ObjectInfo(entry_key, int(entry["size"]), float(entry["last_modified"])))
         return _filter_and_sort(items, prefix)
 
     def delete(self, bucket: str, key: str) -> None:
@@ -221,7 +243,7 @@ class DatatailrBlobBackend:
             try:
                 self._blob.delete(name)
             except Exception:
-                if self._blob.exists(name):
+                if self.stat(bucket, key) is not None:
                     raise
 
 
