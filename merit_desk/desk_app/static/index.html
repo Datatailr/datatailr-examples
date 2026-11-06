@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<base href="{{base}}">
+<title>Merit Desk</title>
+<link rel="icon" href="static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="static/app.css">
+<script defer src="static/vendor/chart.umd.js"></script>
+<script defer src="static/app.js"></script>
+<script defer src="static/pages.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 20 16" aria-hidden="true">
+      <path d="M1 15V12H6V9H11V6H15V1H19V15Z"/>
+    </svg>
+    Merit Desk
+  </div>
+  <div class="prices" id="prices"
+       title="Simulated price in EUR/MWh, and its change since this page opened">
+    <span class="tick" data-market="GB">
+      <b>GB</b><span class="px">–</span><span class="chg"></span>
+    </span>
+    <span class="tick" data-market="DE">
+      <b>DE</b><span class="px">–</span><span class="chg"></span>
+    </span>
+    <span class="tick" data-market="FR">
+      <b>FR</b><span class="px">–</span><span class="chg"></span>
+    </span>
+    <span class="sim">Simulated prices</span>
+    <span class="feed-error" id="feed-error"></span>
+  </div>
+  <div class="who">
+    <span class="live" id="live">
+      <span class="dot"></span><span id="live-text">connecting</span>
+    </span>
+    <span class="env" id="env">–</span>
+    <span class="user" id="user"></span>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="menu" aria-label="Desk functions">
+    <div class="label">Desk</div>
+    <a href="#curves" data-page="curves">Curves</a>
+    <a href="#scenario" data-page="scenario">Scenario</a>
+    <a href="#merit" data-page="merit">Merit order</a>
+    <a href="#backtest" data-page="backtest">Backtest</a>
+    <a href="#jobs" data-page="jobs">Jobs</a>
+    <p class="menu-note">Each click that computes runs as its own job on Datatailr.
+      Watch it in the runs rail.</p>
+  </nav>
+
+  <main class="workspace">
+
+    <!-- Curves -->
+    <section class="page" data-page="curves" hidden>
+      <div class="page-head">
+        <h1>Curves</h1>
+        <p>The newest 12-month forward curve of each market, from the Pricing API.
+          This page only reads.</p>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <span class="label">Newest curves · EUR/MWh</span>
+          <span class="toggles" id="curves-toggles"></span>
+          <button class="btn small" id="curves-reload" type="button">Reload</button>
+        </div>
+        <div class="chart-box"><canvas id="curves-chart"></canvas></div>
+        <p class="caption" id="curves-caption"></p>
+        <p class="error" id="curves-errors"></p>
+      </div>
+      <div class="panel flush">
+        <div class="panel-head"><span class="label">Month prices · EUR/MWh</span></div>
+        <div class="table-wrap"><table id="curves-table"></table></div>
+      </div>
+    </section>
+
+    <!-- Scenario -->
+    <section class="page" data-page="scenario" hidden>
+      <div class="page-head">
+        <h1>Scenario</h1>
+        <p>Shift the temperature over a window and watch the curve move. Run it as a job to price
+          it over many simulated weather paths.</p>
+      </div>
+      <div class="panel">
+        <form class="controls" id="scenario-form">
+          <label>Market
+            <select name="market">
+              <option>GB</option><option selected>DE</option><option>FR</option>
+            </select>
+          </label>
+          <label>Shift
+            <input type="range" name="shift_c" min="-10" max="10" step="0.5" value="-3">
+            <output class="readout" id="scenario-shift">-3.0 °C</output>
+          </label>
+          <label>From <input type="date" name="start" required></label>
+          <label>To <input type="date" name="end" required></label>
+          <label>Weather paths
+            <input type="number" name="n_paths" min="100" max="5000" step="100" value="2000">
+          </label>
+        </form>
+        <div class="tiles" id="scenario-tiles"></div>
+        <div class="chart-box"><canvas id="scenario-chart"></canvas></div>
+        <p class="caption" id="scenario-caption"></p>
+        <p class="error" id="scenario-error"></p>
+        <div class="actions">
+          <button class="btn primary" id="scenario-run" type="button">Run as job</button>
+          <span class="note" id="scenario-note"></span>
+        </div>
+      </div>
+      <div class="panel flush">
+        <div class="panel-head"><span class="label">Month prices · EUR/MWh</span></div>
+        <div class="table-wrap"><table id="scenario-table"></table></div>
+      </div>
+    </section>
+
+    <!-- Merit order -->
+    <section class="page" data-page="merit" hidden>
+      <div class="page-head">
+        <h1>Merit order</h1>
+        <p>The plants of a market, cheapest first. Demand at the chosen temperature sets the
+          clearing price. Change a plant and the price moves at once.</p>
+      </div>
+      <div class="panel">
+        <form class="controls" id="merit-form">
+          <label>Market
+            <select name="market">
+              <option>GB</option><option selected>DE</option><option>FR</option>
+            </select>
+          </label>
+          <label>Temperature
+            <input type="range" name="temp_c" min="-20" max="35" step="0.5" value="8">
+            <output class="readout" id="merit-temp">8.0 °C</output>
+          </label>
+        </form>
+        <div class="tiles" id="merit-tiles"></div>
+        <div class="split">
+          <div class="chart-box"><canvas id="merit-chart"></canvas></div>
+          <div>
+            <div class="table-wrap"><table class="inputs" id="merit-plants"></table></div>
+            <button class="btn small" id="merit-reset" type="button">Reset the plants</button>
+          </div>
+        </div>
+        <p class="error" id="merit-error"></p>
+        <div class="actions">
+          <label class="inline">Weather paths
+            <input type="number" id="merit-paths" min="100" max="5000" step="100" value="1000">
+          </label>
+          <button class="btn primary" id="merit-run" type="button">
+            Price the 12-month curve with this stack
+          </button>
+          <span class="note" id="merit-note"></span>
+        </div>
+      </div>
+      <div class="panel" id="merit-result" hidden>
+        <div class="panel-head">
+          <span class="label">12-month curve with this stack · EUR/MWh</span>
+        </div>
+        <div class="tiles" id="merit-result-tiles"></div>
+        <div class="chart-box"><canvas id="merit-curve-chart"></canvas></div>
+        <p class="caption" id="merit-caption"></p>
+      </div>
+    </section>
+
+    <!-- Backtest -->
+    <section class="page" data-page="backtest" hidden>
+      <div class="page-head">
+        <h1>Backtest</h1>
+        <p>The weather strategy's total P&amp;L from the newest Strategy Sweep. Pick a cell, then
+          run that one setting as a job for its full detail.</p>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <span class="label">Newest sweep · total P&amp;L in EUR by tenor and threshold</span>
+          <span class="caption" id="sweep-caption"></span>
+        </div>
+        <div class="table-wrap"><table class="heatmap" id="sweep-table"></table></div>
+        <p class="error" id="sweep-error"></p>
+        <form class="controls" id="backtest-form">
+          <label>Market
+            <select name="market">
+              <option>GB</option><option selected>DE</option><option>FR</option>
+            </select>
+          </label>
+          <label>Tenor
+            <select name="tenor">
+              <option value="1">M1</option><option value="2" selected>M2</option>
+              <option value="3">M3</option><option value="4">M4</option>
+              <option value="5">M5</option><option value="6">M6</option>
+            </select>
+          </label>
+          <label>Threshold
+            <input type="number" name="threshold" min="0.25" max="3" step="0.25" value="1.5"> °C
+          </label>
+        </form>
+        <div class="actions">
+          <button class="btn primary" id="backtest-run" type="button">Run backtest as job</button>
+          <span class="note" id="backtest-note"></span>
+        </div>
+      </div>
+      <div id="backtest-result" hidden>
+        <div class="panel">
+          <div class="panel-head">
+            <span class="label">P&amp;L and drawdown · EUR</span>
+            <span class="caption" id="backtest-caption"></span>
+          </div>
+          <div class="tiles" id="backtest-tiles"></div>
+          <div class="chart-box"><canvas id="backtest-chart"></canvas></div>
+        </div>
+        <div class="panel flush">
+          <div class="panel-head"><span class="label">Trades</span></div>
+          <div class="table-wrap tall"><table id="backtest-trades"></table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Jobs -->
+    <section class="page" data-page="jobs" hidden>
+      <div class="page-head">
+        <h1>Jobs</h1>
+        <p>The desk's scheduled workflows. Run now starts one at once, if the platform lets you.</p>
+      </div>
+      <div class="job-cards" id="job-cards"></div>
+      <p class="error" id="jobs-error"></p>
+      <div class="panel flush">
+        <div class="panel-head">
+          <span class="label">Run history · started from this app</span>
+        </div>
+        <div class="table-wrap"><table id="history"></table></div>
+      </div>
+    </section>
+
+  </main>
+
+  <aside class="rail">
+    <div class="rail-head">
+      <span class="label">Runs</span>
+      <span class="slots" id="slots"></span>
+    </div>
+    <p class="error" id="runs-error"></p>
+    <div id="runs"><p class="empty">No runs yet. Run a scenario or a backtest as a job.</p></div>
+  </aside>
+</div>
+
+<footer class="credit">
+  <p>{{credit}}</p>
+  <p>{{notice}}</p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,8 @@
+numpy
+pandas
+requests
+ecmwf-opendata
+xarray
+cfgrib
+eccodes
+tzdata

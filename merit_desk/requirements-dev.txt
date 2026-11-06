@@ -1,0 +1,17 @@
+datatailr>=0.2.7
+numpy
+pandas
+requests
+fastapi
+uvicorn
+httpx
+xarray
+cfgrib
+eccodes
+ecmwf-opendata
+scikit-learn
+joblib
+cloudpickle
+websockets
+ipywidgets
+pytest

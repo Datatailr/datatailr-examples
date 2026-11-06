@@ -213,3 +213,6 @@ __marimo__/
 .prettierignore
 
 .idea
+
+# Merit Desk local run (merit_desk/run_local.py)
+.merit_desk_data/

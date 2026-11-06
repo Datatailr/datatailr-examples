@@ -1,0 +1,6 @@
+{
+    "name": "Merit Desk",
+    "description": "A small power trading desk on Datatailr: a daily forward curve from ECMWF forecasts, a strategy sweep that fans out, GPU training, two services, a FastAPI desk app that sends each calculation to Datatailr as a job, and an Excel add-in.",
+    "tags": ["energy", "power", "workflows", "dynamic dag", "schedules", "services", "fastapi", "excel", "gpu", "joblib", "blob storage", "secrets", "demo"],
+    "author": "Datatailr"
+}
