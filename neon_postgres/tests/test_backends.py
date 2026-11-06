@@ -17,8 +17,9 @@ from neon_postgres.s3_gateway.backends import (
 class FakeBlob:
     """Mimics ``datatailr.Blob`` with the subset the backend uses."""
 
-    def __init__(self):
+    def __init__(self, silent_on_missing=False):
         self.objects: dict[str, bytes] = {}
+        self.silent_on_missing = silent_on_missing
 
     def put_file(self, name, path):
         with open(path, "rb") as handle:
@@ -26,6 +27,9 @@ class FakeBlob:
 
     def get_file(self, name, path):
         if name not in self.objects:
+            if self.silent_on_missing:
+                open(path, "wb").close()  # some providers write an empty file for a missing object
+                return
             raise RuntimeError("dt blob cp: object not found")
         with open(path, "wb") as handle:
             handle.write(self.objects[name])
@@ -106,3 +110,16 @@ def test_datatailr_backend_maps_bucket_and_key_to_blob_paths(tmp_path):
 
     assert list(blob.objects) == ["neon/pageserver/tenants/t/index_part.json"]
     assert backend.list("neon", "pageserver/")[0].key == "pageserver/tenants/t/index_part.json"
+
+
+def test_datatailr_backend_detects_missing_object_behind_an_empty_download(tmp_path):
+    backend = DatatailrBlobBackend(blob=FakeBlob(silent_on_missing=True), concurrency=1)
+    with pytest.raises(NotFound):
+        backend.download("neon", "neon-postgres/state.json", str(tmp_path / "state.json"))
+
+    # A real empty object is still returned as such.
+    empty = tmp_path / "empty"
+    empty.write_bytes(b"")
+    backend.upload("neon", "empty", str(empty))
+    backend.download("neon", "empty", str(tmp_path / "out"))
+    assert (tmp_path / "out").read_bytes() == b""

@@ -179,14 +179,21 @@ class DatatailrBlobBackend:
             self._blob.put_file(self._name(bucket, key), src_path)
 
     def download(self, bucket: str, key: str, dst_path: str) -> None:
+        """Download to ``dst_path``.
+
+        Depending on the cloud provider, ``dt blob cp`` of a missing object either
+        fails or silently writes an empty file, so both outcomes are checked
+        against ``exists`` before they are reported as NotFound.
+        """
         name = self._name(bucket, key)
         with self._gate:
             try:
                 self._blob.get_file(name, dst_path)
+                failed = os.path.getsize(dst_path) == 0
             except Exception:
-                if not self._blob.exists(name):
-                    raise NotFound(key) from None
-                raise
+                failed = True
+            if failed and not self._blob.exists(name):
+                raise NotFound(key)
 
     def stat(self, bucket: str, key: str) -> ObjectInfo | None:
         name = self._name(bucket, key)
