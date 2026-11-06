@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from neon_postgres.explorer import actions
+from neon_postgres.explorer.app import app
 
 
 def test_identifiers_are_quoted():
@@ -54,3 +56,20 @@ def test_build_validates():
         actions.build("drop_schema", {"bogus": 1})
     with pytest.raises(ValueError):
         actions.build("create_schema", {"name": "  "})
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_page_carries_the_platform_prefix_as_base_href():
+    transport = httpx.ASGITransport(app=app, root_path="/job/dev/neon-postgres-explorer")
+    async with httpx.AsyncClient(transport=transport, base_url="http://explorer") as client:
+        page = (await client.get("/")).text
+    assert '<base href="/job/dev/neon-postgres-explorer/">' in page
+    assert 'href="static/style.css"' in page
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://explorer") as client:
+        assert '<base href="/">' in (await client.get("/")).text

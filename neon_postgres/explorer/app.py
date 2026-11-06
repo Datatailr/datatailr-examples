@@ -14,7 +14,7 @@ from typing import Any
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from neon_postgres.explorer import actions, db, services
@@ -55,8 +55,16 @@ def _guard(func, *args, **kwargs) -> Any:
 
 
 @app.get("/", include_in_schema=False)
-def index():
-    return FileResponse(STATIC_DIR / "index.html")
+def index(request: Request):
+    """The page, with a <base href> for the prefix the platform serves the app under.
+
+    On Datatailr the app runs with uvicorn's root path set to /job/<env>/<name>;
+    locally the root path is empty. All links and API calls in the page are
+    relative to that base.
+    """
+    base = request.scope.get("root_path", "").rstrip("/") + "/"
+    html = (STATIC_DIR / "index.html").read_text().replace("__BASE__", base)
+    return HTMLResponse(html)
 
 
 @app.get("/health", response_class=PlainTextResponse, summary="Health check")

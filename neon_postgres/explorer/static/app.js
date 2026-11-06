@@ -9,7 +9,9 @@ const state = { connection: null, current: null, schemas: [] };
 /* ---------- helpers */
 
 async function api(path, body) {
-  const response = await fetch(path, {
+  // Paths are relative: the platform serves the app under /job/<env>/<name>/ and
+  // the page carries a <base href> for it.
+  const response = await fetch(path.replace(/^\//, ""), {
     method: body === undefined ? "GET" : "POST",
     headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
