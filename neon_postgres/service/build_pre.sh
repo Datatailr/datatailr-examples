@@ -43,6 +43,36 @@ crane export --platform "linux/${ARCH}" "ghcr.io/neondatabase/compute-node-v${PG
 
 rm -f /usr/local/bin/crane
 
+# compute_ctl raises the core dump limit to unlimited and aborts with EPERM when the
+# container's hard limit is finite, as it is on Datatailr nodes. This shim, preloaded
+# into compute_ctl only, turns that one failure into success.
+apt-get install -y gcc libc6-dev
+mkdir -p "${NEON_DIR}/lib"
+cat > /tmp/setrlimit_shim.c <<'CSRC'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <sys/resource.h>
+
+int setrlimit(__rlimit_resource_t res, const struct rlimit *lim)
+{
+	static int (*real)(__rlimit_resource_t, const struct rlimit *) = 0;
+	if (!real)
+		real = dlsym(RTLD_NEXT, "setrlimit");
+	int rc = real(res, lim);
+	if (rc != 0 && res == RLIMIT_CORE && errno == EPERM)
+		return 0;
+	return rc;
+}
+
+int setrlimit64(__rlimit_resource_t res, const struct rlimit64 *lim)
+{
+	return setrlimit(res, (const struct rlimit *)lim);
+}
+CSRC
+gcc -shared -fPIC -O2 -o "${NEON_DIR}/lib/setrlimit_shim.so" /tmp/setrlimit_shim.c -ldl
+rm -f /tmp/setrlimit_shim.c
+
 for binary in bin/pageserver bin/safekeeper bin/storage_broker bin/compute_ctl "v${PG_VERSION}/bin/postgres"; do
 	if ldd "${NEON_DIR}/${binary}" | grep -q "not found"; then
 		echo "missing shared libraries for ${binary}:" >&2

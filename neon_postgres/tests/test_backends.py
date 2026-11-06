@@ -25,14 +25,12 @@ class FakeBlob:
         with open(path, "rb") as handle:
             self.objects[name] = handle.read()
 
-    def get_file(self, name, path):
+    def get(self, name):
         if name not in self.objects:
             if self.silent_on_missing:
-                open(path, "wb").close()  # some providers write an empty file for a missing object
-                return
-            raise RuntimeError("dt blob cp: object not found")
-        with open(path, "wb") as handle:
-            handle.write(self.objects[name])
+                return b""  # some versions return nothing for a missing object
+            raise RuntimeError("dt blob get: object not found")
+        return self.objects[name]
 
     def exists(self, name):
         # Deliberately unusable: the real CLI answer is plain text and the backend

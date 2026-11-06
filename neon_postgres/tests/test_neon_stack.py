@@ -14,6 +14,7 @@ from neon_postgres.service.neon_stack import (
     NeonConfig,
     TenantState,
     compute_ctl_args,
+    compute_ctl_preload,
     compute_spec,
     pageserver_toml,
     safekeeper_args,
@@ -29,6 +30,7 @@ def test_pageserver_config_points_at_the_gateway():
     assert "control_plane_emergency_mode=true" in toml
     assert "control_plane_api='http://127.0.0.1:9100/'" in toml
     assert "checkpoint_timeout='30s'" in toml
+    assert "compaction_target_size=67108864" in toml
 
 
 def test_safekeeper_uploads_wal_through_the_gateway():
@@ -102,3 +104,15 @@ def test_unreadable_state_file_is_an_error_not_a_new_tenant(tmp_path):
     backend.upload("neon", STATE_KEY, str(bad))
     with pytest.raises(RuntimeError, match="not valid JSON"):
         TenantState.load(backend, "neon")
+
+
+def test_core_limit_shim_is_used_only_when_needed(tmp_path):
+    import resource
+
+    cfg = NeonConfig(bin_dir=str(tmp_path))
+    assert compute_ctl_preload(cfg, resource.RLIM_INFINITY) is None
+    assert compute_ctl_preload(cfg, 0) is None  # shim not built
+    cfg.setrlimit_shim.parent.mkdir()
+    cfg.setrlimit_shim.write_bytes(b"")
+    assert compute_ctl_preload(cfg, 0) == str(cfg.setrlimit_shim)
+    assert compute_ctl_preload(cfg, resource.RLIM_INFINITY) is None

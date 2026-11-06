@@ -161,7 +161,7 @@ class DatatailrBlobBackend:
     """Objects live at ``<bucket>/<key>`` in the user's Datatailr blob storage.
 
     ``blob`` is a ``datatailr.Blob`` instance (or anything with the same
-    ``put_file`` / ``get_file`` / ``delete`` / ``ls`` methods).
+    ``put_file`` / ``get`` / ``delete`` / ``ls`` methods).
     Each call runs the ``dt`` CLI, so ``concurrency`` bounds how many run at once.
     """
 
@@ -193,29 +193,31 @@ class DatatailrBlobBackend:
             self._blob.put_file(self._name(bucket, key), src_path)
 
     def download(self, bucket: str, key: str, dst_path: str) -> None:
-        """Download to ``dst_path``.
+        """Download to ``dst_path`` through ``Blob.get`` (the object's bytes on stdout).
 
-        Depending on the cloud provider, ``dt blob cp`` of a missing object either
-        fails or silently writes an empty file. Both outcomes are checked against
-        the structured listing (not ``exists``, whose plain-text answer is easy to
-        misread) before they are reported as NotFound.
+        ``Blob.get_file`` is not used: inside a job it goes through the platform's
+        remote client, and on some versions the destination file ends up empty.
+        A missing object either raises or comes back empty, so both outcomes are
+        checked against the structured listing before they are reported as NotFound.
         """
         name = self._name(bucket, key)
         with self._gate:
             try:
-                self._blob.get_file(name, dst_path)
+                data = self._blob.get(name)
                 error = None
             except Exception as exc:
-                error = exc
-        size = os.path.getsize(dst_path) if os.path.exists(dst_path) else 0
-        if error is None and size > 0:
+                data, error = b"", exc
+        if error is None and data:
+            with open(dst_path, "wb") as handle:
+                handle.write(data)
             return
         info = self.stat(bucket, key)
         if info is None:
             raise NotFound(key)
         if error is not None:
             raise error
-        log.warning("downloaded %s as %d bytes while the listing reports %d bytes", name, size, info.size)
+        log.warning("downloaded %s as 0 bytes while the listing reports %d bytes", name, info.size)
+        open(dst_path, "wb").close()
 
     def stat(self, bucket: str, key: str) -> ObjectInfo | None:
         name = self._name(bucket, key)

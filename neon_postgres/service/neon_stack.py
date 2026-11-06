@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import resource
 import secrets
 import signal
 import subprocess
@@ -71,6 +72,7 @@ class NeonConfig:
     partial_backup_timeout: str = "1m"
     checkpoint_timeout: str = "1m"
     checkpoint_distance: int = 64 * 1024 * 1024
+    compaction_target_size: int = 64 * 1024 * 1024
     extra_settings: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -90,6 +92,7 @@ class NeonConfig:
             partial_backup_timeout=env.get("NEON_PARTIAL_BACKUP_TIMEOUT", cls.partial_backup_timeout),
             checkpoint_timeout=env.get("NEON_CHECKPOINT_TIMEOUT", cls.checkpoint_timeout),
             checkpoint_distance=int(env.get("NEON_CHECKPOINT_DISTANCE", cls.checkpoint_distance)),
+            compaction_target_size=int(env.get("NEON_COMPACTION_TARGET_SIZE", cls.compaction_target_size)),
         )
 
     @property
@@ -98,6 +101,10 @@ class NeonConfig:
 
     def binary(self, name: str) -> str:
         return str(Path(self.bin_dir) / "bin" / name)
+
+    @property
+    def setrlimit_shim(self) -> Path:
+        return Path(self.bin_dir) / "lib" / "setrlimit_shim.so"
 
     @property
     def gateway_url(self) -> str:
@@ -165,6 +172,9 @@ def pageserver_toml(cfg: NeonConfig) -> str:
             "[tenant_config]",
             f"checkpoint_timeout='{cfg.checkpoint_timeout}'",
             f"checkpoint_distance={cfg.checkpoint_distance}",
+            # Blob transfers through the platform's remote client are capped at 100 MB,
+            # so no layer file may grow past that.
+            f"compaction_target_size={cfg.compaction_target_size}",
             "",
         ]
     )
@@ -228,6 +238,18 @@ def compute_spec(cfg: NeonConfig, state: TenantState) -> dict:
         },
         "compute_ctl_config": {"jwks": COMPUTE_CTL_JWKS},
     }
+
+
+def compute_ctl_preload(cfg: NeonConfig, hard_core_limit: int) -> str | None:
+    """The LD_PRELOAD compute_ctl needs, or None.
+
+    compute_ctl raises the core dump limit to unlimited and aborts with EPERM when
+    the container's hard limit is finite, which is the case on Datatailr nodes.
+    The shim built by build_pre.sh turns that one failure into success.
+    """
+    if hard_core_limit == resource.RLIM_INFINITY or not cfg.setrlimit_shim.is_file():
+        return None
+    return str(cfg.setrlimit_shim)
 
 
 def compute_ctl_args(cfg: NeonConfig, datadir: Path, spec_path: Path) -> list[str]:
@@ -306,9 +328,13 @@ class NeonStack:
         )
         return env
 
-    def _spawn(self, name: str, args: list[str], cwd: Path | None = None) -> subprocess.Popen:
+    def _spawn(
+        self, name: str, args: list[str], cwd: Path | None = None, extra_env: dict[str, str] | None = None
+    ) -> subprocess.Popen:
         log.info("starting %s: %s", name, " ".join(args))
-        process = subprocess.Popen(args, cwd=cwd, env=self.child_env())
+        env = self.child_env()
+        env.update(extra_env or {})
+        process = subprocess.Popen(args, cwd=cwd, env=env)
         with self._lock:
             self.processes[name] = process
         return process
@@ -439,7 +465,16 @@ class NeonStack:
         datadir.mkdir(exist_ok=True)
         spec_path = datadir / "spec.json"
         spec_path.write_text(json.dumps(compute_spec(self.cfg, self.state), indent=2))
-        self._spawn("compute_ctl", compute_ctl_args(self.cfg, datadir, spec_path), cwd=datadir)
+        hard_core_limit = resource.getrlimit(resource.RLIMIT_CORE)[1]
+        preload = compute_ctl_preload(self.cfg, hard_core_limit)
+        if preload:
+            log.info("hard core dump limit is %s, preloading %s for compute_ctl", hard_core_limit, preload)
+        self._spawn(
+            "compute_ctl",
+            compute_ctl_args(self.cfg, datadir, spec_path),
+            cwd=datadir,
+            extra_env={"LD_PRELOAD": preload} if preload else None,
+        )
         wait_for("postgres", self.postgres_ready, timeout=300, abort=self._abort_reason)
 
     def postgres_ready(self) -> bool:
