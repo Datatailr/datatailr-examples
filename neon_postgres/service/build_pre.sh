@@ -1,0 +1,54 @@
+#!/bin/bash
+# Install the Neon binaries into the job image.
+#
+# Neon ships Docker images, not binary tarballs, so this script pulls the image
+# filesystems with crane (no Docker daemon needed) and copies out:
+#   - pageserver, safekeeper, storage_broker and a Postgres build with the neon
+#     extension from ghcr.io/neondatabase/neon
+#   - compute_ctl from ghcr.io/neondatabase/compute-node-v<PG_VERSION>
+# Binaries land in /opt/neon/bin, Postgres in /opt/neon/v<PG_VERSION>.
+# Override NEON_TAG / NEON_PG_VERSION to pin versions.
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+NEON_TAG="${NEON_TAG:-latest}"
+PG_VERSION="${NEON_PG_VERSION:-17}"
+CRANE_VERSION="${CRANE_VERSION:-v0.22.1}"
+NEON_DIR=/opt/neon
+
+apt-get update
+# curl + ca-certificates for the download; the rest are runtime libraries of the Neon binaries.
+apt-get install -y curl ca-certificates libreadline8 libseccomp2 openssl libicu76 zlib1g
+
+ARCH="$(dpkg --print-architecture)"
+case "${ARCH}" in
+	amd64) CRANE_ARCH=x86_64 ;;
+	arm64) CRANE_ARCH=arm64 ;;
+	*) echo "unsupported architecture: ${ARCH}" >&2; exit 1 ;;
+esac
+
+curl -sSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_${CRANE_ARCH}.tar.gz" \
+	| tar -xz -C /usr/local/bin crane
+
+mkdir -p "${NEON_DIR}"
+
+echo "Extracting pageserver, safekeeper, storage_broker and Postgres ${PG_VERSION} from ghcr.io/neondatabase/neon:${NEON_TAG}"
+crane export --platform "linux/${ARCH}" "ghcr.io/neondatabase/neon:${NEON_TAG}" - \
+	| tar -x -C "${NEON_DIR}" --strip-components=2 \
+		usr/local/bin/pageserver usr/local/bin/safekeeper usr/local/bin/storage_broker "usr/local/v${PG_VERSION}"
+
+echo "Extracting compute_ctl from ghcr.io/neondatabase/compute-node-v${PG_VERSION}:${NEON_TAG}"
+crane export --platform "linux/${ARCH}" "ghcr.io/neondatabase/compute-node-v${PG_VERSION}:${NEON_TAG}" - \
+	| tar -x -C "${NEON_DIR}" --strip-components=2 usr/local/bin/compute_ctl
+
+rm -f /usr/local/bin/crane
+
+for binary in bin/pageserver bin/safekeeper bin/storage_broker bin/compute_ctl "v${PG_VERSION}/bin/postgres"; do
+	if ldd "${NEON_DIR}/${binary}" | grep -q "not found"; then
+		echo "missing shared libraries for ${binary}:" >&2
+		ldd "${NEON_DIR}/${binary}" | grep "not found" >&2
+		exit 1
+	fi
+done
+"${NEON_DIR}/bin/pageserver" --version
+"${NEON_DIR}/v${PG_VERSION}/bin/postgres" --version

@@ -1,0 +1,6 @@
+{
+    "name": "Neon Postgres",
+    "description": "Postgres as a Datatailr service: self-hosted Neon with its durable state in Datatailr blob storage, through a local S3 gateway.",
+    "tags": ["postgres", "neon", "blob", "service", "database"],
+    "author": "Datatailr"
+}
