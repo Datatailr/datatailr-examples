@@ -107,7 +107,7 @@ safekeepers on separate machines, which a Datatailr service cannot provide.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `NEON_PG_PASSWORD` | `cloud_admin` | Password of the `cloud_admin` superuser |
+| `NEON_PG_PASSWORD` | `cloud_admin` | Password of the `cloud_admin` superuser. Set your own, see Deployment. |
 | `NEON_BUCKET` | `neon` | Directory in blob storage that holds this database |
 | `NEON_PG_PORT` | `5432` | Postgres port |
 | `NEON_SHARED_BUFFERS` | `256MB` | Postgres `shared_buffers` |
@@ -123,10 +123,17 @@ The image build downloads about 2 GB of Neon images with
 [crane](https://github.com/google/go-containerregistry) and copies the
 binaries into `/opt/neon`. Expect the first build to take several minutes.
 
+Set a password before you deploy. `NEON_PG_PASSWORD` becomes the password of
+the `cloud_admin` superuser, and every job in the environment can reach the
+database on port 5432. If you do not set it, the password is `cloud_admin`,
+which anyone who reads this README knows. The deploy script prints a warning
+in that case. The value is stored in the job definition on the platform, where
+other users with access to the job can read it.
+
 From this directory, run:
 
 ```bash
-NEON_PG_PASSWORD=change-me python deploy.py
+NEON_PG_PASSWORD='a-long-random-password' python deploy.py
 ```
 
 The service appears on the platform as **Neon Postgres**. Its status API is
@@ -138,7 +145,7 @@ connections, and `/` returns the tenant, timeline and generation.
 Other jobs in the same environment reach Postgres by the service hostname on
 port 5432. The hostname is the service name in lowercase with hyphens. The
 user is `cloud_admin` and the password is the `NEON_PG_PASSWORD` value from
-the deploy, `cloud_admin` if you did not set one. To read it back later:
+the deploy. To read it back later:
 
 ```bash
 dt job get neon-postgres --json | grep NEON_PG_PASSWORD
@@ -151,7 +158,7 @@ with psycopg.connect(
     host="neon-postgres",
     port=5432,
     user="cloud_admin",
-    password="cloud_admin",  # the NEON_PG_PASSWORD you deployed with
+    password="a-long-random-password",  # the NEON_PG_PASSWORD you deployed with
     dbname="postgres",
 ) as conn:
     conn.execute("CREATE TABLE IF NOT EXISTS t(id int primary key, v text)")
