@@ -3,7 +3,9 @@
 This example runs a Postgres database as a Datatailr service. A service has no
 persistent disk, so the database keeps its durable state in Datatailr blob
 storage. It does this with [Neon](https://github.com/neondatabase/neon), an
-open source Postgres whose storage layer writes to object storage.
+open source Postgres whose storage layer writes to object storage. A second
+job, the Neon Postgres Explorer, is a web app to run queries against such a
+database and manage its schemas, tables and indexes.
 
 Neon speaks the S3 API. Datatailr blob storage speaks the `dt blob` API. A
 small S3 gateway inside the service container translates between the two.
@@ -29,7 +31,13 @@ neon_postgres/
 │   ├── service.py      # main(port): gateway + Neon stack + status API
 │   ├── neon_stack.py   # starts broker, safekeeper, pageserver and compute
 │   └── build_pre.sh    # copies the Neon binaries into the job image
-├── tests/              # gateway tests with boto3, config and state tests
+├── explorer/
+│   ├── app.py          # FastAPI app: query, metadata and management endpoints
+│   ├── db.py           # catalog queries with psycopg
+│   ├── actions.py      # management actions rendered as SQL
+│   ├── services.py     # finds Neon Postgres services on the platform
+│   └── static/         # the single-page UI
+├── tests/              # gateway tests with boto3, config, state and explorer tests
 ├── deploy.py
 ├── requirements.txt
 └── requirements-dev.txt
@@ -78,6 +86,26 @@ which lives on local disk only, and the pageserver's in-memory position of the
 previous WAL record, which Postgres needs before it writes anything. A branch
 point is the one place where Postgres may start without it. The old timeline
 stays as the ancestor of the new one, so every restart adds one branch.
+
+### The explorer (`explorer/`)
+
+A FastAPI app with a single-page UI, deployed as the **Neon Postgres
+Explorer** app. The connection panel lists the Neon Postgres services found
+on the platform (every service whose status API reports a tenant), or takes a
+host, port, database, user and password by hand. The browser keeps the
+connection details and sends them with every request, so the app holds no
+state and several people can use it against different databases.
+
+- Query tab: run SQL with Ctrl+Enter, see the result set as a table, the
+  status line, timing and errors. Every statement runs with autocommit.
+- Table tab: columns, indexes, constraints, the view definition and sample
+  rows of the relation picked in the sidebar.
+- Management: create schema, create table, add, rename or drop a column,
+  create or drop an index, rename, comment, truncate or drop a relation, drop a
+  schema. Each action renders its SQL into the query editor with properly
+  quoted identifiers, and nothing runs until you press Run.
+- Server tab: version, size, and the databases on the server. Click one to
+  reconnect to it.
 
 ### Durability
 
@@ -142,9 +170,14 @@ From this directory, run:
 NEON_BUCKET=my-database NEON_PG_PASSWORD='a-long-random-password' python deploy.py
 ```
 
+This deploys both jobs. `python deploy.py service` deploys the database only
+and `python deploy.py explorer` the app only; the app needs no variables.
+
 The service appears on the platform as **Neon Postgres**. Its status API is
 served on the platform port: `/health` returns `OK` once Postgres accepts
-connections, and `/` returns the tenant, timeline and generation.
+connections, and `/` returns the tenant, timeline and generation. The app
+appears as **Neon Postgres Explorer** in the apps section; open it, pick the
+service, enter the password and connect.
 
 ## Connecting from another job
 
@@ -208,11 +241,24 @@ Wait until `curl localhost:8080/health` prints `OK`, then connect with
 some rows, wait a minute for the upload, kill the container, start it again
 with the same volume, and the rows are still there.
 
+## Running the explorer locally
+
+With the Docker container above running, start the app and point it at
+`127.0.0.1:5432`:
+
+```bash
+pip install -r neon_postgres/explorer/requirements.txt
+uvicorn neon_postgres.explorer.app:app --reload
+```
+
 ## Tests
 
 ```bash
-pip install -r neon_postgres/requirements.txt -r neon_postgres/requirements-dev.txt
+pip install -r neon_postgres/requirements.txt -r neon_postgres/explorer/requirements.txt -r neon_postgres/requirements-dev.txt
 python -m pytest neon_postgres/tests
+NEON_TEST_DSN=postgresql://cloud_admin:cloud_admin@localhost:5432/postgres python -m pytest neon_postgres/tests
 ```
 
 The gateway tests drive it with boto3, the same way a real S3 client would.
+The explorer API tests need a running Postgres and are skipped unless
+`NEON_TEST_DSN` is set.

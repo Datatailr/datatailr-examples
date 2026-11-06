@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Postgres Explorer</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<header>
+  <strong>Neon Postgres Explorer</strong>
+  <span id="conn-status" class="muted">not connected</span>
+</header>
+
+<div id="layout">
+  <aside id="sidebar">
+    <section id="connection">
+      <h2>Connection</h2>
+      <label>Service
+        <select id="service-select">
+          <option value="">type the host below</option>
+        </select>
+      </label>
+      <label>Host <input id="host" placeholder="neon-postgres" autocomplete="off"></label>
+      <div class="row">
+        <label>Port <input id="port" value="5432" size="5"></label>
+        <label>Database <input id="dbname" value="postgres"></label>
+      </div>
+      <label>User <input id="user" value="cloud_admin"></label>
+      <label>Password <input id="password" type="password"></label>
+      <div class="row">
+        <button id="connect-btn">Connect</button>
+        <button id="refresh-services" class="secondary" title="Look for database services on the platform">Find services</button>
+      </div>
+      <p id="connect-msg" class="msg"></p>
+    </section>
+
+    <section id="browser" hidden>
+      <h2>Schemas <button id="new-schema" class="small secondary" title="Create a schema">+</button></h2>
+      <ul id="schema-list" class="tree"></ul>
+    </section>
+  </aside>
+
+  <main>
+    <nav id="tabs">
+      <button data-tab="query" class="active">Query</button>
+      <button data-tab="relation">Table</button>
+      <button data-tab="server">Server</button>
+    </nav>
+
+    <section id="tab-query" class="tab">
+      <textarea id="sql" placeholder="select now();" spellcheck="false"></textarea>
+      <div class="row toolbar">
+        <button id="run-btn">Run (Ctrl+Enter)</button>
+        <label class="inline">Row limit <input id="limit" value="1000" size="6"></label>
+        <span id="query-msg" class="msg"></span>
+      </div>
+      <div id="results" class="table-wrap"></div>
+    </section>
+
+    <section id="tab-relation" class="tab" hidden>
+      <p class="muted" id="relation-empty">Pick a table or view in the sidebar.</p>
+      <div id="relation-view" hidden>
+        <h2 id="relation-title"></h2>
+        <p id="relation-meta" class="muted"></p>
+        <div class="row toolbar" id="relation-actions">
+          <button data-action="select">Select rows</button>
+          <button data-action="add-column" class="secondary">Add column</button>
+          <button data-action="create-index" class="secondary">Create index</button>
+          <button data-action="rename" class="secondary">Rename</button>
+          <button data-action="comment" class="secondary">Comment</button>
+          <button data-action="truncate" class="danger">Truncate</button>
+          <button data-action="drop" class="danger">Drop</button>
+        </div>
+        <h3>Columns</h3>
+        <div id="relation-columns" class="table-wrap"></div>
+        <h3>Indexes</h3>
+        <div id="relation-indexes" class="table-wrap"></div>
+        <h3>Constraints</h3>
+        <div id="relation-constraints" class="table-wrap"></div>
+        <div id="relation-definition-wrap" hidden>
+          <h3>Definition</h3>
+          <pre id="relation-definition"></pre>
+        </div>
+        <h3>Sample rows</h3>
+        <div id="relation-sample" class="table-wrap"></div>
+      </div>
+    </section>
+
+    <section id="tab-server" class="tab" hidden>
+      <h2>Server</h2>
+      <div id="server-info" class="table-wrap"></div>
+      <h3>Databases</h3>
+      <div id="databases" class="table-wrap"></div>
+    </section>
+  </main>
+</div>
+
+<dialog id="dialog">
+  <form method="dialog" id="dialog-form">
+    <h2 id="dialog-title"></h2>
+    <div id="dialog-body"></div>
+    <div class="row toolbar">
+      <button value="ok">Put SQL in editor</button>
+      <button value="cancel" class="secondary" type="button" id="dialog-cancel">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="static/app.js"></script>
+</body>
+</html>
