@@ -117,12 +117,9 @@ setting bounds that window and defaults to one minute:
 |---|---|---|
 | `NEON_CHECKPOINT_TIMEOUT` | `1m` | How long the pageserver waits before it flushes and uploads a layer |
 | `NEON_CHECKPOINT_DISTANCE` | `67108864` | Bytes of WAL after which it flushes and uploads anyway |
-| `NEON_COMPACTION_TARGET_SIZE` | `67108864` | Largest layer file compaction may produce |
 | `NEON_PARTIAL_BACKUP_TIMEOUT` | `1m` | How long the safekeeper waits before it uploads a partial WAL segment |
 
-Lower values mean more calls to blob storage. Inside a job, blob transfers go
-through the platform's remote client, which caps one transfer at 100 MB, so
-the two size settings must stay below that. The safekeeper also uploads its
+Lower values mean more calls to blob storage. The safekeeper also uploads its
 WAL to the bucket, but this example does not replay that WAL on restart. Neon's
 own recovery test (`test_s3_wal_replay`) shows how to do that, and it would
 shrink the window to the safekeeper upload interval.

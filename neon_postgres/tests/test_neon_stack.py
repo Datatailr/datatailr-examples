@@ -30,7 +30,6 @@ def test_pageserver_config_points_at_the_gateway():
     assert "control_plane_emergency_mode=true" in toml
     assert "control_plane_api='http://127.0.0.1:9100/'" in toml
     assert "checkpoint_timeout='30s'" in toml
-    assert "compaction_target_size=67108864" in toml
 
 
 def test_safekeeper_uploads_wal_through_the_gateway():

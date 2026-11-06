@@ -72,7 +72,6 @@ class NeonConfig:
     partial_backup_timeout: str = "1m"
     checkpoint_timeout: str = "1m"
     checkpoint_distance: int = 64 * 1024 * 1024
-    compaction_target_size: int = 64 * 1024 * 1024
     extra_settings: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -96,7 +95,6 @@ class NeonConfig:
             partial_backup_timeout=env.get("NEON_PARTIAL_BACKUP_TIMEOUT", cls.partial_backup_timeout),
             checkpoint_timeout=env.get("NEON_CHECKPOINT_TIMEOUT", cls.checkpoint_timeout),
             checkpoint_distance=int(env.get("NEON_CHECKPOINT_DISTANCE", cls.checkpoint_distance)),
-            compaction_target_size=int(env.get("NEON_COMPACTION_TARGET_SIZE", cls.compaction_target_size)),
         )
 
     @property
@@ -176,9 +174,6 @@ def pageserver_toml(cfg: NeonConfig) -> str:
             "[tenant_config]",
             f"checkpoint_timeout='{cfg.checkpoint_timeout}'",
             f"checkpoint_distance={cfg.checkpoint_distance}",
-            # Blob transfers through the platform's remote client are capped at 100 MB,
-            # so no layer file may grow past that.
-            f"compaction_target_size={cfg.compaction_target_size}",
             "",
         ]
     )
