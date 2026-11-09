@@ -7,7 +7,7 @@ so the app holds no state between requests.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
 
@@ -19,6 +19,9 @@ SYSTEM_SCHEMAS = ("pg_catalog", "information_schema", "pg_toast")
 DEFAULT_ROW_LIMIT = 1000
 
 
+APPLICATION_NAME = "neon-postgres-explorer"
+
+
 @dataclass(frozen=True)
 class ConnectionInfo:
     host: str
@@ -26,9 +29,17 @@ class ConnectionInfo:
     dbname: str = "postgres"
     user: str = "cloud_admin"
     password: str = ""
+    # True when the browser asked to connect as the platform user who is using
+    # the explorer. The app then fills in ``user`` and ``password`` itself, from
+    # the X-Datatailr-User header and the shared role secret.
+    as_user: bool = False
+    # Sent to Postgres as application_name, so the server log attributes every
+    # statement to the platform user behind the explorer. Set by the server from
+    # the request, never from the browser.
+    application_name: str = APPLICATION_NAME
 
     @classmethod
-    def from_dict(cls, data: dict) -> "ConnectionInfo":
+    def from_dict(cls, data: dict, platform_user: str | None = None) -> "ConnectionInfo":
         host = str(data.get("host", "")).strip()
         if not host:
             raise ValueError("host is required")
@@ -38,10 +49,15 @@ class ConnectionInfo:
             dbname=str(data.get("dbname") or "postgres"),
             user=str(data.get("user") or "cloud_admin"),
             password=str(data.get("password") or ""),
+            as_user=bool(data.get("as_user", False)),
+            application_name=application_name(platform_user),
         )
 
+    def for_user(self, username: str, password: str) -> "ConnectionInfo":
+        return replace(self, user=username, password=password, as_user=False)
+
     def connect(self, autocommit: bool = True) -> psycopg.Connection:
-        return psycopg.connect(
+        conn = psycopg.connect(
             host=self.host,
             port=self.port,
             dbname=self.dbname,
@@ -49,8 +65,28 @@ class ConnectionInfo:
             password=self.password,
             connect_timeout=10,
             autocommit=autocommit,
-            application_name="neon-postgres-explorer",
+            application_name=self.application_name,
         )
+        # Log every statement of this session, whatever the server-wide
+        # log_statement is: the explorer's statements are the ones a person typed.
+        # Only a superuser can raise the level; other roles keep the server's.
+        try:
+            conn.execute("set log_statement = 'all'")
+        except psycopg.errors.InsufficientPrivilege:
+            conn.rollback()
+        return conn
+
+
+def application_name(platform_user: str | None) -> str:
+    """``neon-postgres-explorer:<user>`` for a platform user, the bare name otherwise.
+
+    Postgres truncates application_name at 63 bytes and replaces characters
+    outside printable ASCII with ``?``, so long or unusual names are cut here.
+    """
+    if not platform_user:
+        return APPLICATION_NAME
+    user = "".join(ch for ch in platform_user if 32 < ord(ch) < 127)
+    return f"{APPLICATION_NAME}:{user}"[:63]
 
 
 def jsonable(value: Any) -> Any:

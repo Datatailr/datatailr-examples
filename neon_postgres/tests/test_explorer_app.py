@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from urllib.parse import urlparse
 
@@ -179,3 +180,16 @@ async def test_errors_are_reported(client):
 
     no_host = await client.post("/api/connect", json={"connection": {"host": ""}})
     assert no_host.status_code == 400
+
+
+@pytest.mark.anyio
+async def test_platform_user_is_visible_to_the_server(client):
+    """The statement log attributes a query to the application name, which carries the platform user."""
+    header = {"x-datatailr-user": json.dumps({"name": "audit_tester"})}
+    response = await client.post(
+        "/api/query",
+        json={"connection": _connection(), "sql": "select application_name from pg_stat_activity where pid = pg_backend_pid()"},
+        headers=header,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["rows"] == [["neon-postgres-explorer:audit_tester"]]
