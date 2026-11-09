@@ -952,9 +952,50 @@ async function loadDatabases() {
   });
 }
 
+/* ---------- audit tab */
+
+const AUDIT_COLUMNS = ["time", "platform_user", "user", "database", "host", "kind", "sql"];
+let auditRows = [];
+
+function renderAudit() {
+  const needle = $("audit-filter").value.trim().toLowerCase();
+  const rows = needle
+    ? auditRows.filter((r) => AUDIT_COLUMNS.some((c) => String(r[c] ?? "").toLowerCase().includes(needle)))
+    : auditRows;
+  renderTable($("audit-rows"), AUDIT_COLUMNS, rows.map((r) => AUDIT_COLUMNS.map((c) => r[c])));
+  setMsg($("audit-msg"), `${rows.length} of ${auditRows.length} statement(s)`, "ok");
+}
+
+async function loadAudit() {
+  if (!state.connection) {
+    setMsg($("audit-msg"), "connect first", "error");
+    return;
+  }
+  // The service log is read by job name, which is the hostname of a platform service.
+  const service = state.connection.host;
+  setMsg($("audit-msg"), `reading the log of ${service}…`);
+  try {
+    const { statements } = await api("/api/audit", { service, lines: Number($("audit-lines").value) || 2000 });
+    auditRows = statements;
+    renderAudit();
+  } catch (err) {
+    auditRows = [];
+    renderTable($("audit-rows"), [], []);
+    setMsg($("audit-msg"), err.message, "error");
+  }
+}
+
+$("audit-refresh").addEventListener("click", loadAudit);
+$("audit-filter").addEventListener("input", renderAudit);
+
 /* ---------- tabs and startup */
 
-document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
+document.querySelectorAll("#tabs button").forEach((b) =>
+  b.addEventListener("click", () => {
+    showTab(b.dataset.tab);
+    if (b.dataset.tab === "audit" && !auditRows.length) loadAudit();
+  })
+);
 
 (async function start() {
   renderHistory();

@@ -52,6 +52,10 @@ def test_compute_spec_wires_tenant_timeline_and_password():
     assert settings["listen_addresses"] == "0.0.0.0"
     assert settings["shared_preload_libraries"] == "neon"
     assert settings["neon.safekeepers"] == "127.0.0.1:5454"
+    # The audit trail: DDL and writes are logged with who ran them.
+    assert settings["log_statement"] == "mod"
+    assert settings["log_connections"] == "on"
+    assert settings["log_line_prefix"] == "%m [%p] user=%u db=%d app=%a host=%h "
 
     role = spec["spec"]["cluster"]["roles"][0]
     assert role["name"] == "app"
@@ -93,6 +97,18 @@ def test_config_from_env(monkeypatch):
     assert cfg.bucket == "mydb"
     assert cfg.checkpoint_distance == 1024
     assert cfg.pg_dir == Path("/opt/neon/v17")
+    assert cfg.log_statement == "mod"
+
+
+def test_statement_logging_level_from_env(monkeypatch):
+    monkeypatch.setenv("NEON_LOG_STATEMENT", " DDL ")
+    cfg = NeonConfig.from_env()
+    assert cfg.log_statement == "ddl"
+    assert {s["name"]: s["value"] for s in compute_spec(cfg, TenantState("t" * 32, "l" * 32, 1))["spec"]["cluster"]["settings"]}["log_statement"] == "ddl"
+
+    monkeypatch.setenv("NEON_LOG_STATEMENT", "verbose")
+    with pytest.raises(ValueError, match="NEON_LOG_STATEMENT"):
+        NeonConfig.from_env()
 
 
 

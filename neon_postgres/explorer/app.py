@@ -27,7 +27,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from neon_postgres import access
-from neon_postgres.explorer import actions, db, rows, services
+from neon_postgres.explorer import actions, audit, db, rows, services
 
 log = logging.getLogger("explorer")
 
@@ -40,7 +40,7 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-def platform_user(request: Request) -> str | None:
+def platform_user(request: Request | None) -> str | None:
     """The platform user behind this request, from the X-Datatailr-User header.
 
     The header carries the signed user as JSON (``{"name": ..., "expiry": ...,
@@ -48,7 +48,7 @@ def platform_user(request: Request) -> str | None:
     datatailr SDK offers ``User.from_request`` for the same purpose; it also
     looks the user up on the platform, which this app does not need.
     """
-    raw = request.headers.get("x-datatailr-user", "").strip()
+    raw = request.headers.get("x-datatailr-user", "").strip() if request is not None else ""
     if not raw:
         return None
     if raw.startswith("{"):
@@ -60,14 +60,19 @@ def platform_user(request: Request) -> str | None:
     return raw
 
 
-def _connection(body: dict, request: Request) -> db.ConnectionInfo:
+def _connection(body: dict, request: Request | None = None) -> db.ConnectionInfo:
+    """The connection the browser sent, tagged with the platform user behind the request.
+
+    The platform user goes into ``application_name`` for the audit log. When the
+    browser asked to connect "as me", the connection also uses that user's role.
+    """
+    username = platform_user(request)
     try:
-        info = db.ConnectionInfo.from_dict(body.get("connection") or {})
+        info = db.ConnectionInfo.from_dict(body.get("connection") or {}, platform_user=username)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not info.as_user:
         return info
-    username = platform_user(request)
     if username is None:
         raise HTTPException(status_code=401, detail="no platform user: the request carries no X-Datatailr-User header")
     secret = access.role_secret()
@@ -229,6 +234,21 @@ async def action(request: Request):
         return {"sql": actions.build(str(body.get("action") or ""), dict(body.get("params") or {}))}
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/audit", summary="Recent statements from the service log, with who ran them")
+async def audit_trail(request: Request):
+    body = await request.json()
+    service = str(body.get("service") or "").strip()
+    if not service:
+        raise HTTPException(status_code=400, detail="service is required")
+    lines = max(100, min(int(body.get("lines") or audit.DEFAULT_LINES), 50_000))
+    try:
+        rows = audit.recent_statements(service, lines)
+    except Exception as exc:  # no CLI, not logged in, or no such service
+        log.info("service log unavailable for %s: %s", service, exc)
+        raise HTTPException(status_code=502, detail=f"cannot read the log of service {service!r}: {exc}") from exc
+    return {"service": service, "lines": lines, "statements": rows}
 
 
 @app.get("/api/types", summary="Column types offered by the UI")
