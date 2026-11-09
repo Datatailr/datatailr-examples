@@ -66,9 +66,9 @@ td.null { color: var(--muted); font-style: italic; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .tree { list-style: none; margin: 0; padding: 0; }
 .tree li { margin: 2px 0; }
-.tree .schema > span { cursor: pointer; font-weight: 600; }
-.tree .schema > span::before { content: "▸ "; color: var(--muted); }
-.tree .schema.open > span::before { content: "▾ "; }
+.tree .schema > span:first-child { cursor: pointer; font-weight: 600; }
+.tree .schema > span:first-child::before { content: "▸ "; color: var(--muted); }
+.tree .schema.open > span:first-child::before { content: "▾ "; }
 .tree ul { list-style: none; margin: 0 0 0 14px; padding: 0; }
 .tree .rel { cursor: pointer; padding: 1px 4px; border-radius: 3px; }
 .tree .rel:hover { background: #e8edf5; }
@@ -85,3 +85,35 @@ dialog .cols input[type=checkbox] { width: auto; }
   #layout { flex-direction: column; height: auto; }
   aside { width: auto; border-right: none; border-bottom: 1px solid var(--border); }
 }
+.subtabs { display: flex; gap: 4px; margin: 10px 0 6px; }
+.subtabs button {
+  background: var(--panel); color: var(--muted); border: 1px solid var(--border); padding: 4px 10px;
+}
+.subtabs button.active { color: var(--text); background: var(--bg); border-bottom-color: var(--bg); }
+h3 .normal { text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: 6px; }
+#grid-toolbar select, #grid-toolbar input { width: auto; }
+.spacer { flex: 1; }
+.chip {
+  display: inline-block; margin: 0 4px 0 0; padding: 2px 8px; border: 1px solid var(--border);
+  border-radius: 12px; background: var(--panel); font-size: 12px; cursor: pointer;
+}
+.chip::after { content: " ×"; color: var(--muted); }
+#grid th { cursor: pointer; user-select: none; }
+#grid th.sorted::after { content: " ▲"; color: var(--accent); }
+#grid th.sorted.desc::after { content: " ▼"; }
+#grid th.sel, #grid td.sel { width: 24px; cursor: default; }
+#grid td.editable { cursor: text; }
+#grid td.editing { padding: 0; }
+#grid td.editing input { width: 100%; min-width: 120px; border-radius: 0; border-color: var(--accent); }
+#grid tr.selected td { background: #eef3fb; }
+#grid td.changed { background: #fef9c3; }
+dialog.wide { width: 640px; }
+dialog pre { max-height: 50vh; white-space: pre-wrap; }
+dialog .fields { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 8px; align-items: center; max-height: 60vh; overflow: auto; }
+dialog .fields label { margin: 0; }
+dialog .fields input[type=checkbox] { width: auto; }
+dialog .fields .hint { font-size: 11px; color: var(--muted); }
+.msg.warn { color: #b45309; }
+.tree .schema .tools { display: none; margin-left: 6px; }
+.tree .schema:hover .tools { display: inline; }
+.tree .schema .tools button { padding: 0 5px; font-size: 11px; line-height: 16px; margin-left: 2px; }

@@ -1,10 +1,14 @@
 /* Neon Postgres Explorer front end.
  * The connection details live in this page (and sessionStorage) and are sent
- * with every API call. Management actions ask the server for the SQL, put it in
- * the editor, and the user runs it. */
+ * with every API call. Management actions ask the server for the SQL and show
+ * it in a confirmation dialog before anything runs. The data grid edits rows
+ * through parameterised endpoints. */
 
 const $ = (id) => document.getElementById(id);
-const state = { connection: null, current: null, schemas: [] };
+const state = { connection: null, current: null, schemas: [], lastResult: null, grid: null };
+const HISTORY_KEY = "neon-explorer-history";
+const HISTORY_SIZE = 30;
+const DESTRUCTIVE = ["drop_schema", "drop_relation", "truncate_table", "drop_column", "drop_index"];
 
 /* ---------- helpers */
 
@@ -31,8 +35,14 @@ function setMsg(el, text, kind) {
   el.className = "msg" + (kind ? " " + kind : "");
 }
 
-function cell(value) {
-  const td = document.createElement("td");
+function display(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function fillCell(td, value) {
+  td.className = "";
   if (value === null || value === undefined) {
     td.textContent = "null";
     td.className = "null";
@@ -50,12 +60,13 @@ function cell(value) {
   return td;
 }
 
+function cell(value) {
+  return fillCell(document.createElement("td"), value);
+}
+
 function renderTable(container, columns, rows, options = {}) {
   container.innerHTML = "";
-  if (!columns.length) {
-    container.textContent = "";
-    return;
-  }
+  if (!columns.length) return;
   const table = document.createElement("table");
   const thead = table.createTHead().insertRow();
   columns.forEach((c) => {
@@ -84,11 +95,42 @@ function showTab(name) {
   document.querySelectorAll(".tab").forEach((s) => (s.hidden = s.id !== "tab-" + name));
 }
 
+function showSubtab(name) {
+  document.querySelectorAll(".subtabs button").forEach((b) => b.classList.toggle("active", b.dataset.subtab === name));
+  $("subtab-data").hidden = name !== "data";
+  $("subtab-structure").hidden = name !== "structure";
+}
+
 function putSql(sql, run = false) {
   $("sql").value = sql;
   showTab("query");
   $("sql").focus();
   if (run) runQuery();
+}
+
+function quoteIdent(s) {
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+/* ---------- CSV export (client side, from the rows already loaded) */
+
+function toCsv(columns, rows) {
+  const escape = (v) => {
+    const text = display(v);
+    return /[",\n\r]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+  };
+  return [columns, ...rows].map((r) => r.map(escape).join(",")).join("\r\n") + "\r\n";
+}
+
+function downloadCsv(name, columns, rows) {
+  const blob = new Blob([toCsv(columns, rows)], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name.replace(/[^\w.-]+/g, "_") + ".csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
 }
 
 /* ---------- connection */
@@ -172,12 +214,28 @@ async function loadSchemas() {
   schemas.forEach((schema) => {
     const li = document.createElement("li");
     li.className = "schema";
+    li.dataset.name = schema.name;
     const label = document.createElement("span");
     label.textContent = `${schema.name} `;
     const count = document.createElement("small");
     count.className = "muted";
     count.textContent = `(${schema.relations})`;
     label.appendChild(count);
+    const tools = document.createElement("span");
+    tools.className = "tools";
+    const add = Object.assign(document.createElement("button"), { className: "small secondary", textContent: "+ table", title: "Create a table in this schema" });
+    add.addEventListener("click", (e) => {
+      e.stopPropagation();
+      newTableDialog(schema.name);
+    });
+    const drop = Object.assign(document.createElement("button"), { className: "small danger", textContent: "drop", title: "Drop this schema" });
+    drop.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openDialog(`Drop schema ${schema.name}`, [field("Cascade (drop everything inside)", "cascade", { type: "checkbox" })], (v) =>
+        action("drop_schema", { name: schema.name, cascade: v.cascade })
+      );
+    });
+    tools.append(add, drop);
     const children = document.createElement("ul");
     children.hidden = true;
     label.addEventListener("click", async () => {
@@ -185,11 +243,7 @@ async function loadSchemas() {
       children.hidden = !open;
       if (open && !children.dataset.loaded) await loadRelations(schema.name, children);
     });
-    label.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      if (confirm(`Generate SQL to drop schema "${schema.name}"?`)) action("drop_schema", { name: schema.name, cascade: true });
-    });
-    li.append(label, children);
+    li.append(label, tools, children);
     list.appendChild(li);
   });
 }
@@ -217,11 +271,10 @@ async function loadRelations(schema, container) {
 }
 
 async function refreshSchemas() {
-  const openNames = [...document.querySelectorAll("#schema-list .schema.open > span")].map((s) => s.firstChild.textContent.trim());
+  const openNames = [...document.querySelectorAll("#schema-list .schema.open")].map((li) => li.dataset.name);
   await loadSchemas();
   for (const li of document.querySelectorAll("#schema-list .schema")) {
-    const name = li.querySelector("span").firstChild.textContent.trim();
-    if (openNames.includes(name)) li.querySelector("span").click();
+    if (openNames.includes(li.dataset.name)) li.querySelector("span").click();
   }
 }
 
@@ -232,10 +285,11 @@ async function openRelation(schema, name, li) {
   if (li) li.classList.add("active");
   showTab("relation");
   try {
-    const rel = await api("/api/relation", withConnection({ schema, name, sample: 50 }));
+    const rel = await api("/api/relation", withConnection({ schema, name, sample: 0 }));
     state.current = rel;
     $("relation-empty").hidden = true;
     $("relation-view").hidden = false;
+    $("relation-ddl-wrap").hidden = true;
     $("relation-title").textContent = `${rel.schema}.${rel.name}`;
     $("relation-meta").textContent = [rel.kind, `owner ${rel.owner}`, rel.size, rel.estimated_rows >= 0 ? `~${rel.estimated_rows} rows` : null, rel.comment]
       .filter(Boolean)
@@ -245,11 +299,13 @@ async function openRelation(schema, name, li) {
     renderRecords($("relation-constraints"), rel.constraints, ["name", "type", "definition"]);
     $("relation-definition-wrap").hidden = !rel.definition;
     $("relation-definition").textContent = rel.definition || "";
-    renderTable($("relation-sample"), rel.sample.columns, rel.sample.rows);
     const isTable = rel.kind.endsWith("table");
     document.querySelectorAll("#relation-actions button").forEach((b) => {
       b.hidden = !isTable && ["add-column", "create-index", "truncate"].includes(b.dataset.action);
     });
+    showSubtab("data");
+    resetGrid(rel);
+    await loadRows();
   } catch (err) {
     $("relation-empty").hidden = false;
     $("relation-empty").textContent = err.message;
@@ -257,38 +313,360 @@ async function openRelation(schema, name, li) {
   }
 }
 
-/* ---------- queries */
+async function reopenCurrent() {
+  const rel = state.current;
+  if (rel) await openRelation(rel.schema, rel.name, document.querySelector(".tree .rel.active"));
+}
 
-async function runQuery() {
-  const sql = $("sql").value.trim();
+/* ---------- data grid */
+
+function resetGrid(rel) {
+  state.grid = { schema: rel.schema, name: rel.name, filters: [], sort: [], offset: 0, selected: new Set(), page: null };
+  const columnSelect = $("filter-column");
+  columnSelect.innerHTML = "";
+  rel.columns.forEach((c) => columnSelect.appendChild(Object.assign(document.createElement("option"), { value: c.name, textContent: c.name })));
+  $("filter-value").value = "";
+  renderChips();
+}
+
+function renderChips() {
+  const wrap = $("filter-chips");
+  wrap.innerHTML = "";
+  state.grid.filters.forEach((f, i) => {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = f.op.endsWith("null") ? `${f.column} ${f.op}` : `${f.column} ${f.op} ${f.value}`;
+    chip.title = "remove this filter";
+    chip.addEventListener("click", () => {
+      state.grid.filters.splice(i, 1);
+      state.grid.offset = 0;
+      renderChips();
+      loadRows();
+    });
+    wrap.appendChild(chip);
+  });
+}
+
+function pageSize() {
+  return Math.max(1, Math.min(Number($("page-size").value) || 100, 1000));
+}
+
+async function loadRows() {
+  const g = state.grid;
+  if (!g) return;
+  setMsg($("grid-msg"), "loading…");
+  try {
+    const page = await api("/api/rows", withConnection({ schema: g.schema, name: g.name, filters: g.filters, sort: g.sort, limit: pageSize(), offset: g.offset }));
+    g.page = page;
+    g.selected.clear();
+    renderGrid(page);
+    const from = page.total ? page.offset + 1 : 0;
+    const to = page.offset + page.rows.length;
+    $("page-info").textContent = `${from}–${to} of ${page.total}`;
+    $("prev-page").disabled = page.offset === 0;
+    $("next-page").disabled = to >= page.total;
+    $("insert-row").disabled = !page.editable;
+    setMsg($("grid-msg"), page.editable ? "" : "read only: not a table", page.editable ? "" : "warn");
+  } catch (err) {
+    $("grid").innerHTML = "";
+    setMsg($("grid-msg"), err.message, "error");
+  }
+  updateDeleteButton();
+}
+
+function updateDeleteButton() {
+  const g = state.grid;
+  const n = g && g.page && g.page.editable ? g.selected.size : 0;
+  $("delete-rows").disabled = n === 0;
+  $("delete-rows").textContent = n ? `Delete ${n} selected` : "Delete selected";
+}
+
+function renderGrid(page) {
+  const g = state.grid;
+  const container = $("grid");
+  container.innerHTML = "";
+  const table = document.createElement("table");
+  const head = table.createTHead().insertRow();
+  if (page.editable) {
+    const th = document.createElement("th");
+    th.className = "sel";
+    const all = Object.assign(document.createElement("input"), { type: "checkbox", title: "select all rows on this page" });
+    all.addEventListener("change", () => {
+      table.querySelectorAll("tbody input[type=checkbox]").forEach((cb) => {
+        cb.checked = all.checked;
+        cb.dispatchEvent(new Event("change"));
+      });
+    });
+    th.appendChild(all);
+    head.appendChild(th);
+  }
+  page.columns.forEach((c) => {
+    const th = document.createElement("th");
+    th.textContent = c;
+    const sorted = g.sort.find((s) => s.column === c);
+    if (sorted) th.className = "sorted" + (sorted.desc ? " desc" : "");
+    th.title = "click to sort";
+    th.addEventListener("click", () => {
+      const current = g.sort[0];
+      g.sort = current && current.column === c && !current.desc ? [{ column: c, desc: true }] : current && current.column === c ? [] : [{ column: c, desc: false }];
+      g.offset = 0;
+      loadRows();
+    });
+    head.appendChild(th);
+  });
+  const tbody = table.createTBody();
+  page.rows.forEach((row, r) => {
+    const tr = tbody.insertRow();
+    tr.dataset.index = r;
+    if (page.editable) {
+      const td = document.createElement("td");
+      td.className = "sel";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.addEventListener("change", () => {
+        const id = page.ids[Number(tr.dataset.index)];
+        if (cb.checked) g.selected.add(id);
+        else g.selected.delete(id);
+        tr.classList.toggle("selected", cb.checked);
+        updateDeleteButton();
+      });
+      td.appendChild(cb);
+      tr.appendChild(td);
+    }
+    row.forEach((v, c) => {
+      const td = cell(v);
+      if (page.editable) {
+        td.classList.add("editable");
+        td.title = (td.title ? td.title + "\n" : "") + "click to edit";
+        td.addEventListener("click", () => editCell(td, tr, c));
+      }
+      tr.appendChild(td);
+    });
+  });
+  container.appendChild(table);
+}
+
+function editCell(td, tr, columnIndex) {
+  if (td.classList.contains("editing")) return;
+  const g = state.grid;
+  const page = g.page;
+  const rowIndex = Number(tr.dataset.index);
+  const original = page.rows[rowIndex][columnIndex];
+  const column = page.columns[columnIndex];
+  td.classList.add("editing");
+  td.textContent = "";
+  const input = document.createElement("input");
+  input.value = display(original);
+  input.title = "Enter saves, Escape cancels, Ctrl+Shift+N sets null";
+  let done = false;
+  const finish = async (value) => {
+    if (done) return;
+    done = true;
+    const unchanged = (value === null && original === null) || (value !== null && original !== null && value === display(original));
+    if (unchanged) {
+      fillCell(td, original);
+      td.classList.add("editable");
+      return;
+    }
+    try {
+      const result = await api("/api/rows/update", withConnection({ schema: g.schema, name: g.name, id: page.ids[rowIndex], values: { [column]: value } }));
+      page.ids[rowIndex] = result.id;
+      page.rows[rowIndex] = result.row;
+      [...tr.cells].slice(page.editable ? 1 : 0).forEach((c, i) => {
+        fillCell(c, result.row[i]);
+        c.classList.add("editable");
+      });
+      td.classList.add("changed");
+      setMsg($("grid-msg"), `updated ${column}`, "ok");
+    } catch (err) {
+      fillCell(td, original);
+      td.classList.add("editable");
+      setMsg($("grid-msg"), err.message, "error");
+    }
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(input.value);
+    else if (e.key === "Escape") finish(original === null ? null : display(original));
+    else if (e.key.toLowerCase() === "n" && e.ctrlKey && e.shiftKey) {
+      e.preventDefault();
+      finish(null);
+    }
+  });
+  input.addEventListener("blur", () => finish(input.value));
+  td.appendChild(input);
+  input.focus();
+  input.select();
+}
+
+function insertRowDialog() {
+  const rel = state.current;
+  const g = state.grid;
+  if (!rel || !g) return;
+  const grid = document.createElement("div");
+  grid.className = "fields";
+  const inputs = rel.columns.map((col) => {
+    const label = document.createElement("label");
+    label.textContent = col.name;
+    const input = document.createElement("input");
+    input.placeholder = col.default ? `default: ${col.default}` : col.nullable ? "null" : col.type;
+    input.title = col.type;
+    const nullBox = document.createElement("label");
+    nullBox.className = "hint";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    nullBox.append(cb, " null");
+    grid.append(label, input, nullBox);
+    return { col, input, cb };
+  });
+  $("dialog").classList.add("wide");
+  openDialog(`Insert into ${rel.schema}.${rel.name}`, [grid], async () => {
+    const values = {};
+    inputs.forEach(({ col, input, cb }) => {
+      if (cb.checked) values[col.name] = null;
+      else if (input.value !== "") values[col.name] = input.value;
+    });
+    try {
+      await api("/api/rows/insert", withConnection({ schema: g.schema, name: g.name, values }));
+      setMsg($("grid-msg"), "row inserted", "ok");
+      await loadRows();
+    } catch (err) {
+      setMsg($("grid-msg"), err.message, "error");
+    }
+  });
+}
+
+async function deleteSelected() {
+  const g = state.grid;
+  const ids = [...g.selected];
+  if (!ids.length) return;
+  confirmSql(
+    `Delete ${ids.length} row(s) from ${g.schema}.${g.name}`,
+    `delete from ${quoteIdent(g.schema)}.${quoteIdent(g.name)} where ctid = any($1::tid[]);\n-- $1 = ${JSON.stringify(ids)}`,
+    "This cannot be undone.",
+    async () => {
+      try {
+        const { deleted } = await api("/api/rows/delete", withConnection({ schema: g.schema, name: g.name, ids }));
+        setMsg($("grid-msg"), `${deleted} row(s) deleted`, "ok");
+        await loadRows();
+      } catch (err) {
+        setMsg($("grid-msg"), err.message, "error");
+      }
+    },
+    false
+  );
+}
+
+$("add-filter").addEventListener("click", () => {
+  const g = state.grid;
+  if (!g) return;
+  const op = $("filter-op").value;
+  g.filters.push({ column: $("filter-column").value, op, value: op.endsWith("null") ? null : $("filter-value").value });
+  g.offset = 0;
+  $("filter-value").value = "";
+  renderChips();
+  loadRows();
+});
+$("filter-value").addEventListener("keydown", (e) => e.key === "Enter" && $("add-filter").click());
+$("filter-op").addEventListener("change", () => ($("filter-value").disabled = $("filter-op").value.endsWith("null")));
+$("insert-row").addEventListener("click", insertRowDialog);
+$("delete-rows").addEventListener("click", deleteSelected);
+$("reload-rows").addEventListener("click", loadRows);
+$("export-rows").addEventListener("click", () => {
+  const g = state.grid;
+  if (g && g.page) downloadCsv(`${g.schema}.${g.name}`, g.page.columns, g.page.rows);
+});
+$("prev-page").addEventListener("click", () => {
+  state.grid.offset = Math.max(0, state.grid.offset - pageSize());
+  loadRows();
+});
+$("next-page").addEventListener("click", () => {
+  state.grid.offset += pageSize();
+  loadRows();
+});
+$("page-size").addEventListener("change", () => {
+  state.grid.offset = 0;
+  loadRows();
+});
+["=", "<>", "<", "<=", ">", ">=", "like", "ilike", "is null", "is not null"].forEach((op) =>
+  $("filter-op").appendChild(Object.assign(document.createElement("option"), { value: op, textContent: op }))
+);
+document.querySelectorAll(".subtabs button").forEach((b) => b.addEventListener("click", () => showSubtab(b.dataset.subtab)));
+
+/* ---------- queries and history */
+
+function loadHistory() {
+  try {
+    return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function renderHistory() {
+  const select = $("history");
+  select.innerHTML = '<option value="">history</option>';
+  loadHistory().forEach((sql, i) => {
+    const option = document.createElement("option");
+    option.value = String(i);
+    option.textContent = sql.replace(/\s+/g, " ").slice(0, 80);
+    option.title = sql;
+    select.appendChild(option);
+  });
+}
+
+function remember(sql) {
+  const history = loadHistory().filter((s) => s !== sql);
+  history.unshift(sql);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, HISTORY_SIZE)));
+  renderHistory();
+}
+
+$("history").addEventListener("change", (e) => {
+  const sql = loadHistory()[Number(e.target.value)];
+  if (sql !== undefined) $("sql").value = sql;
+  e.target.value = "";
+});
+
+async function runQuery(sqlText) {
+  const sql = (sqlText || $("sql").value).trim();
   if (!sql) return;
   const limit = Number($("limit").value) || 1000;
   setMsg($("query-msg"), "running…");
   $("run-btn").disabled = true;
   try {
     const result = await api("/api/query", withConnection({ sql, limit }));
+    remember(sql);
+    state.lastResult = result;
     renderTable($("results"), result.columns, result.rows);
+    $("export-query").hidden = !result.columns.length;
     const parts = [result.status, `${result.duration_ms} ms`];
     if (result.columns.length) parts.push(`${result.rows.length} row(s)${result.truncated ? ", truncated" : ""}`);
     setMsg($("query-msg"), parts.filter(Boolean).join(" · "), "ok");
     if (!result.columns.length) refreshSchemas(); // DDL or DML without a result set may have changed metadata
+    return result;
   } catch (err) {
     $("results").innerHTML = "";
+    $("export-query").hidden = true;
     setMsg($("query-msg"), err.message, "error");
+    throw err;
   } finally {
     $("run-btn").disabled = false;
   }
 }
 
-$("run-btn").addEventListener("click", runQuery);
+$("run-btn").addEventListener("click", () => runQuery().catch(() => {}));
 $("sql").addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
     e.preventDefault();
-    runQuery();
+    runQuery().catch(() => {});
   }
 });
+$("export-query").addEventListener("click", () => {
+  const r = state.lastResult;
+  if (r && r.columns.length) downloadCsv("query-result", r.columns, r.rows);
+});
 
-/* ---------- management actions: a dialog collects parameters, the server renders the SQL */
+/* ---------- dialogs: one collects parameters, the other confirms generated SQL */
 
 function field(label, name, attrs = {}) {
   const wrap = document.createElement("label");
@@ -316,11 +694,12 @@ function field(label, name, attrs = {}) {
   return wrap;
 }
 
-function openDialog(title, fields, onOk) {
+function openDialog(title, fields, onOk, okLabel = "OK") {
   const body = $("dialog-body");
   body.innerHTML = "";
   fields.forEach((f) => body.appendChild(f));
   $("dialog-title").textContent = title;
+  $("dialog-ok").textContent = okLabel;
   const dialog = $("dialog");
   const form = $("dialog-form");
   form.onsubmit = (e) => {
@@ -331,21 +710,67 @@ function openDialog(title, fields, onOk) {
       values[i.name] = i.type === "checkbox" ? i.checked : i.value;
     });
     dialog.close();
+    dialog.classList.remove("wide");
     onOk(values);
   };
-  $("dialog-cancel").onclick = () => dialog.close();
+  $("dialog-cancel").onclick = () => {
+    dialog.close();
+    dialog.classList.remove("wide");
+  };
   dialog.showModal();
   const first = body.querySelector("input, select");
   if (first) first.focus();
 }
 
-async function action(name, params) {
-  try {
-    const { sql } = await api("/api/action", { action: name, params });
+function confirmSql(title, sql, note, onRun, allowEdit = true) {
+  const dialog = $("confirm");
+  $("confirm-title").textContent = title;
+  $("confirm-sql").textContent = sql;
+  setMsg($("confirm-note"), note, note ? "warn" : "");
+  $("confirm-edit").hidden = !allowEdit;
+  $("confirm-run").onclick = () => {
+    dialog.close();
+    onRun();
+  };
+  $("confirm-edit").onclick = () => {
+    dialog.close();
     putSql(sql);
+  };
+  $("confirm-cancel").onclick = () => dialog.close();
+  dialog.showModal();
+  $("confirm-cancel").focus();
+}
+
+async function action(name, params) {
+  let sql;
+  try {
+    sql = (await api("/api/action", { action: name, params })).sql;
   } catch (err) {
     alert(err.message);
+    return;
   }
+  const destructive = DESTRUCTIVE.includes(name);
+  confirmSql(
+    destructive ? "This statement destroys data" : "Run this statement?",
+    sql,
+    destructive ? "This cannot be undone. Read the statement before you run it." : "",
+    async () => {
+      try {
+        await runQuery(sql);
+        showTab("relation");
+        if (name === "drop_relation" || name === "drop_schema") {
+          state.current = null;
+          $("relation-view").hidden = true;
+          $("relation-empty").hidden = false;
+          $("relation-empty").textContent = "Pick a table or view in the sidebar.";
+        } else if (state.current) {
+          await reopenCurrent();
+        }
+      } catch {
+        showTab("query"); // the editor shows the error and keeps the statement
+      }
+    }
+  );
 }
 
 let typeOptions = ["text", "integer", "bigint", "numeric", "boolean", "timestamptz", "jsonb"];
@@ -382,6 +807,7 @@ function newTableDialog(schema) {
   const more = Object.assign(document.createElement("button"), { type: "button", className: "secondary small", textContent: "+ column" });
   more.addEventListener("click", () => addRow());
   body.append(nameField, grid, more);
+  $("dialog").classList.add("wide");
   openDialog(`Create table in ${schema}`, [body], () => {
     const columns = rows
       .filter((r) => r.name.value.trim())
@@ -390,16 +816,31 @@ function newTableDialog(schema) {
   });
 }
 
+async function showDdl() {
+  const rel = state.current;
+  if (!rel) return;
+  try {
+    const { sql } = await api("/api/ddl", withConnection({ schema: rel.schema, name: rel.name }));
+    $("relation-ddl").textContent = sql;
+    $("relation-ddl-wrap").hidden = false;
+  } catch (err) {
+    alert(err.message);
+  }
+}
+$("copy-ddl").addEventListener("click", () => navigator.clipboard.writeText($("relation-ddl").textContent));
+$("hide-ddl").addEventListener("click", () => ($("relation-ddl-wrap").hidden = true));
+
 document.querySelectorAll("#relation-actions button").forEach((button) =>
   button.addEventListener("click", () => {
     const rel = state.current;
     if (!rel) return;
-    const q = (s) => '"' + s.replace(/"/g, '""') + '"';
     switch (button.dataset.action) {
       case "select":
-        return putSql(`select * from ${q(rel.schema)}.${q(rel.name)} limit 100;`, true);
+        return putSql(`select * from ${quoteIdent(rel.schema)}.${quoteIdent(rel.name)} limit 100;`, true);
+      case "ddl":
+        return showDdl();
       case "drop":
-        return openDialog(`Drop ${rel.kind} ${rel.schema}.${rel.name}`, [field("Cascade", "cascade", { type: "checkbox" })], (v) =>
+        return openDialog(`Drop ${rel.kind} ${rel.schema}.${rel.name}`, [field("Cascade (drop dependent objects too)", "cascade", { type: "checkbox" })], (v) =>
           action("drop_relation", { schema: rel.schema, name: rel.name, kind: rel.kind, cascade: v.cascade })
         );
       case "truncate":
@@ -444,7 +885,7 @@ document.querySelectorAll("#relation-actions button").forEach((button) =>
   })
 );
 
-// Column-level actions: click a column row to drop, rename or comment it.
+// Column rows in the structure view: rename, comment or drop the column.
 $("relation-columns").addEventListener("click", (e) => {
   const tr = e.target.closest("tbody tr");
   const rel = state.current;
@@ -461,19 +902,12 @@ $("relation-columns").addEventListener("click", (e) => {
   );
 });
 
-// Index rows: click to drop.
+// Index rows: drop.
 $("relation-indexes").addEventListener("click", (e) => {
   const tr = e.target.closest("tbody tr");
   const rel = state.current;
   if (!tr || !rel) return;
-  const index = tr.cells[0].textContent;
-  if (confirm(`Generate SQL to drop index "${index}"?`)) action("drop_index", { schema: rel.schema, index_name: index });
-});
-
-// Schema label double-click: create a table in it.
-$("schema-list").addEventListener("dblclick", (e) => {
-  const label = e.target.closest(".schema > span");
-  if (label) newTableDialog(label.firstChild.textContent.trim());
+  action("drop_index", { schema: rel.schema, index_name: tr.cells[0].textContent });
 });
 
 /* ---------- server tab */
@@ -493,6 +927,7 @@ async function loadDatabases() {
 document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
 
 (function start() {
+  renderHistory();
   const saved = sessionStorage.getItem("neon-explorer-connection");
   if (saved) {
     const c = JSON.parse(saved);

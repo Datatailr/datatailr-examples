@@ -37,7 +37,7 @@
     </section>
 
     <section id="browser" hidden>
-      <h2>Schemas <button id="new-schema" class="small secondary" title="Create a schema">+</button></h2>
+      <h2>Schemas <button id="new-schema" class="small secondary" title="Create a schema">+ schema</button></h2>
       <ul id="schema-list" class="tree"></ul>
     </section>
   </aside>
@@ -54,6 +54,8 @@
       <div class="row toolbar">
         <button id="run-btn">Run (Ctrl+Enter)</button>
         <label class="inline">Row limit <input id="limit" value="1000" size="6"></label>
+        <select id="history" title="Query history"><option value="">history</option></select>
+        <button id="export-query" class="secondary" title="Download the result as CSV" hidden>Export CSV</button>
         <span id="query-msg" class="msg"></span>
       </div>
       <div id="results" class="table-wrap"></div>
@@ -65,7 +67,8 @@
         <h2 id="relation-title"></h2>
         <p id="relation-meta" class="muted"></p>
         <div class="row toolbar" id="relation-actions">
-          <button data-action="select">Select rows</button>
+          <button data-action="select" class="secondary">Query</button>
+          <button data-action="ddl" class="secondary">DDL</button>
           <button data-action="add-column" class="secondary">Add column</button>
           <button data-action="create-index" class="secondary">Create index</button>
           <button data-action="rename" class="secondary">Rename</button>
@@ -73,18 +76,51 @@
           <button data-action="truncate" class="danger">Truncate</button>
           <button data-action="drop" class="danger">Drop</button>
         </div>
-        <h3>Columns</h3>
-        <div id="relation-columns" class="table-wrap"></div>
-        <h3>Indexes</h3>
-        <div id="relation-indexes" class="table-wrap"></div>
-        <h3>Constraints</h3>
-        <div id="relation-constraints" class="table-wrap"></div>
-        <div id="relation-definition-wrap" hidden>
-          <h3>Definition</h3>
-          <pre id="relation-definition"></pre>
+        <div id="relation-ddl-wrap" hidden>
+          <h3>DDL <button id="copy-ddl" class="small secondary">Copy</button> <button id="hide-ddl" class="small secondary">Hide</button></h3>
+          <pre id="relation-ddl"></pre>
         </div>
-        <h3>Sample rows</h3>
-        <div id="relation-sample" class="table-wrap"></div>
+
+        <nav class="subtabs">
+          <button data-subtab="data" class="active">Data</button>
+          <button data-subtab="structure">Structure</button>
+        </nav>
+
+        <div id="subtab-data">
+          <div class="row toolbar" id="grid-toolbar">
+            <select id="filter-column"></select>
+            <select id="filter-op"></select>
+            <input id="filter-value" placeholder="value" size="14">
+            <button id="add-filter" class="secondary small">Add filter</button>
+            <span id="filter-chips"></span>
+          </div>
+          <div class="row toolbar">
+            <button id="insert-row" class="secondary">Insert row</button>
+            <button id="delete-rows" class="danger" disabled>Delete selected</button>
+            <button id="reload-rows" class="secondary">Reload</button>
+            <button id="export-rows" class="secondary">Export CSV</button>
+            <span class="spacer"></span>
+            <button id="prev-page" class="secondary small">‹</button>
+            <span id="page-info" class="muted"></span>
+            <button id="next-page" class="secondary small">›</button>
+            <label class="inline">per page <input id="page-size" value="100" size="4"></label>
+          </div>
+          <p id="grid-msg" class="msg"></p>
+          <div id="grid" class="table-wrap"></div>
+        </div>
+
+        <div id="subtab-structure" hidden>
+          <h3>Columns <span class="muted normal">click a column to rename, comment or drop it</span></h3>
+          <div id="relation-columns" class="table-wrap"></div>
+          <h3>Indexes <span class="muted normal">click an index to drop it</span></h3>
+          <div id="relation-indexes" class="table-wrap"></div>
+          <h3>Constraints</h3>
+          <div id="relation-constraints" class="table-wrap"></div>
+          <div id="relation-definition-wrap" hidden>
+            <h3>Definition</h3>
+            <pre id="relation-definition"></pre>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -102,10 +138,21 @@
     <h2 id="dialog-title"></h2>
     <div id="dialog-body"></div>
     <div class="row toolbar">
-      <button value="ok">Put SQL in editor</button>
+      <button value="ok" id="dialog-ok">OK</button>
       <button value="cancel" class="secondary" type="button" id="dialog-cancel">Cancel</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="confirm">
+  <h2 id="confirm-title"></h2>
+  <p id="confirm-note" class="msg"></p>
+  <pre id="confirm-sql"></pre>
+  <div class="row toolbar">
+    <button id="confirm-run">Run</button>
+    <button id="confirm-edit" class="secondary">Put in editor</button>
+    <button id="confirm-cancel" class="secondary">Cancel</button>
+  </div>
 </dialog>
 
 <script src="static/app.js"></script>
