@@ -30,6 +30,7 @@ neon_postgres/
 ├── service/
 │   ├── service.py      # main(port): gateway + Neon stack + status API
 │   ├── neon_stack.py   # starts broker, safekeeper, pageserver and compute
+│   ├── pg_tunnel.py    # Postgres over a WebSocket, for clients outside the platform
 │   └── build_pre.sh    # copies the Neon binaries into the job image
 ├── explorer/
 │   ├── app.py          # FastAPI app: query, metadata and management endpoints
@@ -135,6 +136,7 @@ safekeepers on separate machines, which a Datatailr service cannot provide.
 | `NEON_PG_PASSWORD` | `cloud_admin` | Password of the `cloud_admin` superuser. Set your own, see Deployment. |
 | `NEON_BUCKET` | none, required | Directory in blob storage that holds this database |
 | `NEON_PG_PORT` | `5432` | Postgres port |
+| `NEON_PG_TUNNEL` | `1` | `0` turns off the `/pg` WebSocket endpoint, see External connections |
 | `NEON_SHARED_BUFFERS` | `256MB` | Postgres `shared_buffers` |
 | `NEON_MAX_CONNECTIONS` | `100` | Postgres `max_connections` |
 | `S3_GATEWAY_CONCURRENCY` | `8` | How many `dt blob` calls run at the same time |
@@ -202,14 +204,117 @@ with psycopg.connect(
     print(conn.execute("SELECT * FROM t").fetchall())
 ```
 
-Clients outside the platform cannot connect: the platform ingress carries HTTP
-only.
+A client outside the platform, such as `psql` on a laptop, needs a tunnel.
+See [External connections](#external-connections).
 
 To see what the database writes, list its directory in blob storage:
 
 ```bash
 dt blob ls my-database/ -r
 ```
+
+## External connections
+
+The platform ingress carries HTTP only. The Postgres wire protocol is raw TCP.
+A client on your laptop therefore cannot open port 5432 on the platform. Two
+paths carry a byte stream through the HTTP ingress. Both work with `psql` and
+with every other Postgres client. Both need a Datatailr login.
+
+Security warning. On both paths the platform checks your login cookie and the
+`access` permission of a job before a byte reaches Postgres. Postgres then
+checks the `cloud_admin` password. A person who holds a valid login cookie and
+the password is the database superuser from anywhere on the internet. Set a
+strong `NEON_PG_PASSWORD`, keep the `access` list of the service and of the
+workstation short, and treat the login cookie (the `jwt_cookie` value in
+`~/.dt/remote_client/remote_client.cfg`) as a secret.
+
+### Through a workstation
+
+A platform workstation runs an SSH server. The SSH connection from your
+laptop travels inside a WebSocket to the ingress. The SSH proxy on the
+platform checks your login, starts the workstation if it is stopped, and
+connects to port 22 of the workstation container. The workstation is on the
+same service network as the database, and its SSH server allows port
+forwarding. No code change is needed.
+
+1. If you have not logged in on this laptop, run `datatailr login`.
+2. If you have not set up SSH for the workstation, run
+   `python -m datatailr setup-ssh default-workstation`. Use the name of the
+   workstation template in your environment. The command installs
+   `websocat`, creates an SSH key and writes a `dt-default-workstation` host
+   to `~/.ssh/config`.
+3. Open the tunnel. The hostname `neon-postgres` resolves inside the
+   workstation. Pick a free local port, for example 25432:
+
+   ```bash
+   ssh -N -L 127.0.0.1:25432:neon-postgres:5432 dt-default-workstation
+   ```
+
+4. Connect from a second terminal:
+
+   ```bash
+   psql "postgresql://cloud_admin:<NEON_PG_PASSWORD>@127.0.0.1:25432/postgres"
+   ```
+
+The workstation must be in the same environment as the service. The
+`setup-ssh` command uses `dev`. If the workstation is stopped, the first
+`ssh` waits while the platform starts it. This path was tested from a laptop
+against the `v2-trial` installation: `psql` created a table, inserted a row,
+read it back and dropped the table.
+
+### Through the service
+
+The status API of the service has a WebSocket endpoint at `/pg`. Every
+binary frame that arrives there goes to the Postgres socket of the container,
+and every byte from Postgres comes back as a binary frame. On your laptop,
+`websocat` turns a local TCP port into that WebSocket.
+
+1. If `websocat` is not installed, install it. On macOS: `brew install
+   websocat`. The `setup-ssh` command above installs it as well.
+2. Read the login cookie that `datatailr login` saved:
+
+   ```bash
+   JWT=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.dt/remote_client/remote_client.cfg')))['jwt_cookie'])")
+   ```
+
+3. Start the local listener. Replace `<domain>` with the platform domain,
+   and `dev` with the environment of the service:
+
+   ```bash
+   websocat -E -b tcp-l:127.0.0.1:25432 "wss://<domain>/job/dev/neon-postgres/pg" -H "Cookie: X-Datatailr-Oidc-Data=$JWT"
+   ```
+
+4. Connect from a second terminal:
+
+   ```bash
+   psql "postgresql://cloud_admin:<NEON_PG_PASSWORD>@127.0.0.1:25432/postgres"
+   ```
+
+TLS ends at the ingress, so the relay carries plain Postgres frames. The
+`psql` default `sslmode=prefer` works. `sslmode=require` fails with
+"server does not support SSL". The service writes one log line when a tunnel
+opens and one when it closes, with the platform user name and the byte
+counts. Set `NEON_PG_TUNNEL=0` at deploy time to turn the endpoint off.
+
+This path was tested on a laptop: `psql`, `websocat`, the relay and a local
+Postgres container. The deployed service on `v2-trial` does not have the
+endpoint yet, because it predates this change. Redeploy the service to get
+it. Note that a redeploy restarts the database.
+
+### What does not work
+
+- No platform setting publishes a TCP port of a job. A job definition has no
+  port field, and the cloud load balancer in front of the platform forwards
+  HTTPS to the ingress only.
+- A load balancer or firewall rule for port 5432 in the cloud account would
+  bypass the platform login and expose the Postgres password prompt to the
+  internet. It also needs a fixed node for the service. Do not do this.
+- The SSH proxy connects to workstations only, never to a service container.
+  A tunnel to the database therefore always runs through a workstation or
+  through the `/pg` endpoint.
+- Postgres `sslmode=require` does not work on either path, because the
+  tunnel ends inside the container. The connection is encrypted between the
+  laptop and the ingress by HTTPS on both paths.
 
 ## Running locally with Docker
 
