@@ -35,6 +35,7 @@ neon_postgres/
 │   ├── app.py          # FastAPI app: query, metadata and management endpoints
 │   ├── db.py           # catalog queries with psycopg
 │   ├── actions.py      # management actions rendered as SQL
+│   ├── audit.py        # the query audit trail, read from the service log
 │   ├── services.py     # finds Neon Postgres services on the platform
 │   └── static/         # the single-page UI
 ├── tests/              # gateway tests with boto3, config, state and explorer tests
@@ -106,6 +107,8 @@ state and several people can use it against different databases.
   quoted identifiers, and nothing runs until you press Run.
 - Server tab: version, size, and the databases on the server. Click one to
   reconnect to it.
+- Audit tab: the statements in the service log, with who ran them. See
+  [Audit logging](#audit-logging).
 
 ### Durability
 
@@ -137,11 +140,70 @@ safekeepers on separate machines, which a Datatailr service cannot provide.
 | `NEON_PG_PORT` | `5432` | Postgres port |
 | `NEON_SHARED_BUFFERS` | `256MB` | Postgres `shared_buffers` |
 | `NEON_MAX_CONNECTIONS` | `100` | Postgres `max_connections` |
+| `NEON_LOG_STATEMENT` | `mod` | Which statements Postgres logs: `none`, `ddl`, `mod` or `all`. See [Audit logging](#audit-logging). |
 | `S3_GATEWAY_CONCURRENCY` | `8` | How many `dt blob` calls run at the same time |
 | `NEON_STORAGE_BACKEND` | `datatailr` | `local` stores objects in a directory instead |
 
 Two databases must use different `NEON_BUCKET` values. The deploy script
 refuses to run without one.
+
+### Audit logging
+
+The service log is the query audit trail. Postgres writes every logged
+statement to its log with the database user, the database, the client's
+application name and the client host. `compute_ctl` passes those lines to the
+service's stderr, and the platform keeps them with the other job logs. Read
+them with the CLI:
+
+```bash
+dt log read -r neon-postgres
+```
+
+A line looks like this:
+
+```
+PG:2026-11-09 11:42:46.715 GMT [665] user=cloud_admin db=postgres app=neon-postgres-explorer:dgeidman host=172.18.0.4 LOG:  statement: select count(*) from orders
+```
+
+Which statements are logged depends on `NEON_LOG_STATEMENT`. The default,
+`mod`, logs every statement that changes the schema or the data, from every
+client. `all` also logs reads. `ddl` logs schema changes only and `none` turns
+the log off. Connections are always logged, with the user, the database and
+the application name.
+
+The Postgres user is `cloud_admin` for everyone, so the Postgres log cannot
+tell people apart by itself. The explorer fills that gap. Every request to the
+explorer carries the platform user, in the `X-Datatailr-User` header that the
+platform adds. The explorer puts that name into the application name of its
+database connection, as `neon-postgres-explorer:<user>`, and the name lands in
+the `app=` field of every log line of that session. The explorer also raises
+`log_statement` to `all` for its own sessions, so every statement that a person
+types is logged, whatever the server-wide setting is. That needs a superuser
+connection. If the connection is not a superuser, the explorer keeps the
+server-wide level.
+
+The Audit tab of the explorer shows the statements from the log of the
+connected service, newest first. It reads the last 2,000 lines of the stderr
+log through the platform CLI, so the service name in the connection panel must
+be the name of a platform job. A filter box narrows the rows by user, SQL or
+host. The explorer needs permission to read the service's log. If it has no
+such permission, the tab shows the error from the platform.
+
+A client that connects to port 5432 directly chooses its own application
+name. Its statements show the database user and the host, but no platform
+user. If a job sets its application name to the name of the platform user it
+works for, the Audit tab shows that name too.
+
+The log lines the trail is made from stay as long as the platform keeps job
+logs. `all` is expensive here: `compute_ctl` runs four monitoring queries every
+half second on the same superuser, and `all` logs every one of them. `mod` logs
+none of those, because they only read.
+
+These do not exist in this build of Neon Postgres: the `pgaudit` extension,
+`pg_stat_statements`, and any Neon table that records queries. The Postgres
+build comes from the Neon storage image, which ships eleven extensions, all of
+them Neon's own or part of Postgres. The compute image that Neon Cloud uses
+has `pgaudit`, but it also needs a control plane this example does not run.
 
 ## Deployment
 
@@ -258,4 +320,5 @@ NEON_TEST_DSN=postgresql://cloud_admin:cloud_admin@localhost:5432/postgres pytho
 
 The gateway tests drive it with boto3, the same way a real S3 client would.
 The explorer API tests need a running Postgres and are skipped unless
-`NEON_TEST_DSN` is set.
+`NEON_TEST_DSN` is set. The audit tests parse a sample of the service log and
+check that the explorer tags its connections with the platform user.

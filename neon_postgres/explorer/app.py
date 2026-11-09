@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from neon_postgres.explorer import actions, db, services
+from neon_postgres.explorer import actions, audit, db, services
 
 log = logging.getLogger("explorer")
 
@@ -30,9 +30,11 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-def _connection(body: dict) -> db.ConnectionInfo:
+def _connection(body: dict, request: Request | None = None) -> db.ConnectionInfo:
+    """The connection the browser sent, tagged with the platform user behind the request."""
+    user = audit.platform_user(request.headers) if request is not None else None
     try:
-        return db.ConnectionInfo.from_dict(body.get("connection") or {})
+        return db.ConnectionInfo.from_dict(body.get("connection") or {}, platform_user=user)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -80,7 +82,7 @@ def list_services():
 @app.post("/api/connect", summary="Test a connection and describe the server")
 async def connect(request: Request):
     body = await request.json()
-    return _guard(db.server_info, _connection(body))
+    return _guard(db.server_info, _connection(body, request))
 
 
 @app.post("/api/query", summary="Run SQL and return the last result set")
@@ -90,19 +92,19 @@ async def query(request: Request):
     if not sql_text:
         raise HTTPException(status_code=400, detail="sql is required")
     limit = max(1, min(int(body.get("limit") or db.DEFAULT_ROW_LIMIT), 10_000))
-    return _guard(db.run_query, _connection(body), sql_text, limit)
+    return _guard(db.run_query, _connection(body, request), sql_text, limit)
 
 
 @app.post("/api/databases", summary="Databases on the server")
 async def databases(request: Request):
     body = await request.json()
-    return {"databases": _guard(db.list_databases, _connection(body))}
+    return {"databases": _guard(db.list_databases, _connection(body, request))}
 
 
 @app.post("/api/schemas", summary="Schemas in the current database")
 async def schemas(request: Request):
     body = await request.json()
-    return {"schemas": _guard(db.list_schemas, _connection(body))}
+    return {"schemas": _guard(db.list_schemas, _connection(body, request))}
 
 
 @app.post("/api/relations", summary="Tables and views in a schema")
@@ -111,7 +113,7 @@ async def relations(request: Request):
     schema = str(body.get("schema") or "")
     if not schema:
         raise HTTPException(status_code=400, detail="schema is required")
-    return {"relations": _guard(db.list_relations, _connection(body), schema)}
+    return {"relations": _guard(db.list_relations, _connection(body, request), schema)}
 
 
 @app.post("/api/relation", summary="Columns, indexes, constraints and sample rows of a relation")
@@ -121,7 +123,7 @@ async def relation(request: Request):
     if not schema or not name:
         raise HTTPException(status_code=400, detail="schema and name are required")
     sample = max(0, min(int(body.get("sample") or 50), 500))
-    return _guard(db.describe_relation, _connection(body), schema, name, sample)
+    return _guard(db.describe_relation, _connection(body, request), schema, name, sample)
 
 
 @app.post("/api/action", summary="Render the SQL for a management action")
@@ -131,6 +133,21 @@ async def action(request: Request):
         return {"sql": actions.build(str(body.get("action") or ""), dict(body.get("params") or {}))}
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/audit", summary="Recent statements from the service log, with who ran them")
+async def audit_trail(request: Request):
+    body = await request.json()
+    service = str(body.get("service") or "").strip()
+    if not service:
+        raise HTTPException(status_code=400, detail="service is required")
+    lines = max(100, min(int(body.get("lines") or audit.DEFAULT_LINES), 50_000))
+    try:
+        rows = audit.recent_statements(service, lines)
+    except Exception as exc:  # no CLI, not logged in, or no such service
+        log.info("service log unavailable for %s: %s", service, exc)
+        raise HTTPException(status_code=502, detail=f"cannot read the log of service {service!r}: {exc}") from exc
+    return {"service": service, "lines": lines, "statements": rows}
 
 
 @app.get("/api/types", summary="Column types offered by the UI")

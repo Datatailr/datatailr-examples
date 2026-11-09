@@ -47,6 +47,7 @@
       <button data-tab="query" class="active">Query</button>
       <button data-tab="relation">Table</button>
       <button data-tab="server">Server</button>
+      <button data-tab="audit">Audit</button>
     </nav>
 
     <section id="tab-query" class="tab">
@@ -86,6 +87,20 @@
         <h3>Sample rows</h3>
         <div id="relation-sample" class="table-wrap"></div>
       </div>
+    </section>
+
+    <section id="tab-audit" class="tab" hidden>
+      <h2>Audit trail</h2>
+      <p class="muted">Statements from the service log, newest first. The platform user column is
+        filled for statements that ran through this explorer; other clients show their
+        database user and host.</p>
+      <div class="row toolbar">
+        <button id="audit-refresh">Refresh</button>
+        <label class="inline">Log lines <input id="audit-lines" value="2000" size="7"></label>
+        <label class="inline">Filter <input id="audit-filter" placeholder="user, sql, host…" size="24"></label>
+        <span id="audit-msg" class="msg"></span>
+      </div>
+      <div id="audit-rows" class="table-wrap"></div>
     </section>
 
     <section id="tab-server" class="tab" hidden>

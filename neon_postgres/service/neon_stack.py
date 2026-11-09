@@ -37,6 +37,11 @@ log = logging.getLogger("neon_stack")
 
 STATE_KEY = "neon-postgres/state.json"
 
+# Every Postgres log line starts with the time, the backend pid, the database
+# user, the database, the client's application name and the client host.
+LOG_LINE_PREFIX = "%m [%p] user=%u db=%d app=%a host=%h "
+LOG_STATEMENT_VALUES = ("none", "ddl", "mod", "all")
+
 # Public key from Neon's own docker-compose example. compute_ctl requires a JWKS to
 # authorize calls to its HTTP API; nobody holds the matching private key, so the
 # API is effectively locked.
@@ -72,6 +77,13 @@ class NeonConfig:
     partial_backup_timeout: str = "1m"
     checkpoint_timeout: str = "1m"
     checkpoint_distance: int = 64 * 1024 * 1024
+    # Which statements Postgres logs: none, ddl, mod (DDL plus writes) or all. The
+    # log line carries the user, database, application name and client host, so
+    # the service log is the query audit trail (see "Audit logging" in the README).
+    # "all" also logs the four queries compute_ctl's monitor runs every half
+    # second; the explorer logs all of its own statements whatever this says.
+    log_statement: str = "mod"
+    log_line_prefix: str = LOG_LINE_PREFIX
     extra_settings: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -81,6 +93,9 @@ class NeonConfig:
             key.removeprefix("DATATAILR_JOB_ENV_"): value
             for key, value in sorted(os.environ.items(), key=lambda item: item[0].startswith("DATATAILR_JOB_ENV_"))
         }
+        log_statement = env.get("NEON_LOG_STATEMENT", cls.log_statement).strip().lower()
+        if log_statement not in LOG_STATEMENT_VALUES:
+            raise ValueError(f"NEON_LOG_STATEMENT must be one of {', '.join(LOG_STATEMENT_VALUES)}, not {log_statement!r}")
         return cls(
             bin_dir=env.get("NEON_BIN_DIR", cls.bin_dir),
             pg_version=int(env.get("NEON_PG_VERSION", cls.pg_version)),
@@ -95,6 +110,7 @@ class NeonConfig:
             partial_backup_timeout=env.get("NEON_PARTIAL_BACKUP_TIMEOUT", cls.partial_backup_timeout),
             checkpoint_timeout=env.get("NEON_CHECKPOINT_TIMEOUT", cls.checkpoint_timeout),
             checkpoint_distance=int(env.get("NEON_CHECKPOINT_DISTANCE", cls.checkpoint_distance)),
+            log_statement=log_statement,
         )
 
     @property
@@ -203,6 +219,8 @@ def compute_spec(cfg: NeonConfig, state: TenantState) -> dict:
         "wal_level": "logical",
         "wal_log_hints": "on",
         "log_connections": "on",
+        "log_statement": cfg.log_statement,
+        "log_line_prefix": cfg.log_line_prefix,
         "max_wal_senders": "10",
         "max_replication_slots": "10",
         "wal_sender_timeout": "5s",
