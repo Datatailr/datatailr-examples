@@ -234,3 +234,92 @@ def describe_relation(info: ConnectionInfo, schema: str, name: str, sample: int 
         "definition": definition,
         "sample": sample_rows,
     }
+
+
+def _ddl_columns(cur, oid: int) -> list[dict]:
+    return [
+        dict(r)
+        for r in cur.execute(
+            """
+            select a.attname as name, format_type(a.atttypid, a.atttypmod) as type, a.attnotnull as not_null,
+                   pg_get_expr(d.adbin, d.adrelid) as "default", a.attidentity as identity,
+                   a.attgenerated as generated, col_description(a.attrelid, a.attnum) as comment
+            from pg_attribute a
+            left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+            where a.attrelid = %s and a.attnum > 0 and not a.attisdropped
+            order by a.attnum
+            """,
+            (oid,),
+        ).fetchall()
+    ]
+
+
+def relation_ddl(info: ConnectionInfo, schema: str, name: str) -> str:
+    """The CREATE statements that rebuild a table or view, built from the catalog.
+
+    Postgres has no function that prints a table definition, so this assembles
+    one: columns, constraints, the indexes that do not back a constraint, and
+    comments. The output is for reading and copying, not a byte-exact pg_dump.
+    """
+    with info.connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+        rel = cur.execute(
+            """
+            select c.oid, c.relkind, obj_description(c.oid, 'pg_class') as comment
+            from pg_class c join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = %s and c.relname = %s
+            """,
+            (schema, name),
+        ).fetchone()
+        if rel is None:
+            raise LookupError(f"{schema}.{name} does not exist")
+        oid, kind = rel["oid"], rel["relkind"]
+        table = sql.Identifier(schema, name)
+        statements: list[sql.Composable] = []
+        if kind in ("v", "m"):
+            body = cur.execute("select pg_get_viewdef(%s, true) as def", (oid,)).fetchone()["def"].rstrip().rstrip(";")
+            verb = "create or replace view" if kind == "v" else "create materialized view"
+            statements.append(sql.SQL("{} {} as\n{}").format(sql.SQL(verb), table, sql.SQL(body)))
+        elif kind in ("r", "p", "f"):
+            lines: list[sql.Composable] = []
+            for col in _ddl_columns(cur, oid):
+                piece = sql.SQL("{} {}").format(sql.Identifier(col["name"]), sql.SQL(col["type"]))
+                if col["generated"] == "s":
+                    piece += sql.SQL(" generated always as ({}) stored").format(sql.SQL(col["default"] or ""))
+                elif col["identity"] in ("a", "d"):
+                    piece += sql.SQL(" generated {} as identity").format(sql.SQL("always" if col["identity"] == "a" else "by default"))
+                elif col["default"] is not None:
+                    piece += sql.SQL(" default {}").format(sql.SQL(col["default"]))
+                if col["not_null"]:
+                    piece += sql.SQL(" not null")
+                lines.append(piece)
+            constraints = cur.execute(
+                "select conname, pg_get_constraintdef(oid) as def from pg_constraint where conrelid = %s order by contype, conname",
+                (oid,),
+            ).fetchall()
+            for con in constraints:
+                lines.append(sql.SQL("constraint {} {}").format(sql.Identifier(con["conname"]), sql.SQL(con["def"])))
+            verb = "create table" if kind != "f" else "create foreign table"
+            body = sql.SQL(",\n    ").join(lines)
+            statements.append(sql.SQL("{} {} (\n    {}\n)").format(sql.SQL(verb), table, body))
+            indexes = cur.execute(
+                """
+                select pg_get_indexdef(x.indexrelid) as def
+                from pg_index x
+                where x.indrelid = %s
+                  and not exists (select 1 from pg_constraint p where p.conindid = x.indexrelid)
+                order by x.indexrelid
+                """,
+                (oid,),
+            ).fetchall()
+            statements.extend(sql.SQL(i["def"]) for i in indexes)
+        else:
+            raise LookupError(f"{schema}.{name} is not a table or view")
+        if rel["comment"]:
+            statements.append(sql.SQL("comment on {} {} is {}").format(sql.SQL("view" if kind == "v" else "table"), table, sql.Literal(rel["comment"])))
+        if kind in ("r", "p", "f"):
+            for col in _ddl_columns(cur, oid):
+                if col["comment"]:
+                    statements.append(
+                        sql.SQL("comment on column {} is {}").format(sql.Identifier(schema, name, col["name"]), sql.Literal(col["comment"]))
+                    )
+        return "\n\n".join(s.as_string(conn) + ";" for s in statements) + "\n"
