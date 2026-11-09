@@ -28,8 +28,9 @@ neon_postgres/
 │   ├── app.py          # the S3 subset Neon uses, as a FastAPI app
 │   └── backends.py     # Datatailr blob, local directory and in-memory backends
 ├── service/
-│   ├── service.py      # main(port): gateway + Neon stack + status API
+│   ├── service.py      # main(port): gateway + Neon stack + role sync + status API
 │   ├── neon_stack.py   # starts broker, safekeeper, pageserver and compute
+│   ├── roles.py        # mirrors platform users and groups into Postgres roles
 │   └── build_pre.sh    # copies the Neon binaries into the job image
 ├── explorer/
 │   ├── app.py          # FastAPI app: query, metadata and management endpoints
@@ -37,7 +38,8 @@ neon_postgres/
 │   ├── actions.py      # management actions rendered as SQL
 │   ├── services.py     # finds Neon Postgres services on the platform
 │   └── static/         # the single-page UI
-├── tests/              # gateway tests with boto3, config, state and explorer tests
+├── access.py           # the role secret and per-user role passwords, shared by both jobs
+├── tests/              # gateway tests with boto3, config, state, role sync and explorer tests
 ├── deploy.py
 ├── requirements.txt
 └── requirements-dev.txt
@@ -92,9 +94,12 @@ stays as the ancestor of the new one, so every restart adds one branch.
 A FastAPI app with a single-page UI, deployed as the **Neon Postgres
 Explorer** app. The connection panel lists the Neon Postgres services found
 on the platform (every service whose status API reports a tenant), or takes a
-host, port, database, user and password by hand. The browser keeps the
-connection details and sends them with every request, so the app holds no
-state and several people can use it against different databases.
+host, port, database, user and password by hand. On the platform it also
+offers "Connect as me": the app then connects as the Postgres role of the
+signed-in platform user and asks for no password (see Access control). The
+browser keeps the connection details and sends them with every request, so
+the app holds no state and several people can use it against different
+databases.
 
 - Query tab: run SQL with Ctrl+Enter, see the result set as a table, the
   status line, timing and errors. Every statement runs with autocommit.
@@ -139,6 +144,8 @@ safekeepers on separate machines, which a Datatailr service cannot provide.
 | `NEON_MAX_CONNECTIONS` | `100` | Postgres `max_connections` |
 | `S3_GATEWAY_CONCURRENCY` | `8` | How many `dt blob` calls run at the same time |
 | `NEON_STORAGE_BACKEND` | `datatailr` | `local` stores objects in a directory instead |
+| `NEON_ROLE_SECRET` | derived from `NEON_PG_PASSWORD` by `deploy.py` | Shared by both jobs. The service derives every per-user role password from it. Unset means no role sync. See Access control. |
+| `NEON_ROLE_SYNC_INTERVAL` | `60` | Seconds between two syncs of platform users and groups into roles |
 
 Two databases must use different `NEON_BUCKET` values. The deploy script
 refuses to run without one.
@@ -168,20 +175,25 @@ NEON_BUCKET=my-database NEON_PG_PASSWORD='a-long-random-password' python deploy.
 ```
 
 This deploys both jobs. `python deploy.py service` deploys the database only
-and `python deploy.py explorer` the app only; the app needs no variables.
+and `python deploy.py explorer` the app only. Both jobs receive
+`NEON_ROLE_SECRET`, so deploy them with the same variables, or the explorer
+derives the wrong role passwords. See Access control.
 
 The service appears on the platform as **Neon Postgres**. Its status API is
 served on the platform port: `/health` returns `OK` once Postgres accepts
 connections, and `/` returns the tenant, timeline and generation. The app
 appears as **Neon Postgres Explorer** in the apps section; open it, pick the
-service, enter the password and connect.
+service and connect as yourself, or untick "Connect as me" and enter the
+`cloud_admin` password.
 
 ## Connecting from another job
 
 Other jobs in the same environment reach Postgres by the service hostname on
 port 5432. The hostname is the service name in lowercase with hyphens. The
-user is `cloud_admin` and the password is the `NEON_PG_PASSWORD` value from
-the deploy. To read it back later:
+superuser is `cloud_admin` and its password is the `NEON_PG_PASSWORD` value
+from the deploy. A job can also connect as a platform user, with the
+password that Access control describes. To read the superuser password back
+later:
 
 ```bash
 dt job get neon-postgres --json | grep NEON_PG_PASSWORD
@@ -294,10 +306,8 @@ explorer derives the wrong passwords. `NEON_ROLE_SECRET=off` deploys without
 the sync. Then the explorer offers no "Connect as me", and everyone connects
 as `cloud_admin` as before.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `NEON_ROLE_SECRET` | derived from `NEON_PG_PASSWORD` | Shared by both jobs. The service derives every role password from it. Unset in the service means no sync. |
-| `NEON_ROLE_SYNC_INTERVAL` | `60` | Seconds between two syncs of users and groups |
+The Settings table above lists `NEON_ROLE_SECRET` and
+`NEON_ROLE_SYNC_INTERVAL`.
 
 ### Other clients
 
@@ -364,5 +374,8 @@ NEON_TEST_DSN=postgresql://cloud_admin:cloud_admin@localhost:5432/postgres pytho
 ```
 
 The gateway tests drive it with boto3, the same way a real S3 client would.
-The explorer API tests need a running Postgres and are skipped unless
-`NEON_TEST_DSN` is set.
+The explorer API tests and the role sync tests need a running Postgres and are
+skipped unless `NEON_TEST_DSN` is set. The role sync tests create and drop
+roles named `acl_*` and a schema `acl_test`, so point them at a database you
+can spare, for example the Docker container above. The user in the DSN must be
+a superuser: the sync reads `pg_authid`.

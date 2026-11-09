@@ -1,6 +1,16 @@
 {
     "name": "Neon Postgres",
-    "description": "Postgres as a Datatailr service: self-hosted Neon with its durable state in Datatailr blob storage, through a local S3 gateway, plus a FastAPI app to query it and manage its schema.",
-    "tags": ["postgres", "neon", "blob", "service", "database", "fastapi", "app"],
+    "description": "Postgres as a Datatailr service: self-hosted Neon with its durable state in Datatailr blob storage, through a local S3 gateway, plus a FastAPI app to query it and manage its schema. Platform users and groups become Postgres roles, so table grants follow platform groups.",
+    "tags": [
+        "postgres",
+        "neon",
+        "blob",
+        "service",
+        "database",
+        "fastapi",
+        "app",
+        "access-control",
+        "roles"
+    ],
     "author": "Datatailr"
 }
