@@ -5,7 +5,9 @@
 1. the S3 gateway on localhost, translating S3 calls into ``dt blob`` operations;
 2. the Neon stack (storage broker, safekeeper, pageserver, compute) pointed at
    that gateway;
-3. a small HTTP status API on the platform-assigned ``port``.
+3. a small HTTP status API on the platform-assigned ``port``;
+4. when ``NEON_ROLE_SECRET`` is set, a thread that mirrors platform users and
+   groups into Postgres roles (see ``roles.py``).
 
 Postgres itself listens on ``NEON_PG_PORT`` (5432) on all interfaces, so other
 jobs in the same environment connect to it by the service's hostname.
@@ -27,6 +29,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from neon_postgres.s3_gateway.app import create_app as create_gateway
 from neon_postgres.s3_gateway.backends import backend_from_env
 from neon_postgres.service.neon_stack import NeonConfig, NeonStack
+from neon_postgres.service.roles import RoleSyncer
 
 log = logging.getLogger("neon_postgres")
 
@@ -44,7 +47,7 @@ def start_gateway(backend, port: int) -> uvicorn.Server:
     return server
 
 
-def status_app(stack: NeonStack) -> FastAPI:
+def status_app(stack: NeonStack, syncer: RoleSyncer | None = None) -> FastAPI:
     app = FastAPI(
         title="Neon Postgres",
         description="A Postgres database whose durable state lives in Datatailr blob storage.",
@@ -64,6 +67,8 @@ def status_app(stack: NeonStack) -> FastAPI:
             "generation": stack.state.generation if stack.state else None,
             "bucket": cfg.bucket,
             "processes": {name: process.pid for name, process in stack.processes.items()},
+            # Tells the explorer whether it can connect as the platform user.
+            "role_sync": syncer.status() if syncer else None,
         }
 
     @app.get("/health", response_class=PlainTextResponse, summary="Health check")
@@ -100,7 +105,15 @@ def main(port):
     stack.start()
     log.info("postgres ready on port %d (tenant %s, generation %d)", cfg.pg_port, stack.state.tenant_id, stack.state.generation)
 
-    status_server = uvicorn.Server(uvicorn.Config(status_app(stack), host="0.0.0.0", port=int(port), log_level="info"))
+    syncer = None
+    if cfg.role_secret:
+        syncer = RoleSyncer(cfg.local_dsn, cfg.role_secret, cfg.role_sync_interval)
+        syncer.start()
+        log.info("syncing platform users and groups into Postgres roles every %.0f seconds", cfg.role_sync_interval)
+    else:
+        log.info("NEON_ROLE_SECRET is not set: platform users and groups are not synced into Postgres roles")
+
+    status_server = uvicorn.Server(uvicorn.Config(status_app(stack, syncer), host="0.0.0.0", port=int(port), log_level="info"))
 
     def shutdown(signum, frame):
         log.info("signal %d received, stopping", signum)
@@ -111,6 +124,8 @@ def main(port):
     signal.signal(signal.SIGINT, shutdown)
     threading.Thread(target=watchdog, args=(stack, status_server), name="watchdog", daemon=True).start()
     status_server.run()
+    if syncer:
+        syncer.stop()
     stack.stop()
 
 

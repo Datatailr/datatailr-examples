@@ -211,6 +211,113 @@ To see what the database writes, list its directory in blob storage:
 dt blob ls my-database/ -r
 ```
 
+## Access control
+
+Datatailr ACLs decide who can open the explorer app and who can read, change
+or operate the service. They do not reach inside the database: an ACL is
+attached to a platform object (a job, a blob, a key in the KV store) and
+cannot be attached to a table. Table access is the job of Postgres. This
+example connects the two. The service turns platform users and groups into
+Postgres roles, and the explorer connects as the platform user who is using
+it. You then grant tables to groups with plain SQL, and Postgres enforces the
+grants for every client.
+
+### How it works
+
+The service holds a secret, `NEON_ROLE_SECRET`. Every minute it reads the
+users and groups of the platform and makes the roles match:
+
+- Every platform group becomes a Postgres role of the same name that cannot
+  log in. Grant tables to these roles.
+- Every platform user becomes a Postgres role of the same name that can log
+  in. Its password is derived from the secret and the user name, and it is a
+  member of the roles of the user's groups.
+- A user who leaves a group loses that membership. A user who leaves the
+  platform can no longer log in. Roles are never dropped, because a role may
+  own tables.
+- Roles the sync created carry the comment `datatailr:user` or
+  `datatailr:group`. The sync never changes a role without that comment, so a
+  role you created by hand keeps its settings. System users, `root` and names
+  of built-in roles such as `cloud_admin` are skipped.
+
+The explorer holds the same secret. The platform sends the signed user to
+every app in the `X-Datatailr-User` header, and the auth-server in the app
+container verifies the signature before the request reaches the app. When you
+tick "Connect as me", the explorer reads your user name from that header,
+derives the password of your role, and connects as you. It never asks you for
+a password. Every query then runs with the privileges of your role, and the
+error "permission denied" tells you that a table is not granted to you or to
+one of your groups.
+
+The status API of the service reports the sync under `role_sync`: the time of
+the last sync, the last error, and how many users and groups it mirrored.
+
+### Grant tables to groups
+
+Connect as `cloud_admin` and grant tables to group roles. For example, to let
+the `analysts` group read the `sales` schema and the `developers` group do
+anything in it:
+
+```sql
+grant usage on schema sales to analysts, developers;
+grant select on all tables in schema sales to analysts;
+alter default privileges in schema sales grant select on tables to analysts;
+grant all on all tables in schema sales to developers;
+alter default privileges in schema sales grant all on tables to developers;
+```
+
+A user who belongs to both groups gets both sets of privileges. To give one
+user more than their groups allow, grant to the user role directly. Group
+membership changes made on the platform, with `dt group add-users` or in the
+users page, reach Postgres within a minute.
+
+The `dtusers` group contains every user of the platform. A grant to `dtusers`
+means everyone. In Postgres 15 and later, every role can use the `public`
+schema but cannot create tables in it. Grant select on its tables like on any
+other schema.
+
+### Deploy with a secret
+
+`deploy.py` gives both jobs the same `NEON_ROLE_SECRET`. When you do not set
+it, the deploy derives it from `NEON_PG_PASSWORD`. Knowing the secret gives
+every role password but not the `cloud_admin` password. If the password is
+the default `cloud_admin`, the derived secret is public knowledge too, and the
+deploy prints a warning. Set your own:
+
+```bash
+NEON_BUCKET=my-database NEON_PG_PASSWORD='a-long-random-password' \
+NEON_ROLE_SECRET='another-long-random-secret' python deploy.py
+```
+
+Deploy the service and the explorer together, or with the same secret, or the
+explorer derives the wrong passwords. `NEON_ROLE_SECRET=off` deploys without
+the sync. Then the explorer offers no "Connect as me", and everyone connects
+as `cloud_admin` as before.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NEON_ROLE_SECRET` | derived from `NEON_PG_PASSWORD` | Shared by both jobs. The service derives every role password from it. Unset in the service means no sync. |
+| `NEON_ROLE_SYNC_INTERVAL` | `60` | Seconds between two syncs of users and groups |
+
+### Other clients
+
+Any job can connect as a platform user when it knows the secret, with the
+password from `neon_postgres.access.role_password(secret, user)`. A job that
+connects as `cloud_admin` still bypasses all grants. Keep that password to
+administrators.
+
+### Limits
+
+- The sync runs every minute. A new user or group appears in Postgres after
+  the next sync, not at once.
+- The catalog stays visible. A user sees that a table exists, with its
+  columns, but cannot read its rows without a grant. Row-level security on top
+  of this works as in any Postgres, with `current_user` as the key.
+- A user whose name matches a group name, a built-in role, or a role you
+  created by hand gets no role. The service log says so.
+- The sync lists users and groups as the user the service runs as. That user
+  needs the right to run `dt user ls` and `dt group ls`.
+
 ## Running locally with Docker
 
 The local backend stores objects in a directory, so you can run the service

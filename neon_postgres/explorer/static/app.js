@@ -4,7 +4,7 @@
  * the editor, and the user runs it. */
 
 const $ = (id) => document.getElementById(id);
-const state = { connection: null, current: null, schemas: [] };
+const state = { connection: null, current: null, schemas: [], platformUser: null, roleSecret: false };
 
 /* ---------- helpers */
 
@@ -94,13 +94,39 @@ function putSql(sql, run = false) {
 /* ---------- connection */
 
 function readConnectionForm() {
+  const asUser = $("as-user").checked && !$("as-user-row").hidden;
   return {
     host: $("host").value.trim(),
     port: Number($("port").value) || 5432,
     dbname: $("dbname").value.trim() || "postgres",
-    user: $("user").value.trim() || "cloud_admin",
-    password: $("password").value,
+    user: asUser ? "" : $("user").value.trim() || "cloud_admin",
+    password: asUser ? "" : $("password").value,
+    as_user: asUser,
   };
+}
+
+function updateCredentialFields() {
+  $("credentials").hidden = $("as-user").checked && !$("as-user-row").hidden;
+}
+
+/* Ask the app who is using it. On the platform the answer is the signed-in
+ * user, and "connect as me" is offered when the app also holds the role secret
+ * the service derives role passwords from. */
+async function loadWhoami() {
+  try {
+    const me = await api("/api/whoami");
+    state.platformUser = me.user;
+    state.roleSecret = me.role_secret;
+  } catch (err) {
+    state.platformUser = null;
+  }
+  const offer = Boolean(state.platformUser && state.roleSecret);
+  $("as-user-row").hidden = !offer;
+  if (offer) {
+    $("as-user-label").textContent = `Connect as me (${state.platformUser})`;
+    $("as-user-label").title = "Use the Postgres role the service created for your platform user";
+  }
+  updateCredentialFields();
 }
 
 async function connect() {
@@ -111,7 +137,7 @@ async function connect() {
     const info = await api("/api/connect", { connection });
     state.connection = connection;
     sessionStorage.setItem("neon-explorer-connection", JSON.stringify(connection));
-    $("conn-status").textContent = `${connection.user}@${connection.host}:${connection.port}/${info.database}`;
+    $("conn-status").textContent = `${info.user}@${connection.host}:${connection.port}/${info.database}`;
     $("conn-status").className = "ok";
     setMsg($("connect-msg"), info.version.split(" on ")[0] + ", " + info.size, "ok");
     renderRecords($("server-info"), [info], Object.keys(info));
@@ -156,8 +182,12 @@ $("service-select").addEventListener("change", (e) => {
   $("port").value = s.port;
   $("dbname").value = s.database || "postgres";
   $("user").value = s.user || "cloud_admin";
-  $("password").focus();
+  // A service that syncs platform users into roles is best used as yourself.
+  if (!$("as-user-row").hidden) $("as-user").checked = Boolean(s.role_sync);
+  updateCredentialFields();
+  if (!$("credentials").hidden) $("password").focus();
 });
+$("as-user").addEventListener("change", updateCredentialFields);
 $("connect-btn").addEventListener("click", connect);
 $("refresh-services").addEventListener("click", findServices);
 $("password").addEventListener("keydown", (e) => e.key === "Enter" && connect());
@@ -492,15 +522,20 @@ async function loadDatabases() {
 
 document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
 
-(function start() {
+(async function start() {
+  await loadWhoami();
   const saved = sessionStorage.getItem("neon-explorer-connection");
   if (saved) {
     const c = JSON.parse(saved);
     $("host").value = c.host;
     $("port").value = c.port;
     $("dbname").value = c.dbname;
-    $("user").value = c.user;
-    $("password").value = c.password;
+    $("as-user").checked = Boolean(c.as_user);
+    if (!c.as_user) {
+      $("user").value = c.user;
+      $("password").value = c.password;
+    }
+    updateCredentialFields();
     connect();
   } else {
     findServices();

@@ -3,10 +3,18 @@
 The browser keeps the connection details and sends them with every request,
 so the app itself holds no state. Management actions are rendered as SQL and
 run through the same query endpoint, after the user has seen the statement.
+
+When the browser asks to connect "as me", the app connects as the Postgres
+role that the Neon Postgres service created for the calling platform user.
+The platform puts the signed user in the ``X-Datatailr-User`` header, and the
+container's auth-server has verified it before the request reaches the app.
+The role's password is derived from ``NEON_ROLE_SECRET``, which the deploy
+gives to both jobs.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from importlib.resources import files
 from pathlib import Path
@@ -17,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from neon_postgres import access
 from neon_postgres.explorer import actions, db, services
 
 log = logging.getLogger("explorer")
@@ -30,11 +39,43 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-def _connection(body: dict) -> db.ConnectionInfo:
+def platform_user(request: Request) -> str | None:
+    """The platform user behind this request, from the X-Datatailr-User header.
+
+    The header carries the signed user as JSON (``{"name": ..., "expiry": ...,
+    "signature": ...}``). Off the platform there is no header and no user. The
+    datatailr SDK offers ``User.from_request`` for the same purpose; it also
+    looks the user up on the platform, which this app does not need.
+    """
+    raw = request.headers.get("x-datatailr-user", "").strip()
+    if not raw:
+        return None
+    if raw.startswith("{"):
+        try:
+            name = json.loads(raw).get("name")
+        except (ValueError, AttributeError):
+            return None
+        return str(name) if name else None
+    return raw
+
+
+def _connection(body: dict, request: Request) -> db.ConnectionInfo:
     try:
-        return db.ConnectionInfo.from_dict(body.get("connection") or {})
+        info = db.ConnectionInfo.from_dict(body.get("connection") or {})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not info.as_user:
+        return info
+    username = platform_user(request)
+    if username is None:
+        raise HTTPException(status_code=401, detail="no platform user: the request carries no X-Datatailr-User header")
+    secret = access.role_secret()
+    if secret is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"the explorer has no {access.ROLE_SECRET_VAR}; deploy it with the same secret as the Neon Postgres service",
+        )
+    return info.for_user(username, access.role_password(secret, username))
 
 
 def _guard(func, *args, **kwargs) -> Any:
@@ -72,6 +113,11 @@ def health():
     return "OK\n"
 
 
+@app.get("/api/whoami", summary="The platform user behind the request and whether it can connect as that user")
+def whoami(request: Request):
+    return {"user": platform_user(request), "role_secret": access.role_secret() is not None}
+
+
 @app.get("/api/services", summary="Neon Postgres services found on the platform")
 def list_services():
     return {"services": services.database_services()}
@@ -80,7 +126,7 @@ def list_services():
 @app.post("/api/connect", summary="Test a connection and describe the server")
 async def connect(request: Request):
     body = await request.json()
-    return _guard(db.server_info, _connection(body))
+    return _guard(db.server_info, _connection(body, request))
 
 
 @app.post("/api/query", summary="Run SQL and return the last result set")
@@ -90,19 +136,19 @@ async def query(request: Request):
     if not sql_text:
         raise HTTPException(status_code=400, detail="sql is required")
     limit = max(1, min(int(body.get("limit") or db.DEFAULT_ROW_LIMIT), 10_000))
-    return _guard(db.run_query, _connection(body), sql_text, limit)
+    return _guard(db.run_query, _connection(body, request), sql_text, limit)
 
 
 @app.post("/api/databases", summary="Databases on the server")
 async def databases(request: Request):
     body = await request.json()
-    return {"databases": _guard(db.list_databases, _connection(body))}
+    return {"databases": _guard(db.list_databases, _connection(body, request))}
 
 
 @app.post("/api/schemas", summary="Schemas in the current database")
 async def schemas(request: Request):
     body = await request.json()
-    return {"schemas": _guard(db.list_schemas, _connection(body))}
+    return {"schemas": _guard(db.list_schemas, _connection(body, request))}
 
 
 @app.post("/api/relations", summary="Tables and views in a schema")
@@ -111,7 +157,7 @@ async def relations(request: Request):
     schema = str(body.get("schema") or "")
     if not schema:
         raise HTTPException(status_code=400, detail="schema is required")
-    return {"relations": _guard(db.list_relations, _connection(body), schema)}
+    return {"relations": _guard(db.list_relations, _connection(body, request), schema)}
 
 
 @app.post("/api/relation", summary="Columns, indexes, constraints and sample rows of a relation")
@@ -121,7 +167,7 @@ async def relation(request: Request):
     if not schema or not name:
         raise HTTPException(status_code=400, detail="schema and name are required")
     sample = max(0, min(int(body.get("sample") or 50), 500))
-    return _guard(db.describe_relation, _connection(body), schema, name, sample)
+    return _guard(db.describe_relation, _connection(body, request), schema, name, sample)
 
 
 @app.post("/api/action", summary="Render the SQL for a management action")

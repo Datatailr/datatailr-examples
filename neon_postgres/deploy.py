@@ -10,6 +10,12 @@ Environment variables read at deploy time and passed to the service:
                        every database needs its own)
     NEON_PG_PASSWORD   password of the Postgres superuser; set it, the default
                        cloud_admin is public knowledge
+    NEON_ROLE_SECRET   secret that the service and the explorer share; the service
+                       derives the password of every per-user Postgres role from it.
+                       Derived from NEON_PG_PASSWORD when not set. Set it to "off"
+                       to deploy without the user and group sync.
+
+Both jobs get NEON_ROLE_SECRET, so deploy them together or with the same value.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from datatailr import App, Resources, Service  # noqa: E402
 from datatailr.logging import CYAN, YELLOW  # noqa: E402
 
 import neon_postgres.explorer.app as explorer_entrypoint  # noqa: E402
+from neon_postgres.access import ROLE_SECRET_VAR, derive_role_secret  # noqa: E402
 from neon_postgres.service.service import main  # noqa: E402
 
 REQUIREMENTS = str(current_dir / "requirements.txt")
@@ -35,6 +42,21 @@ APP_SECTION = "Neon Postgres"
 
 
 DEFAULT_PASSWORD = "cloud_admin"
+
+
+def role_secret() -> str | None:
+    """The secret both jobs share, or None when the sync is switched off."""
+    value = os.environ.get(ROLE_SECRET_VAR, "").strip()
+    if value.lower() == "off":
+        return None
+    if value:
+        return value
+    return derive_role_secret(os.environ.get("NEON_PG_PASSWORD", DEFAULT_PASSWORD))
+
+
+def role_env() -> dict[str, str]:
+    secret = role_secret()
+    return {ROLE_SECRET_VAR: secret} if secret else {}
 
 
 def deploy_service() -> None:
@@ -52,6 +74,10 @@ def deploy_service() -> None:
                 "default from the README, and every job in the environment can reach port 5432."
             )
         )
+    if role_secret() is None:
+        print(YELLOW("NEON_ROLE_SECRET=off: platform users and groups will not become Postgres roles."))
+    elif password == DEFAULT_PASSWORD and not os.environ.get(ROLE_SECRET_VAR):
+        print(YELLOW("WARNING: the role secret is derived from the default password, so every per-user role password is public too."))
     print(CYAN(f"Deploying the Neon Postgres service with its data in blob storage under {bucket}/ ..."))
     service = Service(
         name="Neon Postgres",
@@ -65,6 +91,7 @@ def deploy_service() -> None:
             # Upload WAL and layers at most one minute after they are written.
             "NEON_PARTIAL_BACKUP_TIMEOUT": "1m",
             "NEON_CHECKPOINT_TIMEOUT": "1m",
+            **role_env(),
         },
     )
     service.run()
@@ -79,6 +106,7 @@ def deploy_explorer() -> None:
         resources=Resources(memory="1g", cpu=1),
         app_section=APP_SECTION,
         python_requirements=EXPLORER_REQUIREMENTS,
+        env_vars=role_env(),
     )
     app.run()
 

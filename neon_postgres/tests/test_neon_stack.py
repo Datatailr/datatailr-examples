@@ -124,3 +124,33 @@ def test_config_accepts_the_platform_env_prefix(monkeypatch):
     cfg = NeonConfig.from_env()
     assert cfg.pg_password == "from-platform"
     assert cfg.bucket == "db2"
+
+
+def test_role_sync_settings_come_from_the_environment(monkeypatch):
+    monkeypatch.setenv("DATATAILR_JOB_ENV_NEON_ROLE_SECRET", "s")
+    monkeypatch.setenv("NEON_ROLE_SYNC_INTERVAL", "15")
+    cfg = NeonConfig.from_env()
+    assert cfg.role_secret == "s" and cfg.role_sync_interval == 15.0
+    assert cfg.local_dsn == "postgresql://cloud_admin:cloud_admin@127.0.0.1:5432/postgres"
+    monkeypatch.delenv("DATATAILR_JOB_ENV_NEON_ROLE_SECRET")
+    assert NeonConfig.from_env().role_secret is None
+
+
+def test_status_api_reports_the_role_sync():
+    from fastapi.testclient import TestClient
+
+    from neon_postgres.service.roles import RoleSyncer
+    from neon_postgres.service.service import status_app
+
+    class Stack:
+        cfg = NeonConfig()
+        state = TenantState("t" * 32, "l" * 32, 1)
+        processes: dict = {}
+
+        def dead_processes(self):
+            return []
+
+    syncer = RoleSyncer("postgresql://x", "s", interval=30, load=lambda: None)
+    status = TestClient(status_app(Stack(), syncer)).get("/").json()
+    assert status["role_sync"]["interval_seconds"] == 30 and status["role_sync"]["last_sync"] is None
+    assert TestClient(status_app(Stack())).get("/").json()["role_sync"] is None
