@@ -102,6 +102,70 @@ async def test_metadata_roundtrip(client):
 
 
 @pytest.mark.anyio
+async def test_data_grid_and_ddl(client):
+    await _query(client, "drop schema if exists explorer_grid cascade")
+    await _query(
+        client,
+        """
+        create schema explorer_grid;
+        create table explorer_grid.items(id serial primary key, label text not null default 'none', qty numeric, tags jsonb);
+        comment on table explorer_grid.items is 'grid test';
+        create index items_qty_idx on explorer_grid.items(qty);
+        create view explorer_grid.labels as select id, label from explorer_grid.items;
+        """,
+    )
+    target = {"connection": _connection(), "schema": "explorer_grid", "name": "items"}
+
+    inserted = await client.post("/api/rows/insert", json={**target, "values": {"label": "a", "qty": "1.5", "tags": '{"k": 1}'}})
+    assert inserted.status_code == 200, inserted.text
+    assert inserted.json()["row"] == [1, "a", 1.5, {"k": 1}]
+    defaults = await client.post("/api/rows/insert", json={**target, "values": {}})
+    assert defaults.json()["row"] == [2, "none", None, None]
+    await client.post("/api/rows/insert", json={**target, "values": {"label": "c", "qty": "3"}})
+
+    page = (
+        await client.post(
+            "/api/rows",
+            json={**target, "sort": [{"column": "id", "desc": True}], "filters": [{"column": "qty", "op": "is not null"}], "limit": 1},
+        )
+    ).json()
+    assert page["columns"] == ["id", "label", "qty", "tags"]
+    assert page["total"] == 2 and page["editable"] is True
+    assert page["rows"] == [[3, "c", 3, None]]
+    assert len(page["ids"]) == 1
+
+    row_id = page["ids"][0]
+    updated = await client.post("/api/rows/update", json={**target, "id": row_id, "values": {"label": "changed", "qty": None}})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["row"] == [3, "changed", None, None]
+    stale = await client.post("/api/rows/update", json={**target, "id": row_id, "values": {"label": "again"}})
+    assert stale.status_code == 404
+    bad_value = await client.post("/api/rows/update", json={**target, "id": updated.json()["id"], "values": {"qty": "not a number"}})
+    assert bad_value.status_code == 400
+    bad_filter = await client.post("/api/rows", json={**target, "filters": [{"column": "qty", "op": "; drop"}]})
+    assert bad_filter.status_code == 400
+
+    view = (await client.post("/api/rows", json={**target, "name": "labels"})).json()
+    assert view["editable"] is False and view["ids"] == [] and view["total"] == 3
+
+    deleted = await client.post("/api/rows/delete", json={**target, "ids": [updated.json()["id"], defaults.json()["id"]]})
+    assert deleted.json() == {"deleted": 2}
+    assert (await client.post("/api/rows", json=target)).json()["total"] == 1
+
+    ddl = (await client.post("/api/ddl", json=target)).json()["sql"]
+    assert ddl.startswith('create table "explorer_grid"."items" (\n    "id" integer default nextval(')
+    assert '"label" text default \'none\'::text not null' in ddl
+    assert 'constraint "items_pkey" PRIMARY KEY (id)' in ddl
+    assert "CREATE INDEX items_qty_idx ON explorer_grid.items USING btree (qty);" in ddl
+    assert "comment on table \"explorer_grid\".\"items\" is 'grid test';" in ddl
+    view_ddl = (await client.post("/api/ddl", json={**target, "name": "labels"})).json()["sql"]
+    assert view_ddl.startswith('create or replace view "explorer_grid"."labels" as')
+    assert (await client.post("/api/ddl", json={**target, "name": "nope"})).status_code == 404
+
+    await _query(client, "drop schema explorer_grid cascade")
+
+
+@pytest.mark.anyio
 async def test_errors_are_reported(client):
     bad_sql = await _query(client, "select * from no_such_table_anywhere")
     assert bad_sql.status_code == 400

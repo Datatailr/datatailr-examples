@@ -32,8 +32,9 @@ neon_postgres/
 │   ├── neon_stack.py   # starts broker, safekeeper, pageserver and compute
 │   └── build_pre.sh    # copies the Neon binaries into the job image
 ├── explorer/
-│   ├── app.py          # FastAPI app: query, metadata and management endpoints
-│   ├── db.py           # catalog queries with psycopg
+│   ├── app.py          # FastAPI app: query, metadata, data grid and management endpoints
+│   ├── db.py           # catalog queries and generated DDL with psycopg
+│   ├── rows.py         # the data grid: parameterised select, insert, update, delete
 │   ├── actions.py      # management actions rendered as SQL
 │   ├── services.py     # finds Neon Postgres services on the platform
 │   └── static/         # the single-page UI
@@ -90,22 +91,54 @@ stays as the ancestor of the new one, so every restart adds one branch.
 ### The explorer (`explorer/`)
 
 A FastAPI app with a single-page UI, deployed as the **Neon Postgres
-Explorer** app. The connection panel lists the Neon Postgres services found
-on the platform (every service whose status API reports a tenant), or takes a
-host, port, database, user and password by hand. The browser keeps the
-connection details and sends them with every request, so the app holds no
-state and several people can use it against different databases.
+Explorer** app. It is a small database tool in the spirit of DBeaver: a
+schema browser, a data grid, a SQL editor and the usual table operations.
+The connection panel lists the Neon Postgres services found on the platform.
+A service counts when its status API reports a tenant. The panel also takes a
+host, port, database, user and password by hand. The browser keeps the connection details
+and sends them with every request. The app holds no state, so several people
+can use it against different databases.
 
-- Query tab: run SQL with Ctrl+Enter, see the result set as a table, the
-  status line, timing and errors. Every statement runs with autocommit.
-- Table tab: columns, indexes, constraints, the view definition and sample
-  rows of the relation picked in the sidebar.
-- Management: create schema, create table, add, rename or drop a column,
-  create or drop an index, rename, comment, truncate or drop a relation, drop a
-  schema. Each action renders its SQL into the query editor with properly
-  quoted identifiers, and nothing runs until you press Run.
-- Server tab: version, size, and the databases on the server. Click one to
-  reconnect to it.
+Schema browser. The sidebar lists the schemas of the current database. Expand
+a schema to see its tables and views with their estimated row count and size.
+Each schema has buttons to create a table in it and to drop it. The Server tab
+lists the databases on the server. Click one to reconnect to it.
+
+Table tab. Pick a table or view in the sidebar. The Structure sub-tab shows
+the columns with their types, nullability, defaults and comments, the indexes,
+the constraints and the definition of a view. The DDL button shows the CREATE
+statements that rebuild the table or view, assembled from the catalog, with a
+Copy button.
+
+Data grid. The Data sub-tab shows the rows of the table one page at a time.
+Click a column header to sort by it, and click it again for descending order.
+Add a filter from the column, operator and value boxes. Each filter shows as
+a chip above the grid. Click the chip to remove the filter. Click a cell to edit
+it. Enter saves the cell, Escape cancels, and Ctrl+Shift+N sets it to NULL.
+Insert row opens a form with one field per column. A blank field takes the
+column default. Tick rows and press Delete selected to remove them. Export CSV
+downloads the rows of the current page. A view is read only.
+
+Every grid operation runs as parameterised SQL. Column and table names go
+through `psycopg.sql.Identifier` and values travel as query parameters, so a
+value is never pasted into the statement text. The grid addresses a row by its
+`ctid`, the position Postgres gives it. If someone else changed the row after
+the page was loaded, the update matches no row and the grid asks you to
+reload.
+
+SQL editor. The Query tab runs the text in the editor with Ctrl+Enter and
+shows the result set, the status line, the timing and the error text. Every
+statement runs with autocommit. The history list keeps the last 30 statements
+that ran in this browser. Export CSV downloads the result set, up to the row
+limit.
+
+Table operations. The app can create or drop a schema and create a table
+with its columns, types, primary key and defaults. It can add, rename,
+comment or drop a column, and create or drop an index. It can rename, comment,
+truncate or drop a table or view. Each operation renders its SQL with quoted identifiers and shows it in a
+confirmation dialog. Run executes the statement, Put in editor copies it into
+the Query tab, and Cancel closes the dialog. A dialog for a destructive
+operation (drop, truncate, delete rows) says that the change cannot be undone.
 
 ### Durability
 

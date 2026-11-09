@@ -3,6 +3,7 @@
 The browser keeps the connection details and sends them with every request,
 so the app itself holds no state. Management actions are rendered as SQL and
 run through the same query endpoint, after the user has seen the statement.
+The data grid (``rows``) edits rows with parameterised statements instead.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from neon_postgres.explorer import actions, db, services
+from neon_postgres.explorer import actions, db, rows, services
 
 log = logging.getLogger("explorer")
 
@@ -52,6 +53,15 @@ def _guard(func, *args, **kwargs) -> Any:
         raise HTTPException(status_code=400, detail=detail) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _target(body: dict) -> tuple[str, str]:
+    schema, name = str(body.get("schema") or ""), str(body.get("name") or "")
+    if not schema or not name:
+        raise HTTPException(status_code=400, detail="schema and name are required")
+    return schema, name
 
 
 @app.get("/", include_in_schema=False)
@@ -117,11 +127,53 @@ async def relations(request: Request):
 @app.post("/api/relation", summary="Columns, indexes, constraints and sample rows of a relation")
 async def relation(request: Request):
     body = await request.json()
-    schema, name = str(body.get("schema") or ""), str(body.get("name") or "")
-    if not schema or not name:
-        raise HTTPException(status_code=400, detail="schema and name are required")
-    sample = max(0, min(int(body.get("sample") or 50), 500))
+    schema, name = _target(body)
+    sample = max(0, min(int(body.get("sample") or 0), 500))
     return _guard(db.describe_relation, _connection(body), schema, name, sample)
+
+
+@app.post("/api/ddl", summary="The CREATE statements for a table or view")
+async def ddl(request: Request):
+    body = await request.json()
+    schema, name = _target(body)
+    return {"sql": _guard(db.relation_ddl, _connection(body), schema, name)}
+
+
+@app.post("/api/rows", summary="One page of a table, filtered and sorted")
+async def rows_page(request: Request):
+    body = await request.json()
+    schema, name = _target(body)
+    return _guard(
+        rows.fetch_page,
+        _connection(body),
+        schema,
+        name,
+        list(body.get("filters") or []),
+        list(body.get("sort") or []),
+        int(body.get("limit") or 100),
+        int(body.get("offset") or 0),
+    )
+
+
+@app.post("/api/rows/insert", summary="Insert one row; values are parameters, columns left out take their default")
+async def rows_insert(request: Request):
+    body = await request.json()
+    schema, name = _target(body)
+    return _guard(rows.insert, _connection(body), schema, name, dict(body.get("values") or {}))
+
+
+@app.post("/api/rows/update", summary="Change the given columns of the row with this id")
+async def rows_update(request: Request):
+    body = await request.json()
+    schema, name = _target(body)
+    return _guard(rows.update, _connection(body), schema, name, str(body.get("id") or ""), dict(body.get("values") or {}))
+
+
+@app.post("/api/rows/delete", summary="Delete the rows with these ids")
+async def rows_delete(request: Request):
+    body = await request.json()
+    schema, name = _target(body)
+    return _guard(rows.delete, _connection(body), schema, name, [str(i) for i in body.get("ids") or []])
 
 
 @app.post("/api/action", summary="Render the SQL for a management action")
