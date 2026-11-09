@@ -385,33 +385,84 @@ means everyone. In Postgres 15 and later, every role can use the `public`
 schema but cannot create tables in it. Grant select on its tables like on any
 other schema.
 
-### Deploy with a secret
+### The secret and the passwords
 
-`deploy.py` gives both jobs the same `NEON_ROLE_SECRET`. When you do not set
-it, the deploy derives it from `NEON_PG_PASSWORD`. Knowing the secret gives
-every role password but not the `cloud_admin` password. If the password is
-the default `cloud_admin`, the derived secret is public knowledge too, and the
-deploy prints a warning. Set your own:
+`NEON_ROLE_SECRET` is the key from which every per-user password is derived.
+The password of a user's role is an HMAC of the user name under the secret.
+The service computes it when it creates or updates the role, and the explorer
+computes the same value when you tick "Connect as me". No password is stored
+anywhere, and the two jobs never exchange one. Whoever holds the secret can
+derive the password of every platform user's role, so treat it like a
+password. It does not give the `cloud_admin` password.
+
+The person who deploys the example sets the secret. Put it in the
+environment of the shell that runs `deploy.py`, and the script copies it into
+the definitions of both jobs. Any long random string works, for example the
+output of `openssl rand -hex 32`:
 
 ```bash
 NEON_BUCKET=my-database NEON_PG_PASSWORD='a-long-random-password' \
-NEON_ROLE_SECRET='another-long-random-secret' python deploy.py
+NEON_ROLE_SECRET="$(openssl rand -hex 32)" python deploy.py
 ```
 
-Deploy the service and the explorer together, or with the same secret, or the
-explorer derives the wrong passwords. `NEON_ROLE_SECRET=off` deploys without
-the sync. Then the explorer offers no "Connect as me", and everyone connects
-as `cloud_admin` as before.
+Both jobs must receive the same value, or the explorer derives wrong
+passwords and every "Connect as me" fails. Deploy them together, or export
+the same `NEON_ROLE_SECRET` when you deploy them one at a time. When you set
+nothing, `deploy.py` derives the secret from `NEON_PG_PASSWORD` with a hash.
+That is convenient for a trial, but the default password `cloud_admin` then
+gives a secret that anyone can compute, and the deploy prints a warning.
+`NEON_ROLE_SECRET=off` deploys without the sync. Then the explorer offers no
+"Connect as me", and everyone connects as `cloud_admin` as before.
+
+To rotate every role password, deploy both jobs again with a new secret. The
+service sets the new passwords at the next sync. This is also how you lock
+out a job that was given the old secret.
 
 The Settings table above lists `NEON_ROLE_SECRET` and
 `NEON_ROLE_SYNC_INTERVAL`.
 
-### Other clients
+### Using the passwords
 
-Any job can connect as a platform user when it knows the secret, with the
-password from `neon_postgres.access.role_password(secret, user)`. A job that
-connects as `cloud_admin` still bypasses all grants. Keep that password to
-administrators.
+In the explorer you never see or type a role password. Tick "Connect as me"
+and the app derives yours from the header and the secret.
+
+Other clients, such as a workflow or a notebook in a workstation, connect as a
+platform user with the user name as the Postgres user and the derived
+password. They need the secret. Read it from the service definition, which
+the platform shows to users with read access to the job:
+
+```bash
+dt job get neon-postgres --json | grep NEON_ROLE_SECRET
+```
+
+Then derive the password, in a shell:
+
+```bash
+NEON_ROLE_SECRET='the-secret' python -m neon_postgres.access alice
+```
+
+or in Python:
+
+```python
+import psycopg
+
+from neon_postgres.access import role_password
+
+secret = "the-secret"  # NEON_ROLE_SECRET from the service definition
+with psycopg.connect(
+    host="neon-postgres",
+    port=5432,
+    user="alice",
+    password=role_password(secret, "alice"),
+    dbname="postgres",
+) as conn:
+    print(conn.execute("select current_user").fetchone())
+```
+
+A job that connects this way acts with the grants of that user's groups. A
+job that connects as `cloud_admin` bypasses all grants. Keep that password to
+administrators, and prefer the per-user roles for anything that runs on
+behalf of a person.
 
 ### Limits
 

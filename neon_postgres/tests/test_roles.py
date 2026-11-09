@@ -256,3 +256,11 @@ def test_syncer_runs_the_loader_and_reports(synced_db):
     syncer.sync_once()
     assert syncer.last_error == "platform unreachable"
     assert fetch_existing_roles(conn)["acl_alice"].login  # the previous roles stay
+
+
+def test_access_main_prints_the_role_password(monkeypatch, capsys):
+    monkeypatch.setenv(access.ROLE_SECRET_VAR, SECRET)
+    assert access.main(["alice"]) == 0
+    assert capsys.readouterr().out.strip() == access.role_password(SECRET, "alice")
+    monkeypatch.delenv(access.ROLE_SECRET_VAR)
+    assert access.main(["alice"]) == 2

@@ -48,3 +48,26 @@ def role_password(secret: str, username: str) -> str:
 
 def is_reserved_role(name: str) -> bool:
     return name in RESERVED_ROLES or name.startswith("pg_")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Print the role password of a platform user: ``python -m neon_postgres.access alice``.
+
+    The secret comes from ``NEON_ROLE_SECRET`` in the environment.
+    """
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="Print the Postgres password of a platform user's role.")
+    parser.add_argument("user", help="platform user name")
+    args = parser.parse_args(argv)
+    secret = role_secret()
+    if secret is None:
+        print(f"{ROLE_SECRET_VAR} is not set", file=sys.stderr)
+        return 2
+    print(role_password(secret, args.user))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
