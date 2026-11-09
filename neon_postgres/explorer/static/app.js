@@ -527,8 +527,8 @@ function insertRowDialog() {
     });
     try {
       await api("/api/rows/insert", withConnection({ schema: g.schema, name: g.name, values }));
-      setMsg($("grid-msg"), "row inserted", "ok");
       await loadRows();
+      setMsg($("grid-msg"), "row inserted", "ok");
     } catch (err) {
       setMsg($("grid-msg"), err.message, "error");
     }
@@ -546,8 +546,8 @@ async function deleteSelected() {
     async () => {
       try {
         const { deleted } = await api("/api/rows/delete", withConnection({ schema: g.schema, name: g.name, ids }));
-        setMsg($("grid-msg"), `${deleted} row(s) deleted`, "ok");
         await loadRows();
+        setMsg($("grid-msg"), `${deleted} row(s) deleted`, "ok");
       } catch (err) {
         setMsg($("grid-msg"), err.message, "error");
       }
