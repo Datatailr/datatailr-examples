@@ -5,17 +5,19 @@ Usage:
     python deploy.py service     # the database only (needs the variables above)
     python deploy.py explorer    # the web app only
 
-Environment variables read at deploy time and passed to the service:
-    NEON_BUCKET        directory in blob storage that holds this database (required;
-                       every database needs its own)
-    NEON_PG_PASSWORD   password of the Postgres superuser; set it, the default
-                       cloud_admin is public knowledge
-    NEON_ROLE_SECRET   secret that the service and the explorer share; the service
-                       derives the password of every per-user Postgres role from it.
-                       Derived from NEON_PG_PASSWORD when not set. Set it to "off"
-                       to deploy without the user and group sync.
-
-Both jobs get NEON_ROLE_SECRET, so deploy them together or with the same value.
+Environment variables read at deploy time:
+    NEON_BUCKET            directory in blob storage that holds this database (required;
+                           every database needs its own)
+    NEON_PG_PASSWORD       password of the Postgres superuser; set it, the default
+                           cloud_admin is public knowledge
+    NEON_ENVIRONMENT       platform environment to deploy to: dev (default), pre or prod
+    NEON_ROLE_SECRET_KEY   name of the secret, in the platform's secret store, from
+                           which the service derives every per-user Postgres role
+                           password (default neon-postgres/role-secret). The deploy
+                           creates it with a random value when it is missing and
+                           passes the name to both jobs, which read it at runtime.
+    NEON_ROLE_SECRET       a value to store under that name, replacing any existing
+                           one. "off" deploys without the user and group sync.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from datatailr import App, Resources, Service  # noqa: E402
 from datatailr.logging import CYAN, YELLOW  # noqa: E402
 
 import neon_postgres.explorer.app as explorer_entrypoint  # noqa: E402
-from neon_postgres.access import ROLE_SECRET_VAR, derive_role_secret  # noqa: E402
+from neon_postgres import access  # noqa: E402
 from neon_postgres.service.service import main  # noqa: E402
 
 REQUIREMENTS = str(current_dir / "requirements.txt")
@@ -42,21 +44,47 @@ APP_SECTION = "Neon Postgres"
 
 
 DEFAULT_PASSWORD = "cloud_admin"
+ENVIRONMENT = os.environ.get("NEON_ENVIRONMENT", "dev").strip().lower() or "dev"
 
 
-def role_secret() -> str | None:
-    """The secret both jobs share, or None when the sync is switched off."""
-    value = os.environ.get(ROLE_SECRET_VAR, "").strip()
-    if value.lower() == "off":
-        return None
-    if value:
-        return value
-    return derive_role_secret(os.environ.get("NEON_PG_PASSWORD", DEFAULT_PASSWORD))
+def role_sync_off() -> bool:
+    return os.environ.get(access.ROLE_SECRET_VAR, "").strip().lower() == "off"
 
 
 def role_env() -> dict[str, str]:
-    secret = role_secret()
-    return {ROLE_SECRET_VAR: secret} if secret else {}
+    """The variables both jobs get: the store key of the role secret, or nothing.
+
+    The store keeps keys in lowercase, so the key is normalised the same way
+    here and inside the jobs, and both sides name the same entry.
+    """
+    if role_sync_off():
+        return {}
+    key = access.normalize_key(os.environ.get(access.ROLE_SECRET_KEY_VAR, "")) or access.DEFAULT_ROLE_SECRET_KEY
+    return {access.ROLE_SECRET_KEY_VAR: key}
+
+
+def prepare_role_secret() -> None:
+    """Create the role secret in the environment's secret store, unless it is there already.
+
+    Runs ``dt kv put -s -e <environment>`` through the SDK. The value is random
+    unless NEON_ROLE_SECRET holds one, in which case that value replaces the
+    stored one, which is how you rotate every role password.
+    """
+    if role_sync_off():
+        print(YELLOW("NEON_ROLE_SECRET=off: platform users and groups will not become Postgres roles."))
+        return
+    key = role_env()[access.ROLE_SECRET_KEY_VAR]
+    value = os.environ.get(access.ROLE_SECRET_VAR, "").strip() or None
+    stored_key, action = access.ensure_role_secret(ENVIRONMENT, key, value)
+    if action == "created":
+        print(CYAN(f"Created the role secret {stored_key!r} in the {ENVIRONMENT} secret store with a random value."))
+    elif action == "stored":
+        print(CYAN(f"Stored NEON_ROLE_SECRET as {stored_key!r} in the {ENVIRONMENT} secret store; the roles get new passwords at the next sync."))
+    else:
+        print(CYAN(f"The {ENVIRONMENT} secret store already holds the role secret {stored_key!r}; keeping it."))
+    given = os.environ.get(access.ROLE_SECRET_KEY_VAR, "").strip()
+    if given and given != stored_key:
+        print(YELLOW(f"The store keeps keys in lowercase, so the secret is named {stored_key!r}, not {given!r}."))
 
 
 def deploy_service() -> None:
@@ -74,14 +102,11 @@ def deploy_service() -> None:
                 "default from the README, and every job in the environment can reach port 5432."
             )
         )
-    if role_secret() is None:
-        print(YELLOW("NEON_ROLE_SECRET=off: platform users and groups will not become Postgres roles."))
-    elif password == DEFAULT_PASSWORD and not os.environ.get(ROLE_SECRET_VAR):
-        print(YELLOW("WARNING: the role secret is derived from the default password, so every per-user role password is public too."))
-    print(CYAN(f"Deploying the Neon Postgres service with its data in blob storage under {bucket}/ ..."))
+    print(CYAN(f"Deploying the Neon Postgres service to {ENVIRONMENT} with its data in blob storage under {bucket}/ ..."))
     service = Service(
         name="Neon Postgres",
         entrypoint=main,
+        environment=ENVIRONMENT,
         resources=Resources(memory="4g", cpu=2),
         python_requirements=REQUIREMENTS,
         build_script_pre=BUILD_SCRIPT_PRE,
@@ -98,10 +123,11 @@ def deploy_service() -> None:
 
 
 def deploy_explorer() -> None:
-    print(CYAN("Deploying the Neon Postgres Explorer app..."))
+    print(CYAN(f"Deploying the Neon Postgres Explorer app to {ENVIRONMENT}..."))
     app = App(
         name="Neon Postgres Explorer",
         entrypoint=explorer_entrypoint,
+        environment=ENVIRONMENT,
         framework="fastapi",
         resources=Resources(memory="1g", cpu=1),
         app_section=APP_SECTION,
@@ -115,6 +141,7 @@ if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "all"
     if target not in ("all", "service", "explorer"):
         raise SystemExit(f"unknown target {target!r}: use service, explorer, or nothing for both")
+    prepare_role_secret()
     if target in ("all", "service"):
         deploy_service()
     if target in ("all", "explorer"):

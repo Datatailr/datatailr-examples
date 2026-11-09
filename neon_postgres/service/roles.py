@@ -19,6 +19,7 @@ import hashlib
 import logging
 import threading
 import time
+from typing import Callable
 from dataclasses import dataclass, field
 
 import psycopg
@@ -211,8 +212,10 @@ def sync_roles(conn: psycopg.Connection, directory: Directory, secret: str, skip
 class RoleSyncer:
     """Sync roles on a timer, in a background thread, and report the last result."""
 
-    def __init__(self, dsn: str, secret: str, interval: float = 60.0, load=load_directory) -> None:
+    def __init__(self, dsn: str, secret: "str | Callable[[], str | None]", interval: float = 60.0, load=load_directory) -> None:
         self.dsn = dsn
+        # A value, or a function that returns the current value: the service
+        # passes ``access.role_secret`` so a rotated secret is used at the next sync.
         self.secret = secret
         self.interval = interval
         self.load = load
@@ -223,12 +226,19 @@ class RoleSyncer:
         self.skipped: dict[str, str] = {}
         self._stop = threading.Event()
 
+    def current_secret(self) -> str | None:
+        return self.secret() if callable(self.secret) else self.secret
+
     def sync_once(self) -> None:
+        secret = self.current_secret()
+        if not secret:
+            self.last_error = "no role secret: set NEON_ROLE_SECRET or NEON_ROLE_SECRET_KEY"
+            return
         try:
             directory = self.load()
             skipped: dict[str, str] = {}
             with psycopg.connect(self.dsn, connect_timeout=10, autocommit=True) as conn:
-                changed = sync_roles(conn, directory, self.secret, skipped)
+                changed = sync_roles(conn, directory, secret, skipped)
             if skipped != self.skipped:  # say it once, not every minute
                 for name, reason in sorted(skipped.items()):
                     log.warning("%s gets no Postgres role: %s", name, reason)

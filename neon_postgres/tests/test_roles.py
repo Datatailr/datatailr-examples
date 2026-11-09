@@ -35,7 +35,6 @@ def test_role_passwords_are_derived_per_user_and_secret():
     assert alice != access.role_password(SECRET, "bob")
     assert alice != access.role_password("other", "alice")
     assert len(alice) >= 32 and " " not in alice
-    assert access.derive_role_secret("pw") != "pw"
     assert access.is_reserved_role("cloud_admin") and access.is_reserved_role("pg_read_all_data")
     assert not access.is_reserved_role("developers")
 

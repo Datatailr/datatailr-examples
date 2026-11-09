@@ -183,7 +183,8 @@ safekeepers on separate machines, which a Datatailr service cannot provide.
 | `NEON_LOG_STATEMENT` | `mod` | Which statements Postgres logs: `none`, `ddl`, `mod` or `all`. See [Audit logging](#audit-logging). |
 | `S3_GATEWAY_CONCURRENCY` | `8` | How many `dt blob` calls run at the same time |
 | `NEON_STORAGE_BACKEND` | `datatailr` | `local` stores objects in a directory instead |
-| `NEON_ROLE_SECRET` | derived from `NEON_PG_PASSWORD` by `deploy.py` | Shared by both jobs. The service derives every per-user role password from it. Unset means no role sync. See Access control. |
+| `NEON_ROLE_SECRET_KEY` | `neon-postgres/role-secret`, set by `deploy.py` | Name of the secret in the platform's secret store. Both jobs read the role secret from it. Unset means no role sync. See Access control. |
+| `NEON_ROLE_SECRET` | unset | The role secret itself, for tests and runs off the platform. Set, it wins over the store. |
 | `NEON_ROLE_SYNC_INTERVAL` | `60` | Seconds between two syncs of platform users and groups into roles |
 
 Two databases must use different `NEON_BUCKET` values. The deploy script
@@ -272,9 +273,11 @@ NEON_BUCKET=my-database NEON_PG_PASSWORD='a-long-random-password' python deploy.
 ```
 
 This deploys both jobs. `python deploy.py service` deploys the database only
-and `python deploy.py explorer` the app only. Both jobs receive
-`NEON_ROLE_SECRET`, so deploy them with the same variables, or the explorer
-derives the wrong role passwords. See Access control.
+and `python deploy.py explorer` the app only. Before either, the script makes
+sure that the secret store of the environment holds the role secret, and
+creates it with a random value when it is missing. Both jobs receive the name
+of that secret in `NEON_ROLE_SECRET_KEY`. See Access control. `NEON_ENVIRONMENT`
+picks the environment, `dev` by default.
 
 The service appears on the platform as **Neon Postgres**. Its status API is
 served on the platform port: `/health` returns `OK` once Postgres accepts
@@ -333,8 +336,8 @@ grants for every client.
 
 ### How it works
 
-The service holds a secret, `NEON_ROLE_SECRET`. Every minute it reads the
-users and groups of the platform and makes the roles match:
+The service reads a secret from the platform's secret store. Every minute it
+reads the users and groups of the platform and makes the roles match:
 
 - Every platform group becomes a Postgres role of the same name that cannot
   log in. Grant tables to these roles.
@@ -387,7 +390,7 @@ other schema.
 
 ### The secret and the passwords
 
-`NEON_ROLE_SECRET` is the key from which every per-user password is derived.
+The role secret is the key from which every per-user password is derived.
 The password of a user's role is an HMAC of the user name under the secret.
 The service computes it when it creates or updates the role, and the explorer
 computes the same value when you tick "Connect as me". No password is stored
@@ -395,30 +398,53 @@ anywhere, and the two jobs never exchange one. Whoever holds the secret can
 derive the password of every platform user's role, so treat it like a
 password. It does not give the `cloud_admin` password.
 
-The person who deploys the example sets the secret. Put it in the
-environment of the shell that runs `deploy.py`, and the script copies it into
-the definitions of both jobs. Any long random string works, for example the
-output of `openssl rand -hex 32`:
+The secret lives in the platform's secret store, the encrypted entries that
+`dt kv put -s` writes and the Secrets Manager page shows. `deploy.py` creates
+it there:
+
+1. It lists the secrets of the target environment. If the entry
+   `neon-postgres/role-secret` exists, the script keeps it.
+2. If the entry is missing, the script generates 32 random bytes and stores
+   them with `dt kv put -s -e <environment> neon-postgres/role-secret <value>`.
+3. Both jobs receive the name of the entry in `NEON_ROLE_SECRET_KEY` and read
+   the value at runtime with the SDK. The value itself is never written into
+   a job definition.
+
+The entry belongs to the user who deploys, and both jobs run as that user, so
+they can read it. A laptop can write and list the secrets of an environment
+but cannot read them, which is why the deploy never reads the value back.
+
+The store keeps every key in lowercase. `Team/Neon-Secret` is stored as
+`team/neon-secret`, and a lookup with either spelling finds it. `deploy.py`
+and the jobs lowercase the name the same way, so set `NEON_ROLE_SECRET_KEY` in
+any case you like, but expect the lowercase name in listings. The script says
+so when the name it stored differs from the one you gave.
+
+To choose another name, set `NEON_ROLE_SECRET_KEY`:
 
 ```bash
 NEON_BUCKET=my-database NEON_PG_PASSWORD='a-long-random-password' \
-NEON_ROLE_SECRET="$(openssl rand -hex 32)" python deploy.py
+NEON_ROLE_SECRET_KEY=team/neon-secret python deploy.py
 ```
 
-Both jobs must receive the same value, or the explorer derives wrong
-passwords and every "Connect as me" fails. Deploy them together, or export
-the same `NEON_ROLE_SECRET` when you deploy them one at a time. When you set
-nothing, `deploy.py` derives the secret from `NEON_PG_PASSWORD` with a hash.
-That is convenient for a trial, but the default password `cloud_admin` then
-gives a secret that anyone can compute, and the deploy prints a warning.
+To rotate every role password, store a new value and deploy again. Either
+set `NEON_ROLE_SECRET` for the deploy, and the script stores that value:
+
+```bash
+NEON_BUCKET=my-database NEON_ROLE_SECRET="$(openssl rand -hex 32)" python deploy.py
+```
+
+or write the entry yourself with `dt kv put -s -e dev neon-postgres/role-secret <value>`.
+The jobs read the store again within a minute, the service sets the new
+passwords at the next sync, and the explorer derives the new ones. This is
+also how you lock out a client that was given the old secret.
+
 `NEON_ROLE_SECRET=off` deploys without the sync. Then the explorer offers no
-"Connect as me", and everyone connects as `cloud_admin` as before.
+"Connect as me", and everyone connects as `cloud_admin` as before. Set
+`NEON_ROLE_SECRET` to a value, without deploying, to run the service or the
+explorer off the platform with that secret, for example in the tests.
 
-To rotate every role password, deploy both jobs again with a new secret. The
-service sets the new passwords at the next sync. This is also how you lock
-out a job that was given the old secret.
-
-The Settings table above lists `NEON_ROLE_SECRET` and
+The Settings table above lists `NEON_ROLE_SECRET_KEY`, `NEON_ROLE_SECRET` and
 `NEON_ROLE_SYNC_INTERVAL`.
 
 ### Using the passwords
@@ -428,27 +454,26 @@ and the app derives yours from the header and the secret.
 
 Other clients, such as a workflow or a notebook in a workstation, connect as a
 platform user with the user name as the Postgres user and the derived
-password. They need the secret. Read it from the service definition, which
-the platform shows to users with read access to the job:
+password. They need the secret, which they read from the secret store. That
+works inside the platform, for a job or a workstation that runs as the user
+who deployed, or as a user the entry's ACL allows to read it. Derive the
+password in a shell:
 
 ```bash
-dt job get neon-postgres --json | grep NEON_ROLE_SECRET
+python -m neon_postgres.access alice
 ```
 
-Then derive the password, in a shell:
-
-```bash
-NEON_ROLE_SECRET='the-secret' python -m neon_postgres.access alice
-```
-
-or in Python:
+The command reads `NEON_ROLE_SECRET` when it is set, else the store entry
+named by `NEON_ROLE_SECRET_KEY` or `--key`, else `neon-postgres/role-secret`.
+In Python:
 
 ```python
 import psycopg
+from datatailr import Secrets
 
 from neon_postgres.access import role_password
 
-secret = "the-secret"  # NEON_ROLE_SECRET from the service definition
+secret = Secrets().get("neon-postgres/role-secret")
 with psycopg.connect(
     host="neon-postgres",
     port=5432,
