@@ -10,7 +10,9 @@
    groups into Postgres roles (see ``roles.py``).
 
 Postgres itself listens on ``NEON_PG_PORT`` (5432) on all interfaces, so other
-jobs in the same environment connect to it by the service's hostname.
+jobs in the same environment connect to it by the service's hostname. The
+status API also relays the Postgres protocol over a WebSocket at ``/pg``, so a
+client outside the platform can connect through the HTTP ingress.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from neon_postgres.s3_gateway.app import create_app as create_gateway
 from neon_postgres.s3_gateway.backends import backend_from_env
 from neon_postgres.service.neon_stack import NeonConfig, NeonStack
 from neon_postgres.service.roles import RoleSyncer
+from neon_postgres.service.pg_tunnel import add_pg_tunnel, tunnel_enabled
 
 log = logging.getLogger("neon_postgres")
 
@@ -78,6 +81,10 @@ def status_app(stack: NeonStack, syncer: RoleSyncer | None = None) -> FastAPI:
         if not stack.postgres_ready():
             return PlainTextResponse("postgres not ready\n", status_code=503)
         return "OK\n"
+
+    if tunnel_enabled():
+        # /pg: Postgres over a WebSocket, for clients outside the platform (see the README).
+        add_pg_tunnel(app, "127.0.0.1", cfg.pg_port)
 
     return app
 
