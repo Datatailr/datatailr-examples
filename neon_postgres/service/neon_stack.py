@@ -72,6 +72,10 @@ class NeonConfig:
     partial_backup_timeout: str = "1m"
     checkpoint_timeout: str = "1m"
     checkpoint_distance: int = 64 * 1024 * 1024
+    # Platform users and groups become Postgres roles; see service/roles.py.
+    # No secret means no sync. The interval is in seconds.
+    role_secret: str | None = None
+    role_sync_interval: float = 60.0
     extra_settings: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -95,6 +99,8 @@ class NeonConfig:
             partial_backup_timeout=env.get("NEON_PARTIAL_BACKUP_TIMEOUT", cls.partial_backup_timeout),
             checkpoint_timeout=env.get("NEON_CHECKPOINT_TIMEOUT", cls.checkpoint_timeout),
             checkpoint_distance=int(env.get("NEON_CHECKPOINT_DISTANCE", cls.checkpoint_distance)),
+            role_secret=env.get("NEON_ROLE_SECRET") or None,
+            role_sync_interval=float(env.get("NEON_ROLE_SYNC_INTERVAL", cls.role_sync_interval)),
         )
 
     @property
@@ -107,6 +113,11 @@ class NeonConfig:
     @property
     def setrlimit_shim(self) -> Path:
         return Path(self.bin_dir) / "lib" / "setrlimit_shim.so"
+
+    @property
+    def local_dsn(self) -> str:
+        """How processes inside the container connect to Postgres as the superuser."""
+        return f"postgresql://{self.pg_user}:{self.pg_password}@127.0.0.1:{self.pg_port}/postgres"
 
     @property
     def gateway_url(self) -> str:

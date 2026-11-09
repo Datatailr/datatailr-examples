@@ -27,8 +27,13 @@
         <label>Port <input id="port" value="5432" size="5"></label>
         <label>Database <input id="dbname" value="postgres"></label>
       </div>
-      <label>User <input id="user" value="cloud_admin"></label>
-      <label>Password <input id="password" type="password"></label>
+      <label class="inline" id="as-user-row" hidden>
+        <input id="as-user" type="checkbox"> <span id="as-user-label">Connect as me</span>
+      </label>
+      <div id="credentials">
+        <label>User <input id="user" value="cloud_admin"></label>
+        <label>Password <input id="password" type="password"></label>
+      </div>
       <div class="row">
         <button id="connect-btn">Connect</button>
         <button id="refresh-services" class="secondary" title="Look for database services on the platform">Find services</button>

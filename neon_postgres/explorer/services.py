@@ -67,6 +67,9 @@ def database_services(timeout: float = 2.0) -> list[dict]:
                     "database": status.get("database", "postgres"),
                     "bucket": status.get("bucket"),
                     "status": status.get("status"),
+                    # Set when the service syncs platform users into Postgres roles,
+                    # so the browser can offer "connect as me".
+                    "role_sync": bool(status.get("role_sync")),
                 }
             )
     return found

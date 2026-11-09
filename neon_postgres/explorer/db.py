@@ -7,7 +7,7 @@ so the app holds no state between requests.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
 
@@ -26,6 +26,10 @@ class ConnectionInfo:
     dbname: str = "postgres"
     user: str = "cloud_admin"
     password: str = ""
+    # True when the browser asked to connect as the platform user who is using
+    # the explorer. The app then fills in ``user`` and ``password`` itself, from
+    # the X-Datatailr-User header and the shared role secret.
+    as_user: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> "ConnectionInfo":
@@ -38,7 +42,11 @@ class ConnectionInfo:
             dbname=str(data.get("dbname") or "postgres"),
             user=str(data.get("user") or "cloud_admin"),
             password=str(data.get("password") or ""),
+            as_user=bool(data.get("as_user", False)),
         )
+
+    def for_user(self, username: str, password: str) -> "ConnectionInfo":
+        return replace(self, user=username, password=password, as_user=False)
 
     def connect(self, autocommit: bool = True) -> psycopg.Connection:
         return psycopg.connect(
