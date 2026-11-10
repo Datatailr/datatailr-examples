@@ -176,7 +176,7 @@ def test_ensure_validates_names(fx):
 
 
 def test_validate_model_name():
-    for bad in ["../x", "/abs/path", "a/b/c", "org/..", "org", "", "org/na me", "org/-x", "./m", "a--b/c", "a/b--c"]:
+    for bad in ["../x", "/abs/path", "a/b/c", "org/..", "org", "", "org/na me", "org/-x", "./m", "a--b/c", "a/b--c", "a-/b", "a/b-"]:
         with pytest.raises(ValueError):
             validate_model_name(bad)
     assert validate_model_name("Qwen/Qwen2.5-1.5B-Instruct") == "Qwen/Qwen2.5-1.5B-Instruct"
@@ -206,3 +206,10 @@ def test_hf_downloader_calls_snapshot_download(monkeypatch, tmp_path):
         "local_dir": tmp_path,
         "token": "tok",
     }
+
+
+def test_cached_returns_the_names_given_to_ensure(fx):
+    names = ["Qwen/Qwen2.5-1.5B-Instruct", "a-b/c_d.e"]
+    for name in names:
+        fx.cache.ensure(name, "main")
+    assert [e["model"] for e in fx.cache.cached()] == sorted(names)
