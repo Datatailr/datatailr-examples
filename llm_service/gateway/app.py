@@ -1,0 +1,406 @@
+"""The gateway application: OpenAI routes, admin routes and `main`."""
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import date
+
+import httpx
+from fastapi import Depends, FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from llm_service.gateway.audit import AuditLog, iso, parse_time, run_flusher, utc_now
+from llm_service.gateway.config import Config
+from llm_service.gateway.engine import Engine
+from llm_service.gateway.identity import AdminCheck, user_from_headers
+from llm_service.gateway.models import ModelManager, SwitchInProgress
+from llm_service.gateway.proxy import forward, prompt_of
+from llm_service.gateway.storage import BlobStore
+from llm_service.gateway.usage import UsageTotals
+from llm_service.gateway.weights import Downloader, WeightCache
+
+logger = logging.getLogger("llm_service.app")
+
+SYSTEM_USER = "system"
+OPENAI_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings")
+MAX_AUDIT_LIMIT = 1000
+
+
+class ApiError(Exception):
+    """An error that becomes the OpenAI style error body."""
+
+    def __init__(
+        self,
+        status: int,
+        type_: str,
+        code: str,
+        message: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.type = type_
+        self.code = code
+        self.message = message
+        self.headers = headers or {}
+
+
+def error_response(error: ApiError) -> JSONResponse:
+    """Return the JSON response of an `ApiError`."""
+    body = {"error": {"message": error.message, "type": error.type, "code": error.code}}
+    return JSONResponse(body, status_code=error.status, headers=error.headers)
+
+
+def _check_day(name: str, value: str | None) -> str | None:
+    """Return `value` if it is a day like `2026-11-10`. Raise `ApiError` otherwise."""
+    if value is None:
+        return None
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise ApiError(400, "invalid_request_error", "invalid_time", f"{name} must be a day like 2026-11-10") from None
+    return value
+
+
+def create_app(
+    config: Config,
+    store: BlobStore,
+    engine: Engine,
+    admin: AdminCheck,
+    download: Downloader,
+    http: httpx.AsyncClient | None = None,
+) -> FastAPI:
+    """Build the gateway application from its parts."""
+    owns_http = http is None
+    client = http or httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
+    audit = AuditLog(store, config.blob_root, config.flush_size)
+    usage = UsageTotals(store, config.blob_root, audit, lambda: iso(utc_now())[:10])
+    weights = WeightCache(store, config.blob_root, config.local_dir, download)
+
+    def write_audit(record: dict) -> None:
+        """Add a record to the audit log. A failure is logged and never raised."""
+        try:
+            record.setdefault("request_id", uuid.uuid4().hex)
+            record["ts"] = iso(utc_now())
+            audit.add(record)
+        except Exception as error:
+            logger.warning("could not write an audit record: %s", error)
+
+    def on_event(event: dict) -> None:
+        failed = event["result"] != "ok"
+        write_audit(
+            {
+                "user": app.state.last_admin,
+                "endpoint": "/admin/model",
+                "model": event["model"],
+                "stream": False,
+                "prompt": {
+                    "event": "model_switch",
+                    "revision": event["revision"],
+                    "error": event["error"],
+                },
+                "status": 500 if failed else 200,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "duration_ms": None,
+            }
+        )
+
+    manager = ModelManager(weights, engine, store, config.blob_root, config.default_model, on_event)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Load the totals first. Add the listener after that, so that no record
+        # is counted twice.
+        await asyncio.to_thread(usage.load)
+        audit.listeners.append(usage.record)
+        flusher = asyncio.create_task(run_flusher(audit, config.flush_interval))
+        app.state.startup_task = asyncio.create_task(manager.startup())
+        try:
+            yield
+        finally:
+            for task in (app.state.startup_task, app.state.switch_task):
+                if task is not None and not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+            try:
+                await engine.stop()
+            finally:
+                flusher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await flusher
+                if owns_http:
+                    await client.aclose()
+
+    app = FastAPI(title="LLM service", lifespan=lifespan)
+    app.state.last_admin = SYSTEM_USER
+    app.state.switch_task = None
+    app.state.startup_task = None
+    app.state.manager = manager
+    app.state.audit = audit
+    app.state.usage = usage
+
+    # Error bodies
+
+    @app.exception_handler(ApiError)
+    async def api_error_handler(request: Request, error: ApiError):
+        return error_response(error)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error_handler(request: Request, error: StarletteHTTPException):
+        code = {404: "not_found", 405: "method_not_allowed"}.get(error.status_code, "http_error")
+        type_ = "invalid_request_error" if error.status_code < 500 else "server_error"
+        return error_response(ApiError(error.status_code, type_, code, str(error.detail)))
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, error: RequestValidationError):
+        first = error.errors()[0]
+        place = ".".join(str(part) for part in first["loc"][1:])
+        message = f"invalid {place}: {first['msg']}" if place else first["msg"]
+        return error_response(ApiError(400, "invalid_request_error", "invalid_parameter", message))
+
+    # Dependencies
+
+    async def current_user(request: Request) -> str:
+        user = user_from_headers(request.headers)
+        if user is None:
+            raise ApiError(401, "authentication_error", "missing_user", "the request has no platform user")
+        return user
+
+    async def require_admin(user: str = Depends(current_user)) -> str:
+        if not await asyncio.to_thread(admin.is_admin, user):
+            raise ApiError(403, "permission_error", "admin_required", "this endpoint is for admins")
+        return user
+
+    # Platform
+
+    @app.get("/health")
+    async def health() -> PlainTextResponse:
+        return PlainTextResponse("OK")
+
+    # OpenAI API
+
+    def make_handler(path: str):
+        async def handler(request: Request, user: str = Depends(current_user)):
+            started = time.monotonic()
+            request_id = uuid.uuid4().hex
+            headers = {"x-request-id": request_id}
+            body: dict | None = None
+            model: str | None = None
+
+            def record(status: int, usage_counts: dict | None = None) -> None:
+                counts = usage_counts or {}
+                write_audit(
+                    {
+                        "request_id": request_id,
+                        "user": user,
+                        "endpoint": path,
+                        "model": model,
+                        "stream": bool(body.get("stream")) if body else False,
+                        "prompt": prompt_of(body) if body else {},
+                        "status": status,
+                        "prompt_tokens": counts.get("prompt_tokens"),
+                        "completion_tokens": counts.get("completion_tokens"),
+                        "total_tokens": counts.get("total_tokens"),
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                    }
+                )
+
+            def refuse(error: ApiError) -> JSONResponse:
+                record(error.status)
+                error.headers = {**error.headers, **headers}
+                return error_response(error)
+
+            try:
+                parsed = json.loads(await request.body())
+            except ValueError:
+                parsed = None
+            if not isinstance(parsed, dict):
+                return refuse(
+                    ApiError(400, "invalid_request_error", "invalid_json", "the request body must be a JSON object")
+                )
+            body = parsed
+            if isinstance(body.get("model"), str):
+                model = body["model"]
+
+            manager.check_engine()
+            if manager.state != "ready":
+                loading = manager.state == "loading"
+                return refuse(
+                    ApiError(
+                        503,
+                        "service_unavailable",
+                        "model_loading" if loading else "no_model",
+                        "a model is loading, try again later" if loading else "no model is loaded",
+                        {"Retry-After": "30"},
+                    )
+                )
+            active = manager.active["model"]
+            if body.get("model") is None:
+                body = {**body, "model": active}
+                model = active
+            elif model != active:
+                return refuse(
+                    ApiError(
+                        404,
+                        "invalid_request_error",
+                        "model_not_found",
+                        f"the model {body['model']!r} is not served, the active model is {active!r}",
+                    )
+                )
+
+            def on_done(status: int, usage_counts: dict | None) -> None:
+                record(status, usage_counts)
+
+            response = await forward(client, engine.base_url, path, body, on_done)
+            response.headers["x-request-id"] = request_id
+            return response
+
+        return handler
+
+    for openai_path in OPENAI_PATHS:
+        app.post(openai_path)(make_handler(openai_path))
+
+    @app.get("/v1/models")
+    async def list_models(user: str = Depends(current_user)) -> dict:
+        cached = await asyncio.to_thread(weights.cached)
+        entries = {(c["model"], c["revision"]): "cached" for c in cached}
+        active = manager.active
+        target = manager.target
+        if active:
+            entries[(active["model"], active["revision"])] = "active"
+        if target:
+            entries[(target["model"], target["revision"])] = "loading"
+        order = sorted(entries, key=lambda key: (entries[key] != "active", entries[key] != "loading", key))
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": name.split("/")[0],
+                    "status": entries[(name, revision)],
+                    "revision": revision,
+                }
+                for name, revision in order
+            ],
+        }
+
+    @app.get("/v1/usage/me")
+    async def usage_me(
+        since: str | None = None, until: str | None = None, user: str = Depends(current_user)
+    ) -> dict:
+        _check_day("since", since)
+        _check_day("until", until)
+        return await asyncio.to_thread(usage.user_detail, user, since, until)
+
+    # Admin API
+
+    @app.get("/admin/model")
+    async def get_model(admin_user: str = Depends(require_admin)) -> dict:
+        return manager.status()
+
+    @app.post("/admin/model", status_code=202)
+    async def switch_model(request: Request, admin_user: str = Depends(require_admin)):
+        try:
+            body = json.loads(await request.body())
+        except ValueError:
+            body = None
+        if not isinstance(body, dict) or not isinstance(body.get("model"), str):
+            raise ApiError(400, "invalid_request_error", "invalid_model", "the body needs a string 'model'")
+        revision = body.get("revision", "main")
+        if not isinstance(revision, str):
+            raise ApiError(400, "invalid_request_error", "invalid_model", "'revision' must be a string")
+        try:
+            app.state.switch_task = manager.request_switch(body["model"], revision)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
+        except SwitchInProgress as error:
+            raise ApiError(409, "invalid_request_error", "switch_in_progress", str(error)) from None
+        app.state.last_admin = admin_user
+        return manager.status()
+
+    @app.get("/admin/audit")
+    async def get_audit(
+        user: str | None = None,
+        model: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = Query(100, ge=1, le=MAX_AUDIT_LIMIT),
+        offset: int = Query(0, ge=0),
+        admin_user: str = Depends(require_admin),
+    ) -> dict:
+        try:
+            start = parse_time(since) if since is not None else None
+            end = parse_time(until) if until is not None else None
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_time", str(error)) from None
+        records = await asyncio.to_thread(audit.query, user, model, start, end, limit, offset)
+        return {"data": records, "limit": limit, "offset": offset}
+
+    @app.get("/admin/audit/users")
+    async def get_audit_users(admin_user: str = Depends(require_admin)) -> dict:
+        return {"data": await asyncio.to_thread(audit.users)}
+
+    @app.get("/admin/usage")
+    async def get_usage(
+        since: str | None = None,
+        until: str | None = None,
+        user: str | None = None,
+        model: str | None = None,
+        group_by: str = "user",
+        admin_user: str = Depends(require_admin),
+    ) -> dict:
+        _check_day("since", since)
+        _check_day("until", until)
+        try:
+            rows = await asyncio.to_thread(usage.summary, since, until, user, model, group_by)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_group_by", str(error)) from None
+        return {"data": rows}
+
+    @app.get("/admin/usage/{name}")
+    async def get_user_usage(
+        name: str,
+        since: str | None = None,
+        until: str | None = None,
+        admin_user: str = Depends(require_admin),
+    ) -> dict:
+        _check_day("since", since)
+        _check_day("until", until)
+        return await asyncio.to_thread(usage.user_detail, name, since, until)
+
+    return app
+
+
+def main(port) -> None:
+    """Run the gateway on `port`. The platform calls this with the assigned port."""
+    import uvicorn
+    from datatailr import Secrets
+
+    from llm_service.gateway.engine import VllmEngine
+    from llm_service.gateway.identity import platform_group_members
+    from llm_service.gateway.storage import DatatailrBlobStore
+    from llm_service.gateway.weights import hf_downloader
+
+    logging.basicConfig(level=logging.INFO)
+    config = Config.from_env(os.environ)
+    token = Secrets().get(config.hf_token_key) if config.hf_token_key else None
+    app = create_app(
+        config,
+        DatatailrBlobStore(),
+        VllmEngine(config.engine_port, config.vllm_args),
+        AdminCheck(config.owner, config.admin_group, platform_group_members),
+        hf_downloader(token),
+    )
+    uvicorn.run(app, host="0.0.0.0", port=int(port))

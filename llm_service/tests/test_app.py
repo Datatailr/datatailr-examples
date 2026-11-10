@@ -1,0 +1,362 @@
+"""Tests for the gateway application."""
+
+import asyncio
+import json
+import threading
+import time
+from pathlib import Path
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from llm_service.gateway.app import create_app
+from llm_service.gateway.config import Config
+from llm_service.gateway.identity import AdminCheck
+from llm_service.gateway.storage import MemoryBlobStore
+from llm_service.tests.fakes import FakeEngine, fake_vllm_app
+
+ALICE = {"X-Datatailr-User": "alice"}
+BOB = {"X-Datatailr-User": "bob"}
+CHAT = "/v1/chat/completions"
+HI = {"model": "org/a", "messages": [{"role": "user", "content": "hi"}]}
+
+
+class GatedEngine(FakeEngine):
+    """A fake engine whose `start` waits for `gate` when the model is in `blocked`."""
+
+    def __init__(self, blocked: set[str]) -> None:
+        super().__init__()
+        self.blocked = blocked
+        self.gate = threading.Event()
+
+    async def start(self, model_dir: Path, served_name: str) -> None:
+        if served_name in self.blocked:
+            await asyncio.to_thread(self.gate.wait, 10)
+        await super().start(model_dir, served_name)
+
+
+def make_app(tmp_path, engine=None, store=None):
+    store = store or MemoryBlobStore()
+    engine = engine or FakeEngine()
+    config = Config(owner="alice", local_dir=tmp_path / "local", default_model="org/a")
+
+    def download(model: str, revision: str, target: Path) -> None:
+        (target / "config.json").write_text("{}")
+
+    http = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=fake_vllm_app()), base_url="http://engine"
+    )
+    admin = AdminCheck("alice", None, lambda group: [])
+    return create_app(config, store, engine, admin, download, http)
+
+
+def wait_for(client, predicate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = client.get("/admin/model", headers=ALICE).json()
+        if predicate(status):
+            return status
+        time.sleep(0.02)
+    raise AssertionError(f"timeout, last status: {status}")
+
+
+def wait_ready(client):
+    return wait_for(client, lambda s: s["state"] == "ready")
+
+
+@pytest.fixture
+def client(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        yield c
+
+
+def audit_records(client, **params):
+    return client.get("/admin/audit", headers=ALICE, params=params).json()["data"]
+
+
+def test_health_needs_no_user(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        r = c.get("/health")
+        assert r.status_code == 200 and r.text == "OK"
+        assert c.get("/openapi.json").status_code == 200
+
+
+def test_chat_completion_roundtrip_and_audit(client):
+    r = client.post(CHAT, headers=BOB, json=HI)
+    assert r.status_code == 200 and r.headers["x-request-id"]
+    rec = client.get("/admin/audit?user=bob", headers=ALICE).json()["data"][0]
+    assert rec["prompt"] == {"messages": [{"role": "user", "content": "hi"}]}
+    assert rec["total_tokens"] == 5 and rec["prompt_tokens"] == 3 and rec["completion_tokens"] == 2
+    assert rec["request_id"] == r.headers["x-request-id"]
+    assert rec["status"] == 200 and rec["endpoint"] == CHAT and rec["model"] == "org/a"
+    assert rec["stream"] is False and rec["duration_ms"] >= 0
+    assert rec["ts"].endswith("Z")
+
+
+def test_streaming_client_sees_no_usage_chunk_but_audit_has_tokens(client):
+    r = client.post(CHAT, headers=BOB, json={**HI, "stream": True})
+    assert r.status_code == 200 and r.headers["x-request-id"]
+    assert "usage" not in r.text and "[DONE]" in r.text
+    rec = audit_records(client, user="bob")[0]
+    assert rec["stream"] is True and rec["status"] == 200
+    assert rec["total_tokens"] == 5
+
+
+def test_missing_model_field_uses_active_model(client):
+    r = client.post(CHAT, headers=BOB, json={"messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    assert audit_records(client, user="bob")[0]["model"] == "org/a"
+
+
+def test_wrong_model_is_404_model_not_found(client):
+    r = client.post(CHAT, headers=BOB, json={**HI, "model": "org/other"})
+    assert r.status_code == 404
+    error = r.json()["error"]
+    assert error["code"] == "model_not_found" and error["type"] == "invalid_request_error"
+    assert "org/a" in error["message"]
+    rec = audit_records(client, user="bob")[0]
+    assert rec["status"] == 404 and rec["model"] == "org/other"
+
+
+def test_no_user_is_401(client):
+    r = client.post(CHAT, json=HI)
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "missing_user"
+    assert r.json()["error"]["type"] == "authentication_error"
+    assert client.get("/v1/models").status_code == 401
+
+
+@pytest.mark.parametrize("content", [b"hello", b"[1]", b""])
+def test_non_json_and_non_object_body_is_400_and_audited(client, content):
+    r = client.post(CHAT, headers=BOB, content=content)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_json"
+    rec = audit_records(client, user="bob")[0]
+    assert rec["status"] == 400 and rec["request_id"] == r.headers["x-request-id"]
+    assert rec["prompt"] == {} and rec["total_tokens"] is None
+
+
+def test_503_with_retry_after_while_loading(tmp_path):
+    engine = GatedEngine({"org/a"})
+    try:
+        with TestClient(make_app(tmp_path, engine)) as c:
+            assert c.get("/health").status_code == 200
+            r = c.post(CHAT, headers=BOB, json=HI)
+            assert r.status_code == 503
+            assert r.headers["retry-after"] == "30"
+            assert r.json()["error"]["code"] == "model_loading"
+            assert r.json()["error"]["type"] == "service_unavailable"
+            models = c.get("/v1/models", headers=BOB).json()["data"]
+            assert models[0]["id"] == "org/a" and models[0]["status"] == "loading"
+            assert audit_records(c, user="bob")[0]["status"] == 503
+            engine.gate.set()
+            wait_ready(c)
+            assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+    finally:
+        engine.gate.set()
+
+
+def test_503_no_model_when_the_load_failed(tmp_path):
+    engine = FakeEngine()
+    engine.fail_on = {"org/a"}
+    with TestClient(make_app(tmp_path, engine)) as c:
+        wait_for(c, lambda s: s["state"] == "failed")
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 503 and r.json()["error"]["code"] == "no_model"
+        assert r.headers["retry-after"] == "30"
+
+
+def test_models_list_marks_active_and_cached(client):
+    client.app.state.manager._store.put("llm-service/models/org--b/main/.complete", "")
+    body = client.get("/v1/models", headers=BOB).json()
+    assert body["object"] == "list"
+    first, second = body["data"]
+    assert first == {
+        "id": "org/a", "object": "model", "created": 0, "owned_by": "org",
+        "status": "active", "revision": "main",
+    }
+    assert second["id"] == "org/b" and second["status"] == "cached"
+
+
+ADMIN_ROUTES = [
+    ("POST", "/admin/model", {"json": {"model": "org/b"}}),
+    ("GET", "/admin/model", {}),
+    ("GET", "/admin/audit", {}),
+    ("GET", "/admin/audit/users", {}),
+    ("GET", "/admin/usage", {}),
+    ("GET", "/admin/usage/bob", {}),
+]
+
+
+@pytest.mark.parametrize("method,path,kwargs", ADMIN_ROUTES)
+def test_admin_endpoints_reject_non_admin(client, method, path, kwargs):
+    r = client.request(method, path, headers=BOB, **kwargs)
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "admin_required"
+    assert r.json()["error"]["type"] == "permission_error"
+    assert client.request(method, path, **kwargs).status_code == 401
+
+
+def test_switch_model_202_then_ready_and_event_in_audit(client):
+    r = client.post("/admin/model", headers=ALICE, json={"model": "org/b", "revision": "v2"})
+    assert r.status_code == 202 and r.json()["state"] == "loading"
+    assert r.json()["target"] == {"model": "org/b", "revision": "v2"}
+    status = wait_ready(client)
+    assert status["active"] == {"model": "org/b", "revision": "v2"}
+    events = [r for r in audit_records(client, model="org/b") if r["endpoint"] == "/admin/model"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["user"] == "alice" and event["status"] == 200
+    assert event["prompt"] == {"event": "model_switch", "revision": "v2", "error": None}
+    assert event["total_tokens"] is None
+    assert client.post(CHAT, headers=BOB, json={**HI, "model": "org/b"}).status_code == 200
+
+
+def test_startup_load_is_audited_as_system(client):
+    events = [r for r in audit_records(client) if r["endpoint"] == "/admin/model"]
+    assert [(e["user"], e["model"], e["status"]) for e in events] == [("system", "org/a", 200)]
+
+
+def test_failed_switch_is_audited_with_status_500(tmp_path):
+    engine = FakeEngine()
+    engine.fail_on = {"org/b"}
+    with TestClient(make_app(tmp_path, engine)) as c:
+        wait_ready(c)
+        assert c.post("/admin/model", headers=ALICE, json={"model": "org/b"}).status_code == 202
+        status = wait_for(c, lambda s: s["error"] is not None)
+        events = [r for r in audit_records(c, model="org/b") if r["endpoint"] == "/admin/model"]
+        assert events[0]["status"] == 500 and events[0]["prompt"]["error"] == status["error"]
+
+
+def test_switch_invalid_name_400_and_conflict_409(tmp_path):
+    engine = GatedEngine({"org/b"})
+    try:
+        with TestClient(make_app(tmp_path, engine)) as c:
+            wait_ready(c)
+            for body in ({"model": "nonsense"}, {"model": "org/b", "revision": "a/b"},
+                         {"model": 5}, {}, [1]):
+                r = c.post("/admin/model", headers=ALICE, json=body)
+                assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_model"
+            r = c.post("/admin/model", headers=ALICE, content=b"nope")
+            assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_model"
+            assert c.post("/admin/model", headers=ALICE, json={"model": "org/b"}).status_code == 202
+            r = c.post("/admin/model", headers=ALICE, json={"model": "org/c"})
+            assert r.status_code == 409 and r.json()["error"]["code"] == "switch_in_progress"
+            engine.gate.set()
+            wait_ready(c)
+    finally:
+        engine.gate.set()
+
+
+def test_audit_filters_and_invalid_time_400(client):
+    client.post(CHAT, headers=BOB, json=HI)
+    client.post(CHAT, headers=ALICE, json=HI)
+    client.post(CHAT, headers=BOB, json={**HI, "model": "org/other"})
+    body = client.get("/admin/audit", headers=ALICE).json()
+    assert body["limit"] == 100 and body["offset"] == 0
+    assert [r["user"] for r in audit_records(client, user="bob")] == ["bob", "bob"]
+    assert [r["status"] for r in audit_records(client, user="bob")] == [404, 200]
+    assert len(audit_records(client, user="bob", model="org/a")) == 1
+    assert len(audit_records(client, user="bob", limit=1)) == 1
+    assert audit_records(client, user="bob", limit=1, offset=1)[0]["status"] == 200
+    assert audit_records(client, since="2999-01-01") == []
+    assert audit_records(client, until="2000-01-01") == []
+    assert len(audit_records(client, since="2000-01-01", until="2999-01-01", user="bob")) == 2
+    for params in ({"since": "garbage"}, {"until": "13/45"}):
+        r = client.get("/admin/audit", headers=ALICE, params=params)
+        assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_time"
+    assert client.get("/admin/audit?limit=1001", headers=ALICE).status_code == 400
+    assert client.get("/admin/audit?limit=0", headers=ALICE).status_code == 400
+    assert client.get("/admin/audit?limit=1000", headers=ALICE).status_code == 200
+
+
+def test_audit_users(client):
+    client.post(CHAT, headers=BOB, json=HI)
+    rows = {r["user"]: r for r in client.get("/admin/audit/users", headers=ALICE).json()["data"]}
+    assert rows["bob"]["requests"] == 1
+    assert rows["bob"]["first_request"] <= rows["bob"]["last_request"]
+    assert "system" in rows
+
+
+def test_usage_by_user_and_user_detail(client):
+    client.post(CHAT, headers=BOB, json=HI)
+    rows = client.get("/admin/usage", headers=ALICE).json()["data"]
+    assert rows[0]["user"] == "bob" and rows[0]["total_tokens"] == 5 and rows[0]["requests"] == 1
+    assert len(rows) == 1
+    by_model = client.get("/admin/usage?group_by=model", headers=ALICE).json()["data"]
+    assert by_model[0]["model"] == "org/a"
+    assert client.get("/admin/usage?user=alice", headers=ALICE).json()["data"] == []
+    detail = client.get("/admin/usage/bob", headers=ALICE).json()
+    assert detail["user"] == "bob" and detail["totals"]["total_tokens"] == 5
+    assert [r["model"] for r in detail["by_model"]] == ["org/a"]
+    assert len(detail["by_day"]) == 1
+
+
+def test_usage_rejects_bad_group_by_and_bad_days(client):
+    r = client.get("/admin/usage?group_by=colour", headers=ALICE)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_group_by"
+    r = client.get("/admin/usage?since=yesterday", headers=ALICE)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_time"
+
+
+def test_usage_me_returns_only_the_caller(client):
+    client.post(CHAT, headers=BOB, json=HI)
+    client.post(CHAT, headers=ALICE, json=HI)
+    client.post(CHAT, headers=ALICE, json=HI)
+    bob = client.get("/v1/usage/me", headers=BOB).json()
+    assert bob["user"] == "bob" and bob["totals"]["requests"] == 1
+    alice = client.get("/v1/usage/me", headers=ALICE).json()
+    assert alice["user"] == "alice" and alice["totals"]["requests"] == 2
+
+
+def test_audit_failure_does_not_fail_the_request(client, caplog):
+    def broken(record):
+        raise RuntimeError("listener broke")
+
+    client.app.state.audit.listeners.append(broken)
+    with caplog.at_level("WARNING", logger="llm_service.app"):
+        r = client.post(CHAT, headers=BOB, json=HI)
+    assert r.status_code == 200
+    assert any("could not write an audit record" in m for m in caplog.messages)
+
+
+def test_shutdown_flushes_the_audit_log(tmp_path):
+    store = MemoryBlobStore()
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        c.post(CHAT, headers=BOB, json=HI)
+    files = store.ls("llm-service/audit")
+    text = "".join(store.get(f).decode() for f in files)
+    assert any(json.loads(line)["user"] == "bob" for line in text.splitlines())
+
+
+def test_openai_sdk_shape_of_errors(tmp_path):
+    engine = GatedEngine({"org/b"})
+    try:
+        with TestClient(make_app(tmp_path, engine)) as c:
+            wait_ready(c)
+            c.post("/admin/model", headers=ALICE, json={"model": "org/b"})
+            responses = [
+                c.post(CHAT, json=HI),                                          # 401
+                c.get("/admin/model", headers=BOB),                             # 403
+                c.post(CHAT, headers=BOB, content=b"x"),                        # 400
+                c.get("/admin/audit?limit=0", headers=ALICE),                   # 400 validation
+                c.get("/admin/audit?since=x", headers=ALICE),                   # 400
+                c.post("/admin/model", headers=ALICE, json={"model": "org/c"}), # 409
+                c.post(CHAT, headers=BOB, json=HI),                             # 503 loading
+                c.get("/no/such/route", headers=BOB),                           # 404
+                c.put(CHAT, headers=BOB),                                       # 405
+            ]
+            assert [r.status_code for r in responses] == [401, 403, 400, 400, 400, 409, 503, 404, 405]
+            for r in responses:
+                error = r.json()["error"]
+                assert set(error) == {"message", "type", "code"}
+                assert all(isinstance(v, str) and v for v in error.values())
+            engine.gate.set()
+            wait_ready(c)
+            r = c.post(CHAT, headers=BOB, json={**HI, "model": "org/zzz"})
+            assert set(r.json()["error"]) == {"message", "type", "code"}
+    finally:
+        engine.gate.set()
