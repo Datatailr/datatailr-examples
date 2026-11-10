@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -314,3 +315,133 @@ def test_bad_ts_is_rejected_before_buffer_and_listeners(bad):
     assert len(store.ls("root/audit")) == 1
     assert [r["user"] for r in log.query()] == ["alice"]
     assert log.days() == ["2026-11-10"]
+
+
+def test_parse_time_turns_an_overflow_into_value_error():
+    with pytest.raises(ValueError):
+        parse_time("0001-01-01T00:00:00+01:00")
+
+
+class CountingReads(MemoryBlobStore):
+    def __init__(self):
+        super().__init__()
+        self.reads: list[str] = []
+
+    def get(self, path):
+        self.reads.append(path)
+        return super().get(path)
+
+
+def test_query_without_since_stops_at_the_newest_days():
+    store, log = make(CountingReads())
+    for day in ("2026-11-07", "2026-11-08", "2026-11-09", "2026-11-10"):
+        log.add(rec("alice", f"{day}T08:00:00.000Z"))
+        log.add(rec("alice", f"{day}T09:00:00.000Z"))
+    log.flush()
+    store.reads.clear()
+    out = log.query(limit=2)
+    assert [r["ts"] for r in out] == ["2026-11-10T09:00:00.000Z", "2026-11-10T08:00:00.000Z"]
+    assert all("2026-11-10" in p for p in store.reads) and store.reads
+    store.reads.clear()
+    out = log.query(limit=2, offset=1)
+    assert [r["ts"] for r in out] == ["2026-11-10T08:00:00.000Z", "2026-11-09T09:00:00.000Z"]
+    assert {p.split("/")[2] for p in store.reads} == {"2026-11-10", "2026-11-09"}
+    store.reads.clear()
+    assert len(log.query(user="nobody")) == 0
+    assert len(store.reads) == 4  # without a match every day is read
+
+
+def test_stored_records_need_a_valid_ts_and_a_string_user(caplog):
+    store, log = make()
+    good = rec("alice", T)
+    bad = [
+        {"user": "bob"},
+        {"ts": "yesterday", "user": "bob"},
+        {"ts": "0001-01-01T00:00:00+01:00", "user": "bob"},
+        {"ts": 5, "user": "bob"},
+        {"ts": T, "user": 7},
+        {"ts": T},
+        [1, 2],
+    ]
+    body = "".join(json.dumps(r) + "\n" for r in [good, *bad])
+    store.put("root/audit/2026-11-10/120000.000000-abc.jsonl", body)
+    with caplog.at_level(logging.WARNING, logger="llm_service.audit"):
+        out = log.query()
+    assert [r["user"] for r in out] == ["alice"]
+    warnings = [r for r in caplog.records if r.name == "llm_service.audit"]
+    assert len(warnings) == 1 and "7" in warnings[0].getMessage()
+
+
+def test_usage_load_skips_bad_stored_records():
+    from llm_service.gateway.usage import UsageTotals
+
+    store, log = make()
+    bad = [
+        {"ts": T, "endpoint": "/v1/chat/completions"},
+        {"ts": 5, "user": "x", "endpoint": "/v1/chat/completions"},
+    ]
+    body = "".join(json.dumps(r) + "\n" for r in [rec("alice", T), *bad])
+    store.put("root/audit/2026-11-10/120000.000000-abc.jsonl", body)
+    usage = UsageTotals(store, "root", log, lambda: "2026-11-10")
+    usage.load()
+    rows = usage.summary(None, None, None, None)
+    assert [(r["user"], r["requests"]) for r in rows] == [("alice", 1)]
+
+
+class BlockingStore(MemoryBlobStore):
+    """A store whose `put` waits for `release`. It writes before or after the wait."""
+
+    def __init__(self, write_first: bool):
+        super().__init__()
+        self.write_first = write_first
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def put(self, path, data):
+        if self.write_first:
+            super().put(path, data)
+        self.entered.set()
+        assert self.release.wait(5)
+        if not self.write_first:
+            super().put(path, data)
+
+
+@pytest.mark.parametrize("write_first", [False, True])
+def test_query_during_a_flush_sees_each_record_once(write_first):
+    store, log = make(BlockingStore(write_first))
+    log.add(rec("alice", "2026-11-10T08:00:00.000Z"))
+    log.add(rec("bob", "2026-11-10T09:00:00.000Z"))
+    flusher = threading.Thread(target=log.flush)
+    flusher.start()
+    try:
+        assert store.entered.wait(5)
+        during = log.query()
+        assert [r["user"] for r in during] == ["bob", "alice"]
+        assert len(log.records_for_day("2026-11-10")) == 2
+    finally:
+        store.release.set()
+        flusher.join()
+    assert [r["user"] for r in log.query()] == ["bob", "alice"]
+
+
+def test_partial_flush_failure_keeps_only_the_failed_day():
+    class FailOneDay(MemoryBlobStore):
+        fail = True
+
+        def put(self, path, data):
+            if self.fail and "/2026-11-09/" in path:
+                raise OSError("down")
+            super().put(path, data)
+
+    store, log = make(FailOneDay())
+    log.add(rec("alice", "2026-11-09T08:00:00.000Z"))
+    log.add(rec("bob", "2026-11-10T08:00:00.000Z"))
+    assert log.flush() is False
+    assert len(store.ls("root/audit/2026-11-10")) == 1
+    assert store.ls("root/audit/2026-11-09") == []
+    assert [r["user"] for r in log.query()] == ["bob", "alice"]
+    store.fail = False
+    assert log.flush() is True
+    assert len(store.ls("root/audit/2026-11-10")) == 1  # not written twice
+    assert len(store.ls("root/audit/2026-11-09")) == 1
+    assert [r["user"] for r in log.query()] == ["bob", "alice"]

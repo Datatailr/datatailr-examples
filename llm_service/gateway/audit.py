@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -42,7 +43,29 @@ def parse_time(text: str) -> datetime:
         raise ValueError(f"not a date or an ISO time: {text!r}") from None
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError:
+        raise ValueError(f"time out of range: {text!r}") from None
+
+
+def _valid_record(value: object) -> bool:
+    """Return True for a dict with a string `user` and a `ts` that `parse_time` accepts."""
+    if not isinstance(value, dict) or not isinstance(value.get("user"), str):
+        return False
+    ts = value.get("ts")
+    if not isinstance(ts, str):
+        return False
+    try:
+        parse_time(ts)
+    except ValueError:
+        return False
+    return True
+
+
+def _key(record: dict) -> str:
+    """Return a text that is the same for a record and its copy read from a file."""
+    return json.dumps(record, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _day_of(ts: str) -> str:
@@ -68,15 +91,18 @@ class AuditLog:
         self._flush_size = flush_size
         self._now = now
         self._buffer: list[dict] = []
-        self._lock = threading.Lock()  # guards the buffer
+        self._inflight: list[dict] = []  # records that a running flush writes
+        self._lock = threading.Lock()  # guards the buffer and the in-flight list
         self._flush_lock = threading.Lock()  # one flush at a time
         self.listeners: list[Callable[[dict], None]] = []
 
     def add(self, record: dict) -> None:
         """Buffer `record` and tell the listeners. This does no storage I/O.
 
-        The flusher writes the buffer, see `should_flush` and `run_flusher`. Raise `ValueError` if `ts` is missing or is not a time that `parse_time`
-        accepts. The record is then neither buffered nor passed to a listener.
+        The flusher writes the buffer, see `should_flush` and `run_flusher`.
+        Raise `ValueError` if `ts` is missing or is not a time that
+        `parse_time` accepts. The record is then neither buffered nor passed
+        to a listener.
         """
         ts = record.get("ts") if isinstance(record, dict) else None
         if not isinstance(ts, str):
@@ -97,10 +123,12 @@ class AuditLog:
 
         On a store error the records stay in the buffer and a warning is logged.
         Return True when the buffer is empty afterwards, False when records were kept.
+        While the flush runs, the records stay visible to queries as in-flight records.
         """
         with self._flush_lock:
             with self._lock:
                 pending, self._buffer = self._buffer, []
+                self._inflight = pending
             if not pending:
                 return True
             by_day: dict[str, list[dict]] = {}
@@ -121,36 +149,41 @@ class AuditLog:
                         error,
                     )
                     failed.extend(records)
-            if failed:
-                with self._lock:
-                    self._buffer = failed + self._buffer
+            with self._lock:
+                self._buffer = failed + self._buffer
+                self._inflight = []
             return not failed
 
     def _day_files(self, day: str) -> list[str]:
         return self._store.ls(f"{self._prefix}/{day}")
 
     def _read_file(self, path: str) -> list[dict]:
+        """Return the valid records of one file. Skip the others with one warning."""
         try:
             text = self._store.get(path).decode("utf-8", errors="replace")
         except KeyError:
             return []
         records = []
-        for number, line in enumerate(text.splitlines(), start=1):
+        skipped = 0
+        for line in text.splitlines():
             if not line.strip():
                 continue
             try:
                 value = json.loads(line)
             except ValueError:
                 value = None
-            if not isinstance(value, dict):
-                logger.warning("skipping malformed audit line %d in %s", number, path)
+            if not _valid_record(value):
+                skipped += 1
                 continue
             records.append(value)
+        if skipped:
+            logger.warning("skipping %d malformed audit lines in %s", skipped, path)
         return records
 
     def _buffered(self) -> list[dict]:
+        """Return the in-flight and the buffered records."""
         with self._lock:
-            return list(self._buffer)
+            return self._inflight + self._buffer
 
     def _stored_days(self) -> set[str]:
         days = set()
@@ -162,11 +195,25 @@ class AuditLog:
         return days
 
     def records_for_day(self, day: str) -> list[dict]:
-        """Return the stored records of `day` plus the buffered records of that day."""
+        """Return the stored records of `day` plus the buffered records of that day.
+
+        The buffer is read before the files. A record that a flush writes in
+        between is then in both, and only the stored copy is kept. A record is
+        never missing, because a flush clears the in-flight list only after
+        the file is written.
+        """
+        pending = [r for r in self._buffered() if _day_of(r["ts"]) == day]
         records = []
         for path in self._day_files(day):
             records.extend(self._read_file(path))
-        records.extend(r for r in self._buffered() if _day_of(r["ts"]) == day)
+        if pending:
+            stored = Counter(_key(r) for r in records)
+            for record in pending:
+                key = _key(record)
+                if stored[key]:
+                    stored[key] -= 1
+                else:
+                    records.append(record)
         return records
 
     def days(self) -> list[str]:
@@ -188,14 +235,16 @@ class AuditLog:
 
         `since` is inclusive and `until` is exclusive. Without `since`, the range
         starts at the oldest day. Without `until`, it ends at the newest record.
-        Only the days in the range are read.
+        Only the days in the range are read. The days are read newest first,
+        and the reading stops when `offset + limit` records match.
         """
         first = since.astimezone(timezone.utc).strftime("%Y-%m-%d") if since else None
         last = until.astimezone(timezone.utc).strftime("%Y-%m-%d") if until else None
         found: list[tuple[datetime, dict]] = []
-        for day in self.days():
+        for day in sorted(self.days(), reverse=True):
             if (first and day < first) or (last and day > last):
                 continue
+            matches: list[tuple[datetime, dict]] = []
             for record in self.records_for_day(day):
                 if user is not None and record.get("user") != user:
                     continue
@@ -204,8 +253,11 @@ class AuditLog:
                 when = parse_time(record["ts"])
                 if (since and when < since) or (until and when >= until):
                     continue
-                found.append((when, record))
-        found.sort(key=lambda item: item[0], reverse=True)
+                matches.append((when, record))
+            matches.sort(key=lambda item: item[0], reverse=True)
+            found.extend(matches)
+            if len(found) >= offset + limit:
+                break
         return [record for _, record in found[offset : offset + limit]]
 
     def users(self) -> list[dict]:

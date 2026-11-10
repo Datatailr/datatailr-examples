@@ -72,20 +72,31 @@ class DatatailrBlobStore:
     def put(self, path: str, data: bytes | str) -> None:
         self._blob.put(path, data)
 
+    def _missing(self, path: str) -> bool:
+        """Return True if `path` does not exist. Call it only after a failed read."""
+        return not self._blob.exists(path)
+
     def get(self, path: str) -> bytes:
-        if not self._blob.exists(path):
-            raise KeyError(path)
-        return self._blob.get(path)
+        # Read first. Only a failed read pays for the second call to `exists`.
+        try:
+            return self._blob.get(path)
+        except Exception:
+            if self._missing(path):
+                raise KeyError(path) from None
+            raise
 
     def put_file(self, path: str, local: Path) -> None:
         self._blob.put_file(path, str(local))
 
     def get_file(self, path: str, local: Path) -> None:
-        if not self._blob.exists(path):
-            raise KeyError(path)
         local = Path(local)
         local.parent.mkdir(parents=True, exist_ok=True)
-        self._blob.get_file(path, str(local))
+        try:
+            self._blob.get_file(path, str(local))
+        except Exception:
+            if self._missing(path):
+                raise KeyError(path) from None
+            raise
 
     def ls(self, prefix: str) -> list[str]:
         # `Blob.ls` is not recursive by default and returns dicts with the keys
