@@ -72,7 +72,15 @@ class AuditLog:
         self.listeners: list[Callable[[dict], None]] = []
 
     def add(self, record: dict) -> None:
-        """Buffer `record`, tell the listeners, and flush when the buffer is full."""
+        """Buffer `record`, tell the listeners, and flush when the buffer is full.
+
+        Raise `ValueError` if `ts` is missing or is not a time that `parse_time`
+        accepts. The record is then neither buffered nor passed to a listener.
+        """
+        ts = record.get("ts") if isinstance(record, dict) else None
+        if not isinstance(ts, str):
+            raise ValueError("audit record needs a string 'ts'")
+        parse_time(ts)
         with self._lock:
             self._buffer.append(record)
             full = len(self._buffer) >= self._flush_size

@@ -214,3 +214,23 @@ def test_run_flusher_writes_and_flushes_on_cancel():
 
     asyncio.run(scenario())
     assert len(store.ls("root/audit")) == 1
+
+
+@pytest.mark.parametrize("bad", [None, "yesterday", 12345])
+def test_bad_ts_is_rejected_before_buffer_and_listeners(bad):
+    store, log = make()
+    seen = []
+    log.listeners.append(seen.append)
+    log.add(rec("alice", T))
+    broken = rec("bob", T)
+    if bad is None:
+        del broken["ts"]
+    else:
+        broken["ts"] = bad
+    with pytest.raises(ValueError):
+        log.add(broken)
+    assert len(seen) == 1
+    log.flush()
+    assert len(store.ls("root/audit")) == 1
+    assert [r["user"] for r in log.query()] == ["alice"]
+    assert log.days() == ["2026-11-10"]
