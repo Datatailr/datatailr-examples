@@ -1,8 +1,9 @@
+import json
+import shutil
 import sys
 import threading
 import time
 import types
-from pathlib import Path
 
 import pytest
 
@@ -16,15 +17,27 @@ from llm_service.gateway.weights import (
 
 
 class CountingStore(MemoryBlobStore):
-    """A memory store that counts file downloads."""
+    """A memory store that counts file downloads and listings."""
 
     def __init__(self):
         super().__init__()
         self.file_gets = 0
+        self.listings = 0
 
     def get_file(self, path, local):
         self.file_gets += 1
         super().get_file(path, local)
+
+    def ls(self, prefix):
+        self.listings += 1
+        return super().ls(prefix)
+
+
+MARKER = "root/models/org--m/main/.complete"
+
+
+def manifest(store):
+    return json.loads(store.get(MARKER))
 
 
 class Fixture:
@@ -74,8 +87,6 @@ def test_local_hit_touches_nothing(fx):
 
 
 def test_blob_hit_after_local_loss(fx, tmp_path):
-    import shutil
-
     fx.cache.ensure("org/m", "main")
     shutil.rmtree(fx.local)
     path = fx.cache.ensure("org/m", "main")
@@ -243,3 +254,82 @@ def test_prune_logs_a_deletion_error_and_goes_on(fx, monkeypatch, caplog):
 def test_prune_without_a_local_directory_does_nothing(fx):
     fx.cache.prune(lambda: [])
     assert not fx.local.exists()
+
+
+def test_upload_writes_a_manifest_marker(fx):
+    fx.cache.ensure("org/m", "main")
+    assert manifest(fx.store) == {
+        "files": [
+            {"path": "config.json", "size": 2},
+            {"path": "sub/model.safetensors", "size": 1},
+        ]
+    }
+
+
+def test_blob_fetch_downloads_only_the_manifest_files(fx):
+    fx.cache.ensure("org/m", "main")
+    fx.store.put("root/models/org--m/main/stale.bin", b"old upload")
+    shutil.rmtree(fx.local)
+    fx.store.file_gets = fx.store.listings = 0
+    path = fx.cache.ensure("org/m", "main")
+    assert fx.store.file_gets == 2 and fx.store.listings == 0
+    assert not (path / "stale.bin").exists()
+    assert (path / ".complete").exists() and fx.calls == 1
+
+
+def test_missing_blob_file_fails_and_writes_no_local_marker(fx):
+    fx.cache.ensure("org/m", "main")
+    del fx.store._files["root/models/org--m/main/sub/model.safetensors"]
+    shutil.rmtree(fx.local)
+    with pytest.raises(Exception, match="sub/model.safetensors"):
+        fx.cache.ensure("org/m", "main")
+    assert not (fx.local / "org--m" / "main").exists()
+    assert fx.calls == 1
+
+
+def test_size_mismatch_fails_and_removes_the_partial_copy(fx):
+    fx.cache.ensure("org/m", "main")
+    fx.store.put("root/models/org--m/main/config.json", "{ }")
+    shutil.rmtree(fx.local)
+    with pytest.raises(Exception, match="config.json"):
+        fx.cache.ensure("org/m", "main")
+    assert not (fx.local / "org--m" / "main").exists()
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "",
+        "not json",
+        "[]",
+        json.dumps({"files": "x"}),
+        json.dumps({"files": [{"path": "../evil", "size": 1}]}),
+        json.dumps({"files": [{"path": "/abs", "size": 1}]}),
+        json.dumps({"files": [{"path": "a", "size": -1}]}),
+        json.dumps({"files": [{"path": "a", "size": True}]}),
+    ],
+)
+def test_old_or_broken_marker_downloads_again_and_overwrites(fx, marker):
+    fx.store.put(MARKER, marker)
+    path = fx.cache.ensure("org/m", "main")
+    assert fx.calls == 1 and (path / ".complete").exists()
+    assert [f["path"] for f in manifest(fx.store)["files"]] == ["config.json", "sub/model.safetensors"]
+
+
+def test_upload_writes_the_marker_after_the_files(tmp_path):
+    class OrderStore(CountingStore):
+        def __init__(self):
+            super().__init__()
+            self.order = []
+
+        def put(self, path, data):
+            self.order.append(path)
+            super().put(path, data)
+
+        def put_file(self, path, local):
+            self.order.append(path)
+            super().put_file(path, local)
+
+    f = Fixture(tmp_path, OrderStore())
+    f.cache.ensure("org/m", "main")
+    assert f.store.order[-1] == MARKER and f.store.order.count(MARKER) == 1

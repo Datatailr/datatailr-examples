@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
@@ -16,12 +17,24 @@ log = logging.getLogger("llm_service.weights")
 COMPLETE = ".complete"
 _PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
+
+
+class IncompleteCopy(Exception):
+    """A file of the blob storage copy is missing or has the wrong size."""
+
+
 # Arguments: model, revision, target directory.
 Downloader = Callable[[str, str, Path], None]
 
 
 def _valid_part(part: str) -> bool:
     return bool(_PART.fullmatch(part)) and part not in (".", "..")
+
+
+def _safe_relative(path: str) -> bool:
+    """Return True if `path` is a relative POSIX path that stays in its directory."""
+    parts = path.split("/")
+    return bool(path) and all(part not in ("", ".", "..") for part in parts)
 
 
 def validate_model_name(model: str) -> str:
@@ -82,20 +95,54 @@ class WeightCache:
                 return target
             # A directory without the marker is a partial copy. Remove it.
             shutil.rmtree(target, ignore_errors=True)
-            if self._store.exists(f"{blob_dir}/{COMPLETE}"):
-                self._fetch_from_blob(blob_dir, target)
+            files = self._read_manifest(f"{blob_dir}/{COMPLETE}")
+            if files is not None:
+                self._fetch_from_blob(blob_dir, files, target)
             else:
                 self._fetch_from_hub(model, revision, blob_dir, target)
             (target / COMPLETE).write_text("")
         return target
 
-    def _fetch_from_blob(self, blob_dir: str, target: Path) -> None:
-        prefix = blob_dir + "/"
+    def _read_manifest(self, marker: str) -> list[dict] | None:
+        """Return the file list of the blob marker, or None if it is not usable.
+
+        The marker holds `{"files": [{"path": ..., "size": ...}, ...]}`. A
+        missing, empty or invalid marker means that blob storage has no
+        complete copy. A store error other than "missing" is raised.
+        """
         try:
-            for path in self._store.ls(blob_dir):
-                relative = path[len(prefix):]
-                if relative != COMPLETE:
-                    self._store.get_file(path, target / relative)
+            raw = self._store.get(marker)
+        except KeyError:
+            return None
+        try:
+            files = json.loads(raw)["files"]
+            if not isinstance(files, list):
+                raise ValueError("files is not a list")
+            for entry in files:
+                path, size = entry["path"], entry["size"]
+                if not isinstance(path, str) or not _safe_relative(path):
+                    raise ValueError(f"unsafe path {path!r}")
+                if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                    raise ValueError(f"bad size for {path!r}")
+            return files
+        except (ValueError, KeyError, TypeError) as exc:
+            log.warning("ignoring the unusable marker %s: %s", marker, exc)
+            return None
+
+    def _fetch_from_blob(self, blob_dir: str, files: list[dict], target: Path) -> None:
+        try:
+            for entry in files:
+                relative, size = entry["path"], entry["size"]
+                local = target / relative
+                try:
+                    self._store.get_file(f"{blob_dir}/{relative}", local)
+                except KeyError:
+                    raise IncompleteCopy(f"{blob_dir}/{relative} is missing in blob storage") from None
+                actual = local.stat().st_size if local.is_file() else None
+                if actual != size:
+                    raise IncompleteCopy(
+                        f"{blob_dir}/{relative} has {actual} bytes, the manifest says {size}"
+                    )
         except BaseException:
             shutil.rmtree(target, ignore_errors=True)
             raise
@@ -103,9 +150,12 @@ class WeightCache:
     def _fetch_from_hub(
         self, model: str, revision: str, blob_dir: str, target: Path
     ) -> None:
+        # The blob marker of this directory is missing or unusable. It stays
+        # so until all files are uploaded. The new marker is written last.
         try:
             target.mkdir(parents=True, exist_ok=True)
             self._download(model, revision, target)
+            files = []
             for file in sorted(target.rglob("*")):
                 relative = file.relative_to(target)
                 if not file.is_file() or ".cache" in relative.parts:
@@ -113,7 +163,8 @@ class WeightCache:
                 if relative.as_posix() == COMPLETE:
                     continue
                 self._store.put_file(f"{blob_dir}/{relative.as_posix()}", file)
-            self._store.put(f"{blob_dir}/{COMPLETE}", "")
+                files.append({"path": relative.as_posix(), "size": file.stat().st_size})
+            self._store.put(f"{blob_dir}/{COMPLETE}", json.dumps({"files": files}))
         except BaseException:
             shutil.rmtree(target, ignore_errors=True)
             raise
