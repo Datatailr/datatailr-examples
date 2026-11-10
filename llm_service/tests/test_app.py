@@ -244,6 +244,7 @@ def test_retrieve_one_model(client):
     r = client.get("/v1/models/org/a", headers=BOB)
     assert r.status_code == 200
     assert r.json() == client.get("/v1/models", headers=BOB).json()["data"][0]
+    assert client.get("/v1/models/org%2Fa", headers=BOB).json()["id"] == "org/a"
     r = client.get("/v1/models/org/zzz", headers=BOB)
     assert r.status_code == 404
     error = r.json()["error"]

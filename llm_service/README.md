@@ -26,7 +26,9 @@ client -> platform edge -> gateway (FastAPI) -> vLLM (127.0.0.1) -> GPU
 
 The platform checks the access list of the service before a request reaches the gateway. It also adds the name of the caller in the `X-Datatailr-User` header. The gateway reads the user name from this header.
 
-An admin is the user who deployed the service. Members of the group in `LLM_ADMIN_GROUP` are admins too.
+An admin is the user who deployed the service. Members of the group in `LLM_ADMIN_GROUP` are admins too. The Datatailr SDK caches group lookups. A change of the group members can take up to 10 minutes to apply.
+
+The design document [docs/design.md](docs/design.md) describes the parts of the service in more detail.
 
 ## Requirements
 
@@ -51,8 +53,16 @@ Choose a type from the `gpu` class. It must have at least as much GPU memory as 
 ```python
 from datatailr import Node
 
-Node.new(instance_type="<a GPU instance type>", node_class="gpu", environment="dev")
+Node.new({
+    "type": "<a GPU instance type>",
+    "node_class": "gpu",
+    "environment": "dev",
+    "num_instances": 1,
+    "disk_size": 100,
+})
 ```
+
+The value of `disk_size` is the size of the root disk in GB. The default is 10 GB, and that is too small. The disk must hold the container image, which is about 10 GB with vLLM. It must also hold the weights of the models that you switch to. During a switch, the disk holds the old and the new model. After a successful switch, the service deletes the local weights of the old model. A 1.5B model needs about 3 GB. A 7B model needs about 15 GB.
 
 A new node costs money until you stop it. For all node commands, see `dt node --help`.
 
@@ -158,17 +168,25 @@ The answer shows the active model, the switch state and the last switch error. I
 
 ### Gated models
 
-Some models need a Hugging Face token. Store the token in the platform secret store. Create the entry in the Secrets Manager of the Datatailr interface. Then set `LLM_HF_TOKEN_KEY` to the key name and deploy again:
+Some models need a Hugging Face token. Store the token in the platform secret store. The secret must exist in the environment that you deploy the service to. Use a key in lowercase letters, because the store keeps every key in lowercase. To create the secret in the `dev` environment, run this command:
+
+```bash
+dt kv put -s -e dev hf_token <your Hugging Face token>
+```
+
+You can also create the entry in the Secrets Manager of the Datatailr interface. Then set `LLM_HF_TOKEN_KEY` to the key name and deploy again:
 
 ```bash
 LLM_HF_TOKEN_KEY=hf_token python deploy.py
 ```
 
-To check that the key exists, run this command:
+To check that the key exists in the `dev` environment, run this command:
 
 ```bash
-dt kv ls -S
+dt kv ls -S -e dev
 ```
+
+If the service cannot read the secret, it logs an error with the key name and the environment. It then starts without a token. Public models still load.
 
 ## List the models
 
@@ -178,11 +196,23 @@ Any user with access can list the models:
 curl "$BASE/v1/models" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
 ```
 
-The list has the active model and each model in the blob storage cache. Each entry has the extra field `status`. Its value is `active`, `cached` or `loading`.
+The list has one entry for each model: the active model, the model that loads, and each model in the blob storage cache. Each entry has the OpenAI fields `id`, `object`, `created` and `owned_by`. It also has three extra fields:
+
+- `status` is `active`, `loading` or `cached`.
+- `revision` is the active or loading revision. For a cached model, it is the first cached revision.
+- `revisions` is the sorted list of the revisions in blob storage.
+
+To read one entry, add the model name to the path:
+
+```bash
+curl "$BASE/v1/models/Qwen/Qwen2.5-1.5B-Instruct" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+```
+
+The OpenAI SDK call `client.models.retrieve("Qwen/Qwen2.5-1.5B-Instruct")` uses this path. If the service does not know the model, it returns the error `model_not_found` with status 404.
 
 ## Read the audit log
 
-Only an admin can read the audit log. Each request makes one record. A record has the time, request id, user, endpoint, model, prompt, status, token counts and duration.
+Only an admin can read the audit log. Each request to `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings` makes one record. Each model load also makes one record: a switch, the load at startup and an automatic reload. Other requests make no record. A record has the time, request id, user, endpoint, model, prompt, status, token counts and duration.
 
 ```bash
 curl "$BASE/admin/audit?user=bob&limit=20" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
@@ -192,7 +222,7 @@ The filters are `user`, `model`, `since`, `until`, `limit` and `offset`. The val
 
 To see the users in the log with their first and last request, call `/admin/audit/users`.
 
-A model switch is also a record. Its user is the admin who started the switch. At startup the user is `system`.
+The user of a model switch record is the admin who started the switch. At startup and after an automatic reload, the user is `system`.
 
 ## Read the usage metrics
 
@@ -215,19 +245,22 @@ All data is in blob storage, under the root directory in `LLM_BLOB_ROOT`:
 
 ```
 <root>/models/<org>--<name>/<revision>/<files>
-<root>/models/<org>--<name>/<revision>/.complete    # written last
+<root>/models/<org>--<name>/<revision>/.complete    # the file list, written last
 <root>/state/active.json                             # the active model
 <root>/audit/YYYY-MM-DD/<time>-<id>.jsonl
 <root>/usage/YYYY-MM-DD.json                         # totals of one finished day
 ```
 
-The service writes `.complete` after the last weight file. An upload that stops half way is not used.
+The service writes `.complete` after the last weight file. The marker lists each file with its size. An upload that stops half way is not used. When the service downloads a model from blob storage, it downloads only the listed files and checks their sizes. If a file is missing or has the wrong size, the load fails with an error that names the file.
 
 The audit files are the source of truth. The usage totals come from them. If you delete a daily usage file, the service builds it again from the audit files.
 
 ## Known limits
 
-- The service buffers audit records in memory. It writes them to blob storage every 5 seconds, at 100 records, and at shutdown. If the container is killed, the records of the last 5 seconds are lost.
+- The service buffers audit records in memory. It writes them to blob storage every 5 seconds, at 100 records, and at shutdown. In normal operation, a kill of the container loses the records of at most about the last 5 seconds. During a blob storage outage, the records wait in memory. A kill then loses all records since the outage began.
+- If vLLM stops, the next request to a model endpoint starts one reload of the active model. During the reload, requests get status 503 with a `Retry-After` header. If that reload fails, an admin must call `POST /admin/model`. Until then, requests get status 503 with the code `no_model`.
+- If the engine fails in the middle of a stream, the stream ends without an error event. The audit record has the status 502.
+- At startup, the service reads the usage totals from blob storage. If that read fails, the service does not start, and the platform restarts it.
 - The service serves one model at a time. A switch stops the old model.
 - The audit log stores each prompt in full. It does not store the answers.
 - Token counts for a stream come from the last chunk. The service asks vLLM for that chunk. It removes the chunk again if the client did not ask for it.

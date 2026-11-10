@@ -1,7 +1,5 @@
 # LLM service on Datatailr: design
 
-Date: 2026-11-10
-
 ## Goal
 
 This example serves an open weights LLM (a language model whose weight files
@@ -50,6 +48,8 @@ llm_service/
 ├── deploy.py              # builds and deploys the Service
 ├── requirements.txt       # runtime: fastapi, uvicorn, httpx, huggingface_hub, vllm
 ├── requirements-dev.txt   # tests: pytest, fastapi, httpx (no vllm, no GPU)
+├── docs/
+│   └── design.md          # this document
 ├── gateway/
 │   ├── app.py             # FastAPI routes and main(port)
 │   ├── config.py          # configuration from environment variables
@@ -76,15 +76,28 @@ fakes.
 | `POST /v1/chat/completions` | Forwarded to vLLM, streaming included. |
 | `POST /v1/completions` | Forwarded to vLLM, streaming included. |
 | `POST /v1/embeddings` | Forwarded to vLLM. Works only if the active model is an embedding model. |
-| `GET /v1/models` | The active model and each model in the blob storage cache, in the OpenAI list format. Each entry has one extra field, `status`: `active`, `cached` or `loading`. |
+| `GET /v1/models` | The active model, the loading model and each model in the blob storage cache, in the OpenAI list format. See below. |
+| `GET /v1/models/{id}` | One entry of that list. The id contains `/`, for example `GET /v1/models/Qwen/Qwen2.5-1.5B-Instruct`. An unknown id gets 404 with code `model_not_found`. |
 | `GET /v1/usage/me` | The usage totals of the caller. Not part of the OpenAI API. |
+
+The model list has one entry for each model id. Each entry has the OpenAI
+fields `id`, `object`, `created` and `owned_by`, and three extra fields:
+
+- `status`: `loading` for the model that loads, `active` for the served model,
+  and `cached` for a model that is only in blob storage. If one id has two
+  states, `loading` comes before `active`, and `active` comes before `cached`.
+- `revision`: the loading or active revision. For a cached model, it is the
+  first cached revision.
+- `revisions`: the sorted list of the revisions in blob storage.
 
 Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 
 - If a request names a model that is not the active model, the gateway returns
   404 with code `model_not_found`.
-- If a switch is in progress or no model is loaded, the gateway returns 503
-  with a `Retry-After` header.
+- If a model is loading, the gateway returns 503 with code `model_loading` and
+  a `Retry-After` header.
+- If no model is loaded, the gateway returns 503 with code `no_model` and no
+  `Retry-After` header. An admin must switch the model first.
 - If the request has no platform user, the gateway returns 401.
 
 ### Admin endpoints
@@ -118,7 +131,9 @@ An admin is one of:
 - the user who deployed the service (the `DATATAILR_USER` of the container),
 - a member of the platform group named in `LLM_ADMIN_GROUP`, if it is set.
 
-The gateway caches the group members for 60 seconds.
+The gateway caches the group members for 60 seconds. The Datatailr SDK also
+caches group lookups for 10 minutes. A change of the group members can
+therefore take up to 10 minutes to apply.
 
 ### Outside clients
 
@@ -134,8 +149,7 @@ client = OpenAI(
 ```
 
 A tool that accepts only a base URL and an API key does not work until the
-platform edge accepts a Bearer token. That change belongs to the sonic
-repository and is not part of this example.
+platform edge accepts a Bearer token. That change belongs to the platform and is not part of this example.
 
 ## Weights
 
@@ -143,7 +157,7 @@ Blob storage layout, under a root set by `LLM_BLOB_ROOT` (default `llm-service`)
 
 ```
 <root>/models/<org>--<name>/<revision>/<files>
-<root>/models/<org>--<name>/<revision>/.complete    # written last
+<root>/models/<org>--<name>/<revision>/.complete    # the file list, written last
 <root>/state/active.json                             # {"model", "revision"}
 <root>/audit/YYYY-MM-DD/<time>-<id>.jsonl
 <root>/usage/YYYY-MM-DD.json                         # totals of one finished day
@@ -152,16 +166,36 @@ Blob storage layout, under a root set by `LLM_BLOB_ROOT` (default `llm-service`)
 To get a model on local disk, `weights.py` does these steps:
 
 1. If the local directory has a `.complete` marker, use it.
-2. If blob storage has the `.complete` marker, download the files from blob
-   storage.
+2. If blob storage has a valid `.complete` marker, download the files that the
+   marker lists. Check the size of each file. Then write the local marker.
 3. If not, download the repository from Hugging Face with `huggingface_hub`,
    upload each file to blob storage, then write `.complete`.
 
+The blob storage marker is a JSON manifest of the files:
+
+```json
+{"files": [{"path": "config.json", "size": 663}, {"path": "model.safetensors", "size": 3087467144}]}
+```
+
 The marker is written last, so an interrupted upload is not used as a cache
-entry. A Hugging Face token for gated models comes from the platform secret
-store, under the key named in `LLM_HF_TOKEN_KEY`. The token is optional.
+entry. A download from blob storage gets exactly the files in the manifest.
+It does not list the blob directory, so stale files of an older upload are not
+used. If a file is missing or has the wrong size, the download stops with an
+error that names the file. The gateway then removes the partial local copy and
+writes no local marker. A marker that is empty or is not valid JSON counts as
+"not in blob storage". The gateway then downloads the model from Hugging Face
+again and writes a new marker.
+
+A Hugging Face token for gated models comes from the platform secret store,
+under the key named in `LLM_HF_TOKEN_KEY`. The token is optional. If the
+gateway cannot read the secret, it logs an error with the key and the
+environment, and it continues without a token. Public models still load.
 
 `GET /v1/models` lists the directories that have a `.complete` marker.
+
+After a successful load, the gateway deletes the local copies of the other
+models in a worker thread, so the node disk does not fill up. It never deletes
+the active model or a model that loads. The blob storage copies stay.
 
 ## Model switch
 
@@ -181,9 +215,27 @@ At startup, the gateway loads the model in `state/active.json`. If that file
 does not exist, it loads `LLM_DEFAULT_MODEL`. A model switch is also an audit
 event.
 
+If the write of `state/active.json` fails, the gateway logs a warning. The
+model stays `ready`, because the engine runs.
+
+### Engine exit
+
+The gateway checks the vLLM process at each request to
+`/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. If the process has
+exited while the state is `ready`, the gateway starts one automatic reload of
+the active model. The reload uses the startup load path and runs as a
+background task. The state is `loading` during the reload. The audit log gets
+an `engine_reload` event with the user `system`.
+
+If the reload fails, the state is `failed`. It stays `failed` until an admin
+switches the model with `POST /admin/model`. The gateway makes no second
+automatic attempt until a model is `ready` again.
+
 ## Audit log
 
-Each API request produces one record:
+Each request to `/v1/chat/completions`, `/v1/completions` and
+`/v1/embeddings` produces one record. Each model load produces one record too.
+Other requests produce no record. A request record looks like this:
 
 ```json
 {"ts": "2026-11-10T12:00:00.123Z", "request_id": "…", "user": "alice",
@@ -197,16 +249,25 @@ Each API request produces one record:
 full. The log does not store the model answer.
 
 The gateway writes the record after the response ends, so it holds the status
-and the token counts. Records go to an in-memory buffer. The gateway flushes
-the buffer to a new JSONL file in blob storage every 5 seconds, when it holds
-100 records, and at shutdown. Each file is written once, so no file is ever
+and the token counts. Records go to an in-memory buffer. A flusher task wakes
+every 0.25 seconds. It flushes the buffer to a new JSONL file in blob storage
+when 5 seconds have passed since the last flush, or when the buffer holds 100
+records. It also flushes at shutdown. After a failed flush, it waits the full 5
+seconds before the next attempt. Each file is written once, so no file is ever
 appended to or rewritten.
 
-If the container is killed, the records of at most the last 5 seconds are lost.
-The README states this.
+In normal operation, a kill of the container loses the records of at most
+about the last 5 seconds. During a blob storage outage, the records wait in
+memory. A kill then loses all records since the outage began. The README
+states this.
 
 `GET /admin/audit` reads the files of the days in the requested range, plus the
-buffer, and applies the filters.
+buffer, and applies the filters. It reads the days newest first, and it stops
+when it has `offset + limit` matching records. During a flush, the records
+that the flush writes stay visible to queries. A query shows each record once.
+
+A stored line that is not a JSON object with a valid `ts` and a string `user`
+is skipped with a warning.
 
 ## Usage metrics
 
@@ -269,9 +330,11 @@ the real ones. The tests cover:
 - identity and the admin check,
 - audit records, the flush, and the audit filters,
 - usage totals and the rebuild at startup,
-- the weight cache: local hit, blob storage hit, Hugging Face download, and an
-  interrupted upload,
-- the switch state machine, the rollback, and the 409, 503 and 404 answers,
+- the weight cache: local hit, blob storage hit, Hugging Face download, an
+  interrupted upload, the manifest check, and the deletion of unused local
+  copies,
+- the switch state machine, the rollback, the automatic reload, and the 409,
+  503 and 404 answers,
 - the proxy, with and without streaming, and the token count chunk.
 
 The run on a real GPU happens on the Azure installation, after the deploy.
