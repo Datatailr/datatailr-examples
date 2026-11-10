@@ -9,11 +9,15 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import re
 from collections.abc import AsyncIterator, Callable
 
+import anyio
 import httpx
 from starlette.responses import JSONResponse, Response, StreamingResponse
+
+LOGGER = logging.getLogger("llm_service.proxy")
 
 _BOUNDARY = re.compile(rb"\r?\n\r?\n")
 
@@ -79,7 +83,7 @@ class StreamUsageFilter:
     def flush(self) -> bytes:
         """Return the bytes still in the buffer."""
         tail, self._buffer = self._buffer, b""
-        return tail
+        return self._process(tail, b"") if tail else b""
 
     def _process(self, event: bytes, separator: bytes) -> bytes:
         lines = event.split(b"\n")
@@ -117,6 +121,82 @@ def _unreachable() -> Response:
     return JSONResponse(ENGINE_UNREACHABLE, status_code=502)
 
 
+def _call_on_done(on_done: Callable[[int, dict | None], None], status: int, usage: dict | None) -> None:
+    """Call `on_done` and log a failure instead of raising it."""
+    try:
+        on_done(status, usage)
+    except Exception:
+        LOGGER.warning("the on_done callback failed", exc_info=True)
+
+
+class _UsageStream(StreamingResponse):
+    """Stream the upstream answer and report the outcome exactly once.
+
+    The generator reports a normal end or an upstream error. This class reports
+    a client that goes away, also when the generator never starts. The first
+    report wins. The upstream response is closed after that report.
+    """
+
+    def __init__(
+        self,
+        upstream: httpx.Response,
+        usage_filter: StreamUsageFilter,
+        on_done: Callable[[int, dict | None], None],
+    ) -> None:
+        self._upstream = upstream
+        self._filter = usage_filter
+        self._on_done = on_done
+        self._finished = False
+        super().__init__(
+            self._events(),
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "text/event-stream"),
+        )
+
+    async def finish(self, status: int, usage: dict | None) -> None:
+        """Report the outcome and close the upstream response. Later calls do nothing."""
+        if self._finished:
+            return
+        self._finished = True
+        _call_on_done(self._on_done, status, usage)
+        with anyio.CancelScope(shield=True):
+            try:
+                await self._upstream.aclose()
+            except Exception:
+                LOGGER.warning("closing the engine response failed", exc_info=True)
+
+    async def _events(self) -> AsyncIterator[bytes]:
+        status, usage = 200, None
+        try:
+            async for chunk in self._upstream.aiter_bytes():
+                out = self._filter.feed(chunk)
+                if out:
+                    yield out
+            tail = self._filter.flush()
+            if tail:
+                yield tail
+            usage = self._filter.usage
+        except (asyncio.CancelledError, GeneratorExit):
+            status = 499
+            raise
+        except httpx.HTTPError:
+            status = 502
+        except Exception:
+            status = 502
+            raise
+        finally:
+            await self.finish(status, usage if status == 200 else None)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        except BaseException:
+            await self.finish(499, None)
+            raise
+        finally:
+            await self.finish(499, None)
+
+
 async def forward(
     client: httpx.AsyncClient,
     base_url: str,
@@ -128,7 +208,7 @@ async def forward(
 
     `on_done(status, usage)` runs exactly once per call: when the answer is
     complete, when the client disconnects (status 499) or when the engine fails
-    (status 502).
+    (status 502). An error in `on_done` is logged and does not break the response.
     """
     prepared, usage_wanted = prepare_body(body)
     streaming = bool(prepared.get("stream"))
@@ -139,8 +219,8 @@ async def forward(
         else:
             request = client.build_request("POST", url, json=prepared)
             upstream = await client.send(request, stream=True)
-    except httpx.TransportError:
-        on_done(502, None)
+    except httpx.HTTPError:
+        _call_on_done(on_done, 502, None)
         return _unreachable()
 
     if not streaming:
@@ -152,7 +232,7 @@ async def forward(
                 payload = None
             if isinstance(payload, dict) and isinstance(payload.get("usage"), dict):
                 usage = payload["usage"]
-        on_done(upstream.status_code, usage)
+        _call_on_done(on_done, upstream.status_code, usage)
         return Response(upstream.content, upstream.status_code, _passthrough_headers(upstream))
 
     if not upstream.is_success:
@@ -160,36 +240,10 @@ async def forward(
             content = await upstream.aread()
         except httpx.HTTPError:
             await upstream.aclose()
-            on_done(502, None)
+            _call_on_done(on_done, 502, None)
             return _unreachable()
         await upstream.aclose()
-        on_done(upstream.status_code, None)
+        _call_on_done(on_done, upstream.status_code, None)
         return Response(content, upstream.status_code, _passthrough_headers(upstream))
 
-    usage_filter = StreamUsageFilter(keep_usage_chunk=usage_wanted)
-
-    async def events() -> AsyncIterator[bytes]:
-        status, usage = 200, None
-        try:
-            async for chunk in upstream.aiter_bytes():
-                out = usage_filter.feed(chunk)
-                if out:
-                    yield out
-            tail = usage_filter.flush()
-            if tail:
-                yield tail
-            usage = usage_filter.usage
-        except (asyncio.CancelledError, GeneratorExit):
-            status = 499
-            raise
-        except httpx.HTTPError:
-            status = 502
-        finally:
-            on_done(status, usage if status == 200 else None)
-            await upstream.aclose()
-
-    return StreamingResponse(
-        events(),
-        status_code=upstream.status_code,
-        media_type=upstream.headers.get("content-type", "text/event-stream"),
-    )
+    return _UsageStream(upstream, StreamUsageFilter(keep_usage_chunk=usage_wanted), on_done)

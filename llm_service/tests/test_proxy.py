@@ -251,3 +251,189 @@ def test_prompt_of():
     }
     assert prompt_of({"prompt": "hi"}) == {"prompt": "hi"}
     assert prompt_of({"input": ["a", "b"]}) == {"input": ["a", "b"]}
+
+
+def test_filter_flush_processes_unterminated_usage_chunk():
+    raw = SSE[:-len(b"data: [DONE]\n\n")].rstrip(b"\n")
+    f = StreamUsageFilter(keep_usage_chunk=False)
+    out = f.feed(raw) + f.flush()
+    assert f.usage == USAGE
+    assert b'"usage"' not in out and out.count(b"data: ") == 2
+
+
+class _TrackedStream(httpx.AsyncByteStream):
+    """An upstream body that records whether it was closed."""
+
+    def __init__(self, parts, error=None):
+        self.parts = parts
+        self.error = error
+        self.closed = False
+
+    async def __aiter__(self):
+        for part in self.parts:
+            yield part
+        if self.error:
+            raise self.error
+
+    async def aclose(self):
+        self.closed = True
+
+
+def _tracked_client(stream):
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+_SCOPE = {"type": "http", "method": "POST", "path": "/", "headers": []}
+_ONE = b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+
+
+async def _forward_stream(client, done):
+    return await forward(client, "http://fake", "/v1/chat/completions", {"stream": True}, lambda s, u: done.append((s, u)))
+
+
+def test_send_failure_before_the_generator_starts_reports_499_once():
+    stream = _TrackedStream([_ONE])
+    done = []
+
+    async def run():
+        async with _tracked_client(stream) as client:
+            response = await _forward_stream(client, done)
+
+            async def receive():
+                await asyncio.sleep(10)
+
+            async def send(message):
+                raise OSError("client gone")
+
+            try:
+                await response(_SCOPE, receive, send)
+            except BaseException as exc:
+                return exc
+
+    assert asyncio.run(run()) is not None
+    assert done == [(499, None)]
+    assert stream.closed
+
+
+def test_response_never_iterated_reports_499_once():
+    stream = _TrackedStream([_ONE])
+    done = []
+
+    async def run():
+        async with _tracked_client(stream) as client:
+            response = await _forward_stream(client, done)
+
+            async def receive():
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                raise OSError("client gone")
+
+            try:
+                await response(_SCOPE, receive, send)
+            except BaseException:
+                pass
+            await response.finish(200, USAGE)
+
+    asyncio.run(run())
+    assert done == [(499, None)]
+    assert stream.closed
+
+
+def test_asgi_disconnect_reports_499_once_and_closes_upstream():
+    stream = _TrackedStream([_ONE])
+    done = []
+    sent = []
+
+    async def run():
+        async with _tracked_client(stream) as client:
+            response = await _forward_stream(client, done)
+            proceed = asyncio.Event()
+
+            async def receive():
+                await proceed.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                sent.append(message)
+                if message["type"] == "http.response.body" and message.get("body"):
+                    proceed.set()
+                    await asyncio.sleep(0.05)
+
+            await response(_SCOPE, receive, send)
+
+    asyncio.run(run())
+    assert any(m.get("body") == _ONE for m in sent)
+    assert done == [(499, None)]
+    assert stream.closed
+
+
+def test_asgi_normal_end_reports_once_and_closes_upstream():
+    stream = _TrackedStream([_ONE, b"data: [DONE]\n\n"])
+    done = []
+
+    async def run():
+        async with _tracked_client(stream) as client:
+            response = await _forward_stream(client, done)
+
+            async def receive():
+                await asyncio.sleep(10)
+
+            async def send(message):
+                pass
+
+            await response(_SCOPE, receive, send)
+
+    asyncio.run(run())
+    assert done == [(200, None)]
+    assert stream.closed
+
+
+def test_unexpected_error_in_the_stream_reports_502_and_raises():
+    stream = _TrackedStream([_ONE], error=RuntimeError("boom"))
+    done = []
+
+    async def run():
+        async with _tracked_client(stream) as client:
+            response = await _forward_stream(client, done)
+            try:
+                await _drain(response)
+            except RuntimeError as exc:
+                return exc
+
+    assert isinstance(asyncio.run(run()), RuntimeError)
+    assert done == [(502, None)]
+    assert stream.closed
+
+
+def test_decoding_error_before_the_body_is_502():
+    def handler(request):
+        raise httpx.DecodingError("bad encoding", request=request)
+
+    done = []
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await forward(client, "http://fake", "/v1/chat/completions", {}, lambda s, u: done.append((s, u)))
+
+    assert asyncio.run(run()).status_code == 502
+    assert done == [(502, None)]
+
+
+def test_failing_on_done_is_logged_and_does_not_break_the_response(caplog):
+    def bad(status, usage):
+        raise ValueError("audit down")
+
+    async def run():
+        async with _client(fake_vllm_app()) as client:
+            plain = await forward(client, "http://fake", "/v1/chat/completions", {}, bad)
+            streamed = await forward(client, "http://fake", "/v1/chat/completions", {"stream": True}, bad)
+            return plain, await _drain(streamed)
+
+    with caplog.at_level("WARNING", logger="llm_service.proxy"):
+        plain, data = asyncio.run(run())
+    assert plain.status_code == 200 and data.endswith(b"data: [DONE]\n\n")
+    assert len([r for r in caplog.records if r.name == "llm_service.proxy"]) == 2
