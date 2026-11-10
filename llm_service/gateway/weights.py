@@ -24,7 +24,8 @@ def _valid_part(part: str) -> bool:
 def validate_model_name(model: str) -> str:
     """Return `model` if it has the form `org/name`. Else raise `ValueError`."""
     parts = model.split("/")
-    if len(parts) != 2 or not all(_valid_part(p) for p in parts):
+    # "--" joins org and name in paths, so it must not appear inside a part.
+    if len(parts) != 2 or not all(_valid_part(p) and "--" not in p for p in parts):
         raise ValueError(f"invalid model name: {model!r}")
     return model
 
