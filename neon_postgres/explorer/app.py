@@ -79,7 +79,10 @@ def _connection(body: dict, request: Request | None = None) -> db.ConnectionInfo
     if secret is None:
         raise HTTPException(
             status_code=400,
-            detail=f"the explorer has no {access.ROLE_SECRET_VAR}; deploy it with the same secret as the Neon Postgres service",
+            detail=(
+                f"the explorer has no role secret: deploy it with {access.ROLE_SECRET_KEY_VAR} "
+                f"(or {access.ROLE_SECRET_VAR}) set like the Neon Postgres service"
+            ),
         )
     return info.for_user(username, access.role_password(secret, username))
 

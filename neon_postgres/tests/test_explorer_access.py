@@ -37,4 +37,4 @@ async def test_as_user_needs_a_platform_user_and_the_secret(client, monkeypatch)
     assert no_user.status_code == 401
     no_secret = await client.post("/api/connect", json={"connection": connection}, headers={"X-Datatailr-User": '{"name": "alice"}'})
     assert no_secret.status_code == 400
-    assert access.ROLE_SECRET_VAR in no_secret.json()["detail"]
+    assert access.ROLE_SECRET_KEY_VAR in no_secret.json()["detail"]

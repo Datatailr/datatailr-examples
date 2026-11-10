@@ -6,7 +6,7 @@
 2. the Neon stack (storage broker, safekeeper, pageserver, compute) pointed at
    that gateway;
 3. a small HTTP status API on the platform-assigned ``port``;
-4. when ``NEON_ROLE_SECRET`` is set, a thread that mirrors platform users and
+4. when ``NEON_ROLE_SECRET_KEY`` (or ``NEON_ROLE_SECRET``) is set, a thread that mirrors platform users and
    groups into Postgres roles (see ``roles.py``).
 
 Postgres itself listens on ``NEON_PG_PORT`` (5432) on all interfaces, so other
@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from neon_postgres.s3_gateway.app import create_app as create_gateway
 from neon_postgres.s3_gateway.backends import backend_from_env
 from neon_postgres.service.neon_stack import NeonConfig, NeonStack
+from neon_postgres import access
 from neon_postgres.service.roles import RoleSyncer
 from neon_postgres.service.pg_tunnel import add_pg_tunnel, tunnel_enabled
 
@@ -113,12 +114,16 @@ def main(port):
     log.info("postgres ready on port %d (tenant %s, generation %d)", cfg.pg_port, stack.state.tenant_id, stack.state.generation)
 
     syncer = None
-    if cfg.role_secret:
-        syncer = RoleSyncer(cfg.local_dsn, cfg.role_secret, cfg.role_sync_interval)
+    if access.role_sync_enabled():
+        # The secret comes from NEON_ROLE_SECRET, or from the platform's secret
+        # store under NEON_ROLE_SECRET_KEY. The provider re-reads the store every
+        # minute, so a rotated secret takes effect at the next sync.
+        syncer = RoleSyncer(cfg.local_dsn, access.role_secret, cfg.role_sync_interval)
         syncer.start()
-        log.info("syncing platform users and groups into Postgres roles every %.0f seconds", cfg.role_sync_interval)
+        source = access.ROLE_SECRET_VAR if (access.env_value(access.ROLE_SECRET_VAR) or "").strip() else f"secret {access.role_secret_key()!r}"
+        log.info("syncing platform users and groups into Postgres roles every %.0f seconds with %s", cfg.role_sync_interval, source)
     else:
-        log.info("NEON_ROLE_SECRET is not set: platform users and groups are not synced into Postgres roles")
+        log.info("neither NEON_ROLE_SECRET nor NEON_ROLE_SECRET_KEY is set: platform users and groups are not synced into Postgres roles")
 
     status_server = uvicorn.Server(uvicorn.Config(status_app(stack, syncer), host="0.0.0.0", port=int(port), log_level="info"))
 
