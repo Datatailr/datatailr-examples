@@ -267,10 +267,7 @@ def create_app(
                     )
                 )
 
-            def on_done(status: int, usage_counts: dict | None) -> None:
-                record(status, usage_counts)
-
-            response = await forward(client, engine.base_url, path, body, on_done)
+            response = await forward(client, engine.base_url, path, body, record)
             response.headers["x-request-id"] = request_id
             return response
 
@@ -410,6 +407,27 @@ def create_app(
     return app
 
 
+def read_hf_token(key: str | None, environment: str, get_secret) -> str | None:
+    """Return the Hugging Face token from the secret `key`, or None.
+
+    If the read fails, log an error that names the key and the environment,
+    and return None. Public models still load without a token.
+    """
+    if not key:
+        return None
+    try:
+        return get_secret(key)
+    except Exception as error:
+        logger.error(
+            "could not read the Hugging Face token from the secret %r in the environment %r: %s. "
+            "The service continues without a token, so only public models load.",
+            key,
+            environment,
+            error,
+        )
+        return None
+
+
 def main(port) -> None:
     """Run the gateway on `port`. The platform calls this with the assigned port."""
     import uvicorn
@@ -422,7 +440,8 @@ def main(port) -> None:
 
     logging.basicConfig(level=logging.INFO)
     config = Config.from_env(os.environ)
-    token = Secrets().get(config.hf_token_key) if config.hf_token_key else None
+    environment = os.environ.get("DATATAILR_JOB_ENVIRONMENT", "unknown")
+    token = read_hf_token(config.hf_token_key, environment, lambda key: Secrets().get(key))
     app = create_app(
         config,
         DatatailrBlobStore(),

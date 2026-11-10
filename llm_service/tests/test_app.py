@@ -10,7 +10,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from llm_service.gateway.app import create_app
+from llm_service.gateway.app import create_app, read_hf_token
 from llm_service.gateway.config import Config
 from llm_service.gateway.identity import AdminCheck
 from llm_service.gateway.storage import MemoryBlobStore
@@ -36,7 +36,7 @@ class GatedEngine(FakeEngine):
         await super().start(model_dir, served_name)
 
 
-def make_app(tmp_path, engine=None, store=None, **config_args):
+def make_app(tmp_path, engine=None, store=None, http=None, **config_args):
     store = store or MemoryBlobStore()
     engine = engine or FakeEngine()
     config = Config(
@@ -46,7 +46,7 @@ def make_app(tmp_path, engine=None, store=None, **config_args):
     def download(model: str, revision: str, target: Path) -> None:
         (target / "config.json").write_text("{}")
 
-    http = httpx.AsyncClient(
+    http = http or httpx.AsyncClient(
         transport=httpx.ASGITransport(app=fake_vllm_app()), base_url="http://engine"
     )
     admin = AdminCheck("alice", None, lambda group: [])
@@ -469,3 +469,55 @@ def test_audit_storage_is_never_written_on_the_event_loop_during_requests(tmp_pa
         assert len(audit_records(c, user="bob", limit=1000)) == 150  # kept in the buffer
     assert engine.loop_thread is not None
     assert engine.loop_thread not in threads
+
+
+@pytest.mark.parametrize(
+    "path,body,prompt",
+    [
+        ("/v1/completions", {"model": "org/a", "prompt": "Say hi"}, {"prompt": "Say hi"}),
+        ("/v1/embeddings", {"model": "org/a", "input": ["a", "b"]}, {"input": ["a", "b"]}),
+    ],
+)
+def test_completions_and_embeddings_are_forwarded_and_audited(client, path, body, prompt):
+    r = client.post(path, headers=BOB, json=body)
+    assert r.status_code == 200 and r.json()["usage"]["total_tokens"] == 5
+    rec = audit_records(client, user="bob")[0]
+    assert rec["endpoint"] == path and rec["prompt"] == prompt
+    assert rec["status"] == 200 and rec["total_tokens"] == 5
+    assert rec["request_id"] == r.headers["x-request-id"]
+
+
+def test_completions_stream(client):
+    r = client.post("/v1/completions", headers=BOB, json={"prompt": "hi", "stream": True})
+    assert r.status_code == 200 and "usage" not in r.text and "[DONE]" in r.text
+    assert audit_records(client, user="bob")[0]["total_tokens"] == 5
+
+
+def test_unreachable_engine_is_502_and_audited(tmp_path):
+    def refuse(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(refuse))
+    with TestClient(make_app(tmp_path, http=http)) as c:
+        wait_ready(c)
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 502
+        assert r.json()["error"]["code"] == "engine_unreachable"
+        assert r.headers["x-request-id"]
+        rec = audit_records(c, user="bob")[0]
+        assert rec["status"] == 502 and rec["total_tokens"] is None
+
+
+def test_read_hf_token():
+    assert read_hf_token(None, "dev", lambda key: "never") is None
+    assert read_hf_token("hf_token", "dev", lambda key: f"value of {key}") == "value of hf_token"
+
+
+def test_read_hf_token_failure_logs_the_key_and_environment(caplog):
+    def broken(key):
+        raise RuntimeError("secret not found")
+
+    with caplog.at_level("ERROR", logger="llm_service.app"):
+        assert read_hf_token("hf_token", "pre", broken) is None
+    message = " ".join(caplog.messages)
+    assert "hf_token" in message and "pre" in message and "secret not found" in message

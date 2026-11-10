@@ -228,21 +228,21 @@ def test_forward_error_in_the_middle_of_the_stream_reports_502():
     assert done == [(502, None)]
 
 
-def test_client_disconnect_reports_499():
-    fake = fake_vllm_app()
+def test_client_disconnect_before_the_usage_chunk_reports_499_without_usage():
+    stream = _TrackedStream([_ONE, _USAGE_CHUNK, b"data: [DONE]\n\n"])
     done = []
 
     async def run():
-        async with _client(fake) as client:
-            response = await forward(client, "http://fake", "/v1/chat/completions", {"stream": True}, lambda s, u: done.append((s, u)))
+        async with _tracked_client(stream) as client:
+            response = await _forward_stream(client, done)
             iterator = response.body_iterator
             first = await iterator.__anext__()
             await iterator.aclose()
             return first
 
-    first = asyncio.run(run())
-    assert first.startswith(b"data: ")
+    assert asyncio.run(run()) == _ONE
     assert done == [(499, None)]
+    assert stream.closed
 
 
 def test_prompt_of():
@@ -437,3 +437,50 @@ def test_failing_on_done_is_logged_and_does_not_break_the_response(caplog):
         plain, data = asyncio.run(run())
     assert plain.status_code == 200 and data.endswith(b"data: [DONE]\n\n")
     assert len([r for r in caplog.records if r.name == "llm_service.proxy"]) == 2
+
+
+_USAGE_CHUNK = _chunk({"id": "x", "choices": [], "usage": USAGE})
+
+
+def test_client_disconnect_after_the_usage_chunk_reports_the_usage():
+    stream = _TrackedStream([_ONE, _USAGE_CHUNK, b"data: [DONE]\n\n"])
+    done = []
+
+    async def run():
+        async with _tracked_client(stream) as client:
+            response = await _forward_stream(client, done)
+            iterator = response.body_iterator
+            assert await iterator.__anext__() == _ONE
+            assert await iterator.__anext__() == b"data: [DONE]\n\n"
+            await iterator.aclose()  # the client goes away before the end
+
+    asyncio.run(run())
+    assert done == [(499, USAGE)]
+    assert stream.closed
+
+
+def test_asgi_disconnect_after_the_usage_chunk_reports_the_usage():
+    stream = _TrackedStream([_ONE, _USAGE_CHUNK, b"data: [DONE]\n\n"])
+    done = []
+
+    async def run():
+        async with _tracked_client(stream) as client:
+            response = await _forward_stream(client, done)
+            proceed = asyncio.Event()
+            bodies = []
+
+            async def receive():
+                await proceed.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                if message["type"] == "http.response.body" and message.get("body"):
+                    bodies.append(message["body"])
+                    if len(bodies) == 2:
+                        proceed.set()
+                        await asyncio.sleep(0.05)
+
+            await response(_SCOPE, receive, send)
+
+    asyncio.run(run())
+    assert done == [(499, USAGE)]

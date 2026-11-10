@@ -185,16 +185,16 @@ class _UsageStream(StreamingResponse):
             status = 502
             raise
         finally:
-            await self.finish(status, usage if status == 200 else None)
+            if status == 499:
+                usage = self._filter.usage  # the usage chunk may have come already
+            await self.finish(status, usage if status in (200, 499) else None)
 
     async def __call__(self, scope, receive, send) -> None:
         try:
             await super().__call__(scope, receive, send)
-        except BaseException:
-            await self.finish(499, None)
-            raise
         finally:
-            await self.finish(499, None)
+            # After a normal end the generator has reported already, so this does nothing.
+            await self.finish(499, self._filter.usage)
 
 
 async def forward(
@@ -208,7 +208,8 @@ async def forward(
 
     `on_done(status, usage)` runs exactly once per call: when the answer is
     complete, when the client disconnects (status 499) or when the engine fails
-    (status 502). An error in `on_done` is logged and does not break the response.
+    (status 502). After a disconnect, `usage` holds the counts if the usage
+    chunk came before the disconnect. An error in `on_done` is logged and does not break the response.
     """
     prepared, usage_wanted = prepare_body(body)
     streaming = bool(prepared.get("stream"))
