@@ -47,14 +47,28 @@ def test_flush_writes_one_file_per_day():
     assert len(store.ls("root/audit")) == 2  # an empty buffer writes nothing
 
 
-def test_flush_at_size():
+def test_add_never_writes_and_should_flush_at_size():
     store, log = make(flush_size=2)
     log.add(rec("alice", T))
-    assert store.ls("root/audit") == []
+    assert not log.should_flush()
     log.add(rec("bob", T))
+    assert log.should_flush()
+    assert store.ls("root/audit") == []  # add does no storage I/O
+    assert log.flush() is True
     assert len(store.ls("root/audit")) == 1
-    log.flush()
-    assert len(store.ls("root/audit")) == 1  # the buffer is empty
+    assert not log.should_flush()
+    assert log.flush() is True  # the buffer is empty
+    assert len(store.ls("root/audit")) == 1
+
+
+def test_flush_returns_false_when_records_are_kept():
+    store = FlakyBlobStore()
+    _, log = make(store)
+    log.add(rec("alice", T))
+    store.fail_puts = True
+    assert log.flush() is False
+    store.fail_puts = False
+    assert log.flush() is True
 
 
 def test_query_filters_and_order():
@@ -214,6 +228,72 @@ def test_run_flusher_writes_and_flushes_on_cancel():
 
     asyncio.run(scenario())
     assert len(store.ls("root/audit")) == 1
+
+
+def test_flusher_writes_a_full_buffer_within_a_tick():
+    store, log = make(flush_size=2)
+
+    async def scenario():
+        task = asyncio.create_task(run_flusher(log, 3600, tick=0.01))
+        log.add(rec("alice", T))
+        await asyncio.sleep(0.1)
+        assert store.ls("root/audit") == []  # not full, interval not over
+        log.add(rec("bob", T))
+        await asyncio.sleep(0.2)
+        assert len(store.ls("root/audit")) == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_flusher_tries_once_per_interval_after_a_failure():
+    attempts = []
+
+    class Failing(MemoryBlobStore):
+        def put(self, path, data):
+            attempts.append(path)
+            raise OSError("down")
+
+    store, log = make(Failing(), flush_size=1)
+    log.add(rec("alice", T))
+
+    async def scenario():
+        task = asyncio.create_task(run_flusher(log, 0.3, tick=0.01))
+        await asyncio.sleep(0.1)  # the buffer is full, so the first attempt is quick
+        assert len(attempts) == 1
+        await asyncio.sleep(0.1)  # still full, but the flusher waits for the interval
+        assert len(attempts) == 1
+        await asyncio.sleep(0.4)  # the interval is over
+        assert len(attempts) == 2
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert len(attempts) == 3  # the last flush on cancel
+    assert len(log.query()) == 1
+
+
+def test_flusher_runs_on_tick_after_each_flush_and_survives_its_errors():
+    store, log = make()
+    calls = []
+
+    def on_tick():
+        calls.append(len(store.ls("root/audit")))
+        raise RuntimeError("boom")
+
+    async def scenario():
+        task = asyncio.create_task(run_flusher(log, 0.02, tick=0.01, on_tick=on_tick))
+        log.add(rec("alice", T))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert len(calls) >= 3 and calls[-1] == 1  # kept running after the errors
 
 
 @pytest.mark.parametrize("bad", [None, "yesterday", 12345])

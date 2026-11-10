@@ -36,10 +36,12 @@ class GatedEngine(FakeEngine):
         await super().start(model_dir, served_name)
 
 
-def make_app(tmp_path, engine=None, store=None):
+def make_app(tmp_path, engine=None, store=None, **config_args):
     store = store or MemoryBlobStore()
     engine = engine or FakeEngine()
-    config = Config(owner="alice", local_dir=tmp_path / "local", default_model="org/a")
+    config = Config(
+        owner="alice", local_dir=tmp_path / "local", default_model="org/a", **config_args
+    )
 
     def download(model: str, revision: str, target: Path) -> None:
         (target / "config.json").write_text("{}")
@@ -128,7 +130,7 @@ def test_no_user_is_401(client):
     assert client.get("/v1/models").status_code == 401
 
 
-@pytest.mark.parametrize("content", [b"hello", b"[1]", b""])
+@pytest.mark.parametrize("content", [b"hello", b"[1]", b"", b"[" * 100000])
 def test_non_json_and_non_object_body_is_400_and_audited(client, content):
     r = client.post(CHAT, headers=BOB, content=content)
     assert r.status_code == 400
@@ -360,3 +362,41 @@ def test_openai_sdk_shape_of_errors(tmp_path):
             assert set(r.json()["error"]) == {"message", "type", "code"}
     finally:
         engine.gate.set()
+
+
+class OutageStore(MemoryBlobStore):
+    """A store whose audit and usage writes fail. It records the writing threads."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.threads: list[int] = []
+
+    def put(self, path: str, data) -> None:
+        if "/audit/" in path or "/usage/" in path:
+            self.threads.append(threading.get_ident())
+            time.sleep(0.01)
+            raise OSError("storage is down")
+        super().put(path, data)
+
+
+class LoopThreadEngine(FakeEngine):
+    """A fake engine that records the thread of the event loop."""
+
+    loop_thread = None
+
+    async def start(self, model_dir: Path, served_name: str) -> None:
+        self.loop_thread = threading.get_ident()
+        await super().start(model_dir, served_name)
+
+
+def test_audit_storage_is_never_written_on_the_event_loop_during_requests(tmp_path):
+    store, engine = OutageStore(), LoopThreadEngine()
+    app = make_app(tmp_path, engine, store, flush_size=10, flush_interval=0.05)
+    with TestClient(app) as c:
+        wait_ready(c)
+        for _ in range(150):
+            assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        threads = list(store.threads)
+        assert len(audit_records(c, user="bob", limit=1000)) == 150  # kept in the buffer
+    assert engine.loop_thread is not None
+    assert engine.loop_thread not in threads

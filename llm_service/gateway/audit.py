@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Callable
@@ -72,9 +73,9 @@ class AuditLog:
         self.listeners: list[Callable[[dict], None]] = []
 
     def add(self, record: dict) -> None:
-        """Buffer `record`, tell the listeners, and flush when the buffer is full.
+        """Buffer `record` and tell the listeners. This does no storage I/O.
 
-        Raise `ValueError` if `ts` is missing or is not a time that `parse_time`
+        The flusher writes the buffer, see `should_flush` and `run_flusher`. Raise `ValueError` if `ts` is missing or is not a time that `parse_time`
         accepts. The record is then neither buffered nor passed to a listener.
         """
         ts = record.get("ts") if isinstance(record, dict) else None
@@ -83,22 +84,25 @@ class AuditLog:
         parse_time(ts)
         with self._lock:
             self._buffer.append(record)
-            full = len(self._buffer) >= self._flush_size
         for listener in list(self.listeners):
             listener(record)
-        if full:
-            self.flush()
 
-    def flush(self) -> None:
+    def should_flush(self) -> bool:
+        """Return True when the buffer holds at least `flush_size` records."""
+        with self._lock:
+            return len(self._buffer) >= self._flush_size
+
+    def flush(self) -> bool:
         """Write the buffered records to blob storage.
 
         On a store error the records stay in the buffer and a warning is logged.
+        Return True when the buffer is empty afterwards, False when records were kept.
         """
         with self._flush_lock:
             with self._lock:
                 pending, self._buffer = self._buffer, []
             if not pending:
-                return
+                return True
             by_day: dict[str, list[dict]] = {}
             for record in pending:
                 by_day.setdefault(_day_of(record["ts"]), []).append(record)
@@ -120,6 +124,7 @@ class AuditLog:
             if failed:
                 with self._lock:
                     self._buffer = failed + self._buffer
+            return not failed
 
     def _day_files(self, day: str) -> list[str]:
         return self._store.ls(f"{self._prefix}/{day}")
@@ -219,11 +224,38 @@ class AuditLog:
         return [summary[name] for name in sorted(summary)]
 
 
-async def run_flusher(log: AuditLog, interval: float) -> None:
-    """Flush `log` every `interval` seconds until cancelled, then flush once more."""
+async def run_flusher(
+    log: AuditLog,
+    interval: float,
+    tick: float = 0.25,
+    on_tick: Callable[[], None] | None = None,
+) -> None:
+    """Flush `log` in a worker thread until cancelled, then flush once more.
+
+    The flusher wakes every `tick` seconds. It flushes when `interval` seconds
+    have passed since the last attempt, or when the buffer is full. After a
+    failed flush it waits the full `interval` again, so a store outage costs one
+    attempt per interval. `on_tick` runs in the same worker thread after each
+    flush attempt. An error in it is logged and does not stop the flusher.
+    """
+
+    def cycle() -> bool:
+        ok = log.flush()
+        if on_tick is not None:
+            try:
+                on_tick()
+            except Exception as error:
+                logger.warning("flusher callback failed: %s", error)
+        return ok
+
+    last = time.monotonic()
+    failed = False
     try:
         while True:
-            await asyncio.sleep(interval)
-            await asyncio.to_thread(log.flush)
+            await asyncio.sleep(min(tick, interval))
+            due = time.monotonic() - last >= interval
+            if due or (not failed and log.should_flush()):
+                failed = not await asyncio.to_thread(cycle)
+                last = time.monotonic()
     finally:
-        log.flush()
+        cycle()

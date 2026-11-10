@@ -122,7 +122,9 @@ def create_app(
         # is counted twice.
         await asyncio.to_thread(usage.load)
         audit.listeners.append(usage.record)
-        flusher = asyncio.create_task(run_flusher(audit, config.flush_interval))
+        flusher = asyncio.create_task(
+            run_flusher(audit, config.flush_interval, on_tick=usage.close_days)
+        )
         app.state.startup_task = asyncio.create_task(manager.startup())
         try:
             yield
@@ -222,7 +224,7 @@ def create_app(
 
             try:
                 parsed = json.loads(await request.body())
-            except ValueError:
+            except (ValueError, RecursionError):
                 parsed = None
             if not isinstance(parsed, dict):
                 return refuse(
@@ -314,7 +316,7 @@ def create_app(
     async def switch_model(request: Request, admin_user: str = Depends(require_admin)):
         try:
             body = json.loads(await request.body())
-        except ValueError:
+        except (ValueError, RecursionError):
             body = None
         if not isinstance(body, dict) or not isinstance(body.get("model"), str):
             raise ApiError(400, "invalid_request_error", "invalid_model", "the body needs a string 'model'")

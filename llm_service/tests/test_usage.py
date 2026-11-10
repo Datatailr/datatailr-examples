@@ -190,6 +190,8 @@ def test_rollover_writes_daily_file():
     assert not store.exists(f"{ROOT}/usage/{D1}.json")
     state["today"] = D2
     audit.add(rec("alice", T2))
+    assert not store.exists(f"{ROOT}/usage/{D1}.json")  # record does no storage I/O
+    usage.close_days()
     saved = json.loads(store.get(f"{ROOT}/usage/{D1}.json"))
     assert saved["day"] == D1
     assert saved["rows"] == [
@@ -217,7 +219,8 @@ def test_failed_daily_write_is_retried_and_never_raises(caplog):
     store.fail_puts = True
     state["today"] = D2
     with caplog.at_level(logging.WARNING, logger="llm_service.usage"):
-        audit.add(rec("alice", T2))  # must not raise
+        audit.add(rec("alice", T2))
+        usage.close_days()  # must not raise
     assert any(r.name == "llm_service.usage" for r in caplog.records)
     assert not store.exists(f"{ROOT}/usage/{D1}.json")
     store.fail_puts = False

@@ -135,16 +135,15 @@ class UsageTotals:
         return ts[:10], str(record["user"]), str(record.get("model") or ""), row
 
     def record(self, rec: dict) -> None:
-        """Add one audit record to the totals. Never raises."""
+        """Add one audit record to the totals. Never raises and does no storage I/O.
+
+        A finished day gets its file at the next `close_days` call.
+        """
         try:
             parts = self._parse(rec)
             if parts is None:
                 return
             day, user, model, row = parts
-            with self._lock:
-                rollover = self._newest is None or day > self._newest
-            if rollover:
-                self.close_days()
             with self._lock:
                 if self._newest is None or day > self._newest:
                     self._newest = day
