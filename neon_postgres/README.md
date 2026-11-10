@@ -326,7 +326,13 @@ dt blob ls my-database/ -r
 ## Access control
 
 Datatailr ACLs decide who can open the explorer app and who can read, change
-or operate the service. They do not reach inside the database: an ACL is
+or operate the service. `deploy.py` gives both jobs the same ACL: the user who
+deploys owns them, and members of the `developers` group get read and access
+permission, so every developer can see the jobs and open the explorer. Only the
+owner can change, operate or promote them. Create the group before you deploy,
+with `dt group add developers`, or change `DEVELOPERS_GROUP` in `deploy.py`.
+
+ACLs do not reach inside the database: an ACL is
 attached to a platform object (a job, a blob, a key in the KV store) and
 cannot be attached to a table. Table access is the job of Postgres. This
 example connects the two. The service turns platform users and groups into

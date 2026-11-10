@@ -30,7 +30,7 @@ current_dir = pathlib.Path(__file__).parent
 # Make the package importable when this file is run as a script.
 sys.path.append(str(current_dir.parent))
 
-from datatailr import App, Resources, Service  # noqa: E402
+from datatailr import ACL, App, Group, Permission, Resources, Service, User  # noqa: E402
 from datatailr.logging import CYAN, YELLOW  # noqa: E402
 
 import neon_postgres.explorer.app as explorer_entrypoint  # noqa: E402
@@ -41,10 +41,32 @@ REQUIREMENTS = str(current_dir / "requirements.txt")
 EXPLORER_REQUIREMENTS = str(current_dir / "explorer" / "requirements.txt")
 BUILD_SCRIPT_PRE = str(current_dir / "service" / "build_pre.sh")
 APP_SECTION = "Neon Postgres"
+# Platform group whose members can open the explorer and reach the service.
+DEVELOPERS_GROUP = "developers"
 
 
 DEFAULT_PASSWORD = "cloud_admin"
 ENVIRONMENT = os.environ.get("NEON_ENVIRONMENT", "dev").strip().lower() or "dev"
+
+
+def deployment_acl() -> ACL:
+    """The ACL of both jobs: the deploying user owns them, every developer can use them.
+
+    Members of the ``developers`` group get read and access permission on the
+    service and the explorer app, so they can see the jobs and open the app.
+    Only the owner can change, operate or promote them.
+    """
+    owner = User.signed_user()
+    developers = Group(DEVELOPERS_GROUP)
+    return ACL(
+        {
+            Permission.READ: [owner, developers],
+            Permission.WRITE: [owner],
+            Permission.OPERATE: [owner],
+            Permission.ACCESS: [owner, developers],
+            Permission.PROMOTE: [owner],
+        }
+    )
 
 
 def role_sync_off() -> bool:
@@ -110,6 +132,7 @@ def deploy_service() -> None:
         resources=Resources(memory="4g", cpu=2),
         python_requirements=REQUIREMENTS,
         build_script_pre=BUILD_SCRIPT_PRE,
+        acl=deployment_acl(),
         env_vars={
             "NEON_PG_PASSWORD": password,
             "NEON_BUCKET": bucket,
@@ -132,6 +155,7 @@ def deploy_explorer() -> None:
         resources=Resources(memory="1g", cpu=1),
         app_section=APP_SECTION,
         python_requirements=EXPLORER_REQUIREMENTS,
+        acl=deployment_acl(),
         env_vars=role_env(),
     )
     app.run()
