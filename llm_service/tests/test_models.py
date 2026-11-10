@@ -202,3 +202,41 @@ def test_events_emitted_for_ok_and_failed(tmp_path):
         assert "org/c" in events[1]["error"]
 
     asyncio.run(run())
+
+
+def test_failed_download_after_engine_crash_stays_failed(tmp_path):
+    async def run():
+        mgr, engine, store, _ = _make(tmp_path, bad_download="org/b")
+        await mgr.startup()
+        engine.alive_flag = False
+        mgr.check_engine()
+        assert mgr.state == "failed"
+        await mgr.request_switch("org/b")
+        assert mgr.state == "failed"
+        assert "org/b" in mgr.error
+
+    asyncio.run(run())
+
+
+def test_startup_ignores_corrupt_active_json(tmp_path):
+    for content in ["not json", "[1, 2]", json.dumps({"revision": "v1"}),
+                    json.dumps({"model": "../x", "revision": "main"})]:
+        mgr, engine, store, _ = _make(tmp_path)
+        store.put("root/state/active.json", content)
+        asyncio.run(mgr.startup())
+        assert mgr.state == "ready"
+        assert mgr.active == {"model": "org/a", "revision": "main"}
+
+
+def test_startup_fails_on_store_error(tmp_path):
+    class BrokenStore(MemoryBlobStore):
+        def get(self, path):
+            raise OSError("store down")
+
+    mgr, engine, store, _ = _make(tmp_path)
+    broken = BrokenStore()
+    broken.put("root/state/active.json", "{}")
+    mgr._store = broken
+    asyncio.run(mgr.startup())
+    assert mgr.state == "failed"
+    assert "store down" in mgr.error

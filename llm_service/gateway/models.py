@@ -68,13 +68,20 @@ class ModelManager:
             self.error = str(exc)
 
     def _read_active(self) -> dict:
-        if self._store.exists(self._active_path):
-            saved = json.loads(self._store.get(self._active_path))
+        default = {"model": self._default_model, "revision": "main"}
+        if not self._store.exists(self._active_path):
+            return default
+        # A store error propagates and fails the startup. Bad content does not.
+        raw = self._store.get(self._active_path)
+        try:
+            saved = json.loads(raw)
             return {
                 "model": validate_model_name(saved["model"]),
-                "revision": validate_revision(saved["revision"]),
+                "revision": validate_revision(saved.get("revision", "main")),
             }
-        return {"model": self._default_model, "revision": "main"}
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            log.warning("ignoring unusable %s: %s", self._active_path, exc)
+            return default
 
     def _begin(self, wanted: dict) -> None:
         self.state = "loading"
@@ -133,7 +140,10 @@ class ModelManager:
         # The old engine still runs, so the old model keeps serving.
         self.target = None
         self.error = error
-        self.state = "ready" if previous is not None else "empty"
+        if previous is None:
+            self.state = "empty"
+        else:
+            self.state = "ready" if self._engine.alive() else "failed"
         self._emit(wanted, "failed", error)
 
     async def _fail_after_stop(
