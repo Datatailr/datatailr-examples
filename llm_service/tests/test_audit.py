@@ -445,3 +445,12 @@ def test_partial_flush_failure_keeps_only_the_failed_day():
     assert len(store.ls("root/audit/2026-11-10")) == 1  # not written twice
     assert len(store.ls("root/audit/2026-11-09")) == 1
     assert [r["user"] for r in log.query()] == ["bob", "alice"]
+
+
+def test_query_puts_the_later_record_first_on_the_same_time():
+    store, log = make()
+    log.add(rec("alice", T))
+    log.flush()
+    log.add(rec("bob", T))
+    log.add(rec("carol", T))
+    assert [r["user"] for r in log.query()] == ["carol", "bob", "alice"]

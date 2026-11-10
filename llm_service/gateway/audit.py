@@ -254,6 +254,9 @@ class AuditLog:
                 if (since and when < since) or (until and when >= until):
                     continue
                 matches.append((when, record))
+            # Records are in write order. Reverse them first, so that the stable
+            # sort puts the later record first when two have the same time.
+            matches.reverse()
             matches.sort(key=lambda item: item[0], reverse=True)
             found.extend(matches)
             if len(found) >= offset + limit:
