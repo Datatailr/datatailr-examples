@@ -7,7 +7,7 @@ import json
 import logging
 import threading
 import uuid
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Callable
 
 from llm_service.gateway.storage import BlobStore
