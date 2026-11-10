@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import threading
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from .storage import BlobStore
+
+log = logging.getLogger("llm_service.weights")
 
 COMPLETE = ".complete"
 _PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -114,6 +117,35 @@ class WeightCache:
         except BaseException:
             shutil.rmtree(target, ignore_errors=True)
             raise
+
+    def prune(self, in_use: Callable[[], Iterable[dict]]) -> None:
+        """Delete the local directories of the models that are not in use.
+
+        `in_use` returns the models to keep, as dicts with `model` and
+        `revision`. It runs under the cache lock, so no fetch runs at the same
+        time. The blob storage copies stay. A deletion error is logged.
+        """
+        with self._lock:
+            keep = {
+                self._local_dir / entry["model"].replace("/", "--") / entry["revision"]
+                for entry in in_use()
+            }
+            if not self._local_dir.is_dir():
+                return
+            for model_dir in sorted(self._local_dir.iterdir()):
+                if not model_dir.is_dir():
+                    continue
+                for revision_dir in sorted(model_dir.iterdir()):
+                    if revision_dir in keep:
+                        continue
+                    try:
+                        shutil.rmtree(revision_dir)
+                    except OSError as exc:
+                        log.warning("could not delete %s: %s", revision_dir, exc)
+                try:
+                    model_dir.rmdir()  # only an empty directory goes
+                except OSError:
+                    pass
 
     def cached(self) -> list[dict]:
         """List the models in blob storage that have a `.complete` marker."""

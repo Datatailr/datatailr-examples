@@ -58,9 +58,9 @@ class ModelManager:
     async def startup(self) -> None:
         """Load the saved model, or the default one. Never raise."""
         try:
-            wanted = self._read_active()
+            wanted = await asyncio.to_thread(self._read_active)
             self._begin(wanted)
-            await self._load(wanted, previous=None)
+            await self._load(wanted, previous=None, trigger="startup")
         except Exception as exc:  # noqa: BLE001
             log.exception("startup failed")
             self.state = "failed"
@@ -68,6 +68,7 @@ class ModelManager:
             self.error = str(exc)
 
     def _read_active(self) -> dict:
+        """Return the saved model. It runs in a worker thread."""
         default = {"model": self._default_model, "revision": "main"}
         if not self._store.exists(self._active_path):
             return default
@@ -95,16 +96,54 @@ class ModelManager:
             raise SwitchInProgress("a model switch is already running")
         wanted = {"model": model, "revision": revision}
         self._begin(wanted)
-        self._task = asyncio.create_task(self._load(wanted, previous=self.active))
+        self._task = asyncio.create_task(
+            self._load(wanted, previous=self.active, trigger="switch")
+        )
         return self._task
 
-    def check_engine(self) -> None:
-        """Set `failed` when the engine process has exited."""
-        if self.state == "ready" and not self._engine.alive():
-            self.state = "failed"
-            self.error = "engine exited"
+    def check_engine(self) -> asyncio.Task | None:
+        """Start one automatic reload when the engine process has exited.
 
-    async def _load(self, wanted: dict, previous: dict | None) -> None:
+        This acts only in the `ready` state. It reloads the active model with
+        the startup load path and returns the task. If the reload fails, the
+        state is `failed` until an admin switch. Call it inside a running loop.
+        """
+        if self.state != "ready" or self._engine.alive():
+            return None
+        wanted = dict(self.active)
+        log.warning("the engine exited, reloading %s", wanted["model"])
+        self._begin(wanted)
+        self.error = "engine exited"
+        self._task = asyncio.create_task(self._reload(wanted))
+        return self._task
+
+    async def _reload(self, wanted: dict) -> None:
+        await self._load(wanted, previous=None, trigger="reload")
+        if self.state != "ready":
+            self.state = "failed"
+            self.active = None
+
+    def _in_use(self) -> list[dict]:
+        """Return the active model and the model that loads, if any."""
+        return [entry for entry in (self.active, self.target) if entry]
+
+    async def _save_active(self) -> None:
+        """Write `active.json` in a worker thread. A failure only logs a warning."""
+        try:
+            await asyncio.to_thread(
+                self._store.put, self._active_path, json.dumps(self.active)
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not write %s: %s", self._active_path, exc)
+
+    async def _prune(self) -> None:
+        """Delete the local copies of the models that are not in use."""
+        try:
+            await asyncio.to_thread(self._weights.prune, self._in_use)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not delete old local weights: %s", exc)
+
+    async def _load(self, wanted: dict, previous: dict | None, trigger: str) -> None:
         model, revision = wanted["model"], wanted["revision"]
         try:
             try:
@@ -112,30 +151,32 @@ class ModelManager:
                     self._weights.ensure, model, revision
                 )
             except Exception as exc:  # noqa: BLE001
-                self._fail_before_stop(wanted, previous, f"{model}: {exc}")
+                self._fail_before_stop(wanted, previous, f"{model}: {exc}", trigger)
                 return
             if previous is not None:
                 await self._engine.stop()
             try:
                 await self._engine.start(model_dir, model)
             except Exception as exc:  # noqa: BLE001
-                await self._fail_after_stop(wanted, previous, f"{model}: {exc}")
+                await self._fail_after_stop(wanted, previous, f"{model}: {exc}", trigger)
                 return
             self.active = dict(wanted)
             self.target = None
             self.error = None
             self.state = "ready"
-            self._store.put(self._active_path, json.dumps(self.active))
-            self._emit(wanted, "ok", None)
+            await self._save_active()
+            self._emit(wanted, "ok", None, trigger)
         except Exception as exc:  # noqa: BLE001
             log.exception("model switch crashed")
             self.target = None
             self.state = "failed"
             self.error = f"{model}: {exc}"
-            self._emit(wanted, "failed", self.error)
+            self._emit(wanted, "failed", self.error, trigger)
+            return
+        await self._prune()
 
     def _fail_before_stop(
-        self, wanted: dict, previous: dict | None, error: str
+        self, wanted: dict, previous: dict | None, error: str, trigger: str
     ) -> None:
         # The old engine still runs, so the old model keeps serving.
         self.target = None
@@ -144,10 +185,10 @@ class ModelManager:
             self.state = "empty"
         else:
             self.state = "ready" if self._engine.alive() else "failed"
-        self._emit(wanted, "failed", error)
+        self._emit(wanted, "failed", error, trigger)
 
     async def _fail_after_stop(
-        self, wanted: dict, previous: dict | None, error: str
+        self, wanted: dict, previous: dict | None, error: str, trigger: str
     ) -> None:
         self.target = None
         self.error = error
@@ -164,10 +205,13 @@ class ModelManager:
             else:
                 self.active = dict(previous)
                 self.state = "ready"
-                self._store.put(self._active_path, json.dumps(self.active))
-        self._emit(wanted, "failed", error)
+                await self._save_active()
+        self._emit(wanted, "failed", error, trigger)
 
-    def _emit(self, wanted: dict, result: str, error: str | None) -> None:
+    def _emit(
+        self, wanted: dict, result: str, error: str | None, trigger: str
+    ) -> None:
+        """Report a load. `trigger` is `startup`, `switch` or `reload`."""
         try:
             self._on_event(
                 {
@@ -176,6 +220,7 @@ class ModelManager:
                     "revision": wanted["revision"],
                     "result": result,
                     "error": error,
+                    "trigger": trigger,
                 }
             )
         except Exception:  # noqa: BLE001

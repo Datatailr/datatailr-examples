@@ -213,3 +213,33 @@ def test_cached_returns_the_names_given_to_ensure(fx):
     for name in names:
         fx.cache.ensure(name, "main")
     assert [e["model"] for e in fx.cache.cached()] == sorted(names)
+
+
+def test_prune_keeps_models_in_use_and_deletes_the_rest(fx):
+    for name in ("org/a", "org/b", "org/c"):
+        fx.cache.ensure(name, "main")
+    fx.cache.ensure("org/a", "v2")
+    fx.cache.prune(lambda: [{"model": "org/a", "revision": "main"}, {"model": "org/c", "revision": "main"}])
+    assert (fx.local / "org--a" / "main" / ".complete").exists()  # active
+    assert (fx.local / "org--c" / "main" / ".complete").exists()  # loading
+    assert not (fx.local / "org--a" / "v2").exists()
+    assert not (fx.local / "org--b").exists()
+    assert fx.store.exists("root/models/org--b/main/.complete")  # blob copies stay
+
+
+def test_prune_logs_a_deletion_error_and_goes_on(fx, monkeypatch, caplog):
+    fx.cache.ensure("org/a", "main")
+    fx.cache.ensure("org/b", "main")
+
+    def broken_rmtree(path, *args, **kwargs):
+        raise OSError("device busy")
+
+    monkeypatch.setattr("llm_service.gateway.weights.shutil.rmtree", broken_rmtree)
+    with caplog.at_level("WARNING", logger="llm_service.weights"):
+        fx.cache.prune(lambda: [])
+    assert sum("device busy" in m for m in caplog.messages) == 2
+
+
+def test_prune_without_a_local_directory_does_nothing(fx):
+    fx.cache.prune(lambda: [])
+    assert not fx.local.exists()

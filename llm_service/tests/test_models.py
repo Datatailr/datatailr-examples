@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import threading
 from pathlib import Path
 
 import pytest
@@ -58,7 +60,7 @@ def test_startup_failure_sets_failed_and_never_raises(tmp_path):
     assert mgr.active is None
 
 
-def test_startup_download_failure_gives_failed(tmp_path):
+def test_startup_download_failure_gives_empty(tmp_path):
     mgr, engine, store, _ = _make(tmp_path, bad_download="org/a")
     asyncio.run(mgr.startup())
     assert mgr.state == "empty"
@@ -159,17 +161,69 @@ def test_invalid_name_raises_and_touches_nothing(tmp_path):
     asyncio.run(run())
 
 
-def test_engine_exit_sets_failed_and_allows_new_switch(tmp_path):
+def test_engine_exit_reloads_the_active_model_once(tmp_path):
     async def run():
-        mgr, engine, store, _ = _make(tmp_path)
+        mgr, engine, store, events = _make(tmp_path)
         await mgr.startup()
+        events.clear()
         engine.alive_flag = False
-        mgr.check_engine()
-        assert mgr.state == "failed" and mgr.error == "engine exited"
-        engine.alive_flag = True
-        await mgr.request_switch("org/a")
+        task = mgr.check_engine()
+        assert isinstance(task, asyncio.Task)
+        assert mgr.state == "loading" and mgr.error == "engine exited"
+        assert mgr.target == {"model": "org/a", "revision": "main"}
+        assert mgr.check_engine() is None  # no second reload while loading
+        with pytest.raises(SwitchInProgress):
+            mgr.request_switch("org/b")
+        await task
+        assert mgr.state == "ready" and mgr.error is None and mgr.target is None
+        assert mgr.active == {"model": "org/a", "revision": "main"}
+        assert [name for _, name in engine.started] == ["org/a", "org/a"]
+        assert [(e["model"], e["result"], e["trigger"]) for e in events] == [
+            ("org/a", "ok", "reload")
+        ]
+        # The model was ready again, so the next exit gets a new reload.
+        engine.alive_flag = False
+        await mgr.check_engine()
         assert mgr.state == "ready"
-        assert mgr.error is None
+        assert len(engine.started) == 3
+
+    asyncio.run(run())
+
+
+def test_failed_automatic_reload_stays_failed_until_an_admin_switch(tmp_path):
+    async def run():
+        mgr, engine, store, events = _make(tmp_path)
+        await mgr.startup()
+        events.clear()
+        engine.alive_flag = False
+        engine.fail_on = {"org/a"}
+        await mgr.check_engine()
+        assert mgr.state == "failed" and mgr.active is None
+        assert "org/a" in mgr.error
+        assert [(e["result"], e["trigger"]) for e in events] == [("failed", "reload")]
+        assert mgr.check_engine() is None
+        assert mgr.state == "failed"
+        assert len(events) == 1  # no second automatic attempt
+        engine.fail_on = set()
+        await mgr.request_switch("org/a")
+        assert mgr.state == "ready" and mgr.error is None
+
+    asyncio.run(run())
+
+
+def test_failed_reload_without_weights_is_failed(tmp_path):
+    async def run():
+        mgr, engine, store, events = _make(tmp_path)
+        await mgr.startup()
+
+        def broken_ensure(model, revision):
+            raise OSError("disk gone")
+
+        mgr._weights.ensure = broken_ensure
+        engine.alive_flag = False
+        await mgr.check_engine()
+        assert mgr.state == "failed" and mgr.active is None
+        assert "disk gone" in mgr.error
 
     asyncio.run(run())
 
@@ -196,7 +250,7 @@ def test_events_emitted_for_ok_and_failed(tmp_path):
         await mgr.request_switch("org/c")
         assert events[0] == {
             "event": "model_switch", "model": "org/b", "revision": "main",
-            "result": "ok", "error": None,
+            "result": "ok", "error": None, "trigger": "switch",
         }
         assert events[1]["model"] == "org/c" and events[1]["result"] == "failed"
         assert "org/c" in events[1]["error"]
@@ -208,9 +262,7 @@ def test_failed_download_after_engine_crash_stays_failed(tmp_path):
     async def run():
         mgr, engine, store, _ = _make(tmp_path, bad_download="org/b")
         await mgr.startup()
-        engine.alive_flag = False
-        mgr.check_engine()
-        assert mgr.state == "failed"
+        engine.alive_flag = False  # the engine died, check_engine has not run yet
         await mgr.request_switch("org/b")
         assert mgr.state == "failed"
         assert "org/b" in mgr.error
@@ -240,3 +292,87 @@ def test_startup_fails_on_store_error(tmp_path):
     asyncio.run(mgr.startup())
     assert mgr.state == "failed"
     assert "store down" in mgr.error
+
+
+def test_startup_event_has_the_startup_trigger(tmp_path):
+    mgr, engine, store, events = _make(tmp_path)
+    asyncio.run(mgr.startup())
+    assert [e["trigger"] for e in events] == ["startup"]
+
+
+class ActiveWriteFails(MemoryBlobStore):
+    """A store whose writes of active.json fail. It records the calling threads."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.threads: list[int] = []
+
+    def _note(self) -> None:
+        self.threads.append(threading.get_ident())
+
+    def put(self, path, data):
+        if path.endswith("state/active.json"):
+            self._note()
+            raise OSError("store down")
+        super().put(path, data)
+
+    def exists(self, path):
+        if path.endswith("state/active.json"):
+            self._note()
+        return super().exists(path)
+
+    def get(self, path):
+        if path.endswith("state/active.json"):
+            self._note()
+        return super().get(path)
+
+
+def _with_store(tmp_path, store):
+    engine = FakeEngine()
+    events: list[dict] = []
+
+    def download(model, revision, target):
+        (target / "config.json").write_text("{}")
+
+    weights = WeightCache(store, "root", tmp_path / "local", download)
+    return ModelManager(weights, engine, store, "root", "org/a", events.append), engine
+
+
+def test_failed_active_json_write_keeps_the_model_ready(tmp_path, caplog):
+    store = ActiveWriteFails()
+
+    async def run():
+        mgr, engine = _with_store(tmp_path, store)
+        loop_thread = threading.get_ident()
+        with caplog.at_level(logging.WARNING, logger="llm_service.models"):
+            await mgr.startup()
+            assert mgr.state == "ready" and mgr.error is None
+            await mgr.request_switch("org/b")
+            assert mgr.state == "ready" and mgr.active["model"] == "org/b"
+            engine.fail_on = {"org/c"}
+            await mgr.request_switch("org/c")  # the rollback writes active.json too
+            assert mgr.state == "ready" and mgr.active["model"] == "org/b"
+        return loop_thread
+
+    loop_thread = asyncio.run(run())
+    assert any("active.json" in m for m in caplog.messages)
+    assert len(store.threads) >= 4  # exists at startup, then three writes
+    assert loop_thread not in store.threads
+
+
+def test_successful_switch_deletes_other_local_models(tmp_path):
+    async def run():
+        mgr, engine, store, _ = _make(tmp_path)
+        await mgr.startup()
+        local = tmp_path / "local"
+        assert (local / "org--a" / "main").is_dir()
+        await mgr.request_switch("org/b")
+        assert not (local / "org--a").exists()
+        assert (local / "org--b" / "main" / ".complete").exists()
+        assert store.exists("root/models/org--a/main/.complete")  # the blob copy stays
+        engine.fail_on = {"org/c"}
+        await mgr.request_switch("org/c")  # a failed switch deletes nothing
+        assert (local / "org--b" / "main" / ".complete").exists()
+        assert (local / "org--c" / "main" / ".complete").exists()
+
+    asyncio.run(run())

@@ -95,14 +95,16 @@ def create_app(
 
     def on_event(event: dict) -> None:
         failed = event["result"] != "ok"
+        trigger = event.get("trigger")
         write_audit(
             {
-                "user": app.state.last_admin,
+                # Only an admin switch has an admin. Startup and reload are the system.
+                "user": app.state.last_admin if trigger == "switch" else SYSTEM_USER,
                 "endpoint": "/admin/model",
                 "model": event["model"],
                 "stream": False,
                 "prompt": {
-                    "event": "model_switch",
+                    "event": "engine_reload" if trigger == "reload" else "model_switch",
                     "revision": event["revision"],
                     "error": event["error"],
                 },
@@ -129,7 +131,8 @@ def create_app(
         try:
             yield
         finally:
-            for task in (app.state.startup_task, app.state.switch_task):
+            tasks = (app.state.startup_task, app.state.switch_task, app.state.reload_task)
+            for task in tasks:
                 if task is not None and not task.done():
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -147,6 +150,7 @@ def create_app(
     app.state.last_admin = SYSTEM_USER
     app.state.switch_task = None
     app.state.startup_task = None
+    app.state.reload_task = None
     app.state.manager = manager
     app.state.audit = audit
     app.state.usage = usage
@@ -234,18 +238,21 @@ def create_app(
             if isinstance(body.get("model"), str):
                 model = body["model"]
 
-            manager.check_engine()
-            if manager.state != "ready":
-                loading = manager.state == "loading"
+            reload = manager.check_engine()
+            if reload is not None:
+                app.state.reload_task = reload
+            if manager.state == "loading":
                 return refuse(
                     ApiError(
                         503,
                         "service_unavailable",
-                        "model_loading" if loading else "no_model",
-                        "a model is loading, try again later" if loading else "no model is loaded",
+                        "model_loading",
+                        "a model is loading, try again later",
                         {"Retry-After": "30"},
                     )
                 )
+            if manager.state != "ready":
+                return refuse(ApiError(503, "service_unavailable", "no_model", "no model is loaded"))
             active = manager.active["model"]
             if body.get("model") is None:
                 body = {**body, "model": active}

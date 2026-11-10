@@ -167,7 +167,40 @@ def test_503_no_model_when_the_load_failed(tmp_path):
         wait_for(c, lambda s: s["state"] == "failed")
         r = c.post(CHAT, headers=BOB, json=HI)
         assert r.status_code == 503 and r.json()["error"]["code"] == "no_model"
+        assert "retry-after" not in r.headers
+
+
+def test_dead_engine_is_reloaded_once_and_audited_as_system(tmp_path):
+    engine = FakeEngine()
+    with TestClient(make_app(tmp_path, engine)) as c:
+        wait_ready(c)
+        assert c.post("/admin/model", headers=ALICE, json={"model": "org/b"}).status_code == 202
+        wait_for(c, lambda s: s["state"] == "ready" and s["active"]["model"] == "org/b")
+        engine.alive_flag = False
+        r = c.post(CHAT, headers=BOB, json={**HI, "model": "org/b"})
+        assert r.status_code == 503 and r.json()["error"]["code"] == "model_loading"
         assert r.headers["retry-after"] == "30"
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json={**HI, "model": "org/b"}).status_code == 200
+        events = [e for e in audit_records(c, model="org/b") if e["endpoint"] == "/admin/model"]
+        assert [(e["user"], e["prompt"]["event"], e["status"]) for e in events] == [
+            ("system", "engine_reload", 200),
+            ("alice", "model_switch", 200),
+        ]
+
+
+def test_failed_reload_answers_no_model_without_retry_after(tmp_path):
+    engine = FakeEngine()
+    with TestClient(make_app(tmp_path, engine)) as c:
+        wait_ready(c)
+        engine.alive_flag = False
+        engine.fail_on = {"org/a"}
+        c.post(CHAT, headers=BOB, json=HI)
+        wait_for(c, lambda s: s["state"] == "failed")
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 503 and r.json()["error"]["code"] == "no_model"
+        assert "retry-after" not in r.headers
+        assert c.get("/admin/model", headers=ALICE).json()["state"] == "failed"
 
 
 def test_models_list_marks_active_and_cached(client):
