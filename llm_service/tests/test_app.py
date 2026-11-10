@@ -203,16 +203,52 @@ def test_failed_reload_answers_no_model_without_retry_after(tmp_path):
         assert c.get("/admin/model", headers=ALICE).json()["state"] == "failed"
 
 
-def test_models_list_marks_active_and_cached(client):
-    client.app.state.manager._store.put("llm-service/models/org--b/main/.complete", "")
+def test_models_list_has_one_entry_per_model(client):
+    store = client.app.state.manager._store
+    store.put("llm-service/models/org--b/v2/.complete", "")
+    store.put("llm-service/models/org--b/main/.complete", "")
+    store.put("llm-service/models/org--a/old/.complete", "")
     body = client.get("/v1/models", headers=BOB).json()
     assert body["object"] == "list"
-    first, second = body["data"]
-    assert first == {
-        "id": "org/a", "object": "model", "created": 0, "owned_by": "org",
-        "status": "active", "revision": "main",
-    }
-    assert second["id"] == "org/b" and second["status"] == "cached"
+    assert body["data"] == [
+        {
+            "id": "org/a", "object": "model", "created": 0, "owned_by": "org",
+            "status": "active", "revision": "main", "revisions": ["main", "old"],
+        },
+        {
+            "id": "org/b", "object": "model", "created": 0, "owned_by": "org",
+            "status": "cached", "revision": "main", "revisions": ["main", "v2"],
+        },
+    ]
+
+
+def test_models_list_shows_the_loading_revision(tmp_path):
+    engine = GatedEngine({"org/b"})
+    try:
+        with TestClient(make_app(tmp_path, engine)) as c:
+            wait_ready(c)
+            c.post("/admin/model", headers=ALICE, json={"model": "org/b", "revision": "v3"})
+            wait_for(c, lambda s: s["state"] == "loading")
+            data = c.get("/v1/models", headers=BOB).json()["data"]
+            assert [(e["id"], e["status"], e["revision"]) for e in data] == [
+                ("org/a", "active", "main"),
+                ("org/b", "loading", "v3"),
+            ]
+            engine.gate.set()
+            wait_ready(c)
+    finally:
+        engine.gate.set()
+
+
+def test_retrieve_one_model(client):
+    r = client.get("/v1/models/org/a", headers=BOB)
+    assert r.status_code == 200
+    assert r.json() == client.get("/v1/models", headers=BOB).json()["data"][0]
+    r = client.get("/v1/models/org/zzz", headers=BOB)
+    assert r.status_code == 404
+    error = r.json()["error"]
+    assert error["code"] == "model_not_found" and error["type"] == "invalid_request_error"
+    assert client.get("/v1/models/org/a").status_code == 401
 
 
 ADMIN_ROUTES = [

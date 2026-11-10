@@ -279,31 +279,49 @@ def create_app(
     for openai_path in OPENAI_PATHS:
         app.post(openai_path)(make_handler(openai_path))
 
-    @app.get("/v1/models")
-    async def list_models(user: str = Depends(current_user)) -> dict:
-        cached = await asyncio.to_thread(weights.cached)
-        entries = {(c["model"], c["revision"]): "cached" for c in cached}
-        active = manager.active
-        target = manager.target
-        if active:
-            entries[(active["model"], active["revision"])] = "active"
-        if target:
-            entries[(target["model"], target["revision"])] = "loading"
-        order = sorted(entries, key=lambda key: (entries[key] != "active", entries[key] != "loading", key))
-        return {
-            "object": "list",
-            "data": [
+    async def model_entries() -> list[dict]:
+        """Return one `/v1/models` entry for each model id.
+
+        The status is `loading` for the model that loads, `active` for the
+        served model and `cached` for the rest. `revision` is the loading or
+        active revision, else the first cached one.
+        """
+        revisions: dict[str, list[str]] = {}
+        for entry in await asyncio.to_thread(weights.cached):
+            revisions.setdefault(entry["model"], []).append(entry["revision"])
+        current: dict[str, tuple[str, str]] = {}
+        if manager.active:
+            current[manager.active["model"]] = ("active", manager.active["revision"])
+        if manager.target:
+            current[manager.target["model"]] = ("loading", manager.target["revision"])
+        entries = []
+        for name in set(revisions) | set(current):
+            cached = sorted(revisions.get(name, []))
+            status, revision = current.get(name, ("cached", cached[0] if cached else None))
+            entries.append(
                 {
                     "id": name,
                     "object": "model",
                     "created": 0,
                     "owned_by": name.split("/")[0],
-                    "status": entries[(name, revision)],
+                    "status": status,
                     "revision": revision,
+                    "revisions": cached,
                 }
-                for name, revision in order
-            ],
-        }
+            )
+        rank = {"active": 0, "loading": 1, "cached": 2}
+        return sorted(entries, key=lambda e: (rank[e["status"]], e["id"]))
+
+    @app.get("/v1/models")
+    async def list_models(user: str = Depends(current_user)) -> dict:
+        return {"object": "list", "data": await model_entries()}
+
+    @app.get("/v1/models/{model_id:path}")
+    async def get_model_entry(model_id: str, user: str = Depends(current_user)) -> dict:
+        for entry in await model_entries():
+            if entry["id"] == model_id:
+                return entry
+        raise ApiError(404, "invalid_request_error", "model_not_found", f"the model {model_id!r} is not known")
 
     @app.get("/v1/usage/me")
     async def usage_me(
