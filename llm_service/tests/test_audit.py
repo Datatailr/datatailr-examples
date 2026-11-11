@@ -1239,3 +1239,32 @@ def test_prompt_cache_drop_forgets_the_prompt_files_of_a_day():
     assert log.record(DAY, alice["request_id"]) == {**full(alice), "prompt": None, "prompt_deleted": True}
     bob = log.record(bob_day, rec("bob", "2026-11-11T08:00:00.000Z")["request_id"])
     assert bob["prompt"] is not None  # another day stays cached
+
+
+class BarrierStore(CountingStore):
+    """A counting store whose reads of the `paired` paths wait until both run at the same time."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.barrier = threading.Barrier(2, timeout=5)
+        self.paired: set[str] = set()
+
+    def get(self, path: str) -> bytes:
+        if path in self.paired:
+            self.barrier.wait()
+        return super().get(path)
+
+
+def test_read_many_reads_in_parallel_keeps_the_order_and_gives_empty_for_a_missing_file():
+    store = BarrierStore()
+    seg = "20261110T120000.000000-aa"
+    paths = [segment_path("root", DAY, f"20261110T12000{n}.000000-aa") for n in range(3)]
+    for n, path in enumerate(paths):
+        store.put(path, json.dumps(dict(rec(f"u{n}", T), seg=seg)) + "\n")
+    store.paired = {paths[0], paths[2]}
+    log = AuditLog(store, "root")
+    log.cache_put(paths[1], [dict(rec("cached", T), seg=seg)])
+    missing = segment_path("root", DAY, "20261110T130000.000000-aa")
+    chunks = log.read_many([paths[2], missing, paths[1], paths[0]])
+    assert [[row["user"] for row in chunk] for chunk in chunks] == [["u2"], [], ["cached"], ["u0"]]
+    assert sorted(store.gets) == sorted([paths[0], paths[2], missing])

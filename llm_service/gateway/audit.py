@@ -354,6 +354,15 @@ class AuditLog:
         rows = self._read(path)
         return rows if rows is not None else []
 
+    def read_many(self, paths: list[str]) -> list[list[dict]]:
+        """Return the rows of each file of `paths`, in the order of `paths`.
+
+        Cached files come from the cache. `READ_WORKERS` threads read the other files. A
+        missing file gives an empty list. A failed read raises. The caller must not change
+        the returned rows.
+        """
+        return [rows if rows is not None else [] for rows in self._read_files(paths)]
+
     def _read(self, path: str) -> list[dict] | None:
         """Return the rows of `read_rows`, or None when the file does not exist."""
         cached = self.cached_rows(path)

@@ -61,10 +61,12 @@ def _day_folder(root: str, day: str) -> str:
 class AuditMerger:
     """Merges the audit metadata of `log` and deletes old prompts.
 
-    Only the flusher thread calls `merge`, `retain` and `tick`. `merge` holds `log.flush_lock`,
-    so no flush runs during a merge. `merge` lists only the day folders that can have work: the
-    first merge after a start finds them with one listing of `audit/`, and `flushed` adds the day
-    of each new segment. With `retention_days` None, `retain` keeps all prompts.
+    Only the flusher thread calls `merge`, `retain` and `tick`. `merge` holds `log.flush_lock`
+    for the listing of a day folder, and for the reads, the write and the `cache_put` of each
+    merged file. It releases the lock before it deletes the inputs, so a flush can run then.
+    `merge` lists only the day folders that can have work: the first merge after a start finds
+    them with one listing of `audit/`, and `flushed` adds the day of each new segment. With
+    `retention_days` None, `retain` keeps all prompts.
     """
 
     def __init__(
@@ -83,7 +85,8 @@ class AuditMerger:
         self._last_merge: datetime | None = None  # time of the last merge of `tick`
         self._listed = False  # True after the first listing of `audit/`
         self._work: set[str] = set()  # day folders that can hold a segment or a part
-        self._work_lock = threading.Lock()  # guards `_work`
+        self._flushes: dict[str, int] = {}  # day -> segments that a flush wrote, for `_work`
+        self._work_lock = threading.Lock()  # guards `_work` and `_flushes`
         self._warned: set[str] = set()  # names without an end time that got a warning
         self._last_retain: datetime | None = None  # time of the last retention check
         self._queue: list[str] = []  # days of the last check that wait for retention
@@ -112,6 +115,7 @@ class AuditMerger:
         """
         with self._work_lock:
             self._work.add(day)
+            self._flushes[day] = self._flushes.get(day, 0) + 1
 
     def _time(self) -> datetime:
         now = self._now()
@@ -125,27 +129,32 @@ class AuditMerger:
         A bucket is ready 1 minute after its 10 minutes end. A day is ready 15 minutes after
         it ends, when its folder has no segment left. Only the day folders that can have work
         are listed. A folder leaves that set when it holds no segment and no part after the
-        merge. A failed listing, write or delete is logged and the other merges go on. Never
-        raise.
+        merge, and no flush wrote to it after its listing. A failed listing, write or delete is
+        logged and the other merges go on. Never raise.
         """
         try:
-            with self._log.flush_lock:
-                now = self._time()
-                if not self._listed:
-                    self._list_all()
-                with self._work_lock:
-                    days = sorted(self._work)
-                for day in days:
-                    try:
+            now = self._time()
+            if not self._listed:
+                self._list_all()
+            with self._work_lock:
+                days = sorted(self._work)
+            for day in days:
+                try:
+                    with self._log.flush_lock:
                         folder = self._folder(day)
-                        self._merge_buckets(day, folder, now)
-                        self._merge_day(day, folder, now)
-                    except Exception as error:
-                        logger.warning("audit merge of %s stopped: %s", day, error)
-                        continue
-                    if not folder.segments and not folder.parts:
                         with self._work_lock:
+                            flushes = self._flushes.get(day, 0)
+                    self._merge_buckets(day, folder, now)
+                    self._merge_day(day, folder, now)
+                except Exception as error:
+                    logger.warning("audit merge of %s stopped: %s", day, error)
+                    continue
+                if not folder.segments and not folder.parts:
+                    with self._work_lock:
+                        # A flush after the listing wrote a segment that the listing missed.
+                        if self._flushes.get(day, 0) == flushes:
                             self._work.discard(day)
+                            self._flushes.pop(day, None)
         except Exception as error:
             logger.warning("audit merge stopped: %s", error)
 
@@ -199,7 +208,8 @@ class AuditMerger:
             names = sorted(folder.segments[bucket])
             target = part_path(self._root, day, bucket)
             inputs = [segment_path(self._root, day, name) for name in names]
-            left = self._merge_files(target, bucket in folder.parts, inputs)
+            label = f"part bucket {bucket}"
+            left = self._merge_files(day, label, target, bucket in folder.parts, inputs)
             if left is None:
                 continue
             folder.parts.add(bucket)
@@ -216,43 +226,52 @@ class AuditMerger:
             return
         buckets = sorted(folder.parts)
         inputs = [part_path(self._root, day, bucket) for bucket in buckets]
-        left = self._merge_files(day_path(self._root, day), folder.has_day, inputs)
+        target = day_path(self._root, day)
+        left = self._merge_files(day, "the day file", target, folder.has_day, inputs)
         if left is not None:
             folder.has_day = True
             folder.parts = {b for b, path in zip(buckets, inputs) if path in left}
 
-    def _merge_files(self, target: str, exists: bool, inputs: list[str]) -> list[str] | None:
+    def _merge_files(
+        self, day: str, label: str, target: str, exists: bool, inputs: list[str]
+    ) -> list[str] | None:
         """Write the rows of `inputs` to `target`, then delete the inputs.
 
         When `exists` is true, the rows of `target` come first. A row whose `seg` occurred in
-        an earlier file is skipped. Return the inputs that are left after a failed delete, or
-        None when a read or the write failed and nothing changed.
+        an earlier file is skipped. `log.flush_lock` is held for the reads, the write and the
+        `cache_put`, and not for the deletes. A reader that sees the merged file and an input
+        drops the copies by `seg`. Return the inputs that are left after a failed delete, or
+        None when a read or the write failed and nothing changed. `label` names the target in
+        the log line.
         """
+        started = time.monotonic()
         rows: list[dict] = []
         seen: set[str] = set()
-        try:
-            for path in ([target] if exists else []) + inputs:
-                segs = set()
-                for row in self._log.read_rows(path):
-                    segs.add(row["seg"])
-                    if row["seg"] not in seen:
-                        rows.append(row)
-                seen |= segs
-            self._store.put(target, dump_lines(rows))
-        except Exception as error:
-            logger.warning("audit merge into %s failed, keeping its inputs: %s", target, error)
-            return None
-        self._log.cache_put(target, rows)
-        left = []
-        for path in inputs:
+        with self._log.flush_lock:
             try:
-                self._store.delete(path)
+                for chunk in self._log.read_many(([target] if exists else []) + inputs):
+                    segs = set()
+                    for row in chunk:
+                        segs.add(row["seg"])
+                        if row["seg"] not in seen:
+                            rows.append(row)
+                    seen |= segs
+                self._store.put(target, dump_lines(rows))
             except Exception as error:
-                logger.warning("cannot delete the merged audit file %s: %s", path, error)
-                left.append(path)
-                continue
-            self._log.cache_drop([path])
-        return left
+                logger.warning("audit merge into %s failed, keeping its inputs: %s", target, error)
+                return None
+            self._log.cache_put(target, rows)
+        failed = self._delete_many(inputs, "merged audit file")
+        self._log.cache_drop([path for path in inputs if path not in failed])
+        logger.info(
+            "merged %d files of %s into %s in %.1f s (%d rows)",
+            len(inputs),
+            day,
+            label,
+            time.monotonic() - started,
+            len(rows),
+        )
+        return [path for path in inputs if path in failed]
 
     # Prompt retention
 

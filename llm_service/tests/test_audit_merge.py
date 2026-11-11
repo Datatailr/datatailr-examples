@@ -631,3 +631,109 @@ def test_a_day_rewrite_whose_part_delete_fails_counts_each_row_once():
     merger.merge()
     assert files(store) == [day_path(ROOT, DAY)]
     assert [r["user"] for r in lines(store, day_path(ROOT, DAY))] == ["alice", "bob", "carol"]
+
+
+# The flush lock during a merge
+
+
+class LockProbe(Store):
+    """A store that notes, at each put of a merged file and each delete, if a flush can run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.log: AuditLog | None = None
+        self.locked_at_put: list[bool] = []
+        self.free_at_delete: list[bool] = []
+        self.on_delete = lambda path: None
+
+    def put(self, path, data):
+        if "/parts/" in path or path.endswith("/day.jsonl"):
+            self.locked_at_put.append(self.log.flush_lock.locked())
+        super().put(path, data)
+
+    def delete(self, path):
+        free = self.log.flush_lock.acquire(timeout=1)
+        if free:
+            self.log.flush_lock.release()
+        self.free_at_delete.append(free)
+        if free:
+            self.on_delete(path)
+        super().delete(path)
+
+
+def test_the_merge_holds_the_flush_lock_for_the_put_and_not_for_the_deletes():
+    store = LockProbe()
+    clock, store, log, merger = make(at(11, 23, 55), store=store)
+    store.log = log
+    write(log, rec("alice", "2026-11-11T23:55:00.000Z"))
+    clock.when = at(11, 23, 56)
+    write(log, rec("bob", "2026-11-11T23:56:00.000Z"))
+    clock.when = at(12, 0, 15)
+    merger.merge()
+    assert files(store) == [day_path(ROOT, DAY)]
+    assert store.locked_at_put == [True, True]  # the part, then the day file
+    assert store.free_at_delete == [True, True, True]  # two segments, then the part
+
+
+def test_a_flush_during_the_delete_phase_keeps_the_day_in_the_work_set():
+    store = LockProbe()
+    clock, store, log, merger = make(at(11, 23, 55), store=store)
+    store.log = log
+    write(log, rec("alice", "2026-11-11T23:55:00.000Z"))
+    part = part_path(ROOT, DAY, "20261111T235")
+    late = []
+
+    def flush_a_late_record(path):
+        if path == part and not late:
+            late.append(write(log, rec("carol", "2026-11-11T23:59:00.000Z")))
+
+    store.on_delete = flush_a_late_record
+    clock.when = at(12, 0, 15)
+    merger.merge()
+    assert files(store) == [day_path(ROOT, DAY), segment_path(ROOT, DAY, late[0])]
+    store.ls_calls.clear()
+    clock.when = at(12, 0, 21)
+    merger.merge()
+    assert day_folder(DAY) in store.ls_calls
+    assert files(store) == [day_path(ROOT, DAY)]
+    assert [row["user"] for row in lines(store, day_path(ROOT, DAY))] == ["alice", "carol"]
+
+
+def test_the_merge_reads_its_inputs_in_parallel():
+    store = Store()
+    clock, store, log, merger = make(at(11, 14, 1), store=store)
+    names = [write(log, rec("alice", "2026-11-11T14:01:00.000Z"))]
+    clock.when = at(11, 14, 2)
+    names.append(write(log, rec("bob", "2026-11-11T14:02:00.000Z")))
+    barrier = threading.Barrier(2, timeout=5)
+    inputs = {segment_path(ROOT, DAY, name) for name in names}
+    get = store.get
+
+    def paired_get(path):
+        if path in inputs:
+            barrier.wait()
+        return get(path)
+
+    store.get = paired_get
+    fresh = AuditLog(store, ROOT, now=clock)  # an empty cache: the merge reads both segments
+    merger = AuditMerger(store, ROOT, fresh, now=clock)
+    clock.when = at(11, 14, 11)
+    merger.merge()
+    assert files(store) == [part_path(ROOT, DAY, "20261111T140")]
+    assert [row["user"] for row in lines(store, part_path(ROOT, DAY, "20261111T140"))] == ["alice", "bob"]
+
+
+def test_each_merge_logs_one_line_with_its_cost(caplog):
+    clock, store, log, merger = make(at(11, 23, 55))
+    write(log, rec("alice", "2026-11-11T23:55:00.000Z"), rec("bob", "2026-11-11T23:55:30.000Z"))
+    clock.when = at(11, 23, 56)
+    write(log, rec("carol", "2026-11-11T23:56:00.000Z"))
+    clock.when = at(12, 0, 15)
+    with caplog.at_level(logging.INFO, logger="llm_service.audit"):
+        merger.merge()
+    merged = [m for m in caplog.messages if m.startswith("merged ")]
+    assert len(merged) == 2
+    assert merged[0].startswith(f"merged 2 files of {DAY} into part bucket 20261111T235 in ")
+    assert merged[0].endswith(" s (3 rows)")
+    assert merged[1].startswith(f"merged 1 files of {DAY} into the day file in ")
+    assert merged[1].endswith(" s (3 rows)")
