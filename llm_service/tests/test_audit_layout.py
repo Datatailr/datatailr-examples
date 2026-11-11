@@ -258,3 +258,17 @@ def test_parse_lines_bad_line_keeps_index():
 def test_parse_lines_gives_none_for_a_line_nested_too_deep():
     deep = "[" * 100_000 + "]" * 100_000
     assert layout.parse_lines(f'{{"a": 1}}\n{deep}\n[2]\n') == [{"a": 1}, None, [2]]
+
+
+def test_the_prompt_marker_has_a_day_and_no_kind():
+    path = layout.prompt_marker_path("r", "2026-11-11")
+    assert path == "r/audit/2026-11-11/prompts.marker"
+    assert layout.classify("r", path) is None
+    assert layout.marker_day("r", path) == "2026-11-11"
+    for other in (
+        "r/audit/2026-11-11/day.jsonl",
+        "r/audit/2026-11-11/segments/prompts.marker",
+        "r/audit/not-a-day/prompts.marker",
+        "r/prompts/2026-11-11/prompts.marker",
+    ):
+        assert layout.marker_day("r", other) is None

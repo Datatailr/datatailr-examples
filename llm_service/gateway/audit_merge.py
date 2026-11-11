@@ -296,8 +296,9 @@ class AuditMerger:
         """Delete the prompt files of each day that ended more than `retention_days` days ago.
 
         A check runs at most one time each hour. It takes the day names from `log.days()`,
-        which lists `audit/`, and queues the days past the limit that are not cleaned yet,
-        newest first. While the queue is not empty, the next call goes on with it without a
+        which lists `audit/`. The prompt marker of a day makes the day appear there, also when
+        the day has no metadata file. The check queues the days past the limit that are not
+        cleaned yet, newest first. While the queue is not empty, the next call goes on with it without a
         wait. One call makes at most `RETAIN_DELETES_PER_CALL` deletes and lists at most
         `RETAIN_LISTINGS_PER_CALL` prompt folders. See `_retain_day`. A failed listing of
         `audit/` waits for the next hourly check. A flush into a cleaned day makes the day not

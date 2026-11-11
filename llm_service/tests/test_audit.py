@@ -20,6 +20,7 @@ from llm_service.gateway.audit_layout import (
     day_path,
     parse_lines,
     part_path,
+    prompt_marker_path,
     prompt_path,
     segment_path,
 )
@@ -81,6 +82,11 @@ def make(store=None, flush_size=100, now=utc_now):
     return store, AuditLog(store, "root", flush_size=flush_size, now=now)
 
 
+def audit_files(store, prefix):
+    """Return the metadata files under `prefix`. The prompt markers are left out."""
+    return [path for path in store.ls(prefix) if path.endswith(".jsonl")]
+
+
 def lines_of(store, path):
     return parse_lines(store.get(path).decode())
 
@@ -90,13 +96,13 @@ def test_flush_writes_one_segment_per_day():
     log.add(rec("alice", "2026-11-10T23:59:59.000Z"))
     log.add(rec("bob", "2026-11-11T00:00:01.000Z"))
     log.flush()
-    paths = store.ls("root/audit")
+    paths = audit_files(store, "root/audit")
     assert [p.split("/")[2] for p in paths] == ["2026-11-10", "2026-11-11"]
     assert all(p.split("/")[3] == "segments" and p.endswith(".jsonl") for p in paths)
     assert lines_of(store, paths[0])[0]["user"] == "alice"
     assert len(store.ls("root/prompts")) == 2
     log.flush()
-    assert len(store.ls("root/audit")) == 2  # an empty buffer writes nothing
+    assert len(audit_files(store, "root/audit")) == 2  # an empty buffer writes nothing
 
 
 def test_add_never_writes_and_should_flush_at_size():
@@ -105,12 +111,12 @@ def test_add_never_writes_and_should_flush_at_size():
     assert not log.should_flush()
     log.add(rec("bob", T))
     assert log.should_flush()
-    assert store.ls("root/audit") == []  # add does no storage I/O
+    assert audit_files(store, "root/audit") == []  # add does no storage I/O
     assert log.flush() is True
-    assert len(store.ls("root/audit")) == 1
+    assert len(audit_files(store, "root/audit")) == 1
     assert not log.should_flush()
     assert log.flush() is True  # the buffer is empty
-    assert len(store.ls("root/audit")) == 1
+    assert len(audit_files(store, "root/audit")) == 1
 
 
 def test_flush_returns_false_when_records_are_kept():
@@ -221,7 +227,7 @@ def test_store_error_keeps_records(caplog):
     assert log.query() != []  # still readable from the buffer
     store.fail_puts = False
     log.flush()
-    assert len(store.ls("root/audit")) == 1
+    assert len(audit_files(store, "root/audit")) == 1
     assert len(log.query()) == 1
 
 
@@ -283,7 +289,7 @@ def test_run_flusher_writes_and_flushes_on_cancel():
             await task
 
     asyncio.run(scenario())
-    assert len(store.ls("root/audit")) == 1
+    assert len(audit_files(store, "root/audit")) == 1
 
 
 def test_flusher_writes_a_full_buffer_within_a_tick():
@@ -293,10 +299,10 @@ def test_flusher_writes_a_full_buffer_within_a_tick():
         task = asyncio.create_task(run_flusher(log, 3600, tick=0.01))
         log.add(rec("alice", T))
         await asyncio.sleep(0.1)
-        assert store.ls("root/audit") == []  # not full, interval not over
+        assert audit_files(store, "root/audit") == []  # not full, interval not over
         log.add(rec("bob", T))
         await asyncio.sleep(0.2)
-        assert len(store.ls("root/audit")) == 1
+        assert len(audit_files(store, "root/audit")) == 1
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -337,7 +343,7 @@ def test_flusher_runs_on_tick_after_each_flush_and_survives_its_errors():
     calls = []
 
     def on_tick():
-        calls.append(len(store.ls("root/audit")))
+        calls.append(len(audit_files(store, "root/audit")))
         raise RuntimeError("boom")
 
     async def scenario():
@@ -367,7 +373,7 @@ def test_bad_ts_is_rejected_before_buffer_and_listeners(bad):
         log.add(broken)
     assert len(seen) == 1
     log.flush()
-    assert len(store.ls("root/audit")) == 1
+    assert len(audit_files(store, "root/audit")) == 1
     assert [r["user"] for r in log.query()] == ["alice"]
     assert log.days() == ["2026-11-10"]
 
@@ -496,13 +502,13 @@ def test_partial_flush_failure_keeps_only_the_failed_day():
     log.add(rec("alice", "2026-11-09T08:00:00.000Z"))
     log.add(rec("bob", "2026-11-10T08:00:00.000Z"))
     assert log.flush() is False
-    assert len(store.ls("root/audit/2026-11-10")) == 1
-    assert store.ls("root/audit/2026-11-09") == []
+    assert len(audit_files(store, "root/audit/2026-11-10")) == 1
+    assert audit_files(store, "root/audit/2026-11-09") == []
     assert [r["user"] for r in log.query()] == ["bob", "alice"]
     store.fail = False
     assert log.flush() is True
-    assert len(store.ls("root/audit/2026-11-10")) == 1  # not written twice
-    assert len(store.ls("root/audit/2026-11-09")) == 1
+    assert len(audit_files(store, "root/audit/2026-11-10")) == 1  # not written twice
+    assert len(audit_files(store, "root/audit/2026-11-09")) == 1
     assert [r["user"] for r in log.query()] == ["bob", "alice"]
 
 
@@ -518,7 +524,7 @@ def test_query_puts_the_later_record_first_on_the_same_time():
 def _stored(store) -> list[dict]:
     return [
         json.loads(line)
-        for path in store.ls("root/audit")
+        for path in audit_files(store, "root/audit")
         for line in store.get(path).decode().splitlines()
     ]
 
@@ -558,7 +564,7 @@ def test_unexpected_error_during_flush_keeps_all_records(caplog):
     assert any("clock broke" in m for m in caplog.messages)
     assert log._inflight == []
     assert [r["user"] for r in log._buffered()] == ["alice", "bob"]
-    assert store.ls("root/audit") == []
+    assert audit_files(store, "root/audit") == []
     assert log.flush() is True
     assert sorted(r["user"] for r in _stored(store)) == ["alice", "bob"]
     assert log._buffered() == []
@@ -757,7 +763,11 @@ def test_flush_writes_the_prompt_file_before_the_segment():
     assert log.flush() is True
     seg = calls[0][1]
     assert seg.startswith(STAMP + "-") and len(seg) > len(STAMP) + 1
-    assert store.ops("put") == [prompt_path("root", DAY, seg), segment_path("root", DAY, seg)]
+    assert store.ops("put") == [
+        prompt_marker_path("root", DAY),
+        prompt_path("root", DAY, seg),
+        segment_path("root", DAY, seg),
+    ]
     rows = lines_of(store, segment_path("root", DAY, seg))
     assert [r["request_id"] for r in rows] == [alice["request_id"], switch["request_id"]]
     assert all("prompt" not in r and r["seg"] == seg for r in rows)
@@ -775,7 +785,7 @@ def test_flush_with_only_events_writes_no_prompt_file():
     assert log.flush() is True
     assert len(store.ops("put")) == 1
     assert store.ls("root/prompts") == []
-    assert len(store.ls("root/audit")) == 1
+    assert len(audit_files(store, "root/audit")) == 1
 
 
 def test_failed_prompt_write_keeps_the_records_and_writes_no_segment():
@@ -784,15 +794,15 @@ def test_failed_prompt_write_keeps_the_records_and_writes_no_segment():
     log.add(rec("alice", T))
     store.fail_puts = {"/prompts/"}
     assert log.flush() is False
-    first = store.ops("put")
-    assert len(first) == 1 and "/prompts/" in first[0]
-    assert store.ls("root/audit") == [] and calls == []
+    marker, first = store.ops("put")
+    assert marker == prompt_marker_path("root", DAY) and "/prompts/" in first
+    assert audit_files(store, "root/audit") == [] and calls == []
     assert [r["user"] for r in log.query()] == ["alice"]
     store.fail_puts = set()
     store.clear()
     assert log.flush() is True
     seg = calls[0][1]
-    assert prompt_path("root", DAY, seg) != first[0]  # a new segment name
+    assert prompt_path("root", DAY, seg) != first  # a new segment name
     assert store.ops("put") == [prompt_path("root", DAY, seg), segment_path("root", DAY, seg)]
     assert [r["user"] for r in log.query()] == ["alice"]
 
@@ -804,12 +814,12 @@ def test_failed_segment_write_keeps_the_records_and_leaves_an_orphan_prompt_file
     log.add(alice)
     store.fail_puts = {"/segments/"}
     assert log.flush() is False
-    assert len(store.ls("root/prompts")) == 1 and store.ls("root/audit") == []
+    assert len(store.ls("root/prompts")) == 1 and audit_files(store, "root/audit") == []
     assert [r["user"] for r in log.query()] == ["alice"]  # once, from the buffer
     store.fail_puts = set()
     assert log.flush() is True
     assert len(store.ls("root/prompts")) == 2  # the orphan stays
-    assert len(store.ls("root/audit")) == 1
+    assert len(audit_files(store, "root/audit")) == 1
     assert [r["user"] for r in log.query()] == ["alice"]
     fresh = AuditLog(store, "root")
     assert fresh.record(DAY, alice["request_id"]) == full(alice)
@@ -847,7 +857,7 @@ def test_flushed_listeners_get_the_day_the_segment_and_the_rows():
         assert rows == lines_of(store, segment_path("root", day, seg))
     assert calls[0][1] != calls[1][1]
     assert log.flush() is True and len(calls) == 2  # an empty buffer calls nobody
-    assert len(store.ls("root/audit")) == 2
+    assert len(audit_files(store, "root/audit")) == 2
 
 
 def test_a_row_counts_once_when_a_merged_file_and_its_inputs_exist():
@@ -1311,3 +1321,26 @@ def test_a_prompt_read_that_overlaps_a_retention_delete_is_not_cached():
     store.pause = False
     assert log.record(DAY, alice["request_id"]) == {**full(alice), "prompt": None, "prompt_deleted": True}
     assert path not in log._prompts
+
+
+def test_a_failed_marker_write_keeps_the_records_and_writes_no_prompt_and_no_segment():
+    store, log = make(RecordingStore(), now=lambda: NOW)
+    calls = flushed(log)
+    alice = rec("alice", T)
+    log.add(alice)
+    store.fail_puts = {"prompts.marker"}
+    assert log.flush() is False
+    assert store.ops("put") == [prompt_marker_path("root", DAY)]
+    assert store.ls("root/prompts") == [] and audit_files(store, "root/audit") == [] and calls == []
+    assert [r["user"] for r in log.query()] == ["alice"]
+    store.fail_puts = set()
+    store.clear()
+    assert log.flush() is True
+    seg = calls[0][1]
+    assert store.ops("put") == [
+        prompt_marker_path("root", DAY),
+        prompt_path("root", DAY, seg),
+        segment_path("root", DAY, seg),
+    ]
+    assert [r["user"] for r in log.query()] == ["alice"]
+    assert AuditLog(store, "root").record(DAY, alice["request_id"]) == full(alice)

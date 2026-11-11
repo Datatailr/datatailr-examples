@@ -1,7 +1,8 @@
 """Audit log: records in a memory buffer, written to blob storage as metadata rows and prompts.
 
 A flush writes the prompts of each day to `prompts/<day>/<segment>.jsonl` and the metadata
-rows to `audit/<day>/segments/<segment>.jsonl`. See `docs/audit-storage-design.md`.
+rows to `audit/<day>/segments/<segment>.jsonl`. Before the first prompt file of a day, it writes
+the marker `audit/<day>/prompts.marker`. See `docs/audit-storage-design.md`.
 """
 
 from __future__ import annotations
@@ -25,7 +26,9 @@ from llm_service.gateway.audit_layout import (
     dump_lines,
     join_record,
     legacy_rows,
+    marker_day,
     parse_lines,
+    prompt_marker_path,
     prompt_path,
     prompts_dir,
     public_row,
@@ -43,6 +46,7 @@ READ_WORKERS = 8  # threads that read uncached files of one day
 LIST_TRIES = 3  # listings of one day when a listed file is gone before its read
 _TICK = timedelta(microseconds=1)  # the smallest step between two stamps
 _KIND_ORDER = {"day": 0, "part": 1, "segment": 2, "legacy": 3}  # the order of "Which files count"
+MARKER_TEXT = "this day can have prompt files\n"  # the content of a prompt marker
 
 
 class PromptUnreadable(Exception):
@@ -181,6 +185,7 @@ class AuditLog:
         self._lock = threading.Lock()  # guards the buffer, the in-flight list and `_Entry.seg`
         self.flush_lock = threading.Lock()  # one flush at a time
         self._last_stamp: datetime | None = None  # time of the last stamp, under `flush_lock`
+        self._marked: set[str] = set()  # days whose prompt marker exists, under `_lock`
         self._row_cache_size = row_cache_size
         self._rows: OrderedDict[str, list[dict]] = OrderedDict()  # path -> metadata rows
         self._row_count = 0  # rows in `_rows`
@@ -220,7 +225,8 @@ class AuditLog:
     def flush(self) -> bool:
         """Write the buffered records to blob storage.
 
-        For each day, the flush writes the prompt file, then the segment file, then puts the
+        For each day, the flush writes the prompt marker of the day if this process did not
+        write or see it yet. Then it writes the prompt file, then the segment file, then puts the
         rows in the cache and calls each `flushed_listeners` entry with `(day, seg, rows)`.
         On a store error the records of that day stay in the buffer and a warning is logged.
         The next flush writes them with a new segment name. A record that `json.dumps` cannot
@@ -298,6 +304,7 @@ class AuditLog:
         path = segment_path(self._root, day, seg)
         try:
             if prompt_lines:
+                self._mark(day)
                 self._store.put(prompt_path(self._root, day, seg), "".join(prompt_lines))
             # A read that lists the segment file skips these buffered records from now on.
             self._set_seg(written, seg)
@@ -316,6 +323,19 @@ class AuditLog:
                 listener(day, seg, rows)
             except Exception as error:
                 logger.warning("audit flush listener failed: %s", error)
+
+    def _mark(self, day: str) -> None:
+        """Write the prompt marker of `day` if this process did not write or see it yet.
+
+        The marker lets retention find a day that has prompt files and no metadata file. A
+        failed put raises. Hold `flush_lock`.
+        """
+        with self._lock:
+            if day in self._marked:
+                return
+        self._store.put(prompt_marker_path(self._root, day), MARKER_TEXT)
+        with self._lock:
+            self._marked.add(day)
 
     def _set_seg(self, entries: list[_Entry], seg: str | None) -> None:
         with self._lock:
@@ -533,13 +553,23 @@ class AuditLog:
         return [row for row, _ in self._day_rows(day, after)]
 
     def days(self) -> list[str]:
-        """Return the days that have stored files or buffered records, sorted."""
+        """Return the days that have stored files or buffered records, sorted.
+
+        A day whose folder holds only the prompt marker counts. It has no rows.
+        """
         days = set()
+        marked = set()
         for path in self._store.ls(audit_dir(self._root)):
             info = classify(self._root, path)
             if info is not None:
                 days.add(info[0])
+                continue
+            day = marker_day(self._root, path)
+            if day is not None:
+                marked.add(day)
+        days |= marked
         with self._lock:
+            self._marked |= marked
             days.update(entry.day for entry in self._inflight + self._buffer)
         return sorted(days)
 

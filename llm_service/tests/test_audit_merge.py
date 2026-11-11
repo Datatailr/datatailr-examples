@@ -12,6 +12,8 @@ from llm_service.gateway.audit_layout import (
     dump_lines,
     parse_lines,
     part_path,
+    classify,
+    prompt_marker_path,
     prompt_path,
     prompts_dir,
     segment_path,
@@ -110,7 +112,8 @@ def write(log: AuditLog, *records: dict) -> str:
 
 
 def files(store, day=DAY):
-    return store.ls(f"{audit_dir(ROOT)}{day}")
+    """Return the metadata files of `day`. The prompt marker is left out."""
+    return [path for path in store.ls(f"{audit_dir(ROOT)}{day}") if path.endswith(".jsonl")]
 
 
 def lines(store, path):
@@ -915,3 +918,83 @@ def test_flushed_does_not_wait_for_a_retention_delete():
         store.release.set()
         retaining.join(5)
     assert not retaining.is_alive()
+
+
+# The prompt marker
+
+
+def test_a_day_with_prompts_and_no_metadata_is_found_by_retention_after_a_restart():
+    day = "2026-11-08"
+    clock, store, log, merger = make(at(8, 12, 1), retention_days=2)
+    store.fail_put = lambda path: "/segments/" in path
+    log.add(rec("alice", f"{day}T12:00:00.000Z"))
+    assert log.flush() is False  # the process then exits before the next flush
+    (orphan,) = store.ls(prompts_dir(ROOT, day))
+    marker = prompt_marker_path(ROOT, day)
+    assert store.ls(f"{audit_dir(ROOT)}{day}") == [marker]
+    store.fail_put = lambda path: False
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2, store=store)  # a restart
+    assert log.days() == [day]
+    merger.tick()
+    assert not store.exists(orphan)
+    assert store.exists(marker)  # retention leaves the marker
+    assert day in merger._cleaned
+    assert log.rows_for_day(day) == []
+
+
+class CountingPuts(Store):
+    def __init__(self) -> None:
+        super().__init__()
+        self.puts: list[str] = []
+
+    def put(self, path, data):
+        self.puts.append(path)
+        super().put(path, data)
+
+
+def test_the_marker_of_a_day_is_written_one_time_in_a_process():
+    clock, store, log, merger = make(at(11, 14, 1), store=CountingPuts())
+    for minute in (1, 2, 3):
+        clock.when = at(11, 14, minute)
+        write(log, rec("alice", f"2026-11-11T14:0{minute}:00.000Z"), rec("bob", "2026-11-10T14:00:00.000Z"))
+    assert store.puts.count(prompt_marker_path(ROOT, DAY)) == 1
+    assert store.puts.count(prompt_marker_path(ROOT, "2026-11-10")) == 1
+    assert store.puts[0] == prompt_marker_path(ROOT, "2026-11-10")  # before the first prompt file
+    clock, store, log, merger = make(at(11, 14, 5), store=store)  # a restart
+    log.days()  # the listing shows the markers
+    write(log, rec("carol", "2026-11-11T14:05:00.000Z"))
+    assert store.puts.count(prompt_marker_path(ROOT, DAY)) == 1
+
+
+def test_a_merge_leaves_the_marker_in_place():
+    clock, store, log, merger = make(at(11, 23, 55))
+    write(log, rec("alice", "2026-11-11T23:55:00.000Z"))
+    marker = prompt_marker_path(ROOT, DAY)
+    assert store.exists(marker)
+    clock.when = at(12, 0, 1)
+    merger.merge()
+    clock.when = at(12, 0, 15)
+    merger.merge()
+    assert store.ls(f"{audit_dir(ROOT)}{DAY}") == [day_path(ROOT, DAY), marker]
+    assert [row["user"] for row in AuditLog(store, ROOT).rows_for_day(DAY)] == ["alice"]
+
+
+def test_the_marker_is_no_metadata_file():
+    assert classify(ROOT, prompt_marker_path(ROOT, DAY)) is None
+    assert prompt_marker_path(ROOT, DAY) == f"{ROOT}/audit/{DAY}/prompts.marker"
+
+
+def test_a_day_folder_with_only_the_marker_reads_as_an_empty_day():
+    from llm_service.gateway.usage import UsageTotals
+
+    clock, store, log, merger = make(at(11, 14, 1))
+    store.put(prompt_marker_path(ROOT, "2026-11-10"), "x\n")
+    assert log.days() == ["2026-11-10"]
+    assert log.rows_for_day("2026-11-10") == []
+    assert log.query() == []
+    assert log.users() == []
+    usage = UsageTotals(store, ROOT, log, lambda: DAY, now=clock)
+    assert usage.load() == 1
+    assert usage.summary(None, None, None, None) == []
+    merger.merge()
+    assert store.ls(audit_dir(ROOT)) == [prompt_marker_path(ROOT, "2026-11-10")]

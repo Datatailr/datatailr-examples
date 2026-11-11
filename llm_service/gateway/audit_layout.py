@@ -14,6 +14,7 @@ BUCKET_LENGTH = 12  # characters of a stamp that name its 10 minute bucket
 _BUCKET = re.compile(r"\d{8}T\d{2}\d")
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 _EVENT_KEY = "event"
+PROMPT_MARKER = "prompts.marker"  # the file name of the prompt marker of a day
 
 
 def stamp(now: datetime) -> str:
@@ -96,12 +97,28 @@ def prompt_path(root: str, day: str, name: str) -> str:
     return f"{prompts_dir(root, day)}{name}.jsonl"
 
 
+def prompt_marker_path(root: str, day: str) -> str:
+    """Return the path of the marker that tells that `day` can have prompt files."""
+    return f"{root}/audit/{day}/{PROMPT_MARKER}"
+
+
+def marker_day(root: str, path: str) -> str | None:
+    """Return the day of a prompt marker path, or None for any other path."""
+    prefix = audit_dir(root)
+    if not path.startswith(prefix):
+        return None
+    parts = path[len(prefix):].split("/")
+    if len(parts) == 2 and parts[1] == PROMPT_MARKER and _DAY.fullmatch(parts[0]):
+        return parts[0]
+    return None
+
+
 def classify(root: str, path: str) -> tuple[str, str, str] | None:
     """Classify a blob path under `audit/`.
 
     Return `(day, kind, name)`. `kind` is "segment", "part", "day" or "legacy". `name` is the
     segment name, the bucket, an empty text, or the old file name without `.jsonl`.
-    Return None for any other path.
+    Return None for any other path. The prompt marker gives None too: it holds no rows.
     """
     prefix = audit_dir(root)
     if not path.startswith(prefix):

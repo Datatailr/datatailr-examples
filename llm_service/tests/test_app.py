@@ -510,7 +510,7 @@ def test_shutdown_flushes_the_audit_log(tmp_path):
     with TestClient(make_app(tmp_path, store=store)) as c:
         wait_ready(c)
         c.post(CHAT, headers=BOB, json=HI)
-    files = store.ls("llm-service/audit")
+    files = [path for path in store.ls("llm-service/audit") if path.endswith(".jsonl")]
     text = "".join(store.get(f).decode() for f in files)
     assert any(json.loads(line)["user"] == "bob" for line in text.splitlines())
 
