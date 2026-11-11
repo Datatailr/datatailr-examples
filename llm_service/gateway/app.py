@@ -20,11 +20,11 @@ from llm_service.gateway.audit import AuditLog, iso, parse_time, run_flusher, ut
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
 from llm_service.gateway.identity import AdminCheck, acting_user_from_headers, user_from_headers
-from llm_service.gateway.models import ModelManager, SwitchInProgress
+from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.proxy import forward, prompt_of
 from llm_service.gateway.storage import BlobStore
 from llm_service.gateway.usage import UsageTotals
-from llm_service.gateway.weights import Downloader, WeightCache
+from llm_service.gateway.weights import Downloader, WeightCache, validate_model_name, validate_revision
 
 logger = logging.getLogger("llm_service.app")
 
@@ -294,11 +294,15 @@ def create_app(
 
         The status is `loading` for the model that loads, `active` for the
         model that the engine serves now and `cached` for the rest. `revision` is the loading or
-        active revision, else the first cached one.
+        active revision, else the first cached one. `size_bytes` is the sum of the sizes of the
+        cached revisions, or None if there is none.
         """
         revisions: dict[str, list[str]] = {}
+        sizes: dict[str, list[int]] = {}
         for entry in await asyncio.to_thread(weights.cached):
             revisions.setdefault(entry["model"], []).append(entry["revision"])
+            if entry["size_bytes"] is not None:
+                sizes.setdefault(entry["model"], []).append(entry["size_bytes"])
         current: dict[str, tuple[str, str]] = {}
         if manager.serving:
             current[manager.serving["model"]] = ("active", manager.serving["revision"])
@@ -317,6 +321,7 @@ def create_app(
                     "status": status,
                     "revision": revision,
                     "revisions": cached,
+                    "size_bytes": sum(sizes.get(name, [])) if cached else None,
                 }
             )
         rank = {"active": 0, "loading": 1, "cached": 2}
@@ -364,8 +369,57 @@ def create_app(
             raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
         except SwitchInProgress as error:
             raise ApiError(409, "invalid_request_error", "switch_in_progress", str(error)) from None
+        except ModelInUse as error:
+            raise ApiError(409, "invalid_request_error", "model_in_use", str(error)) from None
         app.state.last_admin = admin_user
         return manager.status()
+
+    @app.delete("/admin/models/{model_id:path}")
+    async def delete_model(
+        model_id: str, revision: str | None = None, admin_user: str = Depends(require_admin)
+    ) -> dict:
+        try:
+            validate_model_name(model_id)
+            if revision is not None:
+                validate_revision(revision)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
+        cached = await asyncio.to_thread(weights.cached)
+        found = sorted(
+            e["revision"] for e in cached if e["model"] == model_id and revision in (None, e["revision"])
+        )
+        if not found:
+            raise ApiError(404, "invalid_request_error", "model_not_found", f"no cached copy of {model_id!r} matches")
+        try:
+            manager.begin_remove(model_id, found)
+        except ModelInUse as error:
+            raise ApiError(409, "invalid_request_error", "model_in_use", str(error)) from None
+        removed: list[str] = []
+        status = 200
+        try:
+            for name in found:
+                await asyncio.to_thread(weights.remove, model_id, name)
+                removed.append(name)
+        except BaseException:
+            status = 500
+            raise
+        finally:
+            manager.end_remove(model_id, found)
+            write_audit(
+                {
+                    "user": admin_user,
+                    "endpoint": "/admin/models",
+                    "model": model_id,
+                    "stream": False,
+                    "prompt": {"event": "model_delete", "revisions": removed},
+                    "status": status,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
+                    "duration_ms": None,
+                }
+            )
+        return {"deleted": [{"model": model_id, "revision": name} for name in removed]}
 
     @app.get("/admin/audit")
     async def get_audit(

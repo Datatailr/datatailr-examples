@@ -18,6 +18,10 @@ class SwitchInProgress(Exception):
     """A model switch is already running."""
 
 
+class ModelInUse(Exception):
+    """A model revision is in use or is being removed."""
+
+
 class ModelManager:
     """Hold the state of the served model: empty, loading, ready or failed.
 
@@ -25,6 +29,7 @@ class ModelManager:
     that loads. `serving` is the model that the engine serves right now, or
     None when the engine serves no healthy model. During the weight fetch of
     an admin switch, `serving` is the old model and the state is `loading`.
+    `removing` holds the (model, revision) pairs that a delete removes now.
     """
 
     def __init__(
@@ -48,6 +53,7 @@ class ModelManager:
         self.target: dict | None = None
         self.error: str | None = None
         self.serving: dict | None = None
+        self.removing: set[tuple[str, str]] = set()
 
     @property
     def _active_path(self) -> str:
@@ -100,6 +106,8 @@ class ModelManager:
         """Start a switch in the background. Call it inside a running loop."""
         validate_model_name(model)
         validate_revision(revision)
+        if (model, revision) in self.removing:
+            raise ModelInUse(f"{model} {revision} is being removed")
         if self.state == "loading":
             raise SwitchInProgress("a model switch is already running")
         wanted = {"model": model, "revision": revision}
@@ -108,6 +116,30 @@ class ModelManager:
             self._load(wanted, previous=self.active, trigger="switch")
         )
         return self._task
+
+    def begin_remove(self, model: str, revisions: list[str]) -> None:
+        """Mark revisions of a model as being removed.
+
+        Raise `ModelInUse` if one of them is the active, serving or target
+        model, or is already being removed. Nothing is marked in that case.
+        Call `end_remove` when the removal ends. The check and the mark run
+        without an `await`, so no switch can start between them.
+        """
+        pairs = {(model, revision) for revision in revisions}
+        busy = {
+            (entry["model"], entry["revision"])
+            for entry in (self.active, self.serving, self.target)
+            if entry
+        }
+        taken = (pairs & busy) | (pairs & self.removing)
+        if taken:
+            name, revision = sorted(taken)[0]
+            raise ModelInUse(f"{name} {revision} is in use")
+        self.removing |= pairs
+
+    def end_remove(self, model: str, revisions: list[str]) -> None:
+        """Clear the marks that `begin_remove` set."""
+        self.removing -= {(model, revision) for revision in revisions}
 
     def check_engine(self) -> asyncio.Task | None:
         """Notice an engine process that has exited while it served a model.

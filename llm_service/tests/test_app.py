@@ -229,14 +229,17 @@ def test_models_list_has_one_entry_per_model(client):
     store.put("llm-service/models/org--a/old/.complete", "")
     body = client.get("/v1/models", headers=BOB).json()
     assert body["object"] == "list"
+    # Only org/a main has a usable manifest. The sum skips the unusable ones.
     assert body["data"] == [
         {
             "id": "org/a", "object": "model", "created": 0, "owned_by": "org",
             "status": "active", "revision": "main", "revisions": ["main", "old"],
+            "size_bytes": 2,
         },
         {
             "id": "org/b", "object": "model", "created": 0, "owned_by": "org",
             "status": "cached", "revision": "main", "revisions": ["main", "v2"],
+            "size_bytes": 0,
         },
     ]
 
@@ -654,3 +657,187 @@ def test_openai_endpoints_ignore_the_acting_user(client):
     assert r.status_code == 200
     users = [rec["user"] for rec in audit_records(client) if rec["endpoint"] == CHAT]
     assert users == ["bob"]
+
+
+def switch_and_wait(client, model, revision="main"):
+    r = client.post("/admin/model", headers=ALICE, json={"model": model, "revision": revision})
+    assert r.status_code == 202
+    wait_for(client, lambda s: s["state"] == "ready" and s["active"]["model"] == model)
+
+
+def model_ids(client):
+    return [m["id"] for m in client.get("/v1/models", headers=BOB).json()["data"]]
+
+
+def delete_events(client):
+    return [r for r in audit_records(client) if r["prompt"].get("event") == "model_delete"]
+
+
+@pytest.fixture
+def two_models(client):
+    switch_and_wait(client, "org/other")
+    switch_and_wait(client, "org/a")
+    return client
+
+
+def test_delete_cached_model_removes_it_and_is_audited(two_models):
+    client = two_models
+    r = client.delete("/admin/models/org/other", headers=ALICE | {ACTING: "carol"})
+    assert r.status_code == 200 and r.json() == {"deleted": [{"model": "org/other", "revision": "main"}]}
+    assert "org/other" not in model_ids(client)
+    rec = delete_events(client)[0]
+    assert rec["user"] == "carol" and rec["endpoint"] == "/admin/models" and rec["model"] == "org/other"
+    assert rec["prompt"]["revisions"] == ["main"] and rec["status"] == 200
+    assert rec["total_tokens"] is None
+
+
+def test_delete_served_model_is_409(client):
+    r = client.delete("/admin/models/org/a", headers=ALICE)
+    assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+    assert "org/a" in model_ids(client)
+    assert delete_events(client) == []
+
+
+def test_delete_target_of_a_running_switch_is_409(tmp_path):
+    engine = GatedEngine({"org/b"})
+    engine.gate.set()
+    try:
+        with TestClient(make_app(tmp_path, engine)) as c:
+            wait_ready(c)
+            switch_and_wait(c, "org/b")
+            switch_and_wait(c, "org/a")
+            engine.gate.clear()
+            c.post("/admin/model", headers=ALICE, json={"model": "org/b"})
+            wait_for(c, lambda s: s["serving"] is None)
+            r = c.delete("/admin/models/org/b", headers=ALICE)
+            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            engine.gate.set()
+            wait_ready(c)
+    finally:
+        engine.gate.set()
+
+
+class SlowDeleteStore(MemoryBlobStore):
+    """A memory store whose `delete` waits for `gate` once `armed` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = False
+        self.deleting = threading.Event()
+        self.gate = threading.Event()
+
+    def delete(self, path: str) -> None:
+        if self.armed:
+            self.deleting.set()
+            self.gate.wait(10)
+        super().delete(path)
+
+
+def test_switch_to_a_model_under_removal_is_409(tmp_path):
+    store = SlowDeleteStore()
+    try:
+        with TestClient(make_app(tmp_path, store=store)) as c:
+            wait_ready(c)
+            switch_and_wait(c, "org/other")
+            switch_and_wait(c, "org/a")
+            store.armed = True
+            result = {}
+            worker = threading.Thread(
+                target=lambda: result.update(r=c.delete("/admin/models/org/other", headers=ALICE))
+            )
+            worker.start()
+            assert store.deleting.wait(10)
+            r = c.post("/admin/model", headers=ALICE, json={"model": "org/other"})
+            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            assert c.get("/admin/model", headers=ALICE).json()["state"] == "ready"
+            r = c.delete("/admin/models/org/other", headers=ALICE)
+            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            store.gate.set()
+            worker.join(10)
+            assert result["r"].status_code == 200
+            # The mark is gone: the switch works again, after the copy was refetched.
+            switch_and_wait(c, "org/other")
+    finally:
+        store.gate.set()
+
+
+def test_delete_unknown_model_or_revision_is_404(client):
+    for path in ("/admin/models/org/none", "/admin/models/org/a?revision=nope"):
+        r = client.delete(path, headers=ALICE)
+        assert r.status_code == 404 and r.json()["error"]["code"] == "model_not_found"
+    assert delete_events(client) == []
+
+
+@pytest.mark.parametrize(
+    "path", ["/admin/models/bad--name", "/admin/models/nonsense", "/admin/models/org/a?revision=a/b"]
+)
+def test_delete_invalid_name_is_400(client, path):
+    r = client.delete(path, headers=ALICE)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_model"
+
+
+def test_delete_one_revision_keeps_the_others(two_models):
+    client = two_models
+    switch_and_wait(client, "org/other", "v2")
+    switch_and_wait(client, "org/a")
+    r = client.delete("/admin/models/org/other?revision=v2", headers=ALICE)
+    assert r.status_code == 200 and r.json() == {"deleted": [{"model": "org/other", "revision": "v2"}]}
+    entry = [m for m in client.get("/v1/models", headers=BOB).json()["data"] if m["id"] == "org/other"][0]
+    assert entry["revisions"] == ["main"]
+    assert delete_events(client)[0]["prompt"]["revisions"] == ["v2"]
+
+
+def test_delete_all_revisions_without_the_parameter(two_models):
+    client = two_models
+    switch_and_wait(client, "org/other", "v2")
+    switch_and_wait(client, "org/a")
+    r = client.delete("/admin/models/org/other", headers=ALICE)
+    assert r.json()["deleted"] == [
+        {"model": "org/other", "revision": "main"},
+        {"model": "org/other", "revision": "v2"},
+    ]
+    assert "org/other" not in model_ids(client)
+
+
+def test_delete_needs_admin(two_models):
+    r = two_models.delete("/admin/models/org/other", headers=BOB)
+    assert r.status_code == 403 and r.json()["error"]["code"] == "admin_required"
+    assert "org/other" in model_ids(two_models)
+
+
+class FailingDeleteStore(MemoryBlobStore):
+    """A memory store whose `delete` fails for the paths that contain `broken`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.broken: str | None = None
+
+    def delete(self, path: str) -> None:
+        if self.broken and self.broken in path:
+            raise OSError("simulated storage failure")
+        super().delete(path)
+
+
+def test_delete_storage_error_is_500_audits_the_removed_revisions_and_frees_the_mark(tmp_path):
+    store = FailingDeleteStore()
+    with TestClient(make_app(tmp_path, store=store), raise_server_exceptions=False) as c:
+        wait_ready(c)
+        switch_and_wait(c, "org/other")
+        switch_and_wait(c, "org/other", "v2")
+        switch_and_wait(c, "org/a")
+        store.broken = "org--other/v2/"
+        r = c.delete("/admin/models/org/other", headers=ALICE)
+        assert r.status_code == 500
+        rec = delete_events(c)[0]
+        assert rec["status"] == 500 and rec["prompt"]["revisions"] == ["main"]
+        assert c.app.state.manager.removing == set()
+        store.broken = None
+        switch_and_wait(c, "org/other", "v2")
+
+
+def test_models_list_has_size_bytes(two_models):
+    data = two_models.get("/v1/models", headers=BOB).json()["data"]
+    assert [m["id"] for m in data] == ["org/a", "org/other"]
+    assert all(isinstance(m["size_bytes"], int) and m["size_bytes"] > 0 for m in data)
+    one = two_models.get("/v1/models/org/other", headers=BOB).json()
+    assert one["size_bytes"] == data[1]["size_bytes"]

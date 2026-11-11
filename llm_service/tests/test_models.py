@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_service.gateway.models import ModelManager, SwitchInProgress
+from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.storage import MemoryBlobStore
 from llm_service.gateway.weights import WeightCache
 from llm_service.tests.fakes import FakeEngine
@@ -551,5 +551,64 @@ def test_successful_switch_deletes_other_local_models(tmp_path):
         await mgr.request_switch("org/c")  # a failed switch deletes nothing
         assert (local / "org--b" / "main" / ".complete").exists()
         assert (local / "org--c" / "main" / ".complete").exists()
+
+    asyncio.run(run())
+
+
+def test_begin_remove_refuses_the_active_and_the_target_model(tmp_path):
+    async def run():
+        mgr, engine, store, _ = _make(tmp_path)
+        await mgr.startup()
+        with pytest.raises(ModelInUse):
+            mgr.begin_remove("org/a", ["old", "main"])
+        assert mgr.removing == set()
+        task = mgr.request_switch("org/b", "v1")
+        with pytest.raises(ModelInUse):
+            mgr.begin_remove("org/b", ["v1"])
+        mgr.begin_remove("org/b", ["main"])  # another revision of the target is fine
+        assert mgr.removing == {("org/b", "main")}
+        await task
+
+    asyncio.run(run())
+
+
+def test_begin_remove_refuses_the_serving_model(tmp_path):
+    mgr, *_ = _make(tmp_path)
+    mgr.serving = {"model": "org/s", "revision": "main"}
+    with pytest.raises(ModelInUse):
+        mgr.begin_remove("org/s", ["main"])
+
+
+def test_begin_remove_refuses_a_pair_that_is_already_being_removed(tmp_path):
+    mgr, *_ = _make(tmp_path)
+    mgr.begin_remove("org/b", ["main", "v1"])
+    with pytest.raises(ModelInUse):
+        mgr.begin_remove("org/b", ["v1", "v2"])
+    assert mgr.removing == {("org/b", "main"), ("org/b", "v1")}
+
+
+def test_request_switch_refuses_a_model_that_is_being_removed(tmp_path):
+    async def run():
+        mgr, engine, store, _ = _make(tmp_path)
+        await mgr.startup()
+        mgr.begin_remove("org/b", ["main"])
+        with pytest.raises(ModelInUse):
+            mgr.request_switch("org/b")
+        assert mgr.state == "ready" and mgr.target is None
+        task = mgr.request_switch("org/b", "v2")  # another revision is fine
+        await task
+
+    asyncio.run(run())
+
+
+def test_end_remove_allows_the_switch_again(tmp_path):
+    async def run():
+        mgr, engine, store, _ = _make(tmp_path)
+        await mgr.startup()
+        mgr.begin_remove("org/b", ["main"])
+        mgr.end_remove("org/b", ["main"])
+        assert mgr.removing == set()
+        await mgr.request_switch("org/b")
+        assert mgr.active["model"] == "org/b"
 
     asyncio.run(run())
