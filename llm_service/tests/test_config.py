@@ -1,3 +1,5 @@
+import pytest
+
 from llm_service.gateway.config import Config
 
 
@@ -36,3 +38,17 @@ def test_more_overrides():
     )
     assert c.default_model == "org/model" and c.hf_token_key == "hf"
     assert str(c.local_dir) == "/data/w" and c.engine_port == 9000
+
+
+def test_prompt_retention_days():
+    assert Config.from_env({}).prompt_retention_days is None
+    assert Config.from_env({"LLM_PROMPT_RETENTION_DAYS": ""}).prompt_retention_days is None
+    assert Config.from_env({"LLM_PROMPT_RETENTION_DAYS": "  "}).prompt_retention_days is None
+    assert Config.from_env({"LLM_PROMPT_RETENTION_DAYS": "7"}).prompt_retention_days == 7
+    assert Config.from_env({"LLM_PROMPT_RETENTION_DAYS": " 30 "}).prompt_retention_days == 30
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "x", "7d"])
+def test_prompt_retention_days_rejects_anything_else(value):
+    with pytest.raises(ValueError, match="LLM_PROMPT_RETENTION_DAYS"):
+        Config.from_env({"LLM_PROMPT_RETENTION_DAYS": value})

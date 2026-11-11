@@ -17,6 +17,7 @@ def test_service_env_passes_overrides_and_optional_variables():
         "LLM_ADMIN_GROUP": "llm_admins",
         "LLM_HF_TOKEN_KEY": "hf_token",
         "LLM_VLLM_ARGS": "--max-model-len 4096",
+        "LLM_PROMPT_RETENTION_DAYS": "30",
     }
     assert service_env(env) == {
         "LLM_DEFAULT_MODEL": "org/model",
@@ -24,11 +25,12 @@ def test_service_env_passes_overrides_and_optional_variables():
         "LLM_ADMIN_GROUP": "llm_admins",
         "LLM_HF_TOKEN_KEY": "hf_token",
         "LLM_VLLM_ARGS": "--max-model-len 4096",
+        "LLM_PROMPT_RETENTION_DAYS": "30",
     }
 
 
 def test_service_env_leaves_out_empty_optional_variables():
-    env = {"LLM_ADMIN_GROUP": "", "LLM_HF_TOKEN_KEY": "  ", "LLM_VLLM_ARGS": ""}
+    env = {"LLM_ADMIN_GROUP": "", "LLM_HF_TOKEN_KEY": "  ", "LLM_VLLM_ARGS": "", "LLM_PROMPT_RETENTION_DAYS": " "}
     assert set(service_env(env)) == {"LLM_DEFAULT_MODEL", "LLM_BLOB_ROOT"}
 
 

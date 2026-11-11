@@ -8,6 +8,16 @@ from pathlib import Path
 from typing import Mapping
 
 
+def _retention_days(value: str | None) -> int | None:
+    """Return the days to keep prompts, or None for no limit. Raise `ValueError` for a bad value."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    if text.isascii() and text.isdigit() and int(text) >= 1:
+        return int(text)
+    raise ValueError(f"LLM_PROMPT_RETENTION_DAYS must be a whole number of at least 1, not {text!r}")
+
+
 @dataclass(frozen=True)
 class Config:
     """Settings of one gateway process. Build it with `Config.from_env`."""
@@ -22,6 +32,7 @@ class Config:
     engine_port: int = 8001
     flush_interval: float = 5.0
     flush_size: int = 100
+    prompt_retention_days: int | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Config":
@@ -35,4 +46,5 @@ class Config:
             owner=env.get("DATATAILR_USER", ""),
             local_dir=Path(env.get("LLM_LOCAL_DIR") or "/tmp/llm-service"),
             engine_port=int(env.get("LLM_ENGINE_PORT") or 8001),
+            prompt_retention_days=_retention_days(env.get("LLM_PROMPT_RETENTION_DAYS")),
         )

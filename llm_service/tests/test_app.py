@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -18,6 +19,7 @@ from llm_service.tests.fakes import FakeEngine, fake_vllm_app
 
 ALICE = {"X-Datatailr-User": "alice"}
 BOB = {"X-Datatailr-User": "bob"}
+ACTING = "X-LLM-Acting-User"
 CHAT = "/v1/chat/completions"
 HI = {"model": "org/a", "messages": [{"role": "user", "content": "hi"}]}
 
@@ -58,7 +60,9 @@ def plain_download(model: str, revision: str, target: Path) -> None:
     (target / "config.json").write_text("{}")
 
 
-def make_app(tmp_path, engine=None, store=None, http=None, download=plain_download, **config_args):
+def make_app(
+    tmp_path, engine=None, store=None, http=None, download=plain_download, now=None, **config_args
+):
     store = store or MemoryBlobStore()
     engine = engine or FakeEngine()
     config = Config(
@@ -69,7 +73,9 @@ def make_app(tmp_path, engine=None, store=None, http=None, download=plain_downlo
         transport=httpx.ASGITransport(app=fake_vllm_app()), base_url="http://engine"
     )
     admin = AdminCheck("alice", "admins", lambda group: ["carol"])
-    return create_app(config, store, engine, admin, download, http)
+    if now is None:
+        return create_app(config, store, engine, admin, download, http)
+    return create_app(config, store, engine, admin, download, http, now=now)
 
 
 def wait_for(client, predicate, timeout=10.0):
@@ -345,6 +351,7 @@ ADMIN_ROUTES = [
     ("GET", "/admin/model", {}),
     ("GET", "/admin/audit", {}),
     ("GET", "/admin/audit/users", {}),
+    ("GET", "/admin/audit/records/abc?day=2026-11-10", {}),
     ("GET", "/admin/usage", {}),
     ("GET", "/admin/usage/bob", {}),
 ]
@@ -616,7 +623,6 @@ def test_read_hf_token_failure_logs_the_key_and_environment(caplog):
     assert "hf_token" in message and "pre" in message and "secret not found" in message
 
 
-ACTING = "X-LLM-Acting-User"
 
 
 def test_acting_user_must_be_admin_too(client):
@@ -985,3 +991,148 @@ def test_models_list_size_is_null_when_no_size_is_known(client):
     store.put("llm-service/models/org--b/main/.complete", "not json")
     entry = client.get("/v1/models/org/b", headers=BOB).json()
     assert entry["revisions"] == ["main"] and entry["size_bytes"] is None
+
+
+# Record endpoint
+
+def _record_url(row, day=None):
+    return f"/admin/audit/records/{row['request_id']}?day={day or row['ts'][:10]}"
+
+
+def _bob_row(client):
+    client.post(CHAT, headers=BOB, json=HI)
+    return audit_records(client, user="bob")[0]
+
+
+def test_list_rows_have_no_prompt_seg_or_prompt_ref(client):
+    row = _bob_row(client)
+    assert not {"prompt", "seg", "prompt_ref"} & set(row)
+    assert "event" in row
+
+
+def test_record_endpoint_returns_a_buffered_record_with_its_prompt(client):
+    row = _bob_row(client)
+    r = client.get(_record_url(row), headers=ALICE)
+    assert r.status_code == 200
+    assert r.json()["prompt"] == {"messages": [{"role": "user", "content": "hi"}]}
+    assert r.json()["request_id"] == row["request_id"]
+
+
+def test_record_endpoint_returns_a_stored_record_with_its_prompt(client):
+    row = _bob_row(client)
+    client.app.state.audit.flush()
+    r = client.get(_record_url(row), headers=ALICE)
+    assert r.status_code == 200
+    assert r.json()["prompt"] == {"messages": [{"role": "user", "content": "hi"}]}
+
+
+def test_record_endpoint_returns_an_event(client):
+    row = next(r for r in audit_records(client) if r["endpoint"] == "/admin/model")
+    client.app.state.audit.flush()
+    r = client.get(_record_url(row), headers=ALICE)
+    assert r.status_code == 200
+    assert r.json()["prompt"]["event"] == "model_switch"
+
+
+def test_record_endpoint_unknown_id_is_404(client):
+    r = client.get("/admin/audit/records/nope?day=2026-11-10", headers=ALICE)
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "record_not_found"
+    assert set(r.json()["error"]) == {"message", "type", "code"}
+
+
+@pytest.mark.parametrize("query", ["", "?day=", "?day=garbage", "?day=2026-13-40"])
+def test_record_endpoint_bad_or_missing_day_is_400(client, query):
+    r = client.get("/admin/audit/records/abc" + query, headers=ALICE)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_time"
+
+
+def test_record_endpoint_reports_a_deleted_prompt(tmp_path):
+    store = MemoryBlobStore()
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        row = _bob_row(c)
+        c.app.state.audit.flush()
+        for path in store.ls("llm-service/prompts"):
+            store.delete(path)
+        r = c.get(_record_url(row), headers=ALICE)
+        assert r.status_code == 200
+        assert r.json()["prompt_deleted"] is True and r.json()["prompt"] is None
+
+
+def test_record_endpoint_unreadable_prompt_is_502_without_a_path(tmp_path):
+    store = MemoryBlobStore()
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        row = _bob_row(c)
+        c.app.state.audit.flush()
+        for path in store.ls("llm-service/prompts"):
+            store.put(path, b"not json at all")
+        r = c.get(_record_url(row), headers=ALICE)
+        assert r.status_code == 502
+        error = r.json()["error"]
+        assert (error["type"], error["code"]) == ("server_error", "prompt_unreadable")
+        assert "llm-service" not in error["message"] and "/" not in error["message"]
+
+
+def test_record_endpoint_rejects_a_non_admin_and_a_bad_acting_user(client):
+    row = _bob_row(client)
+    assert client.get(_record_url(row), headers=BOB).status_code == 403
+    assert client.get(_record_url(row)).status_code == 401
+    r = client.get(_record_url(row), headers=ALICE | {ACTING: "bob"})
+    assert r.status_code == 403 and "acting user" in r.json()["error"]["message"]
+    assert client.get(_record_url(row), headers=ALICE | {ACTING: "carol"}).status_code == 200
+
+
+def test_audit_users_route_is_not_taken_by_the_record_route(client):
+    r = client.get("/admin/audit/users", headers=ALICE)
+    assert r.status_code == 200 and "data" in r.json()
+
+
+# Wiring of the merger and the checkpoint
+
+
+class Clock:
+    """A clock that tests move forward."""
+
+    def __init__(self) -> None:
+        self.value = datetime(2026, 11, 10, 12, 0, 1, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, **kwargs) -> None:
+        self.value += timedelta(**kwargs)
+
+
+def test_the_flusher_runs_the_merger_and_shutdown_writes_the_checkpoint(tmp_path):
+    store, clock = MemoryBlobStore(), Clock()
+    app = make_app(tmp_path, store=store, now=clock, flush_interval=0.05)
+    with TestClient(app) as c:
+        wait_ready(c)
+        for _ in range(3):
+            assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        c.app.state.audit.flush()  # the segment gets the stamp of the first clock value
+        clock.advance(minutes=12)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if any("/audit/2026-11-10/parts/" in p for p in store.ls("llm-service/audit")):
+                break
+            time.sleep(0.05)
+        files = store.ls("llm-service/audit")
+        assert any("/audit/2026-11-10/parts/" in p for p in files), files
+        rows = audit_records(c, user="bob")
+        assert len(rows) == 3
+    assert "llm-service/usage/2026-11-10.partial.json" in store.ls("llm-service/usage")
+
+
+def test_shutdown_does_not_run_the_merger(tmp_path):
+    store, clock = MemoryBlobStore(), Clock()
+    app = make_app(tmp_path, store=store, now=clock, flush_interval=60)
+    with TestClient(app) as c:
+        wait_ready(c)
+        c.post(CHAT, headers=BOB, json=HI)
+        clock.advance(minutes=12)
+    files = store.ls("llm-service/audit")
+    assert files and not any("/parts/" in p for p in files)

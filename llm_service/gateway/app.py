@@ -5,10 +5,12 @@ import contextlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
+from typing import Callable
 
 import httpx
 from fastapi import Depends, FastAPI, Query, Request
@@ -16,7 +18,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from llm_service.gateway.audit import AuditLog, iso, parse_time, run_flusher, utc_now
+from llm_service.gateway.audit import AuditLog, PromptUnreadable, iso, parse_time, run_flusher, utc_now
+from llm_service.gateway.audit_merge import AuditMerger
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
 from llm_service.gateway.identity import AdminCheck, acting_user_from_headers, user_from_headers
@@ -76,19 +79,25 @@ def create_app(
     admin: AdminCheck,
     download: Downloader,
     http: httpx.AsyncClient | None = None,
+    now: Callable[[], datetime] = utc_now,
 ) -> FastAPI:
-    """Build the gateway application from its parts."""
+    """Build the gateway application from its parts.
+
+    `now` is the clock of the audit log, the merger and the usage totals. Tests replace it.
+    """
     owns_http = http is None
     client = http or httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
-    audit = AuditLog(store, config.blob_root, config.flush_size)
-    usage = UsageTotals(store, config.blob_root, audit, lambda: iso(utc_now())[:10])
+    audit = AuditLog(store, config.blob_root, config.flush_size, now=now)
+    usage = UsageTotals(store, config.blob_root, audit, lambda: iso(now())[:10], now=now)
+    merger = AuditMerger(store, config.blob_root, audit, now, config.prompt_retention_days)
+    stopping = threading.Event()  # set before the last flusher cycle at shutdown
     weights = WeightCache(store, config.blob_root, config.local_dir, download)
 
     def write_audit(record: dict) -> None:
         """Add a record to the audit log. A failure is logged and never raised."""
         try:
             record.setdefault("request_id", uuid.uuid4().hex)
-            record["ts"] = iso(utc_now())
+            record["ts"] = iso(now())
             audit.add(record)
         except Exception as error:
             logger.warning("could not write an audit record: %s", error)
@@ -118,14 +127,32 @@ def create_app(
 
     manager = ModelManager(weights, engine, store, config.blob_root, config.default_model, on_event)
 
+    def on_flusher_tick() -> None:
+        """Run the housekeeping after each flush, in the flusher thread.
+
+        Each step has its own guard, so one failure does not stop the others. The last
+        cycle at shutdown skips the merge and the retention, which list and read storage.
+        """
+        steps = [usage.close_days, usage.checkpoint]
+        if not stopping.is_set():
+            steps.append(merger.tick)
+        for step in steps:
+            try:
+                step()
+            except Exception as error:
+                logger.warning("flusher step %s failed: %s", step.__qualname__, error)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Load the totals first. Add the listener after that, so that no record
-        # is counted twice.
+        # Load the totals first. Register the listeners after that, with no await
+        # in between, so that no record is counted twice and no flush runs against
+        # a half-loaded day.
         await asyncio.to_thread(usage.load)
         audit.listeners.append(usage.record)
+        audit.flushed_listeners.append(usage.flushed)
+        audit.flushed_listeners.append(merger.flushed)
         flusher = asyncio.create_task(
-            run_flusher(audit, config.flush_interval, on_tick=usage.close_days)
+            run_flusher(audit, config.flush_interval, on_tick=on_flusher_tick)
         )
         app.state.startup_task = asyncio.create_task(manager.startup())
         try:
@@ -140,6 +167,7 @@ def create_app(
             try:
                 await engine.stop()
             finally:
+                stopping.set()
                 flusher.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await flusher
@@ -444,6 +472,26 @@ def create_app(
             raise ApiError(400, "invalid_request_error", "invalid_time", str(error)) from None
         records = await asyncio.to_thread(audit.query, user, model, start, end, limit, offset)
         return {"data": records, "limit": limit, "offset": offset}
+
+    @app.get("/admin/audit/records/{request_id}")
+    async def get_audit_record(
+        request_id: str,
+        day: str | None = None,
+        admin_user: str = Depends(require_admin),
+    ) -> dict:
+        if not day:
+            raise ApiError(400, "invalid_request_error", "invalid_time", "day is required, like 2026-11-10")
+        _check_day("day", day)
+        try:
+            record = await asyncio.to_thread(audit.record, day, request_id)
+        except PromptUnreadable as error:
+            logger.warning("the prompt of audit record %s is unreadable: %s", request_id, error)
+            raise ApiError(
+                502, "server_error", "prompt_unreadable", "the prompt of this record cannot be read"
+            ) from None
+        if record is None:
+            raise ApiError(404, "invalid_request_error", "record_not_found", "no audit record has this id on this day")
+        return record
 
     @app.get("/admin/audit/users")
     async def get_audit_users(admin_user: str = Depends(require_admin)) -> dict:
