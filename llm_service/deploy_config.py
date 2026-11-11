@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Mapping
+import re
+from typing import Mapping, Sequence
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_BLOB_ROOT = "llm-service"
 DEFAULT_MEMORY = "24g"
 DEFAULT_CPU = "4"
 DEFAULT_VRAM = "16g"
+DEFAULT_ADMIN_APP_NAME = "LLM Service Admin"
+TARGETS = ("service", "app")
+USAGE = "usage: python deploy.py [service|app]"
 
 # Optional variables. The service gets each one only when it is set.
 OPTIONAL_VARIABLES = ("LLM_ADMIN_GROUP", "LLM_HF_TOKEN_KEY", "LLM_VLLM_ARGS")
@@ -39,3 +43,27 @@ def resources(env: Mapping[str, str]) -> dict:
         "cpu": float(_value(env, "LLM_CPU", DEFAULT_CPU)),
         "vram": _value(env, "LLM_VRAM", DEFAULT_VRAM),
     }
+
+
+def service_url(service_name: str) -> str:
+    """Return the internal URL of the service. `LLM Service` gives `http://llm-service`."""
+    host = re.sub(r"[^a-z0-9]+", "-", service_name.lower()).strip("-")
+    return f"http://{host}"
+
+
+def admin_app_name(env: Mapping[str, str]) -> str:
+    """Return the name of the admin app job."""
+    return _value(env, "LLM_ADMIN_APP_NAME", DEFAULT_ADMIN_APP_NAME)
+
+
+def deploy_targets(argv: Sequence[str]) -> tuple[str, ...]:
+    """Return the jobs to deploy for the arguments of `deploy.py`.
+
+    No argument deploys the service first, then the app. Raise `ValueError`
+    with the usage text for any other argument.
+    """
+    if not argv:
+        return TARGETS
+    if len(argv) == 1 and argv[0] in TARGETS:
+        return (argv[0],)
+    raise ValueError(USAGE)

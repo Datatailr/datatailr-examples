@@ -63,10 +63,12 @@ The other endpoints ignore the header. A user who is not an admin cannot gain an
 - It removes the local directory of the same revision, if one exists.
 - The answer is 200 with `{"deleted": [{"model": ..., "revision": ...}]}`.
 - 404 `model_not_found` if no cached revision matches.
-- 409 `model_in_use` if a matching revision is the served model, the active model, or the target of a running switch. Nothing is removed in that case.
+- 409 `model_in_use` if a matching revision is the served model, the active model, the target of a running switch, the model of a running rollback, or a model that another delete removes. Nothing is removed in that case.
 - 400 `invalid_model` for a model name or revision that fails the existing checks.
 
-The delete runs in a worker thread. It holds the same lock as a model switch for its check and its marker delete, so a switch cannot start on a model while the service removes it.
+The delete runs in a worker thread. Before it removes anything, the model manager marks the revisions under removal. A switch to one of them gets 409 `model_in_use`. The mark ends when the delete ends.
+
+- 500 `delete_failed` if a removal fails. The revisions removed before the error stay removed.
 
 `BlobStore` gets a method `delete(path)`. `MemoryBlobStore` removes the key. `DatatailrBlobStore` calls `Blob.delete`. A delete of a missing path is not an error.
 
@@ -74,7 +76,7 @@ The delete runs in a worker thread. It holds the same lock as a model switch for
 
 ### Audit record of a delete
 
-A delete makes one audit record, in the form of the model switch record: `endpoint` is `/admin/models`, `model` is the model name, `prompt` is `{"event": "model_delete", "revisions": [...]}`, `status` is 200, the token fields are null. The user is the admin user from `require_admin`.
+A delete makes one audit record, in the form of the model switch record: `endpoint` is `/admin/models`, `model` is the model name, `prompt` is `{"event": "model_delete", "revisions": [...]}`, `status` is 200, the token fields are null. The user is the admin user from `require_admin`. If a removal fails, the record has status 500, and `revisions` lists only the revisions removed before the error.
 
 ### Size of a cached model
 
@@ -107,15 +109,16 @@ Routes:
 | `GET /health` | Answers `OK`. Calls nothing. |
 | `GET /api/me` | `GET /admin/model`. Answers `{"user": ..., "admin": true}`, or `{"user": ..., "admin": false}` when the service answers 403. |
 | `GET /api/status` | `GET /admin/model` and `GET /v1/models`, joined: `{"engine": ..., "models": [...]}`. |
-| `POST /api/model` | `POST /admin/model` with the same body. |
-| `DELETE /api/models/{model_id:path}` | `DELETE /admin/models/{model_id}`, with `revision` if given. |
+| `POST /api/model` | `POST /admin/model` with the same body. The app answers 400 `invalid_json` for a body that is not JSON. |
+| `DELETE /api/models/{model_id:path}` | `DELETE /admin/models/{model_id}`, with `revision` if given. The app answers 400 `invalid_model` for a bad id. |
 | `GET /api/usage` | `GET /admin/usage` with `since`, `until`, `user`, `model`, `group_by`. |
-| `GET /api/usage/{user}` | `GET /admin/usage/{user}` with `since`, `until`. |
+| `GET /api/usage/{user}` | `GET /admin/usage/{user}` with `since`, `until`. The app answers 400 `invalid_user` for a bad name. |
 | `GET /api/audit` | `GET /admin/audit` with `user`, `model`, `since`, `until`, `limit`, `offset`. |
 | `GET /api/audit/users` | `GET /admin/audit/users`. |
 
 Rules for the API routes:
 
+- The backend answers 400 `invalid_model` or `invalid_user` for a model id or a user with an empty, `.` or `..` path segment. It answers 400 `invalid_json` for a `POST /api/model` body that is not JSON.
 - The backend passes the status code and the JSON body of the service through, for success and for errors. The page shows the `error.message` of the service.
 - If the service does not answer or the connection fails, the backend answers 502 with `{"error": {"code": "service_unreachable", "message": ...}}`. The timeout is 30 seconds.
 - The backend forwards only the listed query parameters.
@@ -137,7 +140,7 @@ If `GET /api/me` says the viewer is not an admin, the page shows only this text:
 
 ### Audit tab
 
-- Filters: user (a list from `/api/audit/users`), model (free text), since and until.
+- Filters: user (a text field with suggestions from `/api/audit/users`), model (free text), since and until.
 - A table, newest first, 50 rows a page, with "newer" and "older" buttons: time, user, endpoint, model, status, total tokens, duration.
 - A click on a row shows the full record, with the prompt, as formatted JSON.
 
@@ -147,9 +150,11 @@ If `GET /api/me` says the viewer is not an admin, the page shows only this text:
 - A table of the models: name, status (`active`, `loading`, `cached`), revisions, size. Each cached row has two buttons: "Serve" and "Delete".
 - A form to serve a model that is not in the table: model name and revision (default `main`).
 - "Delete" asks for a confirmation that names the model. The served model and the loading model have no "Delete" button.
-- While the engine state is `loading`, the tab reads `/api/status` every 3 seconds and shows the state. It stops when the state is `ready` or `failed`.
+- While the engine state is `loading`, the tab reads `/api/status` every 3 seconds and shows the state. It stops when the state is `ready` or `failed`, and after 5 failed reads.
 
 All text that comes from the service goes into the page as text, never as HTML.
+
+The page has a small inline script that adds a trailing slash to the address. The relative URLs need it. If a Content-Security-Policy forbids inline scripts, open the app with a trailing slash in the address.
 
 ## Deployment
 
@@ -161,9 +166,12 @@ python deploy.py service    # only the service
 python deploy.py app        # only the app
 ```
 
+Any other argument prints `usage: python deploy.py [service|app]`.
+
 The app job:
 
 - Name `LLM Service Admin`, or `LLM_ADMIN_APP_NAME`.
+- The user who deploys the app must be an admin of the service. The platform signs the calls of the app as this user.
 - `framework="fastapi"`, entrypoint `llm_service.admin_app.app`.
 - 0.5 CPU and 512 MB of memory. No GPU and no pre-build script.
 - `LLM_SERVICE_URL` is set from the service name: `LLM Service` gives `http://llm-service`.

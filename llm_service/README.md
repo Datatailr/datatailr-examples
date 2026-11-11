@@ -10,6 +10,8 @@ The service adds these parts to the model:
 - The service keeps the weight files in Datatailr blob storage. It does not download them again at each start.
 - The service writes an audit log. The log records who sent each request and with what prompt. Only an admin can read it.
 - An admin can read the usage of each user, for example the tokens used.
+- An admin can remove the cached weights of a model.
+- An admin app is a web page for the usage, the audit log and the models.
 - Many users can call the service at the same time.
 
 ## How it works
@@ -76,6 +78,13 @@ Set the environment variables that you need. All of them are optional. Then run 
 python deploy.py
 ```
 
+The script deploys two jobs: the service first, then the admin app. To deploy one job, name it:
+
+```bash
+python deploy.py service
+python deploy.py app
+```
+
 The script reads these variables at deploy time:
 
 | Variable | Default | Meaning |
@@ -91,6 +100,7 @@ The script reads these variables at deploy time:
 | `LLM_HF_TOKEN_KEY` | not set | Secret store key of the Hugging Face token. |
 | `LLM_VLLM_ARGS` | not set | Extra arguments for `vllm serve`. |
 | `LLM_ENVIRONMENT` | `dev` | Platform environment: `dev`, `pre` or `prod`. |
+| `LLM_ADMIN_APP_NAME` | `LLM Service Admin` | Name of the admin app. |
 
 If `LLM_ACCESS_GROUP` is not set, only the user who deploys the service has access. If it is set, the owner and the group can read and use the service. Only the owner can change, operate or promote it.
 
@@ -200,11 +210,12 @@ Any user with access can list the models:
 curl "$BASE/v1/models" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
 ```
 
-The list has one entry for each model: the active model, the model that loads, and each model in the blob storage cache. Each entry has the OpenAI fields `id`, `object`, `created` and `owned_by`. It also has three extra fields:
+The list has one entry for each model: the active model, the model that loads, and each model in the blob storage cache. Each entry has the OpenAI fields `id`, `object`, `created` and `owned_by`. It also has four extra fields:
 
 - `status` is `active` for the model that vLLM serves now, `loading` for the model that loads, or `cached`.
 - `revision` is the active or loading revision. For a cached model, it is the first cached revision.
 - `revisions` is the sorted list of the revisions in blob storage.
+- `size_bytes` is the total size of the cached revisions, or `null` if the model has no cached revision.
 
 To read one entry, add the model name to the path:
 
@@ -213,6 +224,19 @@ curl "$BASE/v1/models/Qwen/Qwen2.5-1.5B-Instruct" -H "Cookie: __datatailr_user_c
 ```
 
 The OpenAI SDK call `client.models.retrieve("Qwen/Qwen2.5-1.5B-Instruct")` uses this path. If the service does not know the model, it returns the error `model_not_found` with status 404.
+
+## Delete a cached model
+
+Only an admin can remove the cached weights of a model from blob storage. The query parameter `revision` limits the call to one revision:
+
+```bash
+curl -X DELETE "$BASE/admin/models/Qwen/Qwen2.5-7B-Instruct?revision=main" \
+  -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+```
+
+The call returns status 200 and the list of the removed revisions: `{"deleted": [...]}`. If no cached revision matches, the status is 404 with the code `model_not_found`.
+
+The service does not remove a model that it needs. The status is 409 with the code `model_in_use` for the model that vLLM serves, the active model and the target of a running switch. A switch to a model that the service removes gets the same error. The delete makes one audit record.
 
 ## Read the audit log
 
@@ -226,7 +250,7 @@ The filters are `user`, `model`, `since`, `until`, `limit` and `offset`. The val
 
 To see the users in the log with their first and last request, call `/admin/audit/users`.
 
-The user of a model switch record is the admin who started the switch. At startup and after an automatic reload, the user is `system`.
+The user of a model switch or model delete record is the admin who started it. At startup and after an automatic reload, the user is `system`.
 
 ## Read the usage metrics
 
@@ -242,6 +266,22 @@ The filters are `since`, `until`, `user` and `model`. Both days are included. Th
 Each row has the request count, the failed request count, the prompt, completion and total tokens, and the time of the last request.
 
 To read one user with the split by model and by day, call `/admin/usage/bob`. Each user can read their own usage at `/v1/usage/me`. This call is not part of the OpenAI API.
+
+## Admin app
+
+The admin app is a web page for the admins of the service. It is the second job that `deploy.py` deploys. It has three tabs:
+
+- Usage: requests, failed requests and tokens, by user, by model and by day.
+- Audit: the audit log, with filters for user, model and time.
+- Models: the engine state and the cached models. An admin switches the model, follows the progress and deletes cached weights.
+
+The app keeps no data. It calls the service by its internal URL. The app takes this URL from the service name, so `LLM Service` gives `http://llm-service`.
+
+Only an admin of the service can use the app. The service decides this, not the app. A user who is not an admin sees the text "You are not an admin of the LLM service."
+
+The platform signs the calls of the app as the user who deployed it. This user must be an admin of the service: the user who deployed the service, or a member of `LLM_ADMIN_GROUP`. The app also sends the name of the viewer in the header `X-LLM-Acting-User`. The service then requires that the viewer is an admin too, and the audit log names the viewer.
+
+Open the app from the Datatailr interface. If the page does not load its data, open it with a trailing slash in the address. The design document [docs/admin-app-design.md](docs/admin-app-design.md) describes the app.
 
 ## Where the data lives
 
@@ -266,6 +306,7 @@ The audit files are the source of truth. The usage totals come from them. If you
 - If the engine fails in the middle of a stream, the stream ends without an error event. The audit record has the status 502.
 - At startup, the service reads the usage totals from blob storage. If that read fails, the service does not start, and the platform restarts it.
 - The service serves one model at a time. A switch stops the old model.
+- An admin who calls the service directly can name any admin in `X-LLM-Acting-User`.
 - The audit log stores each prompt in full. It does not store the answers.
 - Token counts for a stream come from the last chunk. The service asks vLLM for that chunk. It removes the chunk again if the client did not ask for it.
 - There are no rate limits and no quotas for each user.

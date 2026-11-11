@@ -45,11 +45,13 @@ client -> platform edge -> gateway (FastAPI) -> vLLM (127.0.0.1) -> GPU
 llm_service/
 ├── README.md
 ├── metadata.json
-├── deploy.py              # builds and deploys the Service
+├── deploy.py              # builds and deploys the Service and the admin app
 ├── requirements.txt       # runtime: fastapi, uvicorn, httpx, huggingface_hub, vllm
 ├── requirements-dev.txt   # tests: pytest, fastapi, httpx (no vllm, no GPU)
 ├── docs/
-│   └── design.md          # this document
+│   ├── design.md          # this document
+│   └── admin-app-design.md
+├── admin_app/             # the admin app: FastAPI backend and one page
 ├── gateway/
 │   ├── app.py             # FastAPI routes and main(port)
 │   ├── config.py          # configuration from environment variables
@@ -81,7 +83,7 @@ fakes.
 | `GET /v1/usage/me` | The usage totals of the caller. Not part of the OpenAI API. |
 
 The model list has one entry for each model id. Each entry has the OpenAI
-fields `id`, `object`, `created` and `owned_by`, and three extra fields:
+fields `id`, `object`, `created` and `owned_by`, and four extra fields:
 
 - `status`: `loading` for the model that loads, `active` for the model that
   vLLM serves now, and `cached` for a model that is only in blob storage. If one id has two
@@ -89,6 +91,7 @@ fields `id`, `object`, `created` and `owned_by`, and three extra fields:
 - `revision`: the loading or active revision. For a cached model, it is the
   first cached revision.
 - `revisions`: the sorted list of the revisions in blob storage.
+- `size_bytes`: the sum of the file sizes in the manifests of the cached revisions, or null if the model has no cached revision.
 
 Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 
@@ -111,8 +114,11 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 | `GET /admin/audit/users` | The users in the log, with the first and last request time of each. |
 | `GET /admin/usage` | Usage totals. Filters: `since`, `until`, `user`, `model`. `group_by` is `user` (default), `model` or `day`. |
 | `GET /admin/usage/{user}` | The totals of one user, by model and by day. |
+| `DELETE /admin/models/{model}` | Removes the cached revisions of a model from blob storage. The query parameter `revision` limits it to one revision. Returns 200 with `{"deleted": [...]}`. The errors are 404 `model_not_found`, 409 `model_in_use` and 400 `invalid_model`. One audit record has the event `model_delete`. |
 
 A caller who is not an admin gets 403.
+
+The admin app calls these endpoints with the header `X-LLM-Acting-User`. See [Acting user](#acting-user). The app is described in [admin-app-design.md](admin-app-design.md).
 
 ### Platform endpoints
 
@@ -135,6 +141,15 @@ An admin is one of:
 The gateway caches the group members for 60 seconds. The Datatailr SDK also
 caches group lookups for 10 minutes. A change of the group members can
 therefore take up to 10 minutes to apply.
+
+### Acting user
+
+The `/admin/*` endpoints read the header `X-LLM-Acting-User`. The signed
+caller must be an admin. If the header names a user, that user must be an admin
+too, or the answer is 403 `admin_required`. The audit records of a model switch
+and a model delete name the acting user. A name that is too long or has a
+control character gets 400 `invalid_acting_user`. Other endpoints ignore the
+header.
 
 ### Outside clients
 
@@ -349,7 +364,7 @@ they do not block request handling.
 
 ## Deployment
 
-`deploy.py` builds the `Service` and reads these environment variables:
+`deploy.py` builds the `Service` and the admin `App`. `python deploy.py service` or `python deploy.py app` deploys one of them. The script reads these environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -364,6 +379,7 @@ they do not block request handling.
 | `LLM_HF_TOKEN_KEY` | not set | Secret store key of the Hugging Face token. |
 | `LLM_VLLM_ARGS` | not set | Extra arguments for `vllm serve`. |
 | `LLM_ENVIRONMENT` | `dev` | Platform environment. |
+| `LLM_ADMIN_APP_NAME` | `LLM Service Admin` | Name of the admin app. |
 
 Because the service sets `vram`, the platform does not start a node for it. The
 operator starts a GPU node manually. The README gives the steps.

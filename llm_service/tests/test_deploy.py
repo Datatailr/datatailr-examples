@@ -1,4 +1,6 @@
-from llm_service.deploy_config import resources, service_env
+import pytest
+
+from llm_service.deploy_config import admin_app_name, deploy_targets, resources, service_env, service_url
 
 
 def test_service_env_defaults_hold_only_the_two_required_variables():
@@ -47,3 +49,27 @@ def test_resources_overrides():
 def test_resources_empty_values_use_the_defaults():
     env = {"LLM_MEMORY": "", "LLM_CPU": " ", "LLM_VRAM": ""}
     assert resources(env) == {"memory": "24g", "cpu": 4.0, "vram": "16g"}
+
+
+def test_service_url_turns_the_name_into_a_host_name():
+    assert service_url("LLM Service") == "http://llm-service"
+    assert service_url("My  LLM_Service!") == "http://my-llm-service"
+    assert service_url("--Team 1--") == "http://team-1"
+
+
+def test_admin_app_name_default_and_override():
+    assert admin_app_name({}) == "LLM Service Admin"
+    assert admin_app_name({"LLM_ADMIN_APP_NAME": "  "}) == "LLM Service Admin"
+    assert admin_app_name({"LLM_ADMIN_APP_NAME": " My Admin "}) == "My Admin"
+
+
+def test_deploy_targets_accepts_nothing_or_one_target():
+    assert deploy_targets([]) == ("service", "app")
+    assert deploy_targets(["service"]) == ("service",)
+    assert deploy_targets(["app"]) == ("app",)
+
+
+@pytest.mark.parametrize("argv", [["both"], ["service", "app"], [""], ["App"]])
+def test_deploy_targets_rejects_anything_else(argv):
+    with pytest.raises(ValueError, match=r"usage: python deploy.py \[service\|app\]"):
+        deploy_targets(argv)
