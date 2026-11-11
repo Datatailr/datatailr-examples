@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -22,6 +23,28 @@ def test_memory_store_roundtrip(tmp_path):
     assert s.get("r/c") == b"hello"
     with pytest.raises(KeyError):
         s.get("missing")
+
+
+def test_memory_store_can_be_listed_while_another_thread_writes():
+    store = MemoryBlobStore()
+    for i in range(20000):
+        store.put(f"a/{i}", b"x")
+    errors = []
+
+    def write():
+        for i in range(20000, 60000):
+            store.put(f"a/{i}", b"x")
+
+    writer = threading.Thread(target=write)
+    writer.start()
+    try:
+        while writer.is_alive():
+            store.ls("a")
+    except RuntimeError as error:
+        errors.append(error)
+    writer.join()
+    assert errors == []
+    assert len(store.ls("a")) == 60000
 
 
 def test_memory_store_delete_removes_the_key_and_ignores_a_missing_one():

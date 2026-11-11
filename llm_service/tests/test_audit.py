@@ -662,7 +662,8 @@ def test_mutating_a_returned_record_does_not_change_a_later_result():
 
 def test_cache_evicts_the_least_recently_used_file():
     store = CountingStore()
-    paths = [put_file(store, f"12000{i}.000000-a", [rec(f"u{i}", T)]) for i in range(3)]
+    names = ("alice", "bob", "carol")
+    paths = [put_file(store, f"12000{i}.000000-a", [rec(names[i], T)]) for i in range(3)]
     log = AuditLog(store, "root", row_cache_size=2)
     log.rows_for_day("2026-11-10")  # reads 3 files, keeps 2
     (evicted,) = [p for p in paths if log.cached_rows(p) is None]
@@ -913,15 +914,15 @@ def test_rows_after_a_segment_read_only_the_files_that_can_hold_later_rows():
     store.put(part_path("root", DAY, bucket_of(s1)), store.get(segment_path("root", DAY, s1)))
     store.delete(segment_path("root", DAY, s1))
     store.put(day_path("root", DAY), store.get(part_path("root", DAY, bucket_of(s1))))
-    put_file(store, "120000.000000-old", [rec("dave", "2026-11-10T12:00:00.000Z")])
+    put_file(store, "120000.000000-old", [rec("alice", "2026-11-10T12:00:00.000Z")])
     reader = AuditLog(store, "root")
-    reader.add(rec("erin", "2026-11-10T15:00:00.000Z"))  # buffered rows are newer
+    reader.add(rec("bob", "2026-11-10T15:00:00.000Z"))  # buffered rows are newer
     store.clear()
     rows = reader.rows_for_day(DAY, after=s2)
-    assert [(r["user"], r["seg"]) for r in rows] == [("carol", s3), ("erin", None)]
+    assert [(r["user"], r["seg"]) for r in rows] == [("carol", s3), ("bob", None)]
     assert sorted(store.ops("get")) == sorted([day_path("root", DAY), segment_path("root", DAY, s3)])
-    assert [r["user"] for r in reader.rows_for_day(DAY)] == ["alice", "bob", "carol", "dave", "erin"]
-    assert [r["user"] for r in reader.rows_for_day(DAY, after=s1)] == ["bob", "carol", "erin"]
+    assert [r["user"] for r in reader.rows_for_day(DAY)] == ["alice", "bob", "carol", "alice", "bob"]
+    assert [r["user"] for r in reader.rows_for_day(DAY, after=s1)] == ["bob", "carol", "bob"]
 
 
 def test_lists_read_no_prompt_file():
@@ -1061,26 +1062,22 @@ def test_row_cache_counts_rows():
     assert log.read_rows("root/audit/2026-11-10/missing.jsonl") == []
 
 
-class LockedStore(MemoryBlobStore):
-    """A memory store that threads can list while another thread writes."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._store_lock = threading.Lock()
+class SlowSegmentStore(MemoryBlobStore):
+    """A memory store that pauses after each segment write."""
 
     def put(self, path, data):
-        with self._store_lock:
-            super().put(path, data)
+        super().put(path, data)
         if "/segments/" in path:
             time.sleep(0.002)  # a read can list the segment before the flush ends
 
-    def ls(self, prefix):
-        with self._store_lock:
-            return super().ls(prefix)
+
+def stress_record(i):
+    """Return record `i` of the stress test. Each has its own `ts`, so its own id."""
+    return rec(("alice", "bob", "carol")[i % 3], f"2026-11-10T12:{i // 60:02d}:{i % 60:02d}.000Z")
 
 
 def test_reads_during_flushes_see_each_record_once():
-    store = LockedStore()
+    store = SlowSegmentStore()
     log = AuditLog(store, "root")
     added = [0]
     stop = threading.Event()
@@ -1089,7 +1086,7 @@ def test_reads_during_flushes_see_each_record_once():
     def write():
         try:
             for i in range(300):
-                log.add(rec(f"u{i}", T))
+                log.add(stress_record(i))
                 added[0] = i + 1
                 if i % 7 == 0:
                     log.flush()
@@ -1103,7 +1100,7 @@ def test_reads_during_flushes_see_each_record_once():
                 before = added[0]
                 ids = [r["request_id"] for r in log.rows_for_day(DAY)]
                 assert len(ids) == len(set(ids)), "a record appears twice"
-                assert {rec(f"u{i}", T)["request_id"] for i in range(before)} <= set(ids)
+                assert {stress_record(i)["request_id"] for i in range(before)} <= set(ids)
         except Exception as error:  # reported by the main thread
             errors.append(error)
 
@@ -1147,3 +1144,98 @@ def test_cached_day_file_is_not_replaced_by_an_older_read(change):
     reader.join()
     assert log.cached_rows(path) == (rows_new if change == "put" else None)
     assert [r["user"] for r in log.read_rows(path)] == ["alice", "bob"]
+
+
+def test_stamps_grow_when_the_clock_steps_back():
+    times = iter(
+        [
+            datetime(2026, 11, 10, 14, 0, 5, tzinfo=timezone.utc),
+            datetime(2026, 11, 10, 14, 0, 1, tzinfo=timezone.utc),  # the clock steps back
+        ]
+    )
+    store, log = make(now=lambda: next(times))
+    calls = flushed(log)
+    log.add(rec("alice", "2026-11-10T14:00:00.000Z"))
+    log.flush()
+    log.add(rec("bob", "2026-11-10T14:00:01.000Z"))
+    log.flush()
+    first, second = calls[0][1], calls[1][1]
+    assert first.startswith("20261110T140005.000000-")
+    assert second.startswith("20261110T140005.000001-") and second > first
+    rows = AuditLog(store, "root").rows_for_day(DAY, after=first)
+    assert [r["user"] for r in rows] == ["bob"]
+
+
+def test_a_read_lists_again_when_a_merge_removes_a_listed_file():
+    class MergingStore(MemoryBlobStore):
+        """A store that merges a segment into a part between a listing and the read."""
+
+        merge_on = None
+
+        def get(self, path):
+            if path == self.merge_on:
+                self.merge_on = None
+                body = super().get(path)
+                super().put(part_path("root", DAY, bucket_of(path.rsplit("/", 1)[1])), body)
+                self.delete(path)
+            return super().get(path)
+
+    alice, bob = rec("alice", T), rec("bob", T)
+
+    def setup():
+        store = MergingStore()
+        _, writer = make(store, now=lambda: NOW)
+        calls = flushed(writer)
+        writer.add(alice)
+        writer.add(bob)
+        writer.flush()
+        writer.add(rec("carol", "2026-11-10T14:30:00.000Z"))
+        writer.flush()
+        store.merge_on = segment_path("root", DAY, calls[0][1])
+        return store, AuditLog(store, "root")  # its cache is empty, as after a restart
+
+    store, log = setup()
+    assert [r["user"] for r in log.rows_for_day(DAY)] == ["alice", "bob", "carol"]
+    assert store.merge_on is None  # the merge ran during the read
+    assert len(store.ls(f"root/audit/{DAY}/segments")) == 1
+    store, log = setup()
+    assert log.record(DAY, bob["request_id"]) == full(bob)
+    assert store.merge_on is None
+    store, log = setup()
+    assert len(log.users()) == 3
+
+
+def test_a_read_gives_up_listing_again_after_three_tries():
+    class VanishingStore(RecordingStore):
+        """A store whose listing always shows a file that is gone."""
+
+        def ls(self, prefix):
+            return sorted(super().ls(prefix) + [f"root/audit/{DAY}/segments/{STAMP}-gone.jsonl"])
+
+    store = VanishingStore()
+    _, writer = make(store)
+    writer.add(rec("alice", T))
+    writer.flush()
+    log = AuditLog(store, "root")
+    store.clear()
+    assert [r["user"] for r in log.rows_for_day(DAY)] == ["alice"]
+    assert store.ops("ls") == [f"root/audit/{DAY}"] * 3
+
+
+def test_prompt_cache_drop_forgets_the_prompt_files_of_a_day():
+    store, log = make()
+    alice = rec("alice", T)
+    log.add(alice)
+    log.add(rec("bob", "2026-11-11T08:00:00.000Z"))
+    log.flush()
+    log = AuditLog(store, "root")
+    bob_day = "2026-11-11"
+    assert log.record(DAY, alice["request_id"]) == full(alice)
+    assert log.record(bob_day, rec("bob", "2026-11-11T08:00:00.000Z")["request_id"])["prompt"]
+    for path in store.ls("root/prompts"):
+        store.delete(path)
+    assert log.record(DAY, alice["request_id"]) == full(alice)  # still cached
+    log.prompt_cache_drop(DAY)
+    assert log.record(DAY, alice["request_id"]) == {**full(alice), "prompt": None, "prompt_deleted": True}
+    bob = log.record(bob_day, rec("bob", "2026-11-11T08:00:00.000Z")["request_id"])
+    assert bob["prompt"] is not None  # another day stays cached

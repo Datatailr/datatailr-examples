@@ -14,7 +14,7 @@ import time
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from llm_service.gateway.audit_layout import (
@@ -27,6 +27,7 @@ from llm_service.gateway.audit_layout import (
     legacy_rows,
     parse_lines,
     prompt_path,
+    prompts_dir,
     public_row,
     segment_name,
     segment_path,
@@ -39,6 +40,8 @@ logger = logging.getLogger("llm_service.audit")
 ROW_CACHE_SIZE = 1_000_000  # metadata rows kept in memory
 PROMPT_CACHE_SIZE = 32  # prompt files kept in memory
 READ_WORKERS = 8  # threads that read uncached files of one day
+LIST_TRIES = 3  # listings of one day when a listed file is gone before its read
+_TICK = timedelta(microseconds=1)  # the smallest step between two stamps
 _KIND_ORDER = {"day": 0, "part": 1, "segment": 2, "legacy": 3}  # the order of "Which files count"
 
 
@@ -177,6 +180,7 @@ class AuditLog:
         self._inflight: list[_Entry] = []  # records that a running flush writes
         self._lock = threading.Lock()  # guards the buffer, the in-flight list and `_Entry.seg`
         self.flush_lock = threading.Lock()  # one flush at a time
+        self._last_stamp: datetime | None = None  # time of the last stamp, under `flush_lock`
         self._row_cache_size = row_cache_size
         self._rows: OrderedDict[str, list[dict]] = OrderedDict()  # path -> metadata rows
         self._row_count = 0  # rows in `_rows`
@@ -249,9 +253,21 @@ class AuditLog:
         by_day: dict[str, list[_Entry]] = {}
         for entry in pending:
             by_day.setdefault(entry.day, []).append(entry)
-        now = self._now()
+        now = self._stamp_time()
         for day, entries in sorted(by_day.items()):
             self._write_day(day, entries, segment_name(now, uuid.uuid4().hex), done)
+
+    def _stamp_time(self) -> datetime:
+        """Return the time for the stamp of this flush. Hold `flush_lock`.
+
+        A later flush always gets a greater stamp, also when the clock steps back.
+        """
+        now = self._now()
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+        if self._last_stamp is not None and now <= self._last_stamp:
+            now = self._last_stamp + _TICK
+        self._last_stamp = now
+        return now
 
     def _write_day(self, day: str, entries: list[_Entry], seg: str, done: set[int]) -> None:
         rows: list[dict] = []
@@ -335,6 +351,11 @@ class AuditLog:
         A missing file gives an empty list. A failed read raises and is not cached. The caller
         must not change the returned rows.
         """
+        rows = self._read(path)
+        return rows if rows is not None else []
+
+    def _read(self, path: str) -> list[dict] | None:
+        """Return the rows of `read_rows`, or None when the file does not exist."""
         cached = self.cached_rows(path)
         if cached is not None:
             return cached
@@ -353,7 +374,7 @@ class AuditLog:
                         self._insert(path, rows)
                 if not self._loading:
                     self._versions.clear()
-        return rows if rows is not None else []
+        return rows
 
     def _changed(self, path: str) -> None:
         """Note a change of `path` for the reads that run now. Hold `_rows_lock`."""
@@ -404,8 +425,8 @@ class AuditLog:
                 row["prompt_ref"]["line"] = index  # the line in the file, skipped lines included
         return rows
 
-    def _read_files(self, paths: list[str]) -> list[list[dict]]:
-        """Return the rows of each file, in the order of `paths`.
+    def _read_files(self, paths: list[str]) -> list[list[dict] | None]:
+        """Return the rows of each file, in the order of `paths`. A missing file gives None.
 
         Files that are not cached are read by a small thread pool. An error in
         a read is raised for that file, in the order of `paths`.
@@ -413,10 +434,10 @@ class AuditLog:
         with self._rows_lock:
             missing = [p for p in paths if p not in self._rows]
         if len(missing) < 2:
-            return [self.read_rows(p) for p in paths]
+            return [self._read(p) for p in paths]
         with ThreadPoolExecutor(max_workers=min(READ_WORKERS, len(missing))) as pool:
-            futures = {p: pool.submit(self.read_rows, p) for p in missing}
-            return [futures[p].result() if p in futures else self.read_rows(p) for p in paths]
+            futures = {p: pool.submit(self._read, p) for p in missing}
+            return [futures[p].result() if p in futures else self._read(p) for p in paths]
 
     # Reads
 
@@ -425,12 +446,10 @@ class AuditLog:
         with self._lock:
             return [entry.record for entry in self._inflight + self._buffer]
 
-    def _stored_rows(self, day: str, after: str | None) -> list[dict]:
-        """Return the stored rows of `day`, each `seg` from one file only.
+    def _day_files(self, day: str, after: str | None) -> list[str]:
+        """List the files of `day` in the order of "Which files count".
 
-        The files count in the order day file, parts, segments, old layout files. A row whose
-        `seg` occurred in an earlier file is skipped. With `after`, only rows whose `seg` is
-        greater are returned, and files that cannot hold them are not read.
+        With `after`, leave out the files that cannot hold a later row.
         """
         files = []
         for path in self._store.ls(_day_dir(self._root, day)):
@@ -442,11 +461,29 @@ class AuditLog:
                 continue
             files.append((_KIND_ORDER[kind], name, path))
         files.sort()
+        return [path for _, _, path in files]
+
+    def _stored_rows(self, day: str, after: str | None) -> list[dict]:
+        """Return the stored rows of `day`, each `seg` from one file only.
+
+        The files count in the order day file, parts, segments, old layout files. A row whose
+        `seg` occurred in an earlier file is skipped. With `after`, only rows whose `seg` is
+        greater are returned, and files that cannot hold them are not read. When a listed
+        file is gone before its read, the day is listed again, up to `LIST_TRIES` times.
+        """
+        for _ in range(LIST_TRIES):
+            chunks = self._read_files(self._day_files(day, after))
+            # A merge writes its file before it deletes the inputs. A listing made after a
+            # listed file is gone has the merged file, and the `seg` rule drops duplicates.
+            if None not in chunks:
+                break
+        else:
+            logger.warning("audit files of %s keep going away, reading what is there", day)
         rows: list[dict] = []
         seen: set[str] = set()
-        for chunk in self._read_files([path for _, _, path in files]):
+        for chunk in chunks:
             segs = set()
-            for row in chunk:
+            for row in chunk or []:
                 seg = row["seg"]
                 segs.add(seg)
                 if seg in seen or (after is not None and seg <= after):
@@ -599,6 +636,13 @@ class AuditLog:
         ):
             raise PromptUnreadable(f"line {index} of {path} does not hold the record")
         return join_record(row, line["prompt"])
+
+    def prompt_cache_drop(self, day: str) -> None:
+        """Drop the cached prompt files of `day`. Call it after their folder is deleted."""
+        prefix = prompts_dir(self._root, day)
+        with self._prompts_lock:
+            for path in [p for p in self._prompts if p.startswith(prefix)]:
+                del self._prompts[path]
 
     def _prompt_lines(self, path: str) -> list | None:
         """Return the parsed lines of a prompt file, or None when it does not exist."""
