@@ -31,6 +31,7 @@ All paths are under `LLM_BLOB_ROOT`.
 audit/<day>/segments/<stamp>-<id>.jsonl    metadata rows of one flush
 audit/<day>/parts/<bucket>.jsonl           metadata rows of one 10 minute bucket
 audit/<day>/day.jsonl                      metadata rows of one finished day
+audit/<day>/prompts.marker                 the day can have prompt files, holds no rows
 prompts/<day>/<stamp>-<id>.jsonl           prompts of one flush
 usage/<day>.json                           usage totals of a finished day (exists today)
 usage/<day>.partial.json                   usage totals of the current day
@@ -43,6 +44,8 @@ audit/<day>/<name>.jsonl                   old layout: full records, read only
 - `<bucket>` is the first 12 characters of the stamp: date, hour and the tens digit of the minute, for example `20261111T140`.
 
 Prompts live under a prefix of their own. A listing of `audit/` never returns a prompt file.
+
+The prompt marker tells retention that a day can have prompt files. It is a small fixed text. The reader, the merge and the usage totals never read it. It counts as no file of the day.
 
 ## Records
 
@@ -73,12 +76,15 @@ One line for each request record of the flush, in the order of the rows:
 
 A flush handles the records of each day in this order:
 
-1. Write the prompt file `prompts/<day>/<segment>.jsonl`. Skip this step if the flush has no request record for the day.
-2. Write the segment file `audit/<day>/segments/<segment>.jsonl`.
+1. Write the prompt marker `audit/<day>/prompts.marker`. Skip this step if the flush has no request record for the day, or if this process already wrote or saw the marker of the day.
+2. Write the prompt file `prompts/<day>/<segment>.jsonl`. Skip this step if the flush has no request record for the day.
+3. Write the segment file `audit/<day>/segments/<segment>.jsonl`.
 
-The segment file is the commit. A record exists when its metadata row exists. If step 1 fails, the flush keeps the records and tries again later with a new segment name. If step 2 fails, the same happens, and the prompt file of step 1 stays as an orphan that nothing reads.
+The segment file is the commit. A record exists when its metadata row exists. If step 1 or step 2 fails, the flush keeps the records and tries again later with a new segment name. If step 3 fails, the same happens, and the prompt file of step 2 stays as an orphan that nothing reads. Retention deletes the orphan with the other prompt files of the day.
 
-After step 2, the flush puts the rows of the segment into the memory cache. The service never reads back a segment that it wrote.
+The process remembers each day whose marker it wrote. It also remembers each marker that a listing of `audit/` showed. So it writes the marker of a day at most one time.
+
+After step 3, the flush puts the rows of the segment into the memory cache. The service never reads back a segment that it wrote.
 
 A record that `json.dumps` cannot write is dropped with a warning that names its `request_id`. It cannot block later flushes.
 
@@ -144,7 +150,7 @@ A file directly in `audit/<day>/` holds full records. The reader builds metadata
 
 The cache holds metadata rows by file path. It holds no prompts. Its limit is a row count, `ROW_CACHE_SIZE = 1,000,000`, and it drops the least recently used file first. A merge puts the merged file into the cache and removes its inputs. When the service writes a day file again, it replaces the cache entry. A file with more rows than the whole limit is not cached.
 
-A small second cache holds the last 32 prompt files that an admin opened.
+A small second cache holds the last 32 prompt files that an admin opened. Retention empties the entries of a day after it deletes prompt files of that day. A prompt read that overlaps such a delete gives its result to its caller, but the cache does not keep it. So a later request for the record answers with `prompt_deleted`.
 
 ### Records in the buffer
 
@@ -196,7 +202,9 @@ A new check starts at most one time each hour. It queues the days past the limit
 
 One maintenance step deletes at most 64 prompt files and lists at most 20 prompt folders. The next step goes on with the rest. A file whose delete fails stays in the list, and the next step tries it again. When the same file fails in three steps in a row, the day waits for the next hourly check. A stop ends the retention with the maintenance task.
 
-The task takes the day names from the day folders of `audit/`. It never lists all of `prompts/`. It keeps the set of clean days in memory, so each hourly check lists only the days that newly passed the limit. After a restart, the set is empty. The first check then lists the prompt folder of each day past the limit again, at most 20 for each step.
+The task takes the day names from the day folders of `audit/`. It never lists all of `prompts/`. The prompt marker puts a day into this listing, also when the day has no metadata file. This happens when a flush writes a prompt file, the segment write fails, and the process stops before the next flush. Retention leaves the marker in place. It costs one small blob for each day. It keeps the set of clean days in memory, so each hourly check lists only the days that newly passed the limit. After a restart, the set is empty. The first check then lists the prompt folder of each day past the limit again, at most 20 for each step.
+
+After a long storage outage, a flush can write prompts into a day that is already clean. The flush then removes the day from the set of clean days, and the next hourly check handles the day again. A flush into the day at the head of the queue makes the task list that day again before it marks the day clean.
 
 A record whose prompt file is gone answers with `"prompt": null` and `"prompt_deleted": true`. The answer has `prompt_deleted` only in this case.
 
@@ -245,7 +253,7 @@ No change in the answers. The days `since` and `until` of the usage endpoints ac
 - Merges: parts and day files, a late record in a finished day, and no merge of a bucket that is not ready. A stop between the write and the deletes. A flush and a checkpoint during the deletes.
 - Reads: the `seg` rule with duplicated inputs, the old layout, the order of records, and a list that makes no prompt read.
 - Usage: the checkpoint holds only flushed rows, and a start from a checkpoint reads only later rows. The three start cases. One listing of `usage/` at a start.
-- Retention: deletion after N days, and no deletion when the variable is not set. The limit of 64 deletes and 20 listings for each step. A failed delete. The answer for a deleted prompt.
+- Retention: deletion after N days, and no deletion when the variable is not set. The limit of 64 deletes and 20 listings for each step. A failed delete. The answer for a deleted prompt. A prompt read during a delete. A flush into a clean day. A day with prompts and no metadata after a restart.
 - API: the new endpoint with its error cases, and the list without prompts.
 - Admin app: the new route and the record dialog.
 - On an installation: a load run that writes a few thousand records, then a restart, with the start time and the audit page time measured.

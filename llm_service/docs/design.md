@@ -182,6 +182,7 @@ Blob storage layout, under a root set by `LLM_BLOB_ROOT` (default `llm-service`)
 <root>/audit/<day>/segments/<time>-<id>.jsonl        # metadata of one flush
 <root>/audit/<day>/parts/<bucket>.jsonl              # metadata of one 10 minute bucket
 <root>/audit/<day>/day.jsonl                         # metadata of one finished day
+<root>/audit/<day>/prompts.marker                    # the day can have prompts, no rows
 <root>/prompts/<day>/<time>-<id>.jsonl               # prompts of one flush
 <root>/usage/<day>.json                              # totals of one finished day
 <root>/usage/<day>.partial.json                      # checkpoint of the current day
@@ -330,8 +331,9 @@ After a failed flush, it waits the full 5 seconds before the next attempt.
 A flush splits each record in two parts. The prompt goes to a prompt file under
 `prompts/<day>/`. The metadata goes to a segment file under
 `audit/<day>/segments/`. Metadata is the record without the prompt, plus the
-fields `event`, `detail`, `seg` and `prompt_ref`. The flush writes the prompt
-file first. The segment file is the commit: a record exists when its metadata
+fields `event`, `detail`, `seg` and `prompt_ref`. Before the first prompt file of
+a day, the flush writes the marker `audit/<day>/prompts.marker`. The flush writes
+the prompt file before the segment file. The segment file is the commit: a record exists when its metadata
 exists. A flush writes each prompt file and each segment file one time. A merge
 writes the day file again when a late record arrives for a finished day.
 
@@ -361,7 +363,10 @@ An admin can set `LLM_PROMPT_RETENTION_DAYS`. The same background task then
 deletes the prompt files of the days that ended more than that many days ago.
 The task runs one step at most every 5 seconds. One step deletes at most 64
 prompt files, eight at a time, and lists at most 20 prompt folders. The metadata
-stays. A record whose prompt is deleted answers with `prompt_deleted`.
+stays. A record whose prompt is deleted answers with `prompt_deleted`. The task
+finds the days in the listing of `audit/`. The prompt marker puts a day there,
+also when the day has prompts and no metadata. A flush into an old day makes
+the task handle that day again.
 
 In normal operation, a kill of the container loses the records since the last
 flush. A flush runs every 5 seconds. It can wait for the write of one merged

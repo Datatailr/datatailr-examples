@@ -345,6 +345,7 @@ All data is in blob storage, under the root directory in `LLM_BLOB_ROOT`:
 <root>/audit/<day>/segments/<time>-<id>.jsonl        # metadata of one flush
 <root>/audit/<day>/parts/<bucket>.jsonl              # metadata of one 10 minute bucket
 <root>/audit/<day>/day.jsonl                         # metadata of one finished day
+<root>/audit/<day>/prompts.marker                    # the day can have prompts, no rows
 <root>/prompts/<day>/<time>-<id>.jsonl               # prompts of one flush
 <root>/usage/<day>.json                              # totals of one finished day
 <root>/usage/<day>.partial.json                      # checkpoint of the current day
@@ -352,7 +353,7 @@ All data is in blob storage, under the root directory in `LLM_BLOB_ROOT`:
 
 The service writes `.complete` after the last weight file. The marker lists each file with its size. An upload that stops half way is not used. When the service downloads a model from blob storage, it downloads only the listed files and checks their sizes. If a file is missing or has the wrong size, the load fails with an error that names the file.
 
-A flush writes the prompts first, then the metadata. The service merges the metadata of each 10 minutes into one part file, and the parts of a finished day into one day file. The merges run in a background task of their own, so a flush does not wait for them. A bucket merges 1 to 2 minutes after its end, and a day 15 to 16 minutes after its end. A `<day>` is a UTC day like `2026-11-11`. A `<bucket>` is the date, the hour and the tens digit of the minute, like `20261111T140`. The prompts live in their own folder, so a list of the audit log never reads them. The design document [docs/audit-storage-design.md](docs/audit-storage-design.md) describes the layout.
+A flush writes the prompts first, then the metadata. Before the first prompts of a day, it writes the small marker `prompts.marker` in the audit folder of the day. Prompt retention uses the marker to find the day. The service merges the metadata of each 10 minutes into one part file, and the parts of a finished day into one day file. The merges run in a background task of their own, so a flush does not wait for them. A bucket merges 1 to 2 minutes after its end, and a day 15 to 16 minutes after its end. A `<day>` is a UTC day like `2026-11-11`. A `<bucket>` is the date, the hour and the tens digit of the minute, like `20261111T140`. The prompts live in their own folder, so a list of the audit log never reads them. The design document [docs/audit-storage-design.md](docs/audit-storage-design.md) describes the layout.
 
 Files of the old layout, `audit/<day>/<time>-<id>.jsonl` with the full records, stay readable. The service never merges or changes them. Their records show in the list and count in the usage totals.
 
