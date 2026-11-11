@@ -265,7 +265,7 @@ def create_app(
                         404,
                         "invalid_request_error",
                         "model_not_found",
-                        f"the model {body['model']!r} is not served, the active model is {active!r}",
+                        f"the model {body['model']!r} is not served, the served model is {active!r}",
                     )
                 )
 

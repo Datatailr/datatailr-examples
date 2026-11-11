@@ -218,7 +218,7 @@ A switch runs these steps. Steps 2 and 3 are the two phases of a switch.
    and starts a background task. A second switch during `loading` gets 409.
 2. The fetch phase. The task gets the weights on local disk. The old vLLM
    process still runs, so the old model keeps serving requests. A request for
-   the new model gets 404 until the switch ends.
+   the new model gets 404 during the fetch.
 3. The restart phase. The task clears `serving` and stops the old vLLM process.
    Then it starts vLLM on the new directory with
    `--served-model-name <org/name>`. Requests get 503 with code
