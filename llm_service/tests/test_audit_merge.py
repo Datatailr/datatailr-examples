@@ -80,6 +80,7 @@ def make(when: datetime, retention_days=None, store=None):
     store = store if store is not None else Store()
     log = AuditLog(store, ROOT, now=clock)
     merger = AuditMerger(store, ROOT, log, now=clock, retention_days=retention_days)
+    log.flushed_listeners.append(merger.flushed)
     return clock, store, log, merger
 
 
@@ -108,10 +109,10 @@ def test_a_bucket_merges_only_one_minute_after_its_end():
     clock.when = at(11, 14, 10, 30)
     later = write(log, rec("carol", "2026-11-11T14:10:30.000Z"))
     clock.when = at(11, 14, 10, 59, 999999)
-    merger.tick()
+    merger.merge()
     assert files(store) == [segment_path(ROOT, DAY, first), segment_path(ROOT, DAY, later)]
     clock.when = at(11, 14, 11)
-    merger.tick()
+    merger.merge()
     assert files(store) == [part_path(ROOT, DAY, "20261111T140"), segment_path(ROOT, DAY, later)]
     assert [row["user"] for row in lines(store, part_path(ROOT, DAY, "20261111T140"))] == ["alice", "bob"]
 
@@ -125,7 +126,7 @@ def test_rows_keep_their_seg_and_their_order():
         name = write(log, *records)
         expected.extend(lines(store, segment_path(ROOT, DAY, name)))
     clock.when = at(11, 14, 11)
-    merger.tick()
+    merger.merge()
     merged = lines(store, part_path(ROOT, DAY, "20261111T140"))
     assert merged == expected
     assert [row["user"] for row in merged] == ["alice", "bob", "carol", "bob", "alice"]
@@ -136,12 +137,12 @@ def test_the_cache_holds_the_merged_file_and_not_the_inputs():
     clock, store, log, merger = make(at(11, 23, 55))
     name = write(log, rec("alice", "2026-11-11T23:55:00.000Z"))
     clock.when = at(12, 0, 1)
-    merger.tick()
+    merger.merge()
     part = part_path(ROOT, DAY, "20261111T235")
     assert log.cached_rows(segment_path(ROOT, DAY, name)) is None
     assert [row["user"] for row in log.cached_rows(part)] == ["alice"]
     clock.when = at(12, 0, 15)
-    merger.tick()
+    merger.merge()
     assert log.cached_rows(part) is None
     assert [row["user"] for row in log.cached_rows(day_path(ROOT, DAY))] == ["alice"]
 
@@ -150,13 +151,13 @@ def test_a_day_merges_only_fifteen_minutes_after_its_end():
     clock, store, log, merger = make(at(11, 23, 55))
     write(log, rec("alice", "2026-11-11T23:55:00.000Z"))
     clock.when = at(12, 0, 1)
-    merger.tick()
+    merger.merge()
     assert files(store) == [part_path(ROOT, DAY, "20261111T235")]
     clock.when = at(12, 0, 14, 59, 999999)
-    merger.tick()
+    merger.merge()
     assert files(store) == [part_path(ROOT, DAY, "20261111T235")]
     clock.when = at(12, 0, 15)
-    merger.tick()
+    merger.merge()
     assert files(store) == [day_path(ROOT, DAY)]
     assert [row["user"] for row in lines(store, day_path(ROOT, DAY))] == ["alice"]
 
@@ -167,10 +168,10 @@ def test_a_day_merges_only_when_no_segment_is_left():
     clock.when = at(12, 0, 14, 30)
     late = write(log, rec("bob", "2026-11-11T23:59:59.000Z"))  # bucket 20261112T001
     clock.when = at(12, 0, 15)
-    merger.tick()
+    merger.merge()
     assert files(store) == [part_path(ROOT, DAY, "20261111T235"), segment_path(ROOT, DAY, late)]
     clock.when = at(12, 0, 21)
-    merger.tick()
+    merger.merge()
     assert files(store) == [day_path(ROOT, DAY)]
     assert [row["user"] for row in lines(store, day_path(ROOT, DAY))] == ["alice", "bob"]
 
@@ -179,14 +180,14 @@ def test_a_late_record_in_a_finished_day_ends_in_the_day_file():
     clock, store, log, merger = make(at(11, 23, 55))
     write(log, rec("alice", "2026-11-11T23:55:00.000Z"), rec("bob", "2026-11-11T23:56:00.000Z"))
     clock.when = at(12, 0, 15)
-    merger.tick()
+    merger.merge()
     assert files(store) == [day_path(ROOT, DAY)]
     clock.when = at(12, 0, 16)
     write(log, rec("carol", "2026-11-11T23:59:00.000Z"))
-    merger.tick()
+    merger.merge()
     assert [row["user"] for row in lines(store, day_path(ROOT, DAY))] == ["alice", "bob"]
     clock.when = at(12, 0, 21)
-    merger.tick()
+    merger.merge()
     assert files(store) == [day_path(ROOT, DAY)]
     assert [row["user"] for row in lines(store, day_path(ROOT, DAY))] == ["alice", "bob", "carol"]
     assert [row["user"] for row in log.cached_rows(day_path(ROOT, DAY))] == ["alice", "bob", "carol"]
@@ -200,11 +201,11 @@ def test_a_failed_merged_write_leaves_the_inputs_and_the_next_tick_merges(caplog
     store.fail_put = lambda path: "/parts/" in path
     clock.when = at(11, 14, 11)
     with caplog.at_level(logging.WARNING, logger="llm_service.audit"):
-        merger.tick()
+        merger.merge()
     assert files(store) == [segment_path(ROOT, DAY, name)]
     assert "failed" in caplog.text
     store.fail_put = lambda path: False
-    merger.tick()
+    merger.merge()
     assert files(store) == [part_path(ROOT, DAY, "20261111T140")]
 
 
@@ -213,10 +214,10 @@ def test_a_failed_day_write_leaves_the_parts_and_the_next_tick_merges():
     write(log, rec("alice", "2026-11-11T23:55:00.000Z"))
     store.fail_put = lambda path: path.endswith("/day.jsonl")
     clock.when = at(12, 0, 15)
-    merger.tick()
+    merger.merge()
     assert files(store) == [part_path(ROOT, DAY, "20261111T235")]
     store.fail_put = lambda path: False
-    merger.tick()
+    merger.merge()
     assert files(store) == [day_path(ROOT, DAY)]
 
 
@@ -227,13 +228,13 @@ def test_a_failed_delete_leaves_a_duplicate_that_counts_once_and_the_next_tick_r
     write(log, rec("bob", "2026-11-11T14:02:00.000Z"))
     store.fail_delete = {segment_path(ROOT, DAY, first)}
     clock.when = at(11, 14, 11)
-    merger.tick()
+    merger.merge()
     part = part_path(ROOT, DAY, "20261111T140")
     assert files(store) == [part, segment_path(ROOT, DAY, first)]
     assert [row["user"] for row in log.rows_for_day(DAY)] == ["alice", "bob"]
     assert [row["user"] for row in AuditLog(store, ROOT).rows_for_day(DAY)] == ["alice", "bob"]
     store.fail_delete = set()
-    merger.tick()
+    merger.merge()
     assert files(store) == [part]
     assert [row["user"] for row in lines(store, part)] == ["alice", "bob"]
 
@@ -242,10 +243,10 @@ def test_a_segment_next_to_an_existing_part_adds_its_rows_after_the_part_rows():
     clock, store, log, merger = make(at(11, 14, 1))
     write(log, rec("alice", "2026-11-11T14:01:00.000Z"))
     clock.when = at(11, 14, 11)
-    merger.tick()
+    merger.merge()
     row = dict(lines(store, part_path(ROOT, DAY, "20261111T140"))[0], user="bob", seg="20261111T140500.000000-ff")
     store.put(segment_path(ROOT, DAY, row["seg"]), dump_lines([row]))
-    merger.tick()
+    merger.merge()
     assert files(store) == [part_path(ROOT, DAY, "20261111T140")]
     assert [r["user"] for r in lines(store, part_path(ROOT, DAY, "20261111T140"))] == ["alice", "bob"]
 
@@ -257,7 +258,7 @@ def test_old_layout_files_are_never_merged_changed_or_deleted():
     store.put(old, body)
     write(log, rec("bob", "2026-11-01T12:00:00.000Z"))
     clock.when = at(13, 0, 0)
-    merger.tick()
+    merger.merge()
     assert files(store, "2026-11-01") == [old, day_path(ROOT, "2026-11-01")]
     assert store.get(old) == body.encode()
     assert [row["user"] for row in lines(store, day_path(ROOT, "2026-11-01"))] == ["bob"]
@@ -315,7 +316,7 @@ def put_day(store, day: str) -> str:
 
 
 def test_retain_deletes_old_prompt_folders_and_keeps_newer_days_and_all_metadata():
-    clock, store, log, merger = make(at(11, 0, 0), retention_days=2)
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
     dropped = []
     log.prompt_cache_drop = dropped.append
     old = put_day(store, "2026-11-08")
@@ -365,7 +366,7 @@ def test_retain_runs_at_most_once_an_hour_and_remembers_the_cleaned_days():
 
 
 def test_retain_tries_a_day_again_after_a_failed_delete():
-    clock, store, log, merger = make(at(11, 0, 0), retention_days=2)
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
     old = put_day(store, "2026-11-08")
     store.fail_delete = {old}
     merger.retain()
@@ -374,3 +375,168 @@ def test_retain_tries_a_day_again_after_a_failed_delete():
     clock.when = clock.when + timedelta(hours=1)
     merger.retain()
     assert not store.exists(old)
+
+
+def test_retain_keeps_a_day_exactly_at_the_limit_and_deletes_it_one_microsecond_later():
+    clock, store, log, merger = make(at(11, 0, 0), retention_days=2)
+    old = put_day(store, "2026-11-08")  # its limit is 2026-11-11 00:00
+    merger.retain()
+    assert store.exists(old)
+    later = AuditMerger(store, ROOT, log, now=Clock(at(11, 0, 0, 0, 1)), retention_days=2)
+    later.retain()
+    assert not store.exists(old)
+
+
+def prompt_listings(store) -> list[str]:
+    return [call for call in store.ls_calls if call.startswith(f"{ROOT}/prompts/")]
+
+
+def test_retain_cleans_at_most_twenty_days_in_one_call_newest_first():
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
+    first = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    days = [(first + timedelta(days=n)).strftime("%Y-%m-%d") for n in range(50)]
+    for day in days:
+        put_day(store, day)
+    store.ls_calls.clear()
+    counts = []
+    for _ in range(4):
+        before = len(prompt_listings(store))
+        merger.retain()
+        counts.append(len(prompt_listings(store)) - before)
+    assert counts == [20, 20, 10, 0]
+    assert prompt_listings(store) == [prompts_dir(ROOT, day) for day in reversed(days)]
+    assert store.ls(f"{ROOT}/prompts") == []
+
+
+def test_retain_starts_no_new_check_before_the_hour():
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
+    old = put_day(store, "2026-11-08")
+    merger.retain()
+    assert not store.exists(old)
+    newer = put_day(store, "2026-11-07")  # a day that a new check would clean
+    store.ls_calls.clear()
+    clock.when = at(11, 1, 59, 59, 999999)
+    merger.retain()
+    assert store.ls_calls == []
+    assert store.exists(newer)
+    clock.when = at(11, 2, 0)
+    merger.retain()
+    assert not store.exists(newer)
+
+
+def test_retain_tries_a_failed_day_again_at_the_next_hourly_check():
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
+    old = put_day(store, "2026-11-08")
+    store.fail_delete = {old}
+    merger.retain()
+    store.fail_delete = set()
+    store.ls_calls.clear()
+    clock.when = at(11, 1, 59)
+    merger.retain()
+    assert store.exists(old)
+    assert store.ls_calls == []
+    clock.when = at(11, 2, 0)
+    merger.retain()
+    assert not store.exists(old)
+
+
+# Cost of the merges
+
+
+def day_folder(day: str) -> str:
+    return f"{audit_dir(ROOT)}{day}/"
+
+
+def test_the_first_merge_lists_audit_once_and_later_merges_list_only_folders_with_work():
+    clock, store, log, merger = make(at(11, 14, 1))
+    store.put(f"{audit_dir(ROOT)}2026-11-01/20261101T120000.jsonl", dump_lines([rec("alice", "2026-11-01T12:00:00.000Z")]))
+    write(log, rec("alice", "2026-11-11T14:01:00.000Z"), rec("bob", "2026-11-10T14:01:00.000Z"))
+    merger = AuditMerger(store, ROOT, log, now=clock)  # a start after the flush
+    store.ls_calls.clear()
+    merger.merge()
+    assert store.ls_calls == [audit_dir(ROOT), day_folder("2026-11-10"), day_folder(DAY)]
+    store.ls_calls.clear()
+    merger.merge()
+    assert store.ls_calls == [day_folder("2026-11-10"), day_folder(DAY)]
+
+
+def test_a_merged_day_leaves_the_set_and_a_flush_puts_it_back():
+    clock, store, log, merger = make(at(11, 23, 55))
+    write(log, rec("alice", "2026-11-11T23:55:00.000Z"))
+    clock.when = at(12, 0, 15)
+    merger.merge()
+    assert files(store) == [day_path(ROOT, DAY)]
+    store.ls_calls.clear()
+    merger.merge()
+    assert store.ls_calls == []
+    clock.when = at(12, 0, 16)
+    write(log, rec("bob", "2026-11-11T23:59:00.000Z"))
+    clock.when = at(12, 0, 21)
+    merger.merge()
+    assert store.ls_calls == [day_folder(DAY)]
+    assert files(store) == [day_path(ROOT, DAY)]
+    assert [row["user"] for row in lines(store, day_path(ROOT, DAY))] == ["alice", "bob"]
+
+
+def test_tick_merges_at_most_once_a_minute():
+    clock, store, log, merger = make(at(11, 14, 1))
+    runs = []
+    merge = merger.merge
+    merger.merge = lambda: runs.append(clock.when) or merge()
+    merger.tick()
+    clock.when = at(11, 14, 1, 59, 999999)
+    merger.tick()
+    assert len(runs) == 1
+    clock.when = at(11, 14, 2)
+    merger.tick()
+    assert runs == [at(11, 14, 1), at(11, 14, 2)]
+
+
+def test_a_segment_with_no_valid_bucket_warns_once(caplog):
+    clock, store, log, merger = make(at(11, 14, 1))
+    row = dict(rec("alice", "2026-11-11T14:01:00.000Z"), seg="bad-name")
+    store.put(segment_path(ROOT, DAY, "bad-name"), dump_lines([row]))
+    with caplog.at_level(logging.DEBUG, logger="llm_service.audit"):
+        merger.merge()
+        merger.merge()
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "bad-name" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_a_failed_rewrite_of_a_part_keeps_the_part_and_the_late_segment():
+    clock, store, log, merger = make(at(11, 14, 1))
+    write(log, rec("alice", "2026-11-11T14:01:00.000Z"))
+    clock.when = at(11, 14, 11)
+    merger.merge()
+    part = part_path(ROOT, DAY, "20261111T140")
+    row = dict(lines(store, part)[0], user="bob", seg="20261111T140500.000000-ff")
+    late = segment_path(ROOT, DAY, row["seg"])
+    store.put(late, dump_lines([row]))
+    merger.flushed(DAY, row["seg"], [row])
+    store.fail_put = lambda path: path == part
+    merger.merge()
+    assert files(store) == [part, late]
+    assert [r["user"] for r in AuditLog(store, ROOT).rows_for_day(DAY)] == ["alice", "bob"]
+    store.fail_put = lambda path: False
+    merger.merge()
+    assert files(store) == [part]
+    assert [r["user"] for r in lines(store, part)] == ["alice", "bob"]
+
+
+def test_a_day_rewrite_whose_part_delete_fails_counts_each_row_once():
+    clock, store, log, merger = make(at(11, 23, 55))
+    write(log, rec("alice", "2026-11-11T23:55:00.000Z"), rec("bob", "2026-11-11T23:56:00.000Z"))
+    clock.when = at(12, 0, 15)
+    merger.merge()
+    clock.when = at(12, 0, 16)
+    write(log, rec("carol", "2026-11-11T23:59:00.000Z"))
+    part = part_path(ROOT, DAY, "20261112T001")
+    store.fail_delete = {part}
+    clock.when = at(12, 0, 21)
+    merger.merge()
+    assert files(store) == [day_path(ROOT, DAY), part]
+    assert [r["user"] for r in AuditLog(store, ROOT).rows_for_day(DAY)] == ["alice", "bob", "carol"]
+    store.fail_delete = set()
+    merger.merge()
+    assert files(store) == [day_path(ROOT, DAY)]
+    assert [r["user"] for r in lines(store, day_path(ROOT, DAY))] == ["alice", "bob", "carol"]
