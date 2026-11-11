@@ -200,14 +200,48 @@ class WeightCache:
                 except OSError:
                     pass
 
+    def remove(self, model: str, revision: str) -> bool:
+        """Delete the blob storage copy and the local copy of a model revision.
+
+        Return True if the revision had a `.complete` marker. The marker goes
+        first, so an interrupted removal leaves an unusable copy and not a
+        broken one. The lock keeps a fetch from running at the same time.
+        """
+        validate_model_name(model)
+        validate_revision(revision)
+        blob_dir = self._blob_dir(model, revision)
+        marker = f"{blob_dir}/{COMPLETE}"
+        local_model = self._local_dir / model.replace("/", "--")
+        with self._lock:
+            existed = self._store.exists(marker)
+            if existed:
+                self._store.delete(marker)
+            for path in self._store.ls(blob_dir):
+                self._store.delete(path)
+            shutil.rmtree(local_model / revision, ignore_errors=True)
+            try:
+                local_model.rmdir()  # only an empty directory goes
+            except OSError:
+                pass
+        return existed
+
     def cached(self) -> list[dict]:
-        """List the models in blob storage that have a `.complete` marker."""
+        """List the models in blob storage that have a `.complete` marker.
+
+        `size_bytes` is the total size of the files in the marker, or None if
+        the marker is not usable.
+        """
         prefix = f"{self._root}/models/"
         found = []
         for path in self._store.ls(prefix):
             parts = path[len(prefix):].split("/")
             if len(parts) == 3 and parts[2] == COMPLETE:
+                files = self._read_manifest(path)
                 found.append(
-                    {"model": parts[0].replace("--", "/", 1), "revision": parts[1]}
+                    {
+                        "model": parts[0].replace("--", "/", 1),
+                        "revision": parts[1],
+                        "size_bytes": None if files is None else sum(f["size"] for f in files),
+                    }
                 )
         return sorted(found, key=lambda e: (e["model"], e["revision"]))

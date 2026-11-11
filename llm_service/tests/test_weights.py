@@ -173,9 +173,71 @@ def test_cached_lists_only_complete(fx):
     fx.cache.ensure("org/a", "main")
     fx.store.put("root/models/org--c/main/config.json", "{}")
     assert fx.cache.cached() == [
-        {"model": "org/a", "revision": "main"},
-        {"model": "org/b", "revision": "v2"},
+        {"model": "org/a", "revision": "main", "size_bytes": 3},
+        {"model": "org/b", "revision": "v2", "size_bytes": 3},
     ]
+
+
+def test_cached_reports_the_size_from_the_manifest(fx):
+    fx.cache.ensure("org/m", "main")
+    assert fx.cache.cached() == [{"model": "org/m", "revision": "main", "size_bytes": 3}]
+
+
+def test_cached_size_is_none_for_an_unusable_manifest(fx):
+    fx.store.put(MARKER, b"not json")
+    assert fx.cache.cached()[0]["size_bytes"] is None
+
+
+def test_cached_size_is_zero_for_a_manifest_without_files(fx):
+    fx.store.put(MARKER, json.dumps({"files": []}))
+    assert fx.cache.cached()[0]["size_bytes"] == 0
+
+
+def test_remove_deletes_marker_files_and_local_directory(fx):
+    fx.cache.ensure("org/m", "main")
+    fx.cache.ensure("org/m", "v2")
+    assert fx.cache.remove("org/m", "main") is True
+    assert fx.store.ls("root/models/org--m/main") == []
+    assert not (fx.local / "org--m" / "main").exists()
+    assert (fx.local / "org--m" / "v2").exists()
+    assert [e["revision"] for e in fx.cache.cached()] == ["v2"]
+    assert fx.cache.remove("org/m", "v2") is True
+    assert fx.store.ls("root/models/org--m") == []
+    assert not (fx.local / "org--m").exists()
+    assert fx.cache.cached() == []
+
+
+def test_remove_of_an_unknown_revision_returns_false(fx):
+    fx.cache.ensure("org/m", "main")
+    assert fx.cache.remove("org/m", "other") is False
+    assert fx.cache.cached()[0]["revision"] == "main"
+
+
+def test_remove_deletes_the_marker_first(tmp_path):
+    class BreakingStore(MemoryBlobStore):
+        def __init__(self):
+            super().__init__()
+            self.deletes = 0
+
+        def delete(self, path):
+            self.deletes += 1
+            if self.deletes == 2:
+                raise OSError("simulated storage failure")
+            super().delete(path)
+
+    fx = Fixture(tmp_path, BreakingStore())
+    fx.cache.ensure("org/m", "main")
+    with pytest.raises(OSError):
+        fx.cache.remove("org/m", "main")
+    assert not fx.store.exists(MARKER)
+    assert fx.cache.cached() == []
+
+
+def test_remove_rejects_invalid_names(fx):
+    with pytest.raises(ValueError):
+        fx.cache.remove("../x", "main")
+    with pytest.raises(ValueError):
+        fx.cache.remove("org/m", "a/b")
 
 
 def test_ensure_validates_names(fx):

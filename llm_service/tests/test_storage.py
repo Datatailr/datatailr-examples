@@ -24,6 +24,14 @@ def test_memory_store_roundtrip(tmp_path):
         s.get("missing")
 
 
+def test_memory_store_delete_removes_the_key_and_ignores_a_missing_one():
+    store = MemoryBlobStore()
+    store.put("a/b", b"x")
+    store.delete("a/b")
+    store.delete("a/b")
+    assert not store.exists("a/b") and store.ls("a") == []
+
+
 class FakeBlob:
     """A stand-in for `datatailr.Blob`. It records each call."""
 
@@ -31,6 +39,7 @@ class FakeBlob:
         self.files: dict[str, bytes] = {}
         self.calls: list[tuple[str, str]] = []
         self.broken_reads: set[str] = set()
+        self.broken_deletes: set[str] = set()
         self.entries: list[dict] = []
 
     def get(self, path):
@@ -48,6 +57,12 @@ class FakeBlob:
     def exists(self, path):
         self.calls.append(("exists", path))
         return path in self.files
+
+    def delete(self, path):
+        self.calls.append(("delete", path))
+        if path in self.broken_deletes:
+            raise RuntimeError(f"dt blob rm failed for {path}")
+        self.files.pop(path, None)
 
     def ls(self, path, recursive=False):
         self.calls.append(("ls", path))
@@ -115,3 +130,22 @@ def test_datatailr_ls_keeps_files_and_strips_the_scheme(blob):
         "root/models/c.json",
     ]
     assert blob.calls == [("ls", "root/models/")]
+
+
+def test_datatailr_delete_removes_the_blob(blob):
+    blob.files["r/a"] = b"x"
+    DatatailrBlobStore().delete("r/a")
+    assert "r/a" not in blob.files and blob.calls == [("delete", "r/a")]
+
+
+def test_datatailr_delete_of_a_missing_blob_is_not_an_error(blob):
+    blob.broken_deletes.add("r/a")
+    DatatailrBlobStore().delete("r/a")
+    assert blob.calls == [("delete", "r/a"), ("exists", "r/a")]
+
+
+def test_datatailr_delete_reraises_the_error_for_an_existing_blob(blob):
+    blob.files["r/a"] = b"x"
+    blob.broken_deletes.add("r/a")
+    with pytest.raises(RuntimeError):
+        DatatailrBlobStore().delete("r/a")

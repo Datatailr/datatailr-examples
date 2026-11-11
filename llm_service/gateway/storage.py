@@ -30,6 +30,9 @@ class BlobStore(Protocol):
     def exists(self, path: str) -> bool:
         """Return True if a file exists at `path`."""
 
+    def delete(self, path: str) -> None:
+        """Delete the file at `path`. A missing file is not an error."""
+
 
 class MemoryBlobStore:
     """Dict backed blob store for tests and local runs."""
@@ -59,6 +62,9 @@ class MemoryBlobStore:
 
     def exists(self, path: str) -> bool:
         return path in self._files
+
+    def delete(self, path: str) -> None:
+        self._files.pop(path, None)
 
 
 class DatatailrBlobStore:
@@ -116,3 +122,11 @@ class DatatailrBlobStore:
 
     def exists(self, path: str) -> bool:
         return bool(self._blob.exists(path))
+
+    def delete(self, path: str) -> None:
+        try:
+            self._blob.delete(path)
+        except Exception:
+            if self._missing(path):
+                return
+            raise
