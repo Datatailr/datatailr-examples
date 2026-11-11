@@ -239,6 +239,7 @@ def test_status_shape(tmp_path):
     mgr, *_ = _make(tmp_path)
     assert mgr.status() == {
         "state": "empty", "active": None, "target": None, "error": None, "serving": None,
+        "rolling_back": None,
     }
 
 
@@ -673,3 +674,73 @@ def test_begin_remove_message_names_a_removal(tmp_path):
     mgr.begin_remove("org/b", ["main"])
     with pytest.raises(ModelInUse, match="being removed"):
         mgr.begin_remove("org/b", ["main"])
+
+
+def test_switch_during_a_rollback_raises_switch_in_progress(tmp_path):
+    async def run():
+        mgr, _, store, _ = _make(tmp_path)
+        engine = HoldingEngine("org/a")
+        mgr._engine = engine
+        await mgr.startup()
+        engine.armed = True
+        engine.fail_on = {"org/b"}
+        task = mgr.request_switch("org/b")
+        while not engine.waiting.is_set():
+            await asyncio.sleep(0.01)
+        # The failed switch reloads org/a. The state is `failed` until it ends.
+        assert mgr.state == "failed"
+        assert mgr.status()["rolling_back"] == A
+        with pytest.raises(SwitchInProgress):
+            mgr.request_switch("org/c")
+        assert mgr.target is None
+        engine.gate.set()
+        await task
+        assert mgr.state == "ready" and mgr.status()["rolling_back"] is None
+        assert [name for _, name in engine.started] == ["org/a", "org/a"]
+        await mgr.request_switch("org/c")
+        assert mgr.active["model"] == "org/c"
+
+    asyncio.run(run())
+
+
+class HeldActiveStore(MemoryBlobStore):
+    """A store whose check of active.json waits for `gate`. `reading` is set when it begins."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reading = threading.Event()
+        self.gate = threading.Event()
+        self.fail = False
+
+    def exists(self, path):
+        if path.endswith("state/active.json"):
+            self.reading.set()
+            self.gate.wait(10)
+            if self.fail:
+                raise OSError("store down")
+        return super().exists(path)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_begin_remove_refuses_while_the_service_starts(tmp_path, fail):
+    store = HeldActiveStore()
+    store.fail = fail
+
+    async def run():
+        mgr, _ = _with_store(tmp_path, store)
+        assert mgr.starting is False  # a manager without a startup accepts deletes
+        task = asyncio.create_task(mgr.startup())
+        assert await asyncio.to_thread(store.reading.wait, 10)
+        assert mgr.starting is True and mgr.target is None
+        with pytest.raises(ModelInUse, match="starting"):
+            mgr.begin_remove("org/x", ["main"])
+        assert mgr.removing == set()
+        store.gate.set()
+        await task
+        assert mgr.starting is False
+        mgr.begin_remove("org/x", ["main"])
+
+    try:
+        asyncio.run(run())
+    finally:
+        store.gate.set()

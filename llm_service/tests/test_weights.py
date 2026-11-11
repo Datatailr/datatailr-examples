@@ -403,3 +403,92 @@ def test_blob_fetch_of_an_empty_manifest_creates_the_directory(fx):
     assert path == fx.local / "org--m" / "main"
     assert (path / ".complete").exists()
     assert fx.calls == 0  # the blob copy was used, not Hugging Face
+
+
+class GetCountingStore(MemoryBlobStore):
+    """A memory store that counts reads and fails them for paths that contain `broken`."""
+
+    def __init__(self):
+        super().__init__()
+        self.gets: list[str] = []
+        self.broken: str | None = None
+
+    def get(self, path):
+        self.gets.append(path)
+        if self.broken and self.broken in path:
+            raise OSError("simulated storage failure")
+        return super().get(path)
+
+
+def test_cached_reads_a_known_manifest_once(tmp_path):
+    fx = Fixture(tmp_path, GetCountingStore())
+    fx.cache.ensure("org/m", "main")
+    first = fx.cache.cached()
+    fx.store.gets.clear()
+    assert fx.cache.cached() == first
+    assert fx.store.gets == []
+
+
+def test_cached_lists_every_model_when_one_manifest_read_fails(tmp_path, caplog):
+    fx = Fixture(tmp_path, GetCountingStore())
+    fx.cache.ensure("org/a", "main")
+    fx.cache.ensure("org/b", "main")
+    fx.store.broken = "org--b/main/.complete"
+    with caplog.at_level("WARNING", logger="llm_service.weights"):
+        assert fx.cache.cached() == [
+            {"model": "org/a", "revision": "main", "size_bytes": 3},
+            {"model": "org/b", "revision": "main", "size_bytes": None},
+        ]
+    assert len([m for m in caplog.messages if "org--b" in m]) == 1
+    # The failed read is not kept: the next call reads the manifest again.
+    fx.store.broken = None
+    assert fx.cache.cached()[1]["size_bytes"] == 3
+
+
+def test_remove_clears_the_size_memo(fx):
+    fx.cache.ensure("org/m", "main")
+    assert fx.cache.cached()[0]["size_bytes"] == 3
+    fx.cache.remove("org/m", "main")
+    fx.store.put("root/models/org--m/main/big.bin", b"x" * 10)
+    fx.store.put(MARKER, json.dumps({"files": [{"path": "big.bin", "size": 10}]}))
+    assert fx.cache.cached()[0]["size_bytes"] == 10
+
+
+def test_a_new_marker_after_an_unusable_one_shows_its_size(fx):
+    fx.store.put(MARKER, b"not json")
+    assert fx.cache.cached()[0]["size_bytes"] is None
+    fx.cache.ensure("org/m", "main")  # downloads again and writes a usable marker
+    assert fx.cache.cached()[0]["size_bytes"] == 3
+
+
+def test_stored_lists_revisions_with_files_with_or_without_a_marker(fx):
+    fx.cache.ensure("org/m", "v2")
+    fx.store.put("root/models/org--m/main/config.json", "{}")
+    fx.store.put("root/models/org--other/main/.complete", "")
+    assert fx.cache.stored("org/m") == ["main", "v2"]
+    assert fx.cache.stored("org/none") == []
+    with pytest.raises(ValueError):
+        fx.cache.stored("../x")
+
+
+def test_remove_after_a_failed_remove_deletes_the_rest(tmp_path):
+    class FailOnce(MemoryBlobStore):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+        def delete(self, path):
+            if path.endswith("config.json") and not self.failed:
+                self.failed = True
+                raise OSError("simulated storage failure")
+            super().delete(path)
+
+    fx = Fixture(tmp_path, FailOnce())
+    fx.cache.ensure("org/m", "main")
+    with pytest.raises(OSError):
+        fx.cache.remove("org/m", "main")
+    assert fx.cache.cached() == []
+    assert fx.cache.stored("org/m") == ["main"]
+    fx.cache.remove("org/m", "main")
+    assert fx.cache.stored("org/m") == []
+    assert fx.store.ls("root/models/org--m") == []

@@ -80,9 +80,22 @@ class WeightCache:
         self._local_dir = Path(local_dir)
         self._download = download
         self._lock = threading.Lock()
+        # Sizes of complete markers, keyed by the marker path. A usable marker
+        # never changes, so `cached` reads each one once. `remove` and a new
+        # upload drop entries and bump the generation, so a read that started
+        # before them keeps no stale size. `cached` runs in worker threads.
+        self._sizes: dict[str, int] = {}
+        self._sizes_generation = 0
+        self._sizes_lock = threading.Lock()
 
     def _blob_dir(self, model: str, revision: str) -> str:
         return f"{self._root}/models/{model.replace('/', '--')}/{revision}"
+
+    def _forget_size(self, marker: str) -> None:
+        """Drop the memo of one marker. Call it when the marker is removed or written."""
+        with self._sizes_lock:
+            self._sizes.pop(marker, None)
+            self._sizes_generation += 1
 
     def ensure(self, model: str, revision: str) -> Path:
         """Return the local directory of the model. Fetch the files if needed."""
@@ -166,6 +179,7 @@ class WeightCache:
                     continue
                 self._store.put_file(f"{blob_dir}/{relative.as_posix()}", file)
                 files.append({"path": relative.as_posix(), "size": file.stat().st_size})
+            self._forget_size(f"{blob_dir}/{COMPLETE}")
             self._store.put(f"{blob_dir}/{COMPLETE}", json.dumps({"files": files}))
         except BaseException:
             shutil.rmtree(target, ignore_errors=True)
@@ -205,7 +219,8 @@ class WeightCache:
 
         Return True if the revision had a `.complete` marker. The marker goes
         first, so an interrupted removal leaves an unusable copy and not a
-        broken one. The lock keeps a fetch from running at the same time.
+        broken one. `stored` still lists such a copy, so a second call removes
+        the rest. The lock keeps a fetch from running at the same time.
         """
         validate_model_name(model)
         validate_revision(revision)
@@ -213,11 +228,13 @@ class WeightCache:
         marker = f"{blob_dir}/{COMPLETE}"
         local_model = self._local_dir / model.replace("/", "--")
         with self._lock:
+            self._forget_size(marker)
             existed = self._store.exists(marker)
             if existed:
                 self._store.delete(marker)
             for path in self._store.ls(blob_dir):
                 self._store.delete(path)
+            self._forget_size(marker)
             shutil.rmtree(local_model / revision, ignore_errors=True)
             try:
                 local_model.rmdir()  # only an empty directory goes
@@ -225,23 +242,59 @@ class WeightCache:
                 pass
         return existed
 
+    def stored(self, model: str) -> list[str]:
+        """Return the sorted revisions of `model` that have files in blob storage.
+
+        A revision counts with or without a `.complete` marker. So the list
+        also holds the rest of a copy that a failed removal left.
+        """
+        validate_model_name(model)
+        prefix = f"{self._root}/models/{model.replace('/', '--')}/"
+        revisions = set()
+        for path in self._store.ls(prefix):
+            parts = path[len(prefix):].split("/")
+            if len(parts) >= 2 and _valid_part(parts[0]):
+                revisions.add(parts[0])
+        return sorted(revisions)
+
+    def _size(self, marker: str) -> int | None:
+        """Return the total size of the files in a marker, or None if it is not known.
+
+        A store error gives None with a warning. Only a usable size is kept.
+        """
+        with self._sizes_lock:
+            if marker in self._sizes:
+                return self._sizes[marker]
+            generation = self._sizes_generation
+        try:
+            files = self._read_manifest(marker)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not read the marker %s: %s", marker, exc)
+            return None
+        if files is None:
+            return None
+        size = sum(f["size"] for f in files)
+        with self._sizes_lock:
+            if generation == self._sizes_generation:
+                self._sizes[marker] = size
+        return size
+
     def cached(self) -> list[dict]:
         """List the models in blob storage that have a `.complete` marker.
 
         `size_bytes` is the total size of the files in the marker, or None if
-        the marker is not usable.
+        the marker is not usable or cannot be read now.
         """
         prefix = f"{self._root}/models/"
         found = []
         for path in self._store.ls(prefix):
             parts = path[len(prefix):].split("/")
             if len(parts) == 3 and parts[2] == COMPLETE:
-                files = self._read_manifest(path)
                 found.append(
                     {
                         "model": parts[0].replace("--", "/", 1),
                         "revision": parts[1],
-                        "size_bytes": None if files is None else sum(f["size"] for f in files),
+                        "size_bytes": self._size(path),
                     }
                 )
         return sorted(found, key=lambda e: (e["model"], e["revision"]))

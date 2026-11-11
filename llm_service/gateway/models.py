@@ -31,6 +31,8 @@ class ModelManager:
     an admin switch, `serving` is the old model and the state is `loading`.
     `rolling_back` is the previous model while a failed switch reloads it.
     `removing` holds the (model, revision) pairs that a delete removes now.
+    `starting` is True while `startup` reads the saved model, before `target`
+    names it.
     """
 
     def __init__(
@@ -56,6 +58,8 @@ class ModelManager:
         self.serving: dict | None = None
         self.rolling_back: dict | None = None
         self.removing: set[tuple[str, str]] = set()
+        # `startup` sets the flag. A manager that never starts accepts deletes.
+        self.starting = False
 
     @property
     def _active_path(self) -> str:
@@ -69,19 +73,27 @@ class ModelManager:
             "target": self.target,
             "error": self.error,
             "serving": self.serving,
+            "rolling_back": self.rolling_back,
         }
 
     async def startup(self) -> None:
-        """Load the saved model, or the default one. Never raise."""
+        """Load the saved model, or the default one. Never raise.
+
+        No delete runs while the saved model is read: `begin_remove` refuses it.
+        """
+        self.starting = True
         try:
             wanted = await asyncio.to_thread(self._read_active)
             self._begin(wanted)
+            self.starting = False
             await self._load(wanted, previous=None, trigger="startup")
         except Exception as exc:  # noqa: BLE001
             log.exception("startup failed")
             self.state = "failed"
             self.target = None
             self.error = str(exc)
+        finally:
+            self.starting = False
 
     def _read_active(self) -> dict:
         """Return the saved model. It runs in a worker thread."""
@@ -112,6 +124,8 @@ class ModelManager:
             raise ModelInUse(f"{model} {revision} is being removed")
         if self.state == "loading":
             raise SwitchInProgress("a model switch is already running")
+        if self.rolling_back is not None:
+            raise SwitchInProgress("the service loads the previous model again after a failed switch")
         wanted = {"model": model, "revision": revision}
         self._begin(wanted)
         self._task = asyncio.create_task(
@@ -122,11 +136,14 @@ class ModelManager:
     def begin_remove(self, model: str, revisions: list[str]) -> None:
         """Mark revisions of a model as being removed.
 
-        Raise `ModelInUse` if one of them is the active, serving, target or
-        rollback model, or is already being removed. Nothing is marked in that case.
+        Raise `ModelInUse` while the service starts, or if one of them is the
+        active, serving, target or rollback model, or is already being removed.
+        Nothing is marked in that case.
         Call `end_remove` when the removal ends. The check and the mark run
         without an `await`, so no switch can start between them.
         """
+        if self.starting:
+            raise ModelInUse("the service is starting")
         pairs = {(model, revision) for revision in revisions}
         busy = {
             (entry["model"], entry["revision"])
@@ -261,6 +278,9 @@ class ModelManager:
                 except Exception as exc:  # noqa: BLE001
                     log.error("rollback to %s failed: %s", previous["model"], exc)
                 else:
+                    # Clear the mark with the state change, so no reader sees
+                    # `ready` while a rollback still shows.
+                    self.rolling_back = None
                     self.active = dict(previous)
                     self.serving = dict(previous)
                     self.state = "ready"

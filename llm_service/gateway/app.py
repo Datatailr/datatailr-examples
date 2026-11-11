@@ -294,8 +294,8 @@ def create_app(
 
         The status is `loading` for the model that loads, `active` for the
         model that the engine serves now and `cached` for the rest. `revision` is the loading or
-        active revision, else the first cached one. `size_bytes` is the sum of the sizes of the
-        cached revisions, or None if there is none.
+        active revision, else the first cached one. `size_bytes` is the sum of the known sizes of
+        the cached revisions, or None if no cached revision has a known size.
         """
         revisions: dict[str, list[str]] = {}
         sizes: dict[str, list[int]] = {}
@@ -321,7 +321,7 @@ def create_app(
                     "status": status,
                     "revision": revision,
                     "revisions": cached,
-                    "size_bytes": sum(sizes.get(name, [])) if cached else None,
+                    "size_bytes": sum(sizes[name]) if name in sizes else None,
                 }
             )
         rank = {"active": 0, "loading": 1, "cached": 2}
@@ -384,12 +384,12 @@ def create_app(
                 validate_revision(revision)
         except ValueError as error:
             raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
-        cached = await asyncio.to_thread(weights.cached)
-        found = sorted(
-            e["revision"] for e in cached if e["model"] == model_id and revision in (None, e["revision"])
-        )
+        # Select from the files in blob storage, not from the complete copies.
+        # So a second delete also removes what a failed delete left.
+        stored = await asyncio.to_thread(weights.stored, model_id)
+        found = [name for name in stored if revision in (None, name)]
         if not found:
-            raise ApiError(404, "invalid_request_error", "model_not_found", f"no cached copy of {model_id!r} matches")
+            raise ApiError(404, "invalid_request_error", "model_not_found", f"no stored copy of {model_id!r} matches")
         try:
             manager.begin_remove(model_id, found)
         except ModelInUse as error:

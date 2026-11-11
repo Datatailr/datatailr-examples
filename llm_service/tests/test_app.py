@@ -230,6 +230,7 @@ def test_models_list_has_one_entry_per_model(client):
     body = client.get("/v1/models", headers=BOB).json()
     assert body["object"] == "list"
     # Only org/a main has a usable manifest. The sum skips the unusable ones.
+    # org/b has no known size at all, so its size is null.
     assert body["data"] == [
         {
             "id": "org/a", "object": "model", "created": 0, "owned_by": "org",
@@ -239,7 +240,7 @@ def test_models_list_has_one_entry_per_model(client):
         {
             "id": "org/b", "object": "model", "created": 0, "owned_by": "org",
             "status": "cached", "revision": "main", "revisions": ["main", "v2"],
-            "size_bytes": 0,
+            "size_bytes": None,
         },
     ]
 
@@ -623,6 +624,7 @@ def test_non_admin_caller_with_acting_user_is_403(client):
 def test_non_admin_caller_with_bad_acting_user_is_403(client):
     r = client.get("/admin/model", headers=BOB | {ACTING: "x" * 257})
     assert r.status_code == 403
+    assert r.json()["error"]["code"] == "admin_required"
 
 
 def test_admin_acting_user_is_accepted(client):
@@ -878,3 +880,98 @@ def test_delete_the_model_of_a_running_rollback_is_409(tmp_path):
             assert "org/a" in model_ids(c)
     finally:
         engine.gate.set()
+
+
+def test_switch_during_a_rollback_is_409(tmp_path):
+    engine = RollbackEngine()
+    try:
+        with TestClient(make_app(tmp_path, engine)) as c:
+            wait_ready(c)
+            engine.armed = True
+            c.post("/admin/model", headers=ALICE, json={"model": "org/other"})
+            assert engine.waiting.wait(10)
+            status = c.get("/admin/model", headers=ALICE).json()
+            assert status["state"] == "failed"
+            assert status["rolling_back"] == {"model": "org/a", "revision": "main"}
+            r = c.post("/admin/model", headers=ALICE, json={"model": "org/c"})
+            assert r.status_code == 409 and r.json()["error"]["code"] == "switch_in_progress"
+            engine.gate.set()
+            status = wait_ready(c)
+            assert status["rolling_back"] is None
+            assert [name for _, name in engine.started] == ["org/a", "org/a"]
+    finally:
+        engine.gate.set()
+
+
+def test_a_second_delete_removes_what_a_failed_delete_left(tmp_path):
+    store = FailingDeleteStore()
+    with TestClient(make_app(tmp_path, store=store), raise_server_exceptions=False) as c:
+        wait_ready(c)
+        switch_and_wait(c, "org/other")
+        switch_and_wait(c, "org/a")
+        # The marker goes first, then the delete of a file fails.
+        store.broken = "org--other/main/config.json"
+        r = c.delete("/admin/models/org/other", headers=ALICE)
+        assert r.status_code == 500 and r.json()["error"]["code"] == "delete_failed"
+        assert "org/other" not in model_ids(c)
+        assert store.ls("llm-service/models/org--other") != []
+        store.broken = None
+        r = c.delete("/admin/models/org/other", headers=ALICE)
+        assert r.status_code == 200
+        assert r.json() == {"deleted": [{"model": "org/other", "revision": "main"}]}
+        assert store.ls("llm-service/models/org--other") == []
+        assert delete_events(c)[0]["prompt"]["revisions"] == ["main"]
+
+
+def test_delete_removes_leftovers_without_a_marker(client):
+    store = client.app.state.manager._store
+    store.put("llm-service/models/org--x/main/config.json", "{}")
+    store.put("llm-service/models/org--x/v2/weights.bin", "w")
+    r = client.delete("/admin/models/org/x?revision=v2", headers=ALICE)
+    assert r.status_code == 200 and r.json() == {"deleted": [{"model": "org/x", "revision": "v2"}]}
+    r = client.delete("/admin/models/org/x", headers=ALICE)
+    assert r.json() == {"deleted": [{"model": "org/x", "revision": "main"}]}
+    assert store.ls("llm-service/models/org--x") == []
+    assert [e["prompt"]["revisions"] for e in delete_events(client)] == [["main"], ["v2"]]
+    r = client.delete("/admin/models/org/x", headers=ALICE)
+    assert r.status_code == 404 and r.json()["error"]["code"] == "model_not_found"
+
+
+class HeldMarkerStore(MemoryBlobStore):
+    """A store whose write of the `org--b` marker waits for `gate`. `uploading` is set then."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.uploading = threading.Event()
+        self.gate = threading.Event()
+
+    def put(self, path, data):
+        if "org--b/main/.complete" in path:
+            self.uploading.set()
+            self.gate.wait(10)
+        super().put(path, data)
+
+
+def test_delete_of_a_target_in_its_fetch_phase_is_409(tmp_path):
+    store = HeldMarkerStore()
+    try:
+        with TestClient(make_app(tmp_path, store=store)) as c:
+            wait_ready(c)
+            c.post("/admin/model", headers=ALICE, json={"model": "org/b"})
+            assert store.uploading.wait(10)
+            # The files of org/b are in blob storage. Its marker is not there yet.
+            assert "org/b" not in [e["id"] for e in c.get("/v1/models", headers=BOB).json()["data"]
+                                   if e["status"] == "cached"]
+            r = c.delete("/admin/models/org/b", headers=ALICE)
+            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            store.gate.set()
+            wait_for(c, lambda s: s["state"] == "ready" and s["active"]["model"] == "org/b")
+    finally:
+        store.gate.set()
+
+
+def test_models_list_size_is_null_when_no_size_is_known(client):
+    store = client.app.state.manager._store
+    store.put("llm-service/models/org--b/main/.complete", "not json")
+    entry = client.get("/v1/models/org/b", headers=BOB).json()
+    assert entry["revisions"] == ["main"] and entry["size_bytes"] is None
