@@ -255,3 +255,101 @@ def test_page_has_no_html_sinks():
         text = (STATIC_DIR / name).read_text()
         for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"):
             assert sink not in text, (name, sink)
+
+
+def _timeout(request: httpx.Request) -> float:
+    return request.extensions["timeout"]["read"]
+
+
+def test_switch_and_delete_wait_longer_than_other_calls(client, service):
+    client.post("/api/model", json={"model": "org/name"}, headers=ALICE)
+    client.delete("/api/models/org/name", headers=ALICE)
+    client.get("/api/usage", headers=ALICE)
+    client.get("/api/status", headers=ALICE)
+    switch, delete, usage, *status = service.requests
+    assert _timeout(switch) == 300 and _timeout(delete) == 300
+    assert _timeout(usage) == 30 and all(_timeout(r) == 30 for r in status)
+
+
+@pytest.mark.parametrize(
+    "method, path, kwargs",
+    [("POST", "/api/model", {"json": {"model": "org/name"}}), ("DELETE", "/api/models/org/name", {})],
+)
+def test_a_slow_switch_or_delete_says_that_it_may_still_finish(client, service, method, path, kwargs):
+    service.error = httpx.ReadTimeout("slow")
+    response = client.request(method, path, headers=ALICE, **kwargs)
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["code"] == "service_unreachable"
+    assert "in time" in error["message"] and "may still finish" in error["message"]
+
+
+def test_a_slow_read_keeps_the_plain_message(client, service):
+    service.error = httpx.ReadTimeout("slow")
+    response = client.get("/api/usage", headers=ALICE)
+    assert response.status_code == 502
+    assert "may still finish" not in response.json()["error"]["message"]
+
+
+def test_a_refused_connection_on_a_switch_keeps_the_plain_message(client, service):
+    service.error = httpx.ConnectError("refused")
+    response = client.post("/api/model", json={"model": "org/name"}, headers=ALICE)
+    assert response.status_code == 502
+    assert "may still finish" not in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("name", ["   ", "\t"])
+def test_a_blank_viewer_name_is_401(client, service, name):
+    response = client.get("/api/usage", headers={"X-Datatailr-User": json.dumps({"name": name})})
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "missing_user"
+    assert service.requests == []
+
+
+def test_the_viewer_name_is_sent_stripped(client, service):
+    client.get("/api/usage", headers={"X-Datatailr-User": json.dumps({"name": "  alice "})})
+    assert service.requests[0].headers["X-LLM-Acting-User"] == "alice"
+    assert client.get("/api/me", headers={"X-Datatailr-User": json.dumps({"name": " bob "})}).json()["user"] == "bob"
+
+
+def test_a_viewer_name_that_is_not_ascii_is_401(client, service):
+    response = client.get("/api/usage", headers={"X-Datatailr-User": json.dumps({"name": "alïce"})})
+    assert response.status_code == 401
+    error = response.json()["error"]
+    assert error["code"] == "missing_user"
+    assert "not usable for the admin app" in error["message"]
+    assert service.requests == []
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Content-Type": "text/plain"}, {"Content-Type": "application/x-www-form-urlencoded"},
+     {"Content-Type": "multipart/form-data; boundary=x"}],
+)
+def test_switch_needs_a_json_content_type(client, service, headers):
+    response = client.post("/api/model", content=b'{"model": "org/name"}', headers=ALICE | headers)
+    assert response.status_code == 415
+    error = response.json()["error"]
+    assert error["code"] == "unsupported_media_type" and error["type"] == "invalid_request_error"
+    assert service.requests == []
+
+
+@pytest.mark.parametrize("content_type", ["application/json", "application/json; charset=utf-8", "Application/JSON"])
+def test_switch_accepts_a_json_content_type_with_parameters(client, service, content_type):
+    response = client.post("/api/model", content=b'{"model": "org/name"}',
+                           headers=ALICE | {"Content-Type": content_type})
+    assert response.status_code == 200
+    assert json.loads(service.requests[0].content) == {"model": "org/name"}
+
+
+def test_switch_with_a_body_that_is_not_json_is_400(client, service):
+    response = client.post("/api/model", content=b"{nope", headers=ALICE | {"Content-Type": "application/json"})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_json"
+    assert service.requests == []
+
+
+def test_page_sends_a_json_content_type_on_its_post():
+    text = (STATIC_DIR / "app.js").read_text()
+    posts = re.findall(r"method: 'POST'[^}]*}", text)
+    assert posts and all("'Content-Type': 'application/json'" in post for post in posts)

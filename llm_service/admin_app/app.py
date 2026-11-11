@@ -17,17 +17,37 @@ from llm_service.gateway.identity import user_from_headers
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TIMEOUT_SECONDS = 30.0
+# A switch or a delete can wait for the weight cache lock while another model downloads.
+ACTION_TIMEOUT_SECONDS = 300.0
 MAX_VIEWER_LENGTH = 256
+UNREACHABLE = "The LLM service did not give a valid answer."
+TOO_SLOW = "The LLM service did not answer in time. The action may still finish. Use Reload to see the state."
+
+
+class UnusableViewer(Exception):
+    """The platform user name cannot go into a header to the service."""
 
 
 def _viewer(request: Request) -> str | None:
-    """Return the viewer name, or None when it is missing or not usable in a header."""
-    name = user_from_headers(request.headers)
-    if name is None or len(name) > MAX_VIEWER_LENGTH:
+    """Return the stripped viewer name, or None when the request has no usable name.
+
+    Raise `UnusableViewer` for a name that is too long, has a control
+    character or is not ASCII.
+    """
+    name = (user_from_headers(request.headers) or "").strip()
+    if not name:
         return None
+    if len(name) > MAX_VIEWER_LENGTH or not name.isascii():
+        raise UnusableViewer(name)
     if any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
-        return None
+        raise UnusableViewer(name)
     return name
+
+
+def _is_json(request: Request) -> bool:
+    """Return True if the request has the content type `application/json`, with or without parameters."""
+    media_type = request.headers.get("content-type", "").split(";", 1)[0]
+    return media_type.strip().lower() == "application/json"
 
 
 def _error(status: int, code: str, message: str, kind: str = "server_error") -> JSONResponse:
@@ -72,15 +92,27 @@ def create_app(service_url: str, http: httpx.AsyncClient | None = None) -> FastA
 
     app = FastAPI(title="LLM Service Admin", lifespan=lifespan)
 
-    async def fetch(request: Request, method: str, path: str, **options) -> tuple[int, object] | JSONResponse:
-        """Call the service for the viewer. Return the answer, or an error response to send."""
-        viewer = _viewer(request)
+    async def fetch(
+        request: Request, method: str, path: str, action: bool = False, **options
+    ) -> tuple[int, object] | JSONResponse:
+        """Call the service for the viewer. Return the answer, or an error response to send.
+
+        `action` marks a switch or a delete. It waits longer, and a timeout says
+        that the action may still finish.
+        """
+        try:
+            viewer = _viewer(request)
+        except UnusableViewer:
+            return _error(
+                401, "missing_user", "The platform user name is not usable for the admin app.", "authentication_error"
+            )
         if viewer is None:
             return _error(401, "missing_user", "The request has no platform user.", "authentication_error")
         try:
-            return await service.request(method, path, viewer, **options)
-        except ServiceUnreachable:
-            return _error(502, "service_unreachable", "The LLM service did not give a valid answer.")
+            timeout = ACTION_TIMEOUT_SECONDS if action else TIMEOUT_SECONDS
+            return await service.request(method, path, viewer, timeout=timeout, **options)
+        except ServiceUnreachable as error:
+            return _error(502, "service_unreachable", TOO_SLOW if action and error.sent else UNREACHABLE)
 
     async def call(request: Request, method: str, path: str, **options) -> JSONResponse:
         """Call the service and pass its status and body through."""
@@ -97,10 +129,8 @@ def create_app(service_url: str, http: httpx.AsyncClient | None = None) -> FastA
         if isinstance(result, JSONResponse):
             return result
         status = result[0]
-        if status == 403:
-            return JSONResponse({"user": _viewer(request), "admin": False})
-        if status == 200:
-            return JSONResponse({"user": _viewer(request), "admin": True})
+        if status in (200, 403):
+            return JSONResponse({"user": _viewer(request), "admin": status == 200})
         return _reply(result)
 
     @app.get("/api/status")
@@ -112,16 +142,21 @@ def create_app(service_url: str, http: httpx.AsyncClient | None = None) -> FastA
         if isinstance(models, JSONResponse) or models[0] != 200:
             return models if isinstance(models, JSONResponse) else _reply(models)
         if not isinstance(models[1], dict):
-            return _error(502, "service_unreachable", "The LLM service did not give a valid answer.")
+            return _error(502, "service_unreachable", UNREACHABLE)
         return JSONResponse({"engine": engine[1], "models": models[1].get("data", [])})
 
     @app.post("/api/model")
     async def switch_model(request: Request) -> JSONResponse:
+        # A form on another site cannot send this content type without a CORS preflight.
+        if not _is_json(request):
+            return _error(
+                415, "unsupported_media_type", "The request body must be application/json.", "invalid_request_error"
+            )
         try:
             body = await request.json()
         except ValueError:
             return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
-        return await call(request, "POST", "/admin/model", json=body)
+        return await call(request, "POST", "/admin/model", action=True, json=body)
 
     @app.delete("/api/models/{model_id:path}")
     async def delete_model(model_id: str, request: Request) -> JSONResponse:
@@ -132,6 +167,7 @@ def create_app(service_url: str, http: httpx.AsyncClient | None = None) -> FastA
             request,
             "DELETE",
             path,
+            action=True,
             params=_query(request, ("revision",)),
         )
 
