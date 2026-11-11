@@ -188,7 +188,8 @@ class AuditLog:
         self._versions: dict[str, int] = {}  # path -> changes made while a read ran
         self._rows_lock = threading.Lock()  # guards the five fields above
         self._prompts: OrderedDict[str, list] = OrderedDict()  # path -> parsed prompt lines
-        self._prompts_lock = threading.Lock()
+        self._prompt_drops: dict[str, int] = {}  # day -> calls of `prompt_cache_drop`
+        self._prompts_lock = threading.Lock()  # guards the two fields above
         self.listeners: list[Callable[[dict], None]] = []
         self.flushed_listeners: list[Callable[[str, str, list[dict]], None]] = []
 
@@ -631,7 +632,7 @@ class AuditLog:
             path = _legacy_path(self._root, day, ref["file"])
         else:
             path = prompt_path(self._root, day, ref["file"])
-        lines = self._prompt_lines(path)
+        lines = self._prompt_lines(day, path)
         if lines is None:
             if legacy:
                 raise PromptUnreadable(f"the audit file {path} is missing")
@@ -647,19 +648,29 @@ class AuditLog:
         return join_record(row, line["prompt"])
 
     def prompt_cache_drop(self, day: str) -> None:
-        """Drop the cached prompt files of `day`. Call it after their folder is deleted."""
+        """Drop the cached prompt files of `day`. Call it after prompt files of `day` are deleted.
+
+        A prompt read of `day` that runs now does not put its result into the cache.
+        """
         prefix = prompts_dir(self._root, day)
         with self._prompts_lock:
+            self._prompt_drops[day] = self._prompt_drops.get(day, 0) + 1
             for path in [p for p in self._prompts if p.startswith(prefix)]:
                 del self._prompts[path]
 
-    def _prompt_lines(self, path: str) -> list | None:
-        """Return the parsed lines of a prompt file, or None when it does not exist."""
+    def _prompt_lines(self, day: str, path: str) -> list | None:
+        """Return the parsed lines of the prompt file `path` of `day`, or None when it is missing.
+
+        The result goes into the cache only when no `prompt_cache_drop` of `day` ran during
+        the read. Else retention deleted the file during the read, and the cache must not
+        keep it. The caller still gets the lines that it read.
+        """
         with self._prompts_lock:
             lines = self._prompts.get(path)
             if lines is not None:
                 self._prompts.move_to_end(path)
                 return lines
+            drops = self._prompt_drops.get(day, 0)
         try:
             data = self._store.get(path)
         except KeyError:
@@ -668,6 +679,8 @@ class AuditLog:
             raise PromptUnreadable(f"cannot read {path}: {error}") from error
         lines = parse_lines(data.decode("utf-8", errors="replace"))
         with self._prompts_lock:
+            if self._prompt_drops.get(day, 0) != drops:
+                return lines
             self._prompts[path] = lines
             self._prompts.move_to_end(path)
             while len(self._prompts) > PROMPT_CACHE_SIZE:

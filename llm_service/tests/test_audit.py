@@ -1268,3 +1268,46 @@ def test_read_many_reads_in_parallel_keeps_the_order_and_gives_empty_for_a_missi
     chunks = log.read_many([paths[2], missing, paths[1], paths[0]])
     assert [[row["user"] for row in chunk] for chunk in chunks] == [["u2"], [], ["cached"], ["u0"]]
     assert sorted(store.gets) == sorted([paths[0], paths[2], missing])
+
+
+class PausedPromptRead(MemoryBlobStore):
+    """A store whose reads of prompt files wait for `release` after they got the data."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pause = False
+        self.reading = threading.Event()
+        self.release = threading.Event()
+
+    def get(self, path):
+        data = super().get(path)
+        if self.pause and "/prompts/" in path:
+            self.reading.set()
+            assert self.release.wait(5)
+        return data
+
+
+def test_a_prompt_read_that_overlaps_a_retention_delete_is_not_cached():
+    store = PausedPromptRead()
+    _, writer = make(store)
+    alice = rec("alice", T)
+    writer.add(alice)
+    writer.flush()
+    log = AuditLog(store, "root")
+    (path,) = store.ls("root/prompts")
+    store.pause = True
+    answers = []
+    reader = threading.Thread(target=lambda: answers.append(log.record(DAY, alice["request_id"])))
+    reader.start()
+    try:
+        assert store.reading.wait(5)
+        store.delete(path)
+        log.prompt_cache_drop(DAY)
+    finally:
+        store.release.set()
+        reader.join(5)
+    assert not reader.is_alive()
+    assert answers == [full(alice)]  # the read got the file before the delete
+    store.pause = False
+    assert log.record(DAY, alice["request_id"]) == {**full(alice), "prompt": None, "prompt_deleted": True}
+    assert path not in log._prompts
