@@ -39,6 +39,8 @@ from llm_service.gateway.app import main  # noqa: E402
 REQUIREMENTS = str(current_dir / "requirements.txt")
 SERVICE_NAME = os.environ.get("LLM_SERVICE_NAME", "").strip() or "LLM Service"
 ENVIRONMENT = os.environ.get("LLM_ENVIRONMENT", "dev").strip().lower() or "dev"
+# vLLM compiles a small C module when it starts. The platform image has no compiler.
+BUILD_SCRIPT_PRE = "apt-get update && apt-get install -y build-essential"
 
 
 def deployment_acl(env=os.environ) -> ACL | None:
@@ -76,6 +78,7 @@ def build_service(env=os.environ) -> Service:
         environment=ENVIRONMENT,
         resources=Resources(**resources(env)),
         python_requirements=REQUIREMENTS,
+        build_script_pre=BUILD_SCRIPT_PRE,
         env_vars=service_env(env),
         **arguments,
     )
