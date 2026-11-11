@@ -83,8 +83,8 @@ fakes.
 The model list has one entry for each model id. Each entry has the OpenAI
 fields `id`, `object`, `created` and `owned_by`, and three extra fields:
 
-- `status`: `loading` for the model that loads, `active` for the served model,
-  and `cached` for a model that is only in blob storage. If one id has two
+- `status`: `loading` for the model that loads, `active` for the model that
+  vLLM serves now, and `cached` for a model that is only in blob storage. If one id has two
   states, `loading` comes before `active`, and `active` comes before `cached`.
 - `revision`: the loading or active revision. For a cached model, it is the
   first cached revision.
@@ -92,10 +92,11 @@ fields `id`, `object`, `created` and `owned_by`, and three extra fields:
 
 Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 
-- If a request names a model that is not the active model, the gateway returns
-  404 with code `model_not_found`.
-- If a model is loading, the gateway returns 503 with code `model_loading` and
-  a `Retry-After` header.
+- If a request names a model that vLLM does not serve now, the gateway returns
+  404 with code `model_not_found`. A request without a model gets the model
+  that vLLM serves.
+- If vLLM serves no model and a model is loading, the gateway returns 503 with
+  code `model_loading` and a `Retry-After` header.
 - If no model is loaded, the gateway returns 503 with code `no_model` and no
   `Retry-After` header. An admin must switch the model first.
 - If the request has no platform user, the gateway returns 401.
@@ -105,7 +106,7 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 | Endpoint | Behavior |
 |---|---|
 | `POST /admin/model` | Body `{"model": "org/name", "revision": "main"}`. Starts a switch and returns 202. `revision` is optional. |
-| `GET /admin/model` | The active model, the switch state and the last switch error. |
+| `GET /admin/model` | The active model, the served model, the switch state and the last switch error. |
 | `GET /admin/audit` | Audit entries, newest first. Filters: `user`, `model`, `since`, `until`, `limit`, `offset`. |
 | `GET /admin/audit/users` | The users in the log, with the first and last request time of each. |
 | `GET /admin/usage` | Usage totals. Filters: `since`, `until`, `user`, `model`. `group_by` is `user` (default), `model` or `day`. |
@@ -199,17 +200,35 @@ the active model or a model that loads. The blob storage copies stay.
 
 ## Model switch
 
-`models.py` holds one state: `empty`, `loading`, `ready` or `failed`.
+`models.py` holds one state: `empty`, `loading`, `ready` or `failed`. It also
+holds three models:
+
+- `active`: the model of the last successful load. `state/active.json` stores
+  it.
+- `target`: the model that loads now.
+- `serving`: the model that vLLM serves now. It is empty when vLLM serves no
+  healthy model.
+
+The gateway forwards a `/v1/*` request only when `serving` is set, and only for
+the model in `serving`. `GET /admin/model` returns all three models.
+
+A switch runs these steps. Steps 2 and 3 are the two phases of a switch.
 
 1. `POST /admin/model` validates the model name, sets the state to `loading`
    and starts a background task. A second switch during `loading` gets 409.
-2. The task fetches the weights while the old model still serves requests.
-3. The task stops the old vLLM process, then starts vLLM on the new directory
-   with `--served-model-name <org/name>`.
+2. The fetch phase. The task gets the weights on local disk. The old vLLM
+   process still runs, so the old model keeps serving requests. A request for
+   the new model gets 404 until the switch ends.
+3. The restart phase. The task clears `serving` and stops the old vLLM process.
+   Then it starts vLLM on the new directory with
+   `--served-model-name <org/name>`. Requests get 503 with code
+   `model_loading` and a `Retry-After` header. A request that is still running
+   when vLLM stops does not complete.
 4. The task waits for the vLLM health endpoint. Then it sets the state to
-   `ready` and writes `state/active.json`.
-5. If the new model fails to load, the task starts the previous model again
-   and stores the error. `GET /admin/model` shows it.
+   `ready`, sets `serving` to the new model and writes `state/active.json`.
+5. If the download fails, the old model keeps serving. If vLLM fails to start
+   with the new model, the task starts the previous model again. In both cases
+   the task stores the error. `GET /admin/model` shows it.
 
 At startup, the gateway loads the model in `state/active.json`. If that file
 does not exist, it loads `LLM_DEFAULT_MODEL`. A model switch is also an audit
@@ -222,14 +241,42 @@ model stays `ready`, because the engine runs.
 
 The gateway checks the vLLM process at each request to
 `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. If the process has
-exited while the state is `ready`, the gateway starts one automatic reload of
-the active model. The reload uses the startup load path and runs as a
-background task. The state is `loading` during the reload. The audit log gets
-an `engine_reload` event with the user `system`.
+exited while `serving` is set, the gateway clears `serving`. If the state is
+`ready`, the gateway also starts one automatic reload of the active model. The
+reload uses the startup load path and runs as a background task. The state is
+`loading` during the reload. The audit log gets an `engine_reload` event with
+the user `system`.
+
+If the process exits during the fetch phase of a switch, the gateway starts no
+reload. The switch goes on and starts vLLM with the new model.
 
 If the reload fails, the state is `failed`. It stays `failed` until an admin
 switches the model with `POST /admin/model`. The gateway makes no second
 automatic attempt until a model is `ready` again.
+
+### Transitions
+
+The table shows the state and `serving` after each event. A and B are two
+models. A request gets an answer from vLLM only when `serving` is set.
+
+| Event | State | `serving` |
+|---|---|---|
+| Startup load begins | `loading` | empty |
+| Startup load succeeds | `ready` | A |
+| At startup, the download fails | `empty` | empty |
+| At startup, vLLM fails to start | `failed` | empty |
+| Admin switch to B begins (fetch phase) | `loading` | A |
+| Download of B succeeds, the task stops vLLM (restart phase) | `loading` | empty |
+| vLLM serves B | `ready` | B |
+| Download of B fails | `ready` | A |
+| Start of B fails, the restart of A succeeds | `ready` | A |
+| Start of B fails, the restart of A fails | `failed` | empty |
+| vLLM exits in `ready`, the automatic reload begins | `loading` | empty |
+| The automatic reload succeeds | `ready` | A |
+| The automatic reload fails | `failed` | empty |
+| vLLM exits during the fetch phase of a switch to B | `loading` | empty |
+| After that, vLLM serves B | `ready` | B |
+| After that, the download of B fails | `failed` | empty |
 
 ## Audit log
 
@@ -333,8 +380,8 @@ the real ones. The tests cover:
 - the weight cache: local hit, blob storage hit, Hugging Face download, an
   interrupted upload, the manifest check, and the deletion of unused local
   copies,
-- the switch state machine, the rollback, the automatic reload, and the 409,
-  503 and 404 answers,
+- the switch state machine, the model that serves in each phase, the
+  rollback, the automatic reload, and the 409, 503 and 404 answers,
 - the proxy, with and without streaming, and the token count chunk.
 
 The run on a real GPU happens on the Azure installation, after the deploy.

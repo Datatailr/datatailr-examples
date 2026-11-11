@@ -123,7 +123,7 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
-If you omit `model`, the service uses the active model. If you name another model, the service returns the error `model_not_found` with status 404.
+If you omit `model`, the service uses the model that it serves now. If you name another model, the service returns the error `model_not_found` with status 404.
 
 ## Use from outside Datatailr
 
@@ -156,7 +156,7 @@ curl -X POST "$BASE/admin/model" \
 
 The field `revision` is optional. The call returns status 202 and the switch runs in the background. In these commands, `BASE` is the service URL without `/v1`.
 
-The old model keeps serving requests while the service fetches the new weights. Then the service stops vLLM and starts it again with the new model. During this time, requests get status 503 with a `Retry-After` header.
+The old model keeps serving requests while the service downloads the new weights. During the download, a request for the new model gets the error `model_not_found` with status 404. Then the service stops vLLM and starts it again with the new model. Only during this restart, requests get status 503 with a `Retry-After` header. A request that is still running when vLLM stops does not complete. If the download fails, the old model keeps serving.
 
 To check the switch, read the state:
 
@@ -164,7 +164,7 @@ To check the switch, read the state:
 curl "$BASE/admin/model" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
 ```
 
-The answer shows the active model, the switch state and the last switch error. If the new model fails to load, the service starts the previous model again and keeps the error. If a switch is already running, a new switch gets status 409.
+The answer shows the active model, the switch state and the last switch error. The field `serving` shows the model that vLLM serves now. It is `null` while vLLM restarts. If the new model fails to load, the service starts the previous model again and keeps the error. If a switch is already running, a new switch gets status 409.
 
 ### Gated models
 
@@ -198,7 +198,7 @@ curl "$BASE/v1/models" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
 
 The list has one entry for each model: the active model, the model that loads, and each model in the blob storage cache. Each entry has the OpenAI fields `id`, `object`, `created` and `owned_by`. It also has three extra fields:
 
-- `status` is `active`, `loading` or `cached`.
+- `status` is `active` for the model that vLLM serves now, `loading` for the model that loads, or `cached`.
 - `revision` is the active or loading revision. For a cached model, it is the first cached revision.
 - `revisions` is the sorted list of the revisions in blob storage.
 

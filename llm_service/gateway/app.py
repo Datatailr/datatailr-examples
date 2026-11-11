@@ -241,7 +241,9 @@ def create_app(
             reload = manager.check_engine()
             if reload is not None:
                 app.state.reload_task = reload
-            if manager.state == "loading":
+            # During the weight fetch of a switch, the old model still serves.
+            serving = manager.serving
+            if serving is None and manager.state == "loading":
                 return refuse(
                     ApiError(
                         503,
@@ -251,9 +253,9 @@ def create_app(
                         {"Retry-After": "30"},
                     )
                 )
-            if manager.state != "ready":
+            if serving is None:
                 return refuse(ApiError(503, "service_unavailable", "no_model", "no model is loaded"))
-            active = manager.active["model"]
+            active = serving["model"]
             if body.get("model") is None:
                 body = {**body, "model": active}
                 model = active
@@ -280,15 +282,15 @@ def create_app(
         """Return one `/v1/models` entry for each model id.
 
         The status is `loading` for the model that loads, `active` for the
-        served model and `cached` for the rest. `revision` is the loading or
+        model that the engine serves now and `cached` for the rest. `revision` is the loading or
         active revision, else the first cached one.
         """
         revisions: dict[str, list[str]] = {}
         for entry in await asyncio.to_thread(weights.cached):
             revisions.setdefault(entry["model"], []).append(entry["revision"])
         current: dict[str, tuple[str, str]] = {}
-        if manager.active:
-            current[manager.active["model"]] = ("active", manager.active["revision"])
+        if manager.serving:
+            current[manager.serving["model"]] = ("active", manager.serving["revision"])
         if manager.target:
             current[manager.target["model"]] = ("loading", manager.target["revision"])
         entries = []

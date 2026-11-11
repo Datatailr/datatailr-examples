@@ -237,7 +237,183 @@ def test_check_engine_ignores_other_states(tmp_path):
 
 def test_status_shape(tmp_path):
     mgr, *_ = _make(tmp_path)
-    assert mgr.status() == {"state": "empty", "active": None, "target": None, "error": None}
+    assert mgr.status() == {
+        "state": "empty", "active": None, "target": None, "error": None, "serving": None,
+    }
+
+
+A = {"model": "org/a", "revision": "main"}
+B = {"model": "org/b", "revision": "main"}
+
+
+class WatchingEngine(FakeEngine):
+    """A fake engine that records `manager.serving` at each start and stop."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.manager: ModelManager | None = None
+        self.seen: list[tuple[str, dict | None]] = []
+
+    async def start(self, model_dir: Path, served_name: str) -> None:
+        self.seen.append((f"start {served_name}", self.manager.serving))
+        await super().start(model_dir, served_name)
+
+    async def stop(self) -> None:
+        self.seen.append(("stop", self.manager.serving))
+        await super().stop()
+
+
+def _make_gated(tmp_path: Path, gated: str, bad_download: str | None = None):
+    """Return a manager whose download of `gated` waits for `gate`.
+
+    `fetching` is set when that download begins, so a test can act during the
+    fetch phase of a switch.
+    """
+    store = MemoryBlobStore()
+    engine = WatchingEngine()
+    events: list[dict] = []
+    gate, fetching = threading.Event(), threading.Event()
+
+    def download(model: str, revision: str, target: Path) -> None:
+        if model == gated:
+            fetching.set()
+            gate.wait(10)
+        if model == bad_download:
+            raise OSError("download failed")
+        (target / "config.json").write_text("{}")
+
+    weights = WeightCache(store, "root", tmp_path / "local", download)
+    mgr = ModelManager(weights, engine, store, "root", "org/a", events.append)
+    engine.manager = mgr
+    return mgr, engine, gate, fetching
+
+
+async def _in_fetch_phase(fetching: threading.Event) -> None:
+    assert await asyncio.to_thread(fetching.wait, 10)
+
+
+def test_serving_is_none_during_the_startup_load(tmp_path):
+    mgr, engine, gate, _ = _make_gated(tmp_path, gated="none")
+    asyncio.run(mgr.startup())
+    assert engine.seen == [("start org/a", None)]
+    assert mgr.serving == A
+
+
+def test_serving_stays_none_after_a_failed_startup(tmp_path):
+    mgr, engine, gate, _ = _make_gated(tmp_path, gated="none")
+    engine.fail_on = {"org/a"}
+    asyncio.run(mgr.startup())
+    assert mgr.state == "failed" and mgr.serving is None
+
+
+def test_serving_through_a_switch(tmp_path):
+    async def run():
+        mgr, engine, gate, fetching = _make_gated(tmp_path, gated="org/b")
+        await mgr.startup()
+        task = mgr.request_switch("org/b")
+        await _in_fetch_phase(fetching)
+        # The old model serves while the new weights download.
+        assert mgr.state == "loading" and mgr.serving == A
+        assert mgr.status()["serving"] == A
+        gate.set()
+        await task
+        assert mgr.state == "ready" and mgr.serving == B
+        assert engine.seen == [
+            ("start org/a", None),
+            ("stop", None),
+            ("start org/b", None),
+        ]
+
+    asyncio.run(run())
+
+
+def test_serving_keeps_the_old_model_after_a_failed_download(tmp_path):
+    async def run():
+        mgr, engine, gate, fetching = _make_gated(tmp_path, gated="org/b", bad_download="org/b")
+        await mgr.startup()
+        task = mgr.request_switch("org/b")
+        await _in_fetch_phase(fetching)
+        assert mgr.serving == A
+        gate.set()
+        await task
+        assert mgr.state == "ready" and mgr.serving == A
+        assert engine.stopped == 0
+
+    asyncio.run(run())
+
+
+def test_serving_after_a_failed_start_with_a_rollback(tmp_path):
+    async def run():
+        mgr, engine, gate, _ = _make_gated(tmp_path, gated="none")
+        await mgr.startup()
+        engine.fail_on = {"org/b"}
+        await mgr.request_switch("org/b")
+        assert mgr.state == "ready" and mgr.serving == A
+        # Nothing serves while vLLM restarts, and during the rollback.
+        assert engine.seen[1:] == [("stop", None), ("start org/b", None), ("start org/a", None)]
+
+    asyncio.run(run())
+
+
+def test_serving_is_none_after_a_failed_rollback(tmp_path):
+    async def run():
+        mgr, engine, gate, _ = _make_gated(tmp_path, gated="none")
+        await mgr.startup()
+        engine.fail_on = {"org/a", "org/b"}
+        await mgr.request_switch("org/b")
+        assert mgr.state == "failed" and mgr.serving is None
+
+    asyncio.run(run())
+
+
+def test_serving_through_an_engine_exit_and_reload(tmp_path):
+    async def run():
+        mgr, engine, gate, _ = _make_gated(tmp_path, gated="none")
+        await mgr.startup()
+        engine.alive_flag = False
+        task = mgr.check_engine()
+        assert mgr.state == "loading" and mgr.serving is None
+        await task
+        assert mgr.state == "ready" and mgr.serving == A
+        engine.alive_flag = False
+        engine.fail_on = {"org/a"}
+        await mgr.check_engine()
+        assert mgr.state == "failed" and mgr.serving is None
+
+    asyncio.run(run())
+
+
+def test_engine_exit_during_the_fetch_phase(tmp_path):
+    async def run():
+        mgr, engine, gate, fetching = _make_gated(tmp_path, gated="org/b")
+        await mgr.startup()
+        task = mgr.request_switch("org/b")
+        await _in_fetch_phase(fetching)
+        engine.alive_flag = False
+        assert mgr.check_engine() is None  # the running switch goes on, no reload
+        assert mgr.state == "loading" and mgr.serving is None
+        assert mgr.target == B
+        gate.set()
+        await task
+        assert mgr.state == "ready" and mgr.serving == B
+        assert [name for _, name in engine.started] == ["org/a", "org/b"]
+
+    asyncio.run(run())
+
+
+def test_engine_exit_during_the_fetch_phase_then_a_failed_download(tmp_path):
+    async def run():
+        mgr, engine, gate, fetching = _make_gated(tmp_path, gated="org/b", bad_download="org/b")
+        await mgr.startup()
+        task = mgr.request_switch("org/b")
+        await _in_fetch_phase(fetching)
+        engine.alive_flag = False
+        mgr.check_engine()
+        gate.set()
+        await task
+        assert mgr.state == "failed" and mgr.serving is None
+
+    asyncio.run(run())
 
 
 def test_events_emitted_for_ok_and_failed(tmp_path):
@@ -266,6 +442,7 @@ def test_failed_download_after_engine_crash_stays_failed(tmp_path):
         await mgr.request_switch("org/b")
         assert mgr.state == "failed"
         assert "org/b" in mgr.error
+        assert mgr.serving is None
 
     asyncio.run(run())
 

@@ -36,15 +36,34 @@ class GatedEngine(FakeEngine):
         await super().start(model_dir, served_name)
 
 
-def make_app(tmp_path, engine=None, store=None, http=None, **config_args):
+class GatedDownload:
+    """A downloader whose download of `gated` waits for `gate`.
+
+    `fetching` is set when that download begins.
+    """
+
+    def __init__(self, gated: str) -> None:
+        self.gated = gated
+        self.gate = threading.Event()
+        self.fetching = threading.Event()
+
+    def __call__(self, model: str, revision: str, target: Path) -> None:
+        if model == self.gated:
+            self.fetching.set()
+            self.gate.wait(10)
+        (target / "config.json").write_text("{}")
+
+
+def plain_download(model: str, revision: str, target: Path) -> None:
+    (target / "config.json").write_text("{}")
+
+
+def make_app(tmp_path, engine=None, store=None, http=None, download=plain_download, **config_args):
     store = store or MemoryBlobStore()
     engine = engine or FakeEngine()
     config = Config(
         owner="alice", local_dir=tmp_path / "local", default_model="org/a", **config_args
     )
-
-    def download(model: str, revision: str, target: Path) -> None:
-        (target / "config.json").write_text("{}")
 
     http = http or httpx.AsyncClient(
         transport=httpx.ASGITransport(app=fake_vllm_app()), base_url="http://engine"
@@ -223,21 +242,79 @@ def test_models_list_has_one_entry_per_model(client):
 
 
 def test_models_list_shows_the_loading_revision(tmp_path):
-    engine = GatedEngine({"org/b"})
+    engine, download = GatedEngine({"org/b"}), GatedDownload("org/b")
     try:
-        with TestClient(make_app(tmp_path, engine)) as c:
+        with TestClient(make_app(tmp_path, engine, download=download)) as c:
             wait_ready(c)
             c.post("/admin/model", headers=ALICE, json={"model": "org/b", "revision": "v3"})
-            wait_for(c, lambda s: s["state"] == "loading")
+            assert download.fetching.wait(10)
+            # The fetch phase: the old model still serves.
             data = c.get("/v1/models", headers=BOB).json()["data"]
             assert [(e["id"], e["status"], e["revision"]) for e in data] == [
                 ("org/a", "active", "main"),
                 ("org/b", "loading", "v3"),
             ]
+            download.gate.set()
+            wait_for(c, lambda s: s["serving"] is None)
+            # vLLM restarts: no model is active, the old one is only cached.
+            data = c.get("/v1/models", headers=BOB).json()["data"]
+            assert [(e["id"], e["status"], e["revision"]) for e in data] == [
+                ("org/b", "loading", "v3"),
+                ("org/a", "cached", "main"),
+            ]
             engine.gate.set()
             wait_ready(c)
     finally:
+        download.gate.set()
         engine.gate.set()
+
+
+def test_old_model_serves_during_the_fetch_phase_of_a_switch(tmp_path):
+    download = GatedDownload("org/b")
+    try:
+        with TestClient(make_app(tmp_path, download=download)) as c:
+            wait_ready(c)
+            assert c.post("/admin/model", headers=ALICE, json={"model": "org/b"}).status_code == 202
+            assert download.fetching.wait(10)
+            status = c.get("/admin/model", headers=ALICE).json()
+            assert status["state"] == "loading"
+            assert status["serving"] == {"model": "org/a", "revision": "main"}
+            r = c.post(CHAT, headers=BOB, json=HI)
+            assert r.status_code == 200
+            rec = audit_records(c, user="bob")[0]
+            assert rec["model"] == "org/a" and rec["status"] == 200
+            r = c.post(CHAT, headers=BOB, json={"messages": HI["messages"]})
+            assert r.status_code == 200
+            assert audit_records(c, user="bob")[0]["model"] == "org/a"
+            r = c.post(CHAT, headers=BOB, json={**HI, "model": "org/b"})
+            assert r.status_code == 404 and r.json()["error"]["code"] == "model_not_found"
+            download.gate.set()
+            status = wait_ready(c)
+            assert status["serving"] == {"model": "org/b", "revision": "main"}
+            assert c.post(CHAT, headers=BOB, json={**HI, "model": "org/b"}).status_code == 200
+            assert c.post(CHAT, headers=BOB, json=HI).status_code == 404
+    finally:
+        download.gate.set()
+
+
+def test_engine_exit_during_the_fetch_phase_answers_model_loading(tmp_path):
+    engine, download = FakeEngine(), GatedDownload("org/b")
+    try:
+        with TestClient(make_app(tmp_path, engine, download=download)) as c:
+            wait_ready(c)
+            c.post("/admin/model", headers=ALICE, json={"model": "org/b"})
+            assert download.fetching.wait(10)
+            engine.alive_flag = False
+            r = c.post(CHAT, headers=BOB, json=HI)
+            assert r.status_code == 503 and r.json()["error"]["code"] == "model_loading"
+            assert r.headers["retry-after"] == "30"
+            download.gate.set()
+            status = wait_ready(c)
+            assert status["active"]["model"] == "org/b"
+            assert c.post(CHAT, headers=BOB, json={**HI, "model": "org/b"}).status_code == 200
+            assert len(engine.started) == 2  # no automatic reload
+    finally:
+        download.gate.set()
 
 
 def test_retrieve_one_model(client):
@@ -410,6 +487,7 @@ def test_openai_sdk_shape_of_errors(tmp_path):
         with TestClient(make_app(tmp_path, engine)) as c:
             wait_ready(c)
             c.post("/admin/model", headers=ALICE, json={"model": "org/b"})
+            wait_for(c, lambda s: s["serving"] is None)  # vLLM restarts
             responses = [
                 c.post(CHAT, json=HI),                                          # 401
                 c.get("/admin/model", headers=BOB),                             # 403

@@ -19,7 +19,13 @@ class SwitchInProgress(Exception):
 
 
 class ModelManager:
-    """Hold the state of the served model: empty, loading, ready or failed."""
+    """Hold the state of the served model: empty, loading, ready or failed.
+
+    `active` is the model of the last successful load. `target` is the model
+    that loads. `serving` is the model that the engine serves right now, or
+    None when the engine serves no healthy model. During the weight fetch of
+    an admin switch, `serving` is the old model and the state is `loading`.
+    """
 
     def __init__(
         self,
@@ -41,6 +47,7 @@ class ModelManager:
         self.active: dict | None = None
         self.target: dict | None = None
         self.error: str | None = None
+        self.serving: dict | None = None
 
     @property
     def _active_path(self) -> str:
@@ -53,6 +60,7 @@ class ModelManager:
             "active": self.active,
             "target": self.target,
             "error": self.error,
+            "serving": self.serving,
         }
 
     async def startup(self) -> None:
@@ -102,13 +110,19 @@ class ModelManager:
         return self._task
 
     def check_engine(self) -> asyncio.Task | None:
-        """Start one automatic reload when the engine process has exited.
+        """Notice an engine process that has exited while it served a model.
 
-        This acts only in the `ready` state. It reloads the active model with
-        the startup load path and returns the task. If the reload fails, the
-        state is `failed` until an admin switch. Call it inside a running loop.
+        Then `serving` becomes None. In the `ready` state, this also starts one
+        automatic reload of the active model with the startup load path and
+        returns the task. During the weight fetch of a switch, it starts no
+        reload: the switch goes on. If the reload fails, the state is `failed`
+        until an admin switch. Call it inside a running loop.
         """
-        if self.state != "ready" or self._engine.alive():
+        if self.serving is None or self._engine.alive():
+            return None
+        self.serving = None
+        if self.state != "ready":
+            log.warning("the engine exited during a model switch")
             return None
         wanted = dict(self.active)
         log.warning("the engine exited, reloading %s", wanted["model"])
@@ -154,6 +168,7 @@ class ModelManager:
                 self._fail_before_stop(wanted, previous, f"{model}: {exc}", trigger)
                 return
             if previous is not None:
+                self.serving = None
                 await self._engine.stop()
             try:
                 await self._engine.start(model_dir, model)
@@ -161,6 +176,7 @@ class ModelManager:
                 await self._fail_after_stop(wanted, previous, f"{model}: {exc}", trigger)
                 return
             self.active = dict(wanted)
+            self.serving = dict(wanted)
             self.target = None
             self.error = None
             self.state = "ready"
@@ -168,6 +184,7 @@ class ModelManager:
             self._emit(wanted, "ok", None, trigger)
         except Exception as exc:  # noqa: BLE001
             log.exception("model switch crashed")
+            self.serving = None
             self.target = None
             self.state = "failed"
             self.error = f"{model}: {exc}"
@@ -178,13 +195,16 @@ class ModelManager:
     def _fail_before_stop(
         self, wanted: dict, previous: dict | None, error: str, trigger: str
     ) -> None:
-        # The old engine still runs, so the old model keeps serving.
+        # The old engine was not stopped. If it still runs, the old model keeps
+        # serving. If it has exited, nothing serves.
         self.target = None
         self.error = error
+        if not self._engine.alive():
+            self.serving = None
         if previous is None:
             self.state = "empty"
         else:
-            self.state = "ready" if self._engine.alive() else "failed"
+            self.state = "ready" if self.serving is not None else "failed"
         self._emit(wanted, "failed", error, trigger)
 
     async def _fail_after_stop(
@@ -204,6 +224,7 @@ class ModelManager:
                 log.error("rollback to %s failed: %s", previous["model"], exc)
             else:
                 self.active = dict(previous)
+                self.serving = dict(previous)
                 self.state = "ready"
                 await self._save_active()
         self._emit(wanted, "failed", error, trigger)
