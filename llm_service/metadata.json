@@ -1,0 +1,15 @@
+{
+    "name": "LLM Service",
+    "description": "An OpenAI-compatible LLM service on a Datatailr GPU node: a FastAPI gateway in front of vLLM, with model weights cached in blob storage, a runtime model switch, an audit log and per-user usage metrics.",
+    "tags": [
+        "llm",
+        "openai",
+        "vllm",
+        "gpu",
+        "service",
+        "fastapi",
+        "blob",
+        "audit"
+    ],
+    "author": "Datatailr"
+}

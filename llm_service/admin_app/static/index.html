@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LLM Service Admin</title>
+<!-- The platform serves the app under a path prefix that the backend cannot know. Without a
+     trailing slash in the address, the relative URLs below would leave that prefix, so this
+     script adds the slash first. If a Content-Security-Policy forbids inline scripts, open the
+     page with a trailing slash in the address. -->
+<script>
+if (!location.pathname.endsWith('/')) {
+  history.replaceState(null, '', location.pathname + '/' + location.search + location.hash);
+}
+</script>
+<link rel="stylesheet" href="static/app.css">
+<script defer src="static/vendor/chart.umd.js"></script>
+<script defer src="static/app.js"></script>
+</head>
+<body>
+
+<header class="topbar" id="topbar" hidden>
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 20 20" aria-hidden="true">
+      <rect x="1" y="11" width="4" height="8" rx="1"/>
+      <rect x="8" y="6" width="4" height="13" rx="1"/>
+      <rect x="15" y="1" width="4" height="18" rx="1"/>
+    </svg>
+    <span>LLM Service Admin</span>
+  </div>
+  <div class="serving" id="serving" title="The model that the service serves now">
+    <span class="dot" id="serving-dot"></span><span id="serving-text">Reading the state</span>
+  </div>
+  <div class="who">
+    <span class="caption">Signed in as</span> <b id="viewer"></b>
+    <button type="button" class="ghost" id="reload" title="Read the data of this tab again">Reload</button>
+  </div>
+</header>
+
+<div class="banner" id="banner" role="alert" hidden>
+  <span id="banner-text"></span>
+  <button type="button" class="ghost small" id="banner-close" aria-label="Close the message">Close</button>
+</div>
+
+<section class="denied" id="denied" hidden>
+  <p>You are not an admin of the LLM service.</p>
+</section>
+
+<main id="main" hidden>
+  <div class="tabs" role="tablist" aria-label="Sections">
+    <button type="button" role="tab" id="tab-usage" aria-controls="panel-usage" data-tab="usage">Usage</button>
+    <button type="button" role="tab" id="tab-audit" aria-controls="panel-audit" data-tab="audit">Audit</button>
+    <button type="button" role="tab" id="tab-models" aria-controls="panel-models" data-tab="models">Models</button>
+  </div>
+
+  <!-- Usage -->
+  <section class="panel" role="tabpanel" id="panel-usage" aria-labelledby="tab-usage" hidden>
+    <div class="toolbar">
+      <div class="segmented" role="group" aria-label="Range">
+        <button type="button" data-range="7">7 days</button>
+        <button type="button" data-range="30">30 days</button>
+        <button type="button" data-range="custom">Dates</button>
+      </div>
+      <div class="dates" id="dates" hidden>
+        <label>From <input type="date" id="range-since"></label>
+        <label>To <input type="date" id="range-until"></label>
+        <span class="caption">UTC days</span>
+      </div>
+      <span class="caption" id="range-text"></span>
+    </div>
+
+    <div class="tiles">
+      <div class="tile"><div class="label">Requests</div><div class="value" id="tile-requests">-</div></div>
+      <div class="tile"><div class="label">Failed requests</div><div class="value" id="tile-failed">-</div></div>
+      <div class="tile"><div class="label">Total tokens</div><div class="value" id="tile-tokens">-</div></div>
+      <div class="tile"><div class="label">Active users</div><div class="value" id="tile-users">-</div></div>
+    </div>
+
+    <div class="charts">
+      <div class="card">
+        <h2>Total tokens by day <span class="caption">UTC days</span></h2>
+        <div class="chart"><canvas id="chart-days" aria-label="Bar chart of total tokens by day" role="img"></canvas></div>
+      </div>
+      <div class="card">
+        <h2>Total tokens by model</h2>
+        <div class="chart"><canvas id="chart-models" aria-label="Bar chart of total tokens by model" role="img"></canvas></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Users <span class="caption">Select a row to see the numbers of that user.</span></h2>
+      <div class="scroll">
+        <table class="grid clickable">
+          <thead><tr>
+            <th scope="col">User</th><th scope="col" class="num">Requests</th>
+            <th scope="col" class="num">Failed</th><th scope="col" class="num">Prompt tokens</th>
+            <th scope="col" class="num">Completion tokens</th><th scope="col" class="num">Total tokens</th>
+            <th scope="col">Last request</th>
+          </tr></thead>
+          <tbody id="users-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card detail" id="detail" hidden>
+      <div class="card-head">
+        <h2><span>Usage of <b id="detail-user"></b></span></h2>
+        <button type="button" class="ghost small" id="detail-close">Close</button>
+      </div>
+      <div class="detail-grid">
+        <div class="scroll">
+          <table class="grid">
+            <caption>By model</caption>
+            <thead><tr><th scope="col">Model</th><th scope="col" class="num">Requests</th>
+              <th scope="col" class="num">Failed</th><th scope="col" class="num">Total tokens</th></tr></thead>
+            <tbody id="detail-models"></tbody>
+          </table>
+        </div>
+        <div class="scroll">
+          <table class="grid">
+            <caption>By day (UTC)</caption>
+            <thead><tr><th scope="col">Day</th><th scope="col" class="num">Requests</th>
+              <th scope="col" class="num">Failed</th><th scope="col" class="num">Total tokens</th></tr></thead>
+            <tbody id="detail-days"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Audit -->
+  <section class="panel" role="tabpanel" id="panel-audit" aria-labelledby="tab-audit" hidden>
+    <form class="toolbar filters" id="audit-form">
+      <label>User <input type="text" id="audit-user" list="audit-users" placeholder="All users" autocomplete="off"></label>
+      <datalist id="audit-users"></datalist>
+      <label>Model <input type="text" id="audit-model" placeholder="org/name" autocomplete="off"></label>
+      <label>Since <input type="datetime-local" id="audit-since"></label>
+      <label>Until <input type="datetime-local" id="audit-until"></label>
+      <button type="submit">Apply</button>
+      <button type="button" class="ghost" id="audit-clear">Clear</button>
+      <span class="caption">Times in your local time.</span>
+    </form>
+
+    <div class="card">
+      <div class="scroll">
+        <table class="grid clickable">
+          <thead><tr>
+            <th scope="col">Time</th><th scope="col">User</th><th scope="col">Endpoint</th>
+            <th scope="col">Model</th><th scope="col">Status</th>
+            <th scope="col" class="num">Total tokens</th><th scope="col" class="num">Duration</th>
+          </tr></thead>
+          <tbody id="audit-body"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button type="button" class="ghost" id="audit-newer">Newer</button>
+        <span class="caption" id="audit-page"></span>
+        <button type="button" class="ghost" id="audit-older">Older</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Models -->
+  <section class="panel" role="tabpanel" id="panel-models" aria-labelledby="tab-models" hidden>
+    <div class="card">
+      <h2>Engine</h2>
+      <dl class="status">
+        <div><dt>State</dt><dd><span class="badge" id="st-state">-</span></dd></div>
+        <div><dt>Served model</dt><dd id="st-serving">-</dd></div>
+        <div><dt>Target of the switch</dt><dd id="st-target">-</dd></div>
+        <div class="wide"><dt>Last error</dt><dd id="st-error" class="mono">-</dd></div>
+        <div class="wide" id="st-rollback-row" hidden><dt>Rollback</dt><dd id="st-rollback">-</dd></div>
+      </dl>
+      <p class="caption" id="poll-text" hidden>The model loads. The page reads the state every 3 seconds.</p>
+    </div>
+
+    <div class="card">
+      <h2>Models</h2>
+      <div class="scroll">
+        <table class="grid">
+          <thead><tr>
+            <th scope="col">Model</th><th scope="col">Status</th><th scope="col">Revisions</th>
+            <th scope="col" class="num">Size</th><th scope="col">Actions</th>
+          </tr></thead>
+          <tbody id="models-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Serve a model</h2>
+      <form class="toolbar" id="serve-form">
+        <label>Model <input type="text" id="serve-model" placeholder="org/name" required autocomplete="off"></label>
+        <label>Revision <input type="text" id="serve-revision" value="main" required autocomplete="off"></label>
+        <button type="submit" id="serve-submit">Serve</button>
+      </form>
+      <p class="caption">The service downloads the model if it has no copy, then loads it.</p>
+    </div>
+  </section>
+</main>
+
+<dialog id="record-dialog" aria-labelledby="record-title">
+  <div class="card-head">
+    <h2 id="record-title">Audit record</h2>
+    <button type="button" class="ghost small" data-close>Close</button>
+  </div>
+  <pre class="json" id="record-json"></pre>
+</dialog>
+
+<dialog id="confirm-dialog" aria-labelledby="confirm-title">
+  <h2 id="confirm-title">Delete a cached model</h2>
+  <p id="confirm-text"></p>
+  <div class="actions">
+    <button type="button" class="ghost" data-close>Cancel</button>
+    <button type="button" class="danger" id="confirm-delete">Delete</button>
+  </div>
+</dialog>
+
+</body>
+</html>
