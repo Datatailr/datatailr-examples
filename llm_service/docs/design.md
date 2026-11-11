@@ -91,7 +91,7 @@ fields `id`, `object`, `created` and `owned_by`, and four extra fields:
 - `revision`: the loading or active revision. For a cached model, it is the
   first cached revision.
 - `revisions`: the sorted list of the revisions in blob storage.
-- `size_bytes`: the sum of the file sizes in the manifests of the cached revisions, or null if the model has no cached revision.
+- `size_bytes`: the sum of the known sizes of the cached revisions, or null if no cached revision has a known size. The size of a revision comes from its manifest.
 
 Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 
@@ -109,12 +109,12 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 | Endpoint | Behavior |
 |---|---|
 | `POST /admin/model` | Body `{"model": "org/name", "revision": "main"}`. Starts a switch and returns 202. `revision` is optional. |
-| `GET /admin/model` | The active model, the served model, the switch state and the last switch error. |
+| `GET /admin/model` | The active model, the served model, the switch state and the last switch error. `rolling_back` is the model that a rollback loads now, or null. |
 | `GET /admin/audit` | Audit entries, newest first. Filters: `user`, `model`, `since`, `until`, `limit`, `offset`. |
 | `GET /admin/audit/users` | The users in the log, with the first and last request time of each. |
 | `GET /admin/usage` | Usage totals. Filters: `since`, `until`, `user`, `model`. `group_by` is `user` (default), `model` or `day`. |
 | `GET /admin/usage/{user}` | The totals of one user, by model and by day. |
-| `DELETE /admin/models/{model}` | Removes the cached revisions of a model from blob storage. The query parameter `revision` limits it to one revision. Returns 200 with `{"deleted": [...]}`. The errors are 404 `model_not_found`, 409 `model_in_use` and 400 `invalid_model`. One audit record has the event `model_delete`. |
+| `DELETE /admin/models/{model}` | Removes the stored revisions of a model from blob storage, with or without a `.complete` marker. The query parameter `revision` limits it to one revision. Returns 200 with `{"deleted": [...]}`. The errors are 404 `model_not_found`, 409 `model_in_use`, 400 `invalid_model` and 500 `delete_failed`. One audit record has the event `model_delete`. |
 
 A caller who is not an admin gets 403.
 
@@ -230,7 +230,8 @@ the model in `serving`. `GET /admin/model` returns all three models.
 A switch runs these steps. Steps 2 and 3 are the two phases of a switch.
 
 1. `POST /admin/model` validates the model name, sets the state to `loading`
-   and starts a background task. A second switch during `loading` gets 409.
+   and starts a background task. A second switch during `loading` or during a
+   rollback gets 409 `switch_in_progress`.
 2. The fetch phase. The task gets the weights on local disk. The old vLLM
    process still runs, so the old model keeps serving requests. A request for
    the new model gets 404 during the fetch.
@@ -242,8 +243,9 @@ A switch runs these steps. Steps 2 and 3 are the two phases of a switch.
 4. The task waits for the vLLM health endpoint. Then it sets the state to
    `ready`, sets `serving` to the new model and writes `state/active.json`.
 5. If the download fails, the old model keeps serving. If vLLM fails to start
-   with the new model, the task starts the previous model again. In both cases
-   the task stores the error. `GET /admin/model` shows it.
+   with the new model, the task starts the previous model again. During this
+   rollback, the state is `failed` and `rolling_back` names the previous model.
+   In both cases the task stores the error. `GET /admin/model` shows it.
 
 At startup, the gateway loads the model in `state/active.json`. If that file
 does not exist, it loads `LLM_DEFAULT_MODEL`. A model switch is also an audit
@@ -284,6 +286,7 @@ models. A request gets an answer from vLLM only when `serving` is set.
 | Download of B succeeds, the task stops vLLM (restart phase) | `loading` | empty |
 | vLLM serves B | `ready` | B |
 | Download of B fails | `ready` | A |
+| Start of B fails, the restart of A begins (`rolling_back` is A) | `failed` | empty |
 | Start of B fails, the restart of A succeeds | `ready` | A |
 | Start of B fails, the restart of A fails | `failed` | empty |
 | vLLM exits in `ready`, the automatic reload begins | `loading` | empty |

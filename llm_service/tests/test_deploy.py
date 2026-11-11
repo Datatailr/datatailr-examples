@@ -57,6 +57,11 @@ def test_service_url_turns_the_name_into_a_host_name():
     assert service_url("--Team 1--") == "http://team-1"
 
 
+def test_service_url_applies_nfkc_before_the_lower_case_step():
+    # Full-width letters and digits become ASCII, as on the platform.
+    assert service_url("\uff2c\uff2c\uff2d \uff33ervice \uff11") == "http://llm-service-1"
+
+
 def test_admin_app_name_default_and_override():
     assert admin_app_name({}) == "LLM Service Admin"
     assert admin_app_name({"LLM_ADMIN_APP_NAME": "  "}) == "LLM Service Admin"

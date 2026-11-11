@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Mapping, Sequence
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -46,8 +47,13 @@ def resources(env: Mapping[str, str]) -> dict:
 
 
 def service_url(service_name: str) -> str:
-    """Return the internal URL of the service. `LLM Service` gives `http://llm-service`."""
-    host = re.sub(r"[^a-z0-9]+", "-", service_name.lower()).strip("-")
+    """Return the internal URL of the service. `LLM Service` gives `http://llm-service`.
+
+    The platform applies NFKC before the lower case step, so full-width
+    letters give the same ASCII host name.
+    """
+    name = unicodedata.normalize("NFKC", service_name)
+    host = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return f"http://{host}"
 
 

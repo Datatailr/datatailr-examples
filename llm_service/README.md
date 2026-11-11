@@ -178,7 +178,9 @@ To check the switch, read the state:
 curl "$BASE/admin/model" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
 ```
 
-The answer shows the active model, the switch state and the last switch error. The field `serving` shows the model that vLLM serves now. It is `null` while vLLM restarts. If the new model fails to load, the service starts the previous model again and keeps the error. If a switch is already running, a new switch gets status 409.
+The answer shows the active model, the switch state and the last switch error. The field `serving` shows the model that vLLM serves now. It is `null` while vLLM restarts. If the new model fails to load, the service starts the previous model again and keeps the error. During this rollback, the field `rolling_back` names the previous model. It is `null` at other times.
+
+While a switch or a rollback runs, a new switch gets status 409 with the code `switch_in_progress`.
 
 ### Gated models
 
@@ -215,7 +217,7 @@ The list has one entry for each model: the active model, the model that loads, a
 - `status` is `active` for the model that vLLM serves now, `loading` for the model that loads, or `cached`.
 - `revision` is the active or loading revision. For a cached model, it is the first cached revision.
 - `revisions` is the sorted list of the revisions in blob storage.
-- `size_bytes` is the total size of the cached revisions, or `null` if the model has no cached revision.
+- `size_bytes` is the total of the known sizes of the cached revisions. It is `null` if no cached revision has a known size.
 
 To read one entry, add the model name to the path:
 
@@ -234,9 +236,25 @@ curl -X DELETE "$BASE/admin/models/Qwen/Qwen2.5-7B-Instruct?revision=main" \
   -H "Cookie: __datatailr_user_cookie__=$TOKEN"
 ```
 
-The call returns status 200 and the list of the removed revisions: `{"deleted": [...]}`. If no cached revision matches, the status is 404 with the code `model_not_found`.
+The call returns status 200 and the list of the removed revisions: `{"deleted": [...]}`. The service removes each matching revision that has files in blob storage, also a revision without a complete copy.
 
-The service does not remove a model that it needs. The status is 409 with the code `model_in_use` for the model that vLLM serves, the active model and the target of a running switch. A switch to a model that the service removes gets the same error. The delete makes one audit record.
+The service does not remove a model that it needs. The call returns status 409 with the code `model_in_use` for these models:
+
+- the model that vLLM serves
+- the active model
+- the target of a running switch
+- the model of a running rollback
+- a model that another delete removes now
+
+The call also returns 409 `model_in_use` while the service starts. A switch to a model that the service removes gets the same error.
+
+The other errors:
+
+- 400 `invalid_model`: the model name or the revision is not valid.
+- 404 `model_not_found`: no stored revision matches.
+- 500 `delete_failed`: a removal failed. The revisions removed before the error stay removed.
+
+After a failed delete, send the same delete again. The second delete removes the files that the failed delete left. Each delete makes one audit record.
 
 ## Read the audit log
 
@@ -275,9 +293,11 @@ The admin app is a web page for the admins of the service. It is the second job 
 - Audit: the audit log, with filters for user, model and time.
 - Models: the engine state and the cached models. An admin switches the model, follows the progress and deletes cached weights.
 
-The app keeps no data. It calls the service by its internal URL. The app takes this URL from the service name, so `LLM Service` gives `http://llm-service`.
+The app keeps no data. It calls the service by its internal URL. The app takes this URL from the service name, so `LLM Service` gives `http://llm-service`. If you deploy the app alone with `python deploy.py app`, set the same `LLM_SERVICE_NAME` as for the deploy of the service. Otherwise the app calls a service that does not exist.
 
-Only an admin of the service can use the app. The service decides this, not the app. A user who is not an admin sees the text "You are not an admin of the LLM service."
+Only an admin of the service can use the app. The service decides this, not the app. A user who is not an admin sees the text "You are not an admin of the LLM service." If every viewer sees this text, the user who deployed the app is not an admin of the service.
+
+The platform user names of the viewers must be ASCII. The app sends the name in an HTTP header. For a name that is not ASCII, the app answers 401 with the code `missing_user`.
 
 The platform signs the calls of the app as the user who deployed it. This user must be an admin of the service: the user who deployed the service, or a member of `LLM_ADMIN_GROUP`. The app also sends the name of the viewer in the header `X-LLM-Acting-User`. The service then requires that the viewer is an admin too, and the audit log names the viewer.
 
