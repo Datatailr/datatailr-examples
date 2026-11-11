@@ -335,15 +335,15 @@ file first. The segment file is the commit: a record exists when its metadata
 exists. A flush writes each prompt file and each segment file one time. A merge
 writes the day file again when a late record arrives for a finished day.
 
-After each flush, the flusher thread merges the metadata, at most one time each
-minute. The merge holds the flush lock for the write of a merged file, not for
-the deletes of its inputs. It reads and deletes eight files at a time. The
-segments of a finished 10 minute bucket become one part file. The parts of a
-finished day become one day file. A bucket merges 1 to 2 minutes after its end,
-and a day 15 to 16 minutes after its end. A reader skips a row whose `seg` it
-already read, so a merge that stops half way loses no record and counts none
-twice. Files of the old layout, with the full records, stay readable and are
-never merged.
+A background task of its own merges the metadata, at most one time each minute.
+A flush never waits for it, except for the write of one merged file. The merge
+holds the flush lock for the write of a merged file, not for the deletes of its
+inputs. It reads and deletes eight files at a time. The segments of a finished
+10 minute bucket become one part file. The parts of a finished day become one
+day file. A bucket merges 1 to 2 minutes after its end, and a day 15 to 16
+minutes after its end. A reader skips a row whose `seg` it already read, so a
+merge that stops half way loses no record and counts none twice. Files of the
+old layout, with the full records, stay readable and are never merged.
 
 The gateway keeps the metadata rows of the files in memory, up to 1,000,000
 rows, and drops the least recently used file first. At that size, the cache
@@ -357,17 +357,17 @@ query shows each record once. `GET /admin/audit/records/{request_id}` lists
 the day, reads the metadata files of the day that are not in memory, and reads
 one prompt file.
 
-An admin can set `LLM_PROMPT_RETENTION_DAYS`. The flusher then deletes the
-prompt files of the days that ended more than that many days ago. One flusher
-cycle deletes at most 64 prompt files, eight at a time, and lists at most 20
-prompt folders. The metadata stays. A record whose prompt is deleted answers
-with `prompt_deleted`.
+An admin can set `LLM_PROMPT_RETENTION_DAYS`. The same background task then
+deletes the prompt files of the days that ended more than that many days ago.
+The task runs one step at most every 5 seconds. One step deletes at most 64
+prompt files, eight at a time, and lists at most 20 prompt folders. The metadata
+stays. A record whose prompt is deleted answers with `prompt_deleted`.
 
 In normal operation, a kill of the container loses the records since the last
-flush. A flush runs every 5 seconds. The write of a merged file or a retention
-step can delay one flush by a few seconds. During a blob storage outage, the
-records wait in memory. A kill then loses all records since the outage began.
-The README states this.
+flush. A flush runs every 5 seconds. It can wait for the write of one merged
+file, a few seconds on the platform. During a blob storage outage, the records
+wait in memory. A kill then loses all records since the outage began. The README
+states this.
 
 A stored line that is not a JSON object with a valid `ts` and a string `user`
 is skipped with a warning.

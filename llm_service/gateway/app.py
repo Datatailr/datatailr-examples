@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from llm_service.gateway.audit import AuditLog, PromptUnreadable, iso, parse_time, run_flusher, utc_now
-from llm_service.gateway.audit_merge import AuditMerger
+from llm_service.gateway.audit_merge import MAINTENANCE_INTERVAL, AuditMerger, run_maintenance
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
 from llm_service.gateway.identity import AdminCheck, acting_user_from_headers, user_from_headers
@@ -84,17 +84,19 @@ def create_app(
     download: Downloader,
     http: httpx.AsyncClient | None = None,
     now: Callable[[], datetime] = utc_now,
+    maintenance_interval: float = MAINTENANCE_INTERVAL,
 ) -> FastAPI:
     """Build the gateway application from its parts.
 
     `now` is the clock of the audit log, the merger and the usage totals. Tests replace it.
+    `maintenance_interval` is the sleep in seconds between two merge and retention steps.
     """
     owns_http = http is None
     client = http or httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
     audit = AuditLog(store, config.blob_root, config.flush_size, now=now)
     usage = UsageTotals(store, config.blob_root, audit, lambda: iso(now())[:10], now=now)
     merger = AuditMerger(store, config.blob_root, audit, now, config.prompt_retention_days)
-    stopping = threading.Event()  # set before the last flusher cycle at shutdown
+    stopping = threading.Event()  # set before the last flusher cycle, which forces the checkpoint
     weights = WeightCache(store, config.blob_root, config.local_dir, download)
 
     def write_audit(record: dict) -> None:
@@ -132,18 +134,17 @@ def create_app(
     manager = ModelManager(weights, engine, store, config.blob_root, config.default_model, on_event)
 
     def on_flusher_tick() -> None:
-        """Run the housekeeping after each flush, in the flusher thread.
+        """Run the usage steps after each flush, in the flusher thread.
 
-        Each step has its own guard, so one failure does not stop the others. The last
-        cycle at shutdown skips the merge and the retention, which list and read storage.
+        Each step has its own guard, so one failure does not stop the other. The last cycle
+        at shutdown forces the checkpoint. The merge and the retention run in the
+        maintenance task, so a flush never waits for their deletes.
         """
         last_cycle = stopping.is_set()
         steps = [
             ("close_days", usage.close_days),
             ("checkpoint", lambda: usage.checkpoint(force=last_cycle)),
         ]
-        if not last_cycle:
-            steps.append(("merge", merger.tick))
         for name, step in steps:
             try:
                 step()
@@ -164,6 +165,8 @@ def create_app(
         flusher = asyncio.create_task(
             run_flusher(audit, config.flush_interval, on_tick=on_flusher_tick)
         )
+        maintenance = asyncio.create_task(run_maintenance(merger.tick, maintenance_interval))
+        app.state.maintenance_task = maintenance
         app.state.startup_task = asyncio.create_task(manager.startup())
         try:
             yield
@@ -177,6 +180,10 @@ def create_app(
             try:
                 await engine.stop()
             finally:
+                # Do not wait for a merge step that runs now. Its thread ends by itself.
+                maintenance.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await maintenance
                 stopping.set()
                 flusher.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -189,6 +196,7 @@ def create_app(
     app.state.switch_task = None
     app.state.startup_task = None
     app.state.reload_task = None
+    app.state.maintenance_task = None
     app.state.manager = manager
     app.state.audit = audit
     app.state.usage = usage

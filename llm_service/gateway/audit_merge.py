@@ -1,6 +1,7 @@
 """Merges of the audit metadata, and the retention of prompts.
 
-The flusher thread calls `AuditMerger.tick` after each flush attempt. A merge puts the segments
+The task `run_maintenance` calls `AuditMerger.tick` in a worker thread of its own, apart from
+the flusher. A merge puts the segments
 of a finished 10 minute bucket into one part, and the parts of a finished day into one day
 file. Retention deletes the prompt folders of old days. See the sections "Merges" and
 "Prompt retention" of `docs/audit-storage-design.md`. All times are UTC.
@@ -8,6 +9,7 @@ file. Retention deletes the prompt folders of old days. See the sections "Merges
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -40,6 +42,7 @@ RETAIN_DELETES_PER_CALL = 64  # prompt files that one `retain` call deletes at m
 RETAIN_LISTINGS_PER_CALL = 20  # prompt folders that one `retain` call lists at most
 RETAIN_TRIES = 3  # calls in a row that a prompt file can fail before its day waits
 DELETE_WORKERS = 8  # threads that delete merged inputs or prompt files
+MAINTENANCE_INTERVAL = 5.0  # seconds between two calls of `AuditMerger.tick` by `run_maintenance`
 
 
 class _Folder:
@@ -61,9 +64,11 @@ def _day_folder(root: str, day: str) -> str:
 class AuditMerger:
     """Merges the audit metadata of `log` and deletes old prompts.
 
-    Only the flusher thread calls `merge`, `retain` and `tick`. `merge` holds `log.flush_lock`
-    for the listing of a day folder, and for the reads, the write and the `cache_put` of each
-    merged file. It releases the lock before it deletes the inputs, so a flush can run then.
+    Only one thread at a time calls `merge`, `retain` and `tick`: the maintenance thread of
+    `run_maintenance`. A flush runs in the flusher thread and calls `flushed`. `merge` holds
+    `log.flush_lock` for the listing of a day folder, and for the reads, the write and the
+    `cache_put` of each merged file. It deletes the inputs without the lock. So a flush waits at
+    most for the write of one merged file.
     `merge` lists only the day folders that can have work: the first merge after a start finds
     them with one listing of `audit/`, and `flushed` adds the day of each new segment. With
     `retention_days` None, `retain` keeps all prompts.
@@ -383,3 +388,19 @@ class AuditMerger:
             with ThreadPoolExecutor(max_workers=min(DELETE_WORKERS, len(paths))) as pool:
                 results = list(pool.map(delete, paths))
         return {path for path, ok in zip(paths, results) if not ok}
+
+
+async def run_maintenance(tick: Callable[[], None], interval: float = MAINTENANCE_INTERVAL) -> None:
+    """Call `tick` in a worker thread, then sleep `interval` seconds, until cancelled.
+
+    `tick` is `AuditMerger.tick`. It has its own limits: a merge at most one time each minute,
+    a retention check each hour. The loop awaits each call, so one call runs at a time. An
+    error in `tick` is logged and the loop goes on. A cancel returns at once. A call that runs
+    then ends in its thread by itself.
+    """
+    while True:
+        try:
+            await asyncio.to_thread(tick)
+        except Exception as error:
+            logger.warning("the maintenance step merge failed: %s", error)
+        await asyncio.sleep(interval)

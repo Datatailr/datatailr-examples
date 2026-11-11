@@ -282,7 +282,7 @@ The answer has the fields of the list row and the field `prompt`. If prompt rete
 
 - 400 `invalid_time`: `day` is missing or has another form.
 - 404 `record_not_found`: the day has no record with this id.
-- 502 `prompt_unreadable`: the prompt file exists and the service cannot read it, or its line does not hold the record. A missing file of the old layout gives the same error.
+- 502 `prompt_unreadable`: the prompt file exists and the service cannot read it, or its line does not hold the record. A missing file of the old layout gives the same error. So does a row with no prompt reference.
 - 403 `admin_required`: the caller is not an admin.
 
 To see the users in the log with their first and last request, call `/admin/audit/users`.
@@ -297,7 +297,7 @@ By default the service keeps all prompts. To delete old prompts, set `LLM_PROMPT
 LLM_PROMPT_RETENTION_DAYS=30 python deploy.py service
 ```
 
-The service then deletes the prompts of each UTC day that ended more than 30 days ago. It checks one time each hour. Each flusher cycle deletes at most 64 prompt files, eight at a time, and lists at most 20 prompt folders. A large backlog of old prompts thus takes many cycles. The metadata of the records stays, so the list and the usage totals do not change. Opening a record whose prompt is deleted gives `prompt_deleted: true`. Any other value stops the service at the start, with an error that names the variable.
+The service then deletes the prompts of each UTC day that ended more than 30 days ago. It checks one time each hour. A background task deletes at most 64 prompt files each 5 seconds, eight at a time. It lists at most 20 prompt folders in that time. A large backlog of old prompts thus takes many steps. The metadata of the records stays, so the list and the usage totals do not change. Opening a record whose prompt is deleted gives `prompt_deleted: true`. Any other value stops the service at the start, with an error that names the variable.
 
 Files of the old layout hold the metadata and the prompt together. Retention does not delete them.
 
@@ -352,7 +352,7 @@ All data is in blob storage, under the root directory in `LLM_BLOB_ROOT`:
 
 The service writes `.complete` after the last weight file. The marker lists each file with its size. An upload that stops half way is not used. When the service downloads a model from blob storage, it downloads only the listed files and checks their sizes. If a file is missing or has the wrong size, the load fails with an error that names the file.
 
-A flush writes the prompts first, then the metadata. The service merges the metadata of each 10 minutes into one part file, and the parts of a finished day into one day file. The merges run in the background. A bucket merges 1 to 2 minutes after its end, and a day 15 to 16 minutes after its end. A `<day>` is a UTC day like `2026-11-11`. A `<bucket>` is the date, the hour and the tens digit of the minute, like `20261111T140`. The prompts live in their own folder, so a list of the audit log never reads them. The design document [docs/audit-storage-design.md](docs/audit-storage-design.md) describes the layout.
+A flush writes the prompts first, then the metadata. The service merges the metadata of each 10 minutes into one part file, and the parts of a finished day into one day file. The merges run in a background task of their own, so a flush does not wait for them. A bucket merges 1 to 2 minutes after its end, and a day 15 to 16 minutes after its end. A `<day>` is a UTC day like `2026-11-11`. A `<bucket>` is the date, the hour and the tens digit of the minute, like `20261111T140`. The prompts live in their own folder, so a list of the audit log never reads them. The design document [docs/audit-storage-design.md](docs/audit-storage-design.md) describes the layout.
 
 Files of the old layout, `audit/<day>/<time>-<id>.jsonl` with the full records, stay readable. The service never merges or changes them. Their records show in the list and count in the usage totals.
 
@@ -364,7 +364,7 @@ The first start after the upgrade reads every old layout file of the days withou
 
 ## Known limits
 
-- The service buffers audit records in memory. It writes them to blob storage every 5 seconds, at 100 records, and at shutdown. In normal operation, a kill of the container loses the records since the last flush. A flush runs every 5 seconds. The write of a merged file or a retention step can delay one flush by a few seconds. During a blob storage outage, the records wait in memory. A kill then loses all records since the outage began.
+- The service buffers audit records in memory. It writes them to blob storage every 5 seconds, at 100 records, and at shutdown. In normal operation, a kill of the container loses the records since the last flush. A flush runs every 5 seconds. It can wait for the write of one merged file, a few seconds on the platform. During a blob storage outage, the records wait in memory. A kill then loses all records since the outage began.
 - If vLLM stops, the next request to a model endpoint starts one reload of the active model. During the reload, requests get status 503 with a `Retry-After` header. If that reload fails, an admin must call `POST /admin/model`. Until then, requests get status 503 with the code `no_model`.
 - If the engine fails in the middle of a stream, the stream ends without an error event. The audit record has the status 502.
 - At startup, the service reads the usage totals from blob storage. If that read fails, the service does not start, and the platform restarts it.
@@ -373,10 +373,10 @@ The first start after the upgrade reads every old layout file of the days withou
 - The audit log stores each prompt in full. It does not store the answers. A prompt is not searchable. The filters work on metadata.
 - One service instance writes the audit log. Two instances on one `LLM_BLOB_ROOT` are not supported.
 - A day file is read in one piece. The design fits about 300,000 requests a day.
-- A blob write that fails after the blob was written leaves the records in the buffer. The next flush writes them again under a new segment name, so they appear two times in the audit list. The usage totals count such a record one time. A restart before the next checkpoint counts it two times.
+- A blob write that fails after the blob was written leaves the records in the buffer. The next flush writes them again under a new segment name, so they appear two times in the audit list. The usage totals count such a record one time. A restart before the next checkpoint counts it two times. A day that the service rebuilds from the metadata, with no checkpoint or with an invalid usage file, also counts it two times.
 - The merges assume that a blob write is atomic. A reader never sees half a file.
 - A clock that steps back across a restart can give a new segment a name that is not greater than the last checkpoint. A crash before the next checkpoint then loses those rows from the usage totals.
-- A stop of the service waits for a merge that runs at that moment.
+- A stop ends the maintenance task first. It does not wait for a merge step that runs at that moment. The last flush waits at most for the write of one merged file. The process exits when the running merge step ends.
 - A late record for a day whose daily usage file exists counts in memory at once. The service writes it to the daily file at the next flusher cycle. A crash between the two loses it from the usage totals.
 - Token counts for a stream come from the last chunk. The service asks vLLM for that chunk. It removes the chunk again if the client did not ask for it.
 - There are no rate limits and no quotas for each user.

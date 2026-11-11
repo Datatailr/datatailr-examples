@@ -62,7 +62,14 @@ def plain_download(model: str, revision: str, target: Path) -> None:
 
 
 def make_app(
-    tmp_path, engine=None, store=None, http=None, download=plain_download, now=None, **config_args
+    tmp_path,
+    engine=None,
+    store=None,
+    http=None,
+    download=plain_download,
+    now=None,
+    maintenance_interval=None,
+    **config_args,
 ):
     store = store or MemoryBlobStore()
     engine = engine or FakeEngine()
@@ -74,9 +81,12 @@ def make_app(
         transport=httpx.ASGITransport(app=fake_vllm_app()), base_url="http://engine"
     )
     admin = AdminCheck("alice", "admins", lambda group: ["carol"])
-    if now is None:
-        return create_app(config, store, engine, admin, download, http)
-    return create_app(config, store, engine, admin, download, http, now=now)
+    extra = {}
+    if now is not None:
+        extra["now"] = now
+    if maintenance_interval is not None:
+        extra["maintenance_interval"] = maintenance_interval
+    return create_app(config, store, engine, admin, download, http, **extra)
 
 
 def wait_for(client, predicate, timeout=10.0):
@@ -1110,9 +1120,9 @@ class Clock:
         self.value += timedelta(**kwargs)
 
 
-def test_the_flusher_runs_the_merger_and_shutdown_writes_the_checkpoint(tmp_path):
+def test_the_maintenance_task_merges_and_shutdown_writes_the_checkpoint(tmp_path):
     store, clock = MemoryBlobStore(), Clock()
-    app = make_app(tmp_path, store=store, now=clock, flush_interval=0.05)
+    app = make_app(tmp_path, store=store, now=clock, flush_interval=0.05, maintenance_interval=0.05)
     with TestClient(app) as c:
         wait_ready(c)
         for _ in range(3):
@@ -1191,3 +1201,45 @@ def test_a_failed_flusher_step_names_the_step(tmp_path, caplog, step):
                 time.sleep(0.05)
             delattr(c.app.state.usage, step)  # the class method again, for the shutdown
     assert f"the flusher step {step} failed: simulated step failure" in caplog.messages
+
+
+class BlockedDeletes(MemoryBlobStore):
+    """A memory store whose deletes of segments wait for `release`. `deleting` is set at the first one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.deleting = threading.Event()
+        self.release = threading.Event()
+
+    def delete(self, path):
+        if "/segments/" in path:
+            self.deleting.set()
+            assert self.release.wait(10)
+        super().delete(path)
+
+
+def test_the_flusher_runs_while_a_merge_deletes_its_inputs(tmp_path):
+    store, clock = BlockedDeletes(), Clock()
+    app = make_app(tmp_path, store=store, now=clock, flush_interval=0.05, maintenance_interval=0.05)
+    path = "llm-service/usage/2026-11-10.partial.json"
+    try:
+        with TestClient(app) as c:
+            wait_ready(c)
+            c.post(CHAT, headers=BOB, json=HI)
+            c.app.state.audit.flush()  # the segment gets the stamp of the first clock value
+            clock.advance(minutes=12)
+            assert store.deleting.wait(10)  # the merge waits in its delete
+            before = store.ls("llm-service/audit/2026-11-10/segments")
+            assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if len(store.ls("llm-service/audit/2026-11-10/segments")) > len(before):
+                    break
+                time.sleep(0.05)
+            assert len(store.ls("llm-service/audit/2026-11-10/segments")) > len(before)
+            store.release.set()
+            task = c.app.state.maintenance_task
+        assert task.done()
+    finally:
+        store.release.set()
+    assert path in store.ls("llm-service/usage")

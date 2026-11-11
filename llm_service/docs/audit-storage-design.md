@@ -88,13 +88,13 @@ The flush interval and the flush size stay as they are: 5 seconds and 100 record
 
 ## Merges
 
-The flusher thread runs the merge after a flush. The merge runs at most one time each minute. It holds the flush lock for the listing of a day folder. It also holds it for the reads, the write and the cache update of each merged file. It releases the lock before it deletes the inputs, so a flush can run during the deletes. The merge reads its inputs eight at a time and deletes them eight at a time.
+The service runs the merge and the retention in a background task of their own, apart from the flusher. The task runs one step at most every 5 seconds. The merge runs at most one time each minute. It holds the flush lock while it lists a folder, reads the inputs and writes the merged file. It deletes the inputs without the lock. So a flush waits at most for one write of a merged file. The merge reads its inputs eight at a time and deletes them eight at a time.
 
 The merge lists only the day folders that have work. The first merge after a start lists `audit/` one time and notes each folder that has a segment or a part. After that, each flush adds its day to the set. A folder leaves the set when it holds no segment and no part after a merge. A flush that writes to the folder after the listing of the merge keeps it in the set.
 
 A bucket merges 1 to 2 minutes after its end, and a day merges 15 to 16 minutes after its end. The wait comes from the delay of the rules below plus the one minute between two merges.
 
-The last flusher cycle at a stop does not merge. A stop of the service waits for a merge that runs at that moment.
+A stop ends the maintenance task first. It does not wait for a merge step that runs at that moment. The last flush waits at most for the write of one merged file. The process exits when the running merge step ends.
 
 ### Parts
 
@@ -116,7 +116,7 @@ A late record can still arrive in a day folder that has a day file. It makes a n
 
 ### Failures
 
-- A failed write in step 2 changes nothing. The merge runs again at the next cycle.
+- A failed write in step 2 changes nothing. The merge runs again one minute later.
 - A flush can run between step 2 and step 3. It writes new segments only, and it never touches a merged file or its inputs.
 - A stop between step 2 and step 3 leaves the merged file and its inputs. The reader handles this with the rule in [Reads](#reads), and the next merge deletes the inputs.
 - A merge never changes a row, so a row keeps its `seg`.
@@ -186,17 +186,17 @@ A new deploy variable `LLM_PROMPT_RETENTION_DAYS`. It is not set by default, and
 
 The value is a whole number from 1 to 36500. Any other value stops the service at the start, with an error that names the variable.
 
-When it is set to N, the flusher deletes the prompt files of each day that ended more than N days ago. The test is strict. A day that ended exactly N days ago stays. The metadata stays.
+When it is set to N, the maintenance task deletes the prompt files of each day that ended more than N days ago. The test is strict. A day that ended exactly N days ago stays. The metadata stays.
 
-A new check starts at most one time each hour. It queues the days past the limit that are not clean yet, newest first. The flusher works on the day at the head of the queue:
+A new check starts at most one time each hour. It queues the days past the limit that are not clean yet, newest first. The task works on the day at the head of the queue:
 
 1. It lists `prompts/<day>/` one time and keeps the list of its files in memory.
-2. Each flusher cycle deletes the next files of that list, eight at a time.
-3. When every file of the list is deleted, the day is clean. The flusher then goes on with the next day.
+2. Each maintenance step deletes the next files of that list, eight at a time.
+3. When every file of the list is deleted, the day is clean. The task then goes on with the next day.
 
-One flusher cycle deletes at most 64 prompt files and lists at most 20 prompt folders. The next cycle goes on with the rest. On the platform, a cycle with retention work takes a few seconds more. A file whose delete fails stays in the list, and the next cycle tries it again. When the same file fails in three cycles in a row, the day waits for the next hourly check. The last cycle at a stop skips retention.
+One maintenance step deletes at most 64 prompt files and lists at most 20 prompt folders. The next step goes on with the rest. A file whose delete fails stays in the list, and the next step tries it again. When the same file fails in three steps in a row, the day waits for the next hourly check. A stop ends the retention with the maintenance task.
 
-The flusher takes the day names from the day folders of `audit/`. It never lists all of `prompts/`. It keeps the set of clean days in memory, so each hourly check lists only the days that newly passed the limit. After a restart, the set is empty. The first check then lists the prompt folder of each day past the limit again, at most 20 for each flusher cycle.
+The task takes the day names from the day folders of `audit/`. It never lists all of `prompts/`. It keeps the set of clean days in memory, so each hourly check lists only the days that newly passed the limit. After a restart, the set is empty. The first check then lists the prompt folder of each day past the limit again, at most 20 for each step.
 
 A record whose prompt file is gone answers with `"prompt": null` and `"prompt_deleted": true`. The answer has `prompt_deleted` only in this case.
 
@@ -231,21 +231,21 @@ No change in the answers. The days `since` and `until` of the usage endpoints ac
 
 - One service instance writes the log. Two instances on one blob root are not supported. This is true today.
 - A day file with N rows is read in one piece. The design fits about 300,000 requests a day. Above that, the day file gets large and needs a split.
-- A crash loses the records that wait in the buffer. A flush runs every 5 seconds. The write of a merged file or a retention step can delay one flush by a few seconds.
+- A crash loses the records that wait in the buffer. A flush runs every 5 seconds. It can wait for the write of one merged file, a few seconds on the platform.
 - A prompt is not searchable. The filters work on metadata.
-- A blob write can fail after the blob was written. The records then stay in the buffer. The next flush writes them again under a new segment name, so they appear two times in the lists. The usage totals count such a record one time. A restart before the next checkpoint reads both copies and counts it two times.
+- A blob write can fail after the blob was written. The records then stay in the buffer. The next flush writes them again under a new segment name, so they appear two times in the lists. The usage totals count such a record one time. A restart before the next checkpoint reads both copies and counts it two times. A day that the service rebuilds from the metadata, with no checkpoint or with an invalid usage file, also counts it two times.
 - The merges assume that a blob write is atomic. A reader never sees half a file.
 - A clock that steps back across a restart can give a new segment a name that is not greater than the last checkpoint. A crash before the next checkpoint then loses those rows from the usage totals.
-- A stop of the service waits for a merge that runs at that moment.
+- A stop ends the maintenance task first. It does not wait for a merge step that runs at that moment. The last flush waits at most for the write of one merged file. The process exits when the running merge step ends.
 - A late record for a day whose daily usage file exists counts in memory at once. The service writes it to the daily file at the next flusher cycle. A crash between the two loses it from the usage totals.
 
 ## Testing
 
 - Flush: prompt file before segment file, the two failure cases, and the write-through cache.
-- Merges: parts and day files, a late record in a finished day, and no merge of a bucket that is not ready. A stop between the write and the deletes. A flush during the deletes.
+- Merges: parts and day files, a late record in a finished day, and no merge of a bucket that is not ready. A stop between the write and the deletes. A flush and a checkpoint during the deletes.
 - Reads: the `seg` rule with duplicated inputs, the old layout, the order of records, and a list that makes no prompt read.
 - Usage: the checkpoint holds only flushed rows, and a start from a checkpoint reads only later rows. The three start cases. One listing of `usage/` at a start.
-- Retention: deletion after N days, and no deletion when the variable is not set. The limit of 64 deletes and 20 listings for each cycle. A failed delete. The answer for a deleted prompt.
+- Retention: deletion after N days, and no deletion when the variable is not set. The limit of 64 deletes and 20 listings for each step. A failed delete. The answer for a deleted prompt.
 - API: the new endpoint with its error cases, and the list without prompts.
 - Admin app: the new route and the record dialog.
 - On an installation: a load run that writes a few thousand records, then a restart, with the start time and the audit page time measured.

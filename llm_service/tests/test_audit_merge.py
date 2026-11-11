@@ -1,5 +1,8 @@
+import asyncio
+import contextlib
 import logging
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 from llm_service.gateway.audit import AuditLog
@@ -13,7 +16,7 @@ from llm_service.gateway.audit_layout import (
     prompts_dir,
     segment_path,
 )
-from llm_service.gateway.audit_merge import AuditMerger
+from llm_service.gateway.audit_merge import AuditMerger, run_maintenance
 from llm_service.gateway.storage import MemoryBlobStore
 
 ROOT = "root"
@@ -737,3 +740,91 @@ def test_each_merge_logs_one_line_with_its_cost(caplog):
     assert merged[0].endswith(" s (3 rows)")
     assert merged[1].startswith(f"merged 1 files of {DAY} into the day file in ")
     assert merged[1].endswith(" s (3 rows)")
+
+
+# The maintenance task
+
+
+class BlockedDelete(Store):
+    """A store whose deletes of segments wait for `release`. `deleting` is set at the first one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.deleting = threading.Event()
+        self.release = threading.Event()
+
+    def delete(self, path):
+        if "/segments/" in path:
+            self.deleting.set()
+            assert self.release.wait(10)
+        super().delete(path)
+
+
+def test_a_flush_and_a_checkpoint_complete_while_a_merge_deletes_its_inputs():
+    from llm_service.gateway.usage import UsageTotals
+
+    store = BlockedDelete()
+    clock, store, log, merger = make(at(11, 14, 1), store=store)
+    usage = UsageTotals(store, ROOT, log, lambda: DAY, now=clock)
+    log.flushed_listeners.append(usage.flushed)
+    write(log, rec("alice", "2026-11-11T14:01:00.000Z"))
+    clock.when = at(11, 14, 11)
+    merging = threading.Thread(target=merger.tick)
+    merging.start()
+    try:
+        assert store.deleting.wait(5)
+        log.add(rec("bob", "2026-11-11T14:11:00.000Z"))
+        assert log.flush()
+        usage.checkpoint(force=True)
+        assert store.exists(f"{ROOT}/usage/{DAY}.partial.json")
+        assert merging.is_alive()  # the merge still waits in its delete
+    finally:
+        store.release.set()
+        merging.join(5)
+    assert [row["user"] for row in AuditLog(store, ROOT).rows_for_day(DAY)] == ["alice", "bob"]
+
+
+def test_the_maintenance_loop_survives_an_error_in_tick(caplog):
+    calls = []
+
+    def tick():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("simulated tick failure")
+
+    async def scenario():
+        task = asyncio.create_task(run_maintenance(tick, interval=0.01))
+        for _ in range(500):
+            if len(calls) >= 3:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    with caplog.at_level(logging.WARNING, logger="llm_service.audit"):
+        asyncio.run(scenario())
+    assert len(calls) >= 3
+    assert "the maintenance step merge failed: simulated tick failure" in caplog.messages
+
+
+def test_a_cancelled_maintenance_loop_does_not_wait_for_a_running_tick():
+    entered = threading.Event()
+    release = threading.Event()
+
+    def tick():
+        entered.set()
+        release.wait(10)
+
+    async def scenario():
+        task = asyncio.create_task(run_maintenance(tick, interval=0.01))
+        assert await asyncio.to_thread(entered.wait, 5)
+        started = time.monotonic()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert time.monotonic() - started < 1
+        assert task.done()
+        release.set()  # the worker thread ends by itself
+
+    asyncio.run(scenario())
