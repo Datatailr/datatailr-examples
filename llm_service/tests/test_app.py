@@ -68,7 +68,7 @@ def make_app(tmp_path, engine=None, store=None, http=None, download=plain_downlo
     http = http or httpx.AsyncClient(
         transport=httpx.ASGITransport(app=fake_vllm_app()), base_url="http://engine"
     )
-    admin = AdminCheck("alice", None, lambda group: [])
+    admin = AdminCheck("alice", "admins", lambda group: ["carol"])
     return create_app(config, store, engine, admin, download, http)
 
 
@@ -600,3 +600,57 @@ def test_read_hf_token_failure_logs_the_key_and_environment(caplog):
         assert read_hf_token("hf_token", "pre", broken) is None
     message = " ".join(caplog.messages)
     assert "hf_token" in message and "pre" in message and "secret not found" in message
+
+
+ACTING = "X-LLM-Acting-User"
+
+
+def test_acting_user_must_be_admin_too(client):
+    r = client.get("/admin/model", headers=ALICE | {ACTING: "bob"})
+    assert r.status_code == 403 and r.json()["error"]["code"] == "admin_required"
+    assert "acting user" in r.json()["error"]["message"]
+
+
+def test_non_admin_caller_with_acting_user_is_403(client):
+    r = client.get("/admin/model", headers=BOB | {ACTING: "alice"})
+    assert r.status_code == 403
+    assert "acting user" not in r.json()["error"]["message"]
+
+
+def test_non_admin_caller_with_bad_acting_user_is_403(client):
+    r = client.get("/admin/model", headers=BOB | {ACTING: "x" * 257})
+    assert r.status_code == 403
+
+
+def test_admin_acting_user_is_accepted(client):
+    r = client.get("/admin/model", headers=ALICE | {ACTING: "carol"})
+    assert r.status_code == 200
+
+
+def test_switch_is_audited_under_the_acting_user(client):
+    client.post("/admin/model", json={"model": "org/other"}, headers=ALICE | {ACTING: "carol"})
+    wait_ready(client)
+    events = [r for r in audit_records(client) if r["prompt"].get("event") == "model_switch"]
+    assert events[0]["user"] == "carol"
+
+
+@pytest.mark.parametrize("name", ["x" * 257, "a\tb"])
+def test_bad_acting_user_is_400(client, name):
+    r = client.get("/admin/model", headers=ALICE | {ACTING: name})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_acting_user"
+
+
+@pytest.mark.parametrize("headers", [{ACTING: "  "}, {}])
+def test_empty_acting_user_means_the_caller(client, headers):
+    client.post("/admin/model", json={"model": "org/other"}, headers=ALICE | headers)
+    wait_ready(client)
+    events = [r for r in audit_records(client) if r["prompt"].get("event") == "model_switch"]
+    assert events[0]["user"] == "alice"
+
+
+def test_openai_endpoints_ignore_the_acting_user(client):
+    r = client.post(CHAT, headers=BOB | {ACTING: "alice"}, json=HI)
+    assert r.status_code == 200
+    users = [rec["user"] for rec in audit_records(client) if rec["endpoint"] == CHAT]
+    assert users == ["bob"]

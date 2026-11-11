@@ -1,8 +1,11 @@
 import sys
 import types
 
+import pytest
+
 from llm_service.gateway.identity import (
     AdminCheck,
+    acting_user_from_headers,
     platform_group_members,
     user_from_headers,
 )
@@ -20,6 +23,25 @@ def test_user_from_headers_is_case_insensitive_with_starlette_headers():
     from starlette.datastructures import Headers
 
     assert user_from_headers(Headers({"X-Datatailr-User": "carol"})) == "carol"
+
+
+def test_acting_user_from_headers():
+    assert acting_user_from_headers({"X-LLM-Acting-User": "  carol "}) == "carol"
+    assert acting_user_from_headers({"X-LLM-Acting-User": "   "}) is None
+    assert acting_user_from_headers({}) is None
+    assert acting_user_from_headers({"X-LLM-Acting-User": "x" * 256}) == "x" * 256
+
+
+@pytest.mark.parametrize("name", ["x" * 257, "a\nb", "a\x00b", "a\tb", "a\x7fb"])
+def test_acting_user_from_headers_rejects_bad_names(name):
+    with pytest.raises(ValueError):
+        acting_user_from_headers({"X-LLM-Acting-User": name})
+
+
+def test_acting_user_from_headers_is_case_insensitive_with_starlette_headers():
+    from starlette.datastructures import Headers
+
+    assert acting_user_from_headers(Headers({"x-llm-acting-user": "carol"})) == "carol"
 
 
 def test_admin_owner_and_group_cache():

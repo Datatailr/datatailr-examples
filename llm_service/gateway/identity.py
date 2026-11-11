@@ -28,6 +28,26 @@ def user_from_headers(headers: Mapping[str, str]) -> str | None:
     return value or None
 
 
+ACTING_USER_HEADER = "X-LLM-Acting-User"
+MAX_ACTING_USER_LENGTH = 256
+
+
+def acting_user_from_headers(headers: Mapping[str, str]) -> str | None:
+    """Return the acting user name from the request headers.
+
+    Return None when the header is missing or empty. Raise `ValueError` when
+    the name is too long or has a control character.
+    """
+    name = (headers.get(ACTING_USER_HEADER) or "").strip()
+    if not name:
+        return None
+    if len(name) > MAX_ACTING_USER_LENGTH:
+        raise ValueError(f"the acting user name is longer than {MAX_ACTING_USER_LENGTH} characters")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
+        raise ValueError("the acting user name has a control character")
+    return name
+
+
 class AdminCheck:
     """Decide whether a user is an admin.
 

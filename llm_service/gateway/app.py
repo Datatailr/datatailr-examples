@@ -19,7 +19,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from llm_service.gateway.audit import AuditLog, iso, parse_time, run_flusher, utc_now
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
-from llm_service.gateway.identity import AdminCheck, user_from_headers
+from llm_service.gateway.identity import AdminCheck, acting_user_from_headers, user_from_headers
 from llm_service.gateway.models import ModelManager, SwitchInProgress
 from llm_service.gateway.proxy import forward, prompt_of
 from llm_service.gateway.storage import BlobStore
@@ -182,10 +182,21 @@ def create_app(
             raise ApiError(401, "authentication_error", "missing_user", "the request has no platform user")
         return user
 
-    async def require_admin(user: str = Depends(current_user)) -> str:
+    async def require_admin(request: Request, user: str = Depends(current_user)) -> str:
+        """Return the admin user: the acting user if the header names one, else the caller."""
         if not await asyncio.to_thread(admin.is_admin, user):
             raise ApiError(403, "permission_error", "admin_required", "this endpoint is for admins")
-        return user
+        try:
+            acting = acting_user_from_headers(request.headers)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_acting_user", str(error)) from None
+        if acting is None:
+            return user
+        if not await asyncio.to_thread(admin.is_admin, acting):
+            raise ApiError(
+                403, "permission_error", "admin_required", "the acting user is not an admin"
+            )
+        return acting
 
     # Platform
 
