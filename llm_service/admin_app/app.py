@@ -193,6 +193,13 @@ def create_app(service_url: str, http: httpx.AsyncClient | None = None) -> FastA
     async def audit_users(request: Request) -> JSONResponse:
         return await call(request, "GET", "/admin/audit/users")
 
+    @app.get("/api/audit/records/{request_id:path}")
+    async def audit_record(request_id: str, request: Request) -> JSONResponse:
+        path = _service_path("/admin/audit/records/", request_id)
+        if path is None or "/" in request_id:
+            return _error(400, "invalid_record", "The record id is not valid.", "invalid_request_error")
+        return await call(request, "GET", path, params=_query(request, ("day",)))
+
     @app.get("/")
     async def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
