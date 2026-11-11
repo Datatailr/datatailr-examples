@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -34,6 +35,7 @@ logger = logging.getLogger("llm_service.app")
 SYSTEM_USER = "system"
 OPENAI_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings")
 MAX_AUDIT_LIMIT = 1000
+DAY_FORM = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
 class ApiError(Exception):
@@ -66,6 +68,8 @@ def _check_day(name: str, value: str | None) -> str | None:
     if value is None:
         return None
     try:
+        if not DAY_FORM.fullmatch(value):
+            raise ValueError(value)
         date.fromisoformat(value)
     except ValueError:
         raise ApiError(400, "invalid_request_error", "invalid_time", f"{name} must be a day like 2026-11-10") from None
@@ -133,14 +137,15 @@ def create_app(
         Each step has its own guard, so one failure does not stop the others. The last
         cycle at shutdown skips the merge and the retention, which list and read storage.
         """
-        steps = [usage.close_days, usage.checkpoint]
-        if not stopping.is_set():
+        last_cycle = stopping.is_set()
+        steps = [usage.close_days, lambda: usage.checkpoint(force=last_cycle)]
+        if not last_cycle:
             steps.append(merger.tick)
         for step in steps:
             try:
                 step()
             except Exception as error:
-                logger.warning("flusher step %s failed: %s", step.__qualname__, error)
+                logger.warning("a flusher step failed: %s", error)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -485,7 +490,7 @@ def create_app(
         try:
             record = await asyncio.to_thread(audit.record, day, request_id)
         except PromptUnreadable as error:
-            logger.warning("the prompt of audit record %s is unreadable: %s", request_id, error)
+            logger.warning("the prompt of audit record %r is unreadable: %s", request_id, error)
             raise ApiError(
                 502, "server_error", "prompt_unreadable", "the prompt of this record cannot be read"
             ) from None

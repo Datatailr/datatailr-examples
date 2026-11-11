@@ -409,6 +409,23 @@ def test_checkpoint_writes_at_most_once_each_60_seconds_and_only_after_a_change(
     assert store.puts == []  # nothing changed
 
 
+def test_forced_checkpoint_ignores_the_60_second_limit_and_still_needs_a_change():
+    clock = Clock("2026-11-10T14:00:00")
+    store = CountingStore()
+    audit, usage = start(store, clock)
+    flush_one(audit, clock, "alice")
+    usage.checkpoint()
+    clock.advance(seconds=10)
+    second = flush_one(audit, clock, "bob")
+    usage.checkpoint()
+    assert partial(store)["through"] != second  # held back by the limit
+    usage.checkpoint(force=True)
+    assert partial(store)["through"] == second
+    store.puts.clear()
+    usage.checkpoint(force=True)
+    assert store.puts == []  # nothing changed
+
+
 def test_failed_checkpoint_is_logged_and_tried_at_the_next_call(caplog):
     clock = Clock("2026-11-10T14:00:00")
     store = FlakyBlobStore()

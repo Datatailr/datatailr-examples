@@ -283,16 +283,17 @@ class UsageTotals:
         except Exception as error:
             logger.warning("could not count a flushed audit segment: %s", error)
 
-    def checkpoint(self) -> None:
+    def checkpoint(self, force: bool = False) -> None:
         """Write the partial file of each day whose flushed totals changed. Never raises.
 
-        It writes at most one time each `CHECKPOINT_INTERVAL` by the clock. A failed
-        write is logged and tried again at the next call.
+        It writes at most one time each `CHECKPOINT_INTERVAL` by the clock, unless `force` is
+        true. A forced call still writes only days that changed since their last write. A
+        failed write is logged and tried again at the next call.
         """
         now = self._now()
         with self._lock:
             last = self._last_checkpoint
-            if last is not None and timedelta(0) <= now - last < CHECKPOINT_INTERVAL:
+            if not force and last is not None and timedelta(0) <= now - last < CHECKPOINT_INTERVAL:
                 return
             due = [
                 (day, version, self._through[day], _file_rows(self._flushed[day]))

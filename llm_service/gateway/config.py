@@ -7,15 +7,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
+MAX_RETENTION_DAYS = 36500  # 100 years
+
 
 def _retention_days(value: str | None) -> int | None:
     """Return the days to keep prompts, or None for no limit. Raise `ValueError` for a bad value."""
     text = (value or "").strip()
     if not text:
         return None
-    if text.isascii() and text.isdigit() and int(text) >= 1:
-        return int(text)
-    raise ValueError(f"LLM_PROMPT_RETENTION_DAYS must be a whole number of at least 1, not {text!r}")
+    days = int(text) if text.isascii() and text.isdigit() and len(text) <= 10 else 0
+    if 1 <= days <= MAX_RETENTION_DAYS:
+        return days
+    raise ValueError(
+        f"LLM_PROMPT_RETENTION_DAYS must be a whole number from 1 to {MAX_RETENTION_DAYS}, "
+        f"not {text[:40]!r}"
+    )
 
 
 @dataclass(frozen=True)

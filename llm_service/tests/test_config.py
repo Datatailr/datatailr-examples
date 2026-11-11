@@ -52,3 +52,10 @@ def test_prompt_retention_days():
 def test_prompt_retention_days_rejects_anything_else(value):
     with pytest.raises(ValueError, match="LLM_PROMPT_RETENTION_DAYS"):
         Config.from_env({"LLM_PROMPT_RETENTION_DAYS": value})
+
+
+def test_prompt_retention_days_upper_bound():
+    assert Config.from_env({"LLM_PROMPT_RETENTION_DAYS": "36500"}).prompt_retention_days == 36500
+    for value in ("36501", "9" * 5000):
+        with pytest.raises(ValueError, match="LLM_PROMPT_RETENTION_DAYS"):
+            Config.from_env({"LLM_PROMPT_RETENTION_DAYS": value})

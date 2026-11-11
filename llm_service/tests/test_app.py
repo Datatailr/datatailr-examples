@@ -469,6 +469,8 @@ def test_usage_rejects_bad_group_by_and_bad_days(client):
     assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_group_by"
     r = client.get("/admin/usage?since=yesterday", headers=ALICE)
     assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_time"
+    r = client.get("/admin/usage?since=20261110", headers=ALICE)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_time"
 
 
 def test_usage_me_returns_only_the_caller(client):
@@ -621,8 +623,6 @@ def test_read_hf_token_failure_logs_the_key_and_environment(caplog):
         assert read_hf_token("hf_token", "pre", broken) is None
     message = " ".join(caplog.messages)
     assert "hf_token" in message and "pre" in message and "secret not found" in message
-
-
 
 
 def test_acting_user_must_be_admin_too(client):
@@ -1041,7 +1041,10 @@ def test_record_endpoint_unknown_id_is_404(client):
     assert set(r.json()["error"]) == {"message", "type", "code"}
 
 
-@pytest.mark.parametrize("query", ["", "?day=", "?day=garbage", "?day=2026-13-40"])
+@pytest.mark.parametrize(
+    "query",
+    ["", "?day=", "?day=garbage", "?day=2026-13-40", "?day=20261110", "?day=2026-W45-2", "?day=2026-11-31"],
+)
 def test_record_endpoint_bad_or_missing_day_is_400(client, query):
     r = client.get("/admin/audit/records/abc" + query, headers=ALICE)
     assert r.status_code == 400
@@ -1136,3 +1139,24 @@ def test_shutdown_does_not_run_the_merger(tmp_path):
         clock.advance(minutes=12)
     files = store.ls("llm-service/audit")
     assert files and not any("/parts/" in p for p in files)
+
+
+def test_shutdown_checkpoint_ignores_the_60_second_limit(tmp_path):
+    store, clock = MemoryBlobStore(), Clock()
+    app = make_app(tmp_path, store=store, now=clock, flush_interval=0.05)
+    path = "llm-service/usage/2026-11-10.partial.json"
+    with TestClient(app) as c:
+        wait_ready(c)
+        c.post(CHAT, headers=BOB, json=HI)
+        c.app.state.audit.flush()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and path not in store.ls("llm-service/usage"):
+            time.sleep(0.05)
+        assert path in store.ls("llm-service/usage")
+        before = json.loads(store.get(path))
+        clock.advance(seconds=5)
+        c.post(CHAT, headers=BOB, json=HI)
+        c.app.state.audit.flush()
+    after = json.loads(store.get(path))
+    assert after["through"] > before["through"]
+    assert after["rows"] != before["rows"]
