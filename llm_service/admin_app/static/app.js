@@ -10,11 +10,13 @@ const BASE = new URL(location.pathname.endsWith('/') ? location.pathname : locat
                      location.origin);
 const PAGE_SIZE = 50;
 const POLL_MS = 3000;
+const MAX_POLL_FAILURES = 5;
 const COLORS = {bar: '#4c8dff', bar2: '#36c2b4', grid: 'rgba(56, 66, 82, .55)', text: '#9aa7b8'};
 
 const $ = id => document.getElementById(id);
 const number = new Intl.NumberFormat();
-const state = {tab: null, range: '30', loaded: {}, offset: 0, polling: false, detailUser: null,
+const state = {tab: null, range: '30', loaded: {}, offset: 0, polling: false, pollTimer: null, pollFailures: 0,
+               detailUser: null, chartsOff: false,
                charts: {}, pendingDelete: null, auditUsersRead: false, calls: {}};
 
 /** A number for a new call of `name`. A call that is no longer the newest drops its answer. */
@@ -54,7 +56,9 @@ function timeCell(iso) {
 }
 
 const shorten = (text, size) => (text.length > size ? `${text.slice(0, size - 1)}…` : text);
-const modelText = ref => (ref ? `${ref.model} @ ${ref.revision}` : 'None');
+const modelText = ref => `${ref.model} @ ${ref.revision}`;
+const servingText = engine => (engine.serving
+  ? `The service serves ${modelText(engine.serving)}.` : 'The service serves no model.');
 
 function replaceRows(body, rows, columns, empty) {
   body.replaceChildren(...rows);
@@ -214,11 +218,13 @@ async function loadUsage() {
   $('tile-failed').textContent = fmt(sum('failed_requests'));
   $('tile-tokens').textContent = fmt(sum('total_tokens'));
   $('tile-users').textContent = fmt(users.data.length);
-  state.charts.days ||= barChart('chart-days', COLORS.bar, false, label => label.slice(5));
-  state.charts.models ||= barChart('chart-models', COLORS.bar2, true,
-                                   label => shorten(label.split('/').pop(), 24));
-  setChart(state.charts.days, ...daySeries(days.data, range.since, range.until));
-  setChart(state.charts.models, models.data.map(row => row.model), models.data.map(row => row.total_tokens));
+  if (!state.chartsOff) {
+    state.charts.days ||= barChart('chart-days', COLORS.bar, false, label => label.slice(5));
+    state.charts.models ||= barChart('chart-models', COLORS.bar2, true,
+                                     label => shorten(label.split('/').pop(), 24));
+    setChart(state.charts.days, ...daySeries(days.data, range.since, range.until));
+    setChart(state.charts.models, models.data.map(row => row.model), models.data.map(row => row.total_tokens));
+  }
   replaceRows($('users-body'), users.data.map(userRow), 7, 'No requests in this range.');
   if (state.detailUser) await loadDetail(state.detailUser);
 }
@@ -244,7 +250,9 @@ function smallRow(key, row) {
 }
 
 async function loadDetail(user) {
+  const call = nextCall('detail');
   const detail = await api(`api/usage/${encodeURIComponent(user)}${query(usageRange())}`);
+  if (call !== state.calls.detail) return;
   state.detailUser = user;
   for (const row of $('users-body').rows) row.classList.toggle('selected', row.cells[0].textContent === user);
   $('detail-user').textContent = user;
@@ -272,20 +280,22 @@ function setRange(range) {
 /** A datetime-local value (local time) as an ISO time in UTC. */
 const isoTime = value => (value ? new Date(value).toISOString() : '');
 
+/** Fill the suggestions of the user filter. The filter also takes free text, so a failure only
+ * shows a banner. Reload tries again. */
 async function loadAuditUsers() {
-  const answer = await api('api/audit/users');
-  const select = $('audit-user');
-  const chosen = select.value;
-  select.replaceChildren(el('option', {value: '', text: 'All users'}),
-    ...answer.data.map(row => el('option', {value: row.user, text: row.user})));
-  select.value = answer.data.some(row => row.user === chosen) ? chosen : '';
   state.auditUsersRead = true;
+  try {
+    const answer = await api('api/audit/users');
+    $('audit-users').replaceChildren(...answer.data.map(row => el('option', {value: row.user})));
+  } catch (error) {
+    showBanner(`The page could not read the list of users: ${error.message}`);
+  }
 }
 
 async function loadAudit() {
   const call = nextCall('audit');
   if (!state.auditUsersRead) await loadAuditUsers();
-  const filters = {user: $('audit-user').value, model: $('audit-model').value.trim(),
+  const filters = {user: $('audit-user').value.trim(), model: $('audit-model').value.trim(),
                    since: isoTime($('audit-since').value), until: isoTime($('audit-until').value)};
   const answer = await api(`api/audit${query({...filters, limit: PAGE_SIZE, offset: state.offset})}`);
   if (call !== state.calls.audit) return;
@@ -329,7 +339,7 @@ function pageAudit(step) {
 function showHeader(engine) {
   const loading = engine.state === 'loading';
   $('serving-text').textContent = loading && engine.target ? `Loading ${modelText(engine.target)}`
-    : engine.serving ? modelText(engine.serving) : `No model (${engine.state})`;
+    : engine.serving ? modelText(engine.serving) : 'The service serves no model.';
   $('serving-dot').className = `dot ${engine.state}`;
 }
 
@@ -337,8 +347,8 @@ function showStatus({engine, models}) {
   showHeader(engine);
   $('st-state').textContent = engine.state;
   $('st-state').className = `badge ${engine.state}`;
-  $('st-serving').textContent = modelText(engine.serving);
-  $('st-target').textContent = engine.target ? modelText(engine.target) : 'None';
+  $('st-serving').textContent = engine.serving ? modelText(engine.serving) : 'The service serves no model.';
+  $('st-target').textContent = engine.target ? modelText(engine.target) : 'No switch runs.';
   $('st-error').textContent = engine.error || 'None';
   $('st-error').classList.toggle('bad', Boolean(engine.error));
   replaceRows($('models-body'), models.map(modelRow), 5, 'The service has no cached model.');
@@ -384,26 +394,56 @@ async function loadStatus() {
 function startPoll() {
   if (state.polling) return;
   state.polling = true;
+  state.pollFailures = 0;
   setBusy(true);
-  setTimeout(poll, POLL_MS);
+  state.pollTimer = setTimeout(poll, POLL_MS);
 }
 
+function stopPoll() {
+  clearTimeout(state.pollTimer);
+  state.pollTimer = null;
+  state.polling = false;
+  setBusy(false);
+}
+
+/** Read the state until the switch ends. Stop after MAX_POLL_FAILURES failed reads in a row. */
 async function poll() {
-  let status = null;
+  state.pollTimer = null;
+  let status;
   try {
     status = await api('api/status');
-    showStatus(status);
   } catch (error) {
-    showBanner(error.message);  // try again: the service may answer the next time
-  }
-  if (status && status.engine.state !== 'loading') {
-    state.polling = false;
-    setBusy(false);
-    if (status.engine.state === 'failed') showBanner(`The model did not load: ${status.engine.error || 'no error text'}`);
-    else showBanner(`The service serves ${modelText(status.engine.serving)}.`, 'ok');
+    state.pollFailures += 1;
+    if (state.pollFailures < MAX_POLL_FAILURES) {
+      state.pollTimer = setTimeout(poll, POLL_MS);
+    } else {
+      stopPoll();
+      showBanner(`The page could not read the state of the service: ${error.message} Use Reload to read it again.`);
+    }
     return;
   }
-  setTimeout(poll, POLL_MS);
+  state.pollFailures = 0;
+  showStatus(status);
+  if (status.engine.state === 'loading') {
+    state.pollTimer = setTimeout(poll, POLL_MS);
+    return;
+  }
+  stopPoll();
+  reportSwitch(status.engine);
+}
+
+/** Say how the switch ended. A successful load clears the error, so an error means a failed switch,
+ * also when the state is `ready` again with the old model. */
+function reportSwitch(engine) {
+  const rollback = engine.state === 'failed' ? ' A rollback may still run. Use Reload to read the state again.' : '';
+  if (engine.error) {
+    const now = engine.serving ? `The service still serves ${modelText(engine.serving)}.` : 'The service serves no model.';
+    showBanner(`The switch failed: ${engine.error.replace(/[.\s]+$/, '')}. ${now}${rollback}`);
+  } else if (engine.state === 'ready') {
+    showBanner(servingText(engine), 'ok');
+  } else {
+    showBanner(`The switch ended in the state ${engine.state}. ${servingText(engine)}${rollback}`);
+  }
 }
 
 async function serve(model, revision) {
@@ -474,8 +514,12 @@ function wire() {
 }
 
 async function start() {
-  themeCharts();
   wire();
+  try {
+    themeCharts();
+  } catch {
+    state.chartsOff = true;  // without Chart.js, the tiles and tables still work
+  }
   let me;
   try {
     me = await api('api/me');
@@ -490,6 +534,10 @@ async function start() {
   $('viewer').textContent = me.user;
   $('topbar').hidden = false;
   $('main').hidden = false;
+  if (state.chartsOff) {
+    document.querySelector('.charts').hidden = true;
+    showBanner('The charts could not load. The numbers and tables still work.');
+  }
   for (const button of document.querySelectorAll('[data-range]')) {
     button.setAttribute('aria-pressed', String(button.dataset.range === state.range));
   }

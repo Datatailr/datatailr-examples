@@ -7,7 +7,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from llm_service.admin_app.app import create_app
+from llm_service.admin_app.app import STATIC_DIR, create_app
 
 ALICE = {"X-Datatailr-User": "alice"}
 ERROR_403 = {"error": {"message": "admin only", "type": "permission_error", "code": "admin_required"}}
@@ -248,3 +248,10 @@ def test_static_assets_are_served(client):
         response = client.get("/" + path)
         assert response.status_code == 200, path
         assert response.content, path
+
+
+def test_page_has_no_html_sinks():
+    for name in ("app.js", "index.html"):
+        text = (STATIC_DIR / name).read_text()
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"):
+            assert sink not in text, (name, sink)

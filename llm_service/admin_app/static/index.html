@@ -4,8 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>LLM Service Admin</title>
-<!-- The platform serves the app under a path prefix. Without a trailing slash in the address,
-     the relative URLs below would leave that prefix, so add the slash first. -->
+<!-- The platform serves the app under a path prefix that the backend cannot know. Without a
+     trailing slash in the address, the relative URLs below would leave that prefix, so this
+     script adds the slash first. If a Content-Security-Policy forbids inline scripts, open the
+     page with a trailing slash in the address. -->
 <script>
 if (!location.pathname.endsWith('/')) {
   history.replaceState(null, '', location.pathname + '/' + location.search + location.hash);
@@ -129,7 +131,8 @@ if (!location.pathname.endsWith('/')) {
   <!-- Audit -->
   <section class="panel" role="tabpanel" id="panel-audit" aria-labelledby="tab-audit" hidden>
     <form class="toolbar filters" id="audit-form">
-      <label>User <select id="audit-user"><option value="">All users</option></select></label>
+      <label>User <input type="text" id="audit-user" list="audit-users" placeholder="All users" autocomplete="off"></label>
+      <datalist id="audit-users"></datalist>
       <label>Model <input type="text" id="audit-model" placeholder="org/name" autocomplete="off"></label>
       <label>Since <input type="datetime-local" id="audit-since"></label>
       <label>Until <input type="datetime-local" id="audit-until"></label>
