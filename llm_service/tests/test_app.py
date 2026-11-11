@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -1160,3 +1161,14 @@ def test_shutdown_checkpoint_ignores_the_60_second_limit(tmp_path):
     after = json.loads(store.get(path))
     assert after["through"] > before["through"]
     assert after["rows"] != before["rows"]
+
+
+def test_the_start_logs_the_cost_of_the_usage_load(tmp_path, caplog):
+    store = MemoryBlobStore()
+    store.put("llm-service/audit/2026-11-09/day.jsonl", "")
+    with caplog.at_level("INFO", logger="llm_service.app"):
+        with TestClient(make_app(tmp_path, store=store)) as c:
+            wait_ready(c)
+    lines = [m for m in caplog.messages if m.startswith("usage totals loaded in ")]
+    assert len(lines) == 1
+    assert re.fullmatch(r"usage totals loaded in \d+\.\d s for 1 days", lines[0])

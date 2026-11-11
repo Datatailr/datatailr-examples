@@ -715,3 +715,61 @@ def test_buffered_rows_at_load_count_once_and_stay_out_of_the_checkpoint():
 def test_default_clock_is_utc():
     usage = UsageTotals(MemoryBlobStore(), ROOT, AuditLog(MemoryBlobStore(), ROOT), lambda: DAY)
     assert usage._now().tzinfo is not None
+
+
+class CallStore(MemoryBlobStore):
+    """A memory store that records each `ls`, `exists` and `get` call."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, str]] = []
+        self._calls_lock = threading.Lock()
+
+    def _note(self, kind: str, path: str) -> None:
+        with self._calls_lock:
+            self.calls.append((kind, path))
+
+    def ls(self, prefix):
+        self._note("ls", prefix)
+        return super().ls(prefix)
+
+    def exists(self, path):
+        self._note("exists", path)
+        return super().exists(path)
+
+    def get(self, path):
+        self._note("get", path)
+        return super().get(path)
+
+
+def test_load_lists_usage_once_and_reads_each_daily_file_without_exists():
+    store = CallStore()
+    audit = AuditLog(store, ROOT)
+    first = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    days = [(first + timedelta(days=n)).strftime("%Y-%m-%d") for n in range(40)]
+    for n, day in enumerate(days):
+        audit.add(rec("alice", f"{day}T08:00:00.000Z"))
+        row = {
+            "user": "alice",
+            "model": "m1",
+            "requests": n + 1,
+            "failed_requests": 0,
+            "prompt_tokens": n,
+            "completion_tokens": 1,
+            "total_tokens": n + 1,
+            "last_request": f"{day}T08:00:00.000Z",
+        }
+        store.put(f"{ROOT}/usage/{day}.json", json.dumps({"day": day, "rows": [row]}))
+    audit.flush()
+    store.calls.clear()
+    usage = UsageTotals(store, ROOT, audit, lambda: "2026-11-10")
+    assert usage.load() == 40
+    usage_calls = [(kind, path) for kind, path in store.calls if path.startswith(f"{ROOT}/usage")]
+    assert [call for call in usage_calls if call[0] == "ls"] == [("ls", f"{ROOT}/usage")]
+    assert not any(kind == "exists" for kind, _ in store.calls)
+    assert sorted(path for kind, path in usage_calls if kind == "get") == [
+        f"{ROOT}/usage/{day}.json" for day in days
+    ]
+    by_day = {row["day"]: row for row in usage.summary(None, None, None, None, "day")}
+    assert {day: by_day[day]["requests"] for day in days} == {day: n + 1 for n, day in enumerate(days)}
+    assert usage.summary(None, None, None, None)[0]["requests"] == sum(range(1, 41))

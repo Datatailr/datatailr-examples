@@ -6,10 +6,11 @@ import json
 import logging
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Callable
 
-from llm_service.gateway.audit import AuditLog, utc_now
+from llm_service.gateway.audit import READ_WORKERS, AuditLog, utc_now
 from llm_service.gateway.storage import BlobStore
 
 logger = logging.getLogger("llm_service.usage")
@@ -19,6 +20,7 @@ _GROUPS = ("user", "model", "day")
 _KEY_INDEX = {"day": 0, "user": 1, "model": 2}  # position in the `(day, user, model)` key
 CHECKPOINT_INTERVAL = timedelta(seconds=60)  # the shortest time between two checkpoint writes
 _SEGMENT_NAME = re.compile(r"\d{8}T\d{6}\.\d{6}-.+")
+_PARTIAL_SUFFIX = ".partial.json"
 
 
 def is_segment_name(name: object) -> bool:
@@ -111,16 +113,19 @@ class UsageTotals:
     def _partial_path(self, day: str) -> str:
         return f"{self._prefix}/{day}.partial.json"
 
-    def load(self) -> None:
+    def load(self) -> int:
         """Read the totals of each day, then save finished days. See "Start" in the design.
 
-        A day with a daily file uses it. Else a day with a partial file uses its rows and the
-        rows after its `through`. Else the day is read in full. Buffered rows count in the
-        live totals only.
+        One listing of `usage/` finds the daily and the partial files. `READ_WORKERS` threads
+        read the daily files. A day with a valid daily file uses it. Else a day with a partial
+        file uses its rows and the rows after its `through`. Else the day is read in full.
+        Buffered rows count in the live totals only. Return the number of days.
         """
-        partials = self._partial_days()
-        for day in self._audit.days():
-            daily = self._read_day(day)
+        dailies, partials = self._usage_files()
+        days = self._audit.days()
+        found = self._read_days([day for day in days if day in dailies])
+        for day in days:
+            daily = found.get(day)
             if daily is not None:
                 with self._lock:
                     self._set_live(day, daily)
@@ -165,6 +170,7 @@ class UsageTotals:
                 else:
                     self._written.pop(day, None)
         self.close_days()
+        return len(days)
 
     def _set_live(self, day: str, rows: list[dict]) -> None:
         """Replace the live totals of `day` with `rows`. Hold the lock."""
@@ -182,15 +188,21 @@ class UsageTotals:
         for state in (self._flushed, self._through, self._version, self._written):
             state.pop(day, None)
 
-    def _partial_days(self) -> set[str]:
-        """Return the days that have a partial file. One listing of `usage/`."""
-        suffix = ".partial.json"
-        days = set()
+    def _usage_files(self) -> tuple[set[str], set[str]]:
+        """Return the days that have a daily file and the days that have a partial file.
+
+        One listing of `usage/`.
+        """
+        dailies, partials = set(), set()
         for path in self._store.ls(self._prefix):
             name = path[len(self._prefix) + 1 :]
-            if name.endswith(suffix) and "/" not in name:
-                days.add(name[: -len(suffix)])
-        return days
+            if "/" in name:
+                continue
+            if name.endswith(_PARTIAL_SUFFIX):
+                partials.add(name[: -len(_PARTIAL_SUFFIX)])
+            elif name.endswith(".json"):
+                dailies.add(name[: -len(".json")])
+        return dailies, partials
 
     def _read_usage(self, path: str, day: str, partial: bool) -> dict | None:
         """Return a valid usage file of `day`, or None if it is missing or invalid.
@@ -216,11 +228,18 @@ class UsageTotals:
 
     def _read_day(self, day: str) -> list[dict] | None:
         """Return the rows of the daily file, or None if it is missing or invalid."""
-        path = self._path(day)
-        if not self._store.exists(path):
-            return None
-        body = self._read_usage(path, day, partial=False)
+        body = self._read_usage(self._path(day), day, partial=False)
         return None if body is None else body["rows"]
+
+    def _read_days(self, days: list[str]) -> dict[str, list[dict] | None]:
+        """Return the rows of the daily file of each day of `days`, read by `READ_WORKERS` threads.
+
+        A missing or invalid file gives None. A failed read raises.
+        """
+        if len(days) < 2:
+            return {day: self._read_day(day) for day in days}
+        with ThreadPoolExecutor(max_workers=min(READ_WORKERS, len(days))) as pool:
+            return dict(zip(days, pool.map(self._read_day, days)))
 
     def _read_partial(self, day: str) -> dict | None:
         """Return the partial file of `day` (`day`, `through`, `rows`), or None."""

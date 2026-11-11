@@ -152,7 +152,9 @@ def create_app(
         # Load the totals first. Register the listeners after that, with no await
         # in between, so that no record is counted twice and no flush runs against
         # a half-loaded day.
-        await asyncio.to_thread(usage.load)
+        started = time.monotonic()
+        days = await asyncio.to_thread(usage.load)
+        logger.info("usage totals loaded in %.1f s for %d days", time.monotonic() - started, days)
         audit.listeners.append(usage.record)
         audit.flushed_listeners.append(usage.flushed)
         audit.flushed_listeners.append(merger.flushed)
