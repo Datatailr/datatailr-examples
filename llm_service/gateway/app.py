@@ -138,14 +138,17 @@ def create_app(
         cycle at shutdown skips the merge and the retention, which list and read storage.
         """
         last_cycle = stopping.is_set()
-        steps = [usage.close_days, lambda: usage.checkpoint(force=last_cycle)]
+        steps = [
+            ("close_days", usage.close_days),
+            ("checkpoint", lambda: usage.checkpoint(force=last_cycle)),
+        ]
         if not last_cycle:
-            steps.append(merger.tick)
-        for step in steps:
+            steps.append(("merge", merger.tick))
+        for name, step in steps:
             try:
                 step()
             except Exception as error:
-                logger.warning("a flusher step failed: %s", error)
+                logger.warning("the flusher step %s failed: %s", name, error)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

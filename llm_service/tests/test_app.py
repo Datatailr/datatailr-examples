@@ -1172,3 +1172,22 @@ def test_the_start_logs_the_cost_of_the_usage_load(tmp_path, caplog):
     lines = [m for m in caplog.messages if m.startswith("usage totals loaded in ")]
     assert len(lines) == 1
     assert re.fullmatch(r"usage totals loaded in \d+\.\d s for 1 days", lines[0])
+
+
+@pytest.mark.parametrize("step", ["close_days", "checkpoint"])
+def test_a_failed_flusher_step_names_the_step(tmp_path, caplog, step):
+    with caplog.at_level("WARNING", logger="llm_service.app"):
+        with TestClient(make_app(tmp_path, flush_interval=0.05)) as c:
+            wait_ready(c)
+
+            def broken(*args, **kwargs):
+                raise RuntimeError("simulated step failure")
+
+            setattr(c.app.state.usage, step, broken)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if any("simulated step failure" in m for m in caplog.messages):
+                    break
+                time.sleep(0.05)
+            delattr(c.app.state.usage, step)  # the class method again, for the shutdown
+    assert f"the flusher step {step} failed: simulated step failure" in caplog.messages

@@ -189,7 +189,10 @@ def dump_lines(objects: list[dict]) -> str:
 
 
 def parse_lines(text: str) -> list[object | None]:
-    """Parse JSON lines. Split on "\\n" only. A line that is not JSON gives None."""
+    """Parse JSON lines. Split on "\\n" only.
+
+    A line that is not JSON, or that is nested too deep to parse, gives None.
+    """
     lines = text.split("\n")
     if lines and lines[-1] == "":
         lines.pop()
@@ -197,6 +200,6 @@ def parse_lines(text: str) -> list[object | None]:
     for item in lines:
         try:
             result.append(json.loads(item))
-        except ValueError:
+        except (ValueError, RecursionError):
             result.append(None)
     return result

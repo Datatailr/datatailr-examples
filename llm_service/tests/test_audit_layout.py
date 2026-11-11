@@ -253,3 +253,8 @@ def test_parse_lines_bad_line_keeps_index():
     assert layout.parse_lines(text) == [{"a": 1}, None, None, {"b": 2}]
     assert layout.parse_lines('{"a": 1}') == [{"a": 1}]
     assert json.loads(layout.dump_lines([{"a": 1}])) == {"a": 1}
+
+
+def test_parse_lines_gives_none_for_a_line_nested_too_deep():
+    deep = "[" * 100_000 + "]" * 100_000
+    assert layout.parse_lines(f'{{"a": 1}}\n{deep}\n[2]\n') == [{"a": 1}, None, [2]]
