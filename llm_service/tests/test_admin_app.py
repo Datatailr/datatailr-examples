@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 
@@ -231,3 +232,19 @@ def test_status_with_a_body_that_is_not_an_object_is_502(client, service):
     response = client.get("/api/status", headers=ALICE)
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "service_unreachable"
+
+
+def test_page_references_only_relative_urls(client):
+    page = client.get("/").text
+    assert "http://" not in page
+    assert "https://" not in page
+    links = re.findall(r'\b(?:src|href)\s*=\s*["\']([^"\']*)["\']', page)
+    assert "static/app.js" in links
+    assert all(not link.startswith("/") for link in links)
+
+
+def test_static_assets_are_served(client):
+    for path in ("static/app.js", "static/app.css", "static/vendor/chart.umd.js"):
+        response = client.get("/" + path)
+        assert response.status_code == 200, path
+        assert response.content, path
