@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Callable
 
 from llm_service.gateway.storage import BlobStore
 
 logger = logging.getLogger("llm_service.audit")
+
+FILE_CACHE_SIZE = 20000  # parsed files kept in memory
+READ_WORKERS = 8  # threads that read uncached files of one day
 
 
 def utc_now() -> datetime:
@@ -75,8 +80,10 @@ def _day_of(ts: str) -> str:
 class AuditLog:
     """Buffers audit records and writes them to `<root>/audit/<day>/` as JSONL files.
 
-    Each file is written once. The buffer is guarded by a lock, because
-    `flush` runs in a worker thread.
+    Each file is written once, so a parsed file never changes. The log keeps
+    the parsed files in a cache, up to `file_cache_size` files, and drops the
+    least recently used first. The buffer is guarded by a lock, because
+    `flush` runs in a worker thread. The cache has a lock of its own.
     """
 
     def __init__(
@@ -85,6 +92,7 @@ class AuditLog:
         root: str,
         flush_size: int = 100,
         now: Callable[[], datetime] = utc_now,
+        file_cache_size: int = FILE_CACHE_SIZE,
     ) -> None:
         self._store = store
         self._prefix = root.rstrip("/") + "/audit"
@@ -94,6 +102,9 @@ class AuditLog:
         self._inflight: list[dict] = []  # records that a running flush writes
         self._lock = threading.Lock()  # guards the buffer and the in-flight list
         self._flush_lock = threading.Lock()  # one flush at a time
+        self._file_cache_size = file_cache_size
+        self._files: OrderedDict[str, list[dict]] = OrderedDict()  # path -> parsed records
+        self._files_lock = threading.Lock()  # guards the cache, never held during a read
         self.listeners: list[Callable[[dict], None]] = []
 
     def add(self, record: dict) -> None:
@@ -187,11 +198,33 @@ class AuditLog:
         return self._store.ls(f"{self._prefix}/{day}")
 
     def _read_file(self, path: str) -> list[dict]:
-        """Return the valid records of one file. Skip the others with one warning."""
+        """Return the valid records of one file. Skip the others with one warning.
+
+        The first read comes from blob storage. Later reads come from the
+        cache. The caller must not change the returned records. A failed read
+        is not cached.
+        """
+        with self._files_lock:
+            cached = self._files.get(path)
+            if cached is not None:
+                self._files.move_to_end(path)
+                return cached
+        records = self._load_file(path)
+        if records is None:
+            return []
+        with self._files_lock:
+            self._files[path] = records
+            self._files.move_to_end(path)
+            while len(self._files) > self._file_cache_size:
+                self._files.popitem(last=False)
+        return records
+
+    def _load_file(self, path: str) -> list[dict] | None:
+        """Read and parse one file. Return None when the file does not exist."""
         try:
             text = self._store.get(path).decode("utf-8", errors="replace")
         except KeyError:
-            return []
+            return None
         records = []
         skipped = 0
         for line in text.splitlines():
@@ -223,8 +256,29 @@ class AuditLog:
                 days.add(day)
         return days
 
+    def _read_files(self, paths: list[str]) -> list[list[dict]]:
+        """Return the records of each file, in the order of `paths`.
+
+        Files that are not cached are read by a small thread pool. An error in
+        a read is raised for that file, in the order of `paths`.
+        """
+        with self._files_lock:
+            missing = [p for p in paths if p not in self._files]
+        if len(missing) < 2:
+            return [self._read_file(p) for p in paths]
+        with ThreadPoolExecutor(max_workers=min(READ_WORKERS, len(missing))) as pool:
+            futures = {p: pool.submit(self._read_file, p) for p in missing}
+            return [futures[p].result() if p in futures else self._read_file(p) for p in paths]
+
     def records_for_day(self, day: str) -> list[dict]:
         """Return the stored records of `day` plus the buffered records of that day.
+
+        The caller owns the returned records and may change them.
+        """
+        return copy.deepcopy(self._day_records(day))
+
+    def _day_records(self, day: str) -> list[dict]:
+        """Return the records of `records_for_day`. The caller must not change them.
 
         The buffer is read before the files. A record that a flush writes in
         between is then in both, and only the stored copy is kept. A record is
@@ -233,8 +287,8 @@ class AuditLog:
         """
         pending = [r for r in self._buffered() if _day_of(r["ts"]) == day]
         records = []
-        for path in self._day_files(day):
-            records.extend(self._read_file(path))
+        for chunk in self._read_files(self._day_files(day)):
+            records.extend(chunk)
         if pending:
             stored = Counter(_key(r) for r in records)
             for record in pending:
@@ -274,7 +328,7 @@ class AuditLog:
             if (first and day < first) or (last and day > last):
                 continue
             matches: list[tuple[datetime, dict]] = []
-            for record in self.records_for_day(day):
+            for record in self._day_records(day):
                 if user is not None and record.get("user") != user:
                     continue
                 if model is not None and record.get("model") != model:
@@ -290,13 +344,13 @@ class AuditLog:
             found.extend(matches)
             if len(found) >= offset + limit:
                 break
-        return [record for _, record in found[offset : offset + limit]]
+        return [copy.deepcopy(record) for _, record in found[offset : offset + limit]]
 
     def users(self) -> list[dict]:
         """Return the first request, last request and request count of each user."""
         summary: dict[str, dict] = {}
         for day in self.days():
-            for record in self.records_for_day(day):
+            for record in self._day_records(day):
                 ts = iso(parse_time(record["ts"]))
                 entry = summary.setdefault(
                     record["user"],

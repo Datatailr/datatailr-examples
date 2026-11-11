@@ -321,6 +321,11 @@ records. It also flushes at shutdown. After a failed flush, it waits the full 5
 seconds before the next attempt. Each file is written once, so no file is ever
 appended to or rewritten.
 
+The gateway keeps each audit file in memory after the first read, up to 20000
+files, and reads new files with 8 threads. Each query still lists the files of a
+day, so a new file shows at once. The first query after a start still reads
+every file of the days in its range.
+
 In normal operation, a kill of the container loses the records of at most
 about the last 5 seconds. During a blob storage outage, the records wait in
 memory. A kill then loses all records since the outage began. The README

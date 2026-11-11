@@ -328,6 +328,7 @@ The audit files are the source of truth. The usage totals come from them. If you
 - The service serves one model at a time. A switch stops the old model.
 - An admin who calls the service directly can name any admin in `X-LLM-Acting-User`.
 - The audit log stores each prompt in full. It does not store the answers.
+- The service keeps audit files in memory after the first read and reads new files in parallel. The first query after a start still reads every file of the days in its range.
 - Token counts for a stream come from the last chunk. The service asks vLLM for that chunk. It removes the chunk again if the client did not ask for it.
 - There are no rate limits and no quotas for each user.
 - The platform does not start GPU nodes. You must start one.

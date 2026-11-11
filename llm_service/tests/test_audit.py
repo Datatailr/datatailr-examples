@@ -345,10 +345,10 @@ def test_query_without_since_stops_at_the_newest_days():
     store.reads.clear()
     out = log.query(limit=2, offset=1)
     assert [r["ts"] for r in out] == ["2026-11-10T08:00:00.000Z", "2026-11-09T09:00:00.000Z"]
-    assert {p.split("/")[2] for p in store.reads} == {"2026-11-10", "2026-11-09"}
+    assert {p.split("/")[2] for p in store.reads} == {"2026-11-09"}  # 11-10 is cached
     store.reads.clear()
     assert len(log.query(user="nobody")) == 0
-    assert len(store.reads) == 4  # without a match every day is read
+    assert {p.split("/")[2] for p in store.reads} == {"2026-11-07", "2026-11-08"}  # every day
 
 
 def test_stored_records_need_a_valid_ts_and_a_string_user(caplog):
@@ -503,3 +503,132 @@ def test_unexpected_error_during_flush_keeps_all_records(caplog):
     assert log.flush() is True
     assert sorted(r["user"] for r in _stored(store)) == ["alice", "bob"]
     assert log._buffered() == []
+
+
+class CountingStore(MemoryBlobStore):
+    """A memory store that counts the `get` calls for each path and can fail some."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gets: list[str] = []
+        self.fail_paths: set[str] = set()
+        self._count_lock = threading.Lock()
+
+    def get(self, path: str) -> bytes:
+        with self._count_lock:
+            self.gets.append(path)
+        if path in self.fail_paths:
+            raise OSError("simulated read failure")
+        return super().get(path)
+
+
+def put_file(store, name, records, day="2026-11-10"):
+    path = f"root/audit/{day}/{name}.jsonl"
+    store.put(path, "".join(json.dumps(r) + "\n" for r in records))
+    return path
+
+
+def test_second_query_reads_no_file_again():
+    store = CountingStore()
+    for i in range(5):
+        put_file(store, f"120000.00000{i}-a", [rec(f"u{i}", T)])
+    log = AuditLog(store, "root")
+    first = log.query()
+    assert len(store.gets) == 5
+    assert log.query() == first
+    assert len(store.gets) == 5
+
+
+def test_new_file_appears_and_only_it_is_read():
+    store = CountingStore()
+    put_file(store, "120000.000000-a", [rec("alice", "2026-11-10T12:00:00.000Z")])
+    log = AuditLog(store, "root")
+    assert len(log.query()) == 1
+    new_path = put_file(store, "120001.000000-b", [rec("bob", "2026-11-10T12:00:01.000Z")])
+    store.gets.clear()
+    assert [r["user"] for r in log.query()] == ["bob", "alice"]
+    assert store.gets == [new_path]
+
+
+def test_failed_read_is_tried_again():
+    store = CountingStore()
+    good = put_file(store, "120000.000000-a", [rec("alice", T)])
+    bad = put_file(store, "120001.000000-b", [rec("bob", T)])
+    store.fail_paths.add(bad)
+    log = AuditLog(store, "root")
+    with pytest.raises(OSError):
+        log.query()
+    store.fail_paths.clear()
+    store.gets.clear()
+    assert {r["user"] for r in log.query()} == {"alice", "bob"}
+    assert store.gets == [bad]  # the good file was cached by the first query
+    assert good not in store.gets
+
+
+def test_order_with_many_files_matches_a_fresh_log():
+    store = CountingStore()
+    for i in range(30):
+        records = [rec(f"u{i}-{n}", f"2026-11-10T12:00:{i:02d}.000Z") for n in range(2)]
+        put_file(store, f"1200{i:02d}.000000-a", records)
+    same = [rec("same-a", "2026-11-10T13:00:00.000Z"), rec("same-b", "2026-11-10T13:00:00.000Z")]
+    put_file(store, "130000.000000-z", same[:1])
+    put_file(store, "130000.000001-z", same[1:])
+    log = AuditLog(store, "root")
+    cold = log.records_for_day("2026-11-10")
+    assert len(cold) == 62
+    warm = log.records_for_day("2026-11-10")
+    fresh = AuditLog(store, "root").records_for_day("2026-11-10")
+    assert cold == warm == fresh
+    assert [r["user"] for r in cold[-2:]] == ["same-a", "same-b"]
+    assert log.query(limit=1000) == AuditLog(store, "root").query(limit=1000)
+    assert [r["user"] for r in log.query(limit=2)] == ["same-b", "same-a"]
+
+
+def test_mutating_a_returned_record_does_not_change_a_later_result():
+    store = CountingStore()
+    put_file(store, "120000.000000-a", [rec("alice", T)])
+    log = AuditLog(store, "root")
+    first = log.query()
+    first[0]["user"] = "mallory"
+    first[0]["prompt"]["messages"].append("x")
+    day = log.records_for_day("2026-11-10")
+    day[0]["user"] = "mallory"
+    again = log.query()
+    assert again[0]["user"] == "alice"
+    assert again[0]["prompt"]["messages"] == rec("alice", T)["prompt"]["messages"]
+    assert [u["user"] for u in log.users()] == ["alice"]
+
+
+def test_cache_evicts_the_least_recently_used_file():
+    store = CountingStore()
+    paths = [put_file(store, f"12000{i}.000000-a", [rec(f"u{i}", T)]) for i in range(3)]
+    log = AuditLog(store, "root", file_cache_size=2)
+    log.records_for_day("2026-11-10")  # reads 3 files, keeps the last 2
+    assert len(log._files) == 2
+    store.gets.clear()
+    log.records_for_day("2026-11-10")
+    assert paths[0] in store.gets  # the oldest was evicted
+    assert len(log._files) == 2
+
+
+def test_users_and_records_for_day_use_the_cache():
+    store = CountingStore()
+    for i in range(3):
+        put_file(store, f"12000{i}.000000-a", [rec("alice", T)])
+    log = AuditLog(store, "root")
+    assert log.users()[0]["requests"] == 3
+    assert len(store.gets) == 3
+    assert len(log.records_for_day("2026-11-10")) == 3
+    assert log.users()[0]["requests"] == 3
+    assert len(store.gets) == 3
+
+
+def test_buffered_records_are_not_cached_and_still_appear():
+    store = CountingStore()
+    log = AuditLog(store, "root")
+    log.add(rec("alice", T))
+    assert len(log.query()) == 1
+    assert len(log._files) == 0
+    log.flush()
+    assert len(log.query()) == 1
+    assert len(log._files) == 1
