@@ -182,3 +182,52 @@ def test_index_and_static_are_served(client):
 def test_import_does_not_load_the_gateway_app():
     code = "import sys, llm_service.admin_app.app; assert 'llm_service.gateway.app' not in sys.modules"
     subprocess.run([sys.executable, "-W", "error", "-c", code], check=True)
+
+
+@pytest.mark.parametrize("model_id", ["x/../../model", "./x", "a//b", "..", "x/."])
+def test_delete_rejects_dot_and_empty_segments(client, service, model_id):
+    # The test client removes literal dot segments, so send them percent-encoded.
+    response = client.delete("/api/models/" + model_id.replace(".", "%2e"), headers=ALICE)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_model"
+    assert service.requests == []
+
+
+def test_delete_encodes_query_and_fragment_characters(client, service):
+    client.delete("/api/models/org/na%3Fme%23x", headers=ALICE)
+    assert service.requests[0].url.raw_path.decode() == "/admin/models/org/na%3Fme%23x"
+
+
+@pytest.mark.parametrize("user", ["..", "."])
+def test_usage_user_rejects_dot_segments(client, service, user):
+    response = client.get("/api/usage/" + user.replace(".", "%2e"), headers=ALICE)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_user"
+    assert service.requests == []
+
+
+def test_viewer_with_control_character_is_401(client, service):
+    header = {"X-Datatailr-User": json.dumps({"name": "ali\nce"})}
+    response = client.get("/api/usage", headers=header)
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "missing_user"
+    assert service.requests == []
+
+
+def test_viewer_that_is_too_long_is_401(client, service):
+    response = client.get("/api/usage", headers={"X-Datatailr-User": "a" * 257})
+    assert response.status_code == 401
+    assert service.requests == []
+
+
+def test_json_form_header_works(client, service):
+    header = {"X-Datatailr-User": '{"name": "alice"}'}
+    assert client.get("/api/usage", headers=header).status_code == 200
+    assert service.requests[0].headers["X-LLM-Acting-User"] == "alice"
+
+
+def test_status_with_a_body_that_is_not_an_object_is_502(client, service):
+    service.answers[("GET", "/v1/models")] = (200, ["not", "an", "object"])
+    response = client.get("/api/status", headers=ALICE)
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "service_unreachable"
