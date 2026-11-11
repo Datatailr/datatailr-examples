@@ -135,10 +135,11 @@ Routes:
 | `GET /api/usage/{user}` | `GET /admin/usage/{user}` with `since`, `until`. The app answers 400 `invalid_user` for a bad name. |
 | `GET /api/audit` | `GET /admin/audit` with `user`, `model`, `since`, `until`, `limit`, `offset`. |
 | `GET /api/audit/users` | `GET /admin/audit/users`. |
+| `GET /api/audit/records/{request_id}` | `GET /admin/audit/records/{request_id}` with `day`. The app answers 400 `invalid_record` for a bad id. |
 
 Rules for the API routes:
 
-- The backend answers 400 `invalid_model` or `invalid_user` for a model id or a user with an empty, `.` or `..` path segment. It answers 400 `invalid_json` for a `POST /api/model` body that is not JSON.
+- The backend answers 400 `invalid_model`, `invalid_user` or `invalid_record` when the id has an empty, `.` or `..` path segment. A record id that contains `/` gets 400 `invalid_record` too. It answers 400 `invalid_json` for a `POST /api/model` body that is not JSON.
 - `POST /api/model` needs the content type `application/json`. Parameters such as `; charset=utf-8` are allowed. Otherwise the backend answers 415 `unsupported_media_type` and calls nothing. A form on another site cannot send this content type without a CORS preflight. No other route has this check.
 - The backend passes the status code and the JSON body of the service through, for success and for errors. The page shows the `error.message` of the service.
 - If the service does not answer or the connection fails, the backend answers 502 with `{"error": {"code": "service_unreachable", "message": ...}}`.
@@ -166,7 +167,10 @@ If `GET /api/me` says the viewer is not an admin, the page shows only this text:
 
 - Filters: user (a text field with suggestions from `/api/audit/users`), model (free text), since and until.
 - A table, newest first, 50 rows a page, with "newer" and "older" buttons: time, user, endpoint, model, status, total tokens, duration.
-- A click on a row shows the full record, with the prompt, as formatted JSON.
+- A row of a model load or delete shows a tag with the name of its `event` next to the endpoint.
+- The list has no prompt. A click on a row loads the full record from `/api/audit/records/{request_id}`, with the `day` set to the UTC day of the row time. The page shows the record as formatted JSON.
+- While the record loads, the dialog says so. If the prompt is deleted by retention, the dialog says "The prompt of this record is deleted."
+- If the load fails, the dialog shows the error message and the fields of the list row.
 
 ### Models tab
 

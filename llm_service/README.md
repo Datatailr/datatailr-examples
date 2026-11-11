@@ -99,6 +99,7 @@ The script reads these variables at deploy time:
 | `LLM_BLOB_ROOT` | `llm-service` | Root directory in blob storage. |
 | `LLM_HF_TOKEN_KEY` | not set | Secret store key of the Hugging Face token. |
 | `LLM_VLLM_ARGS` | not set | Extra arguments for `vllm serve`. |
+| `LLM_PROMPT_RETENTION_DAYS` | not set | Days to keep prompts in the audit log. See [Prompt retention](#prompt-retention). |
 | `LLM_ENVIRONMENT` | `dev` | Platform environment: `dev`, `pre` or `prod`. |
 | `LLM_ADMIN_APP_NAME` | `LLM Service Admin` | Name of the admin app. |
 
@@ -258,7 +259,9 @@ After a failed delete, send the same delete again. The second delete removes the
 
 ## Read the audit log
 
-Only an admin can read the audit log. Each request to `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings` makes one record. Each model load also makes one record: a switch, the load at startup and an automatic reload. Other requests make no record. A record has the time, request id, user, endpoint, model, prompt, status, token counts and duration.
+Only an admin can read the audit log. Each request to `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings` makes one record. Each model load also makes one record: a switch, the load at startup and an automatic reload. Other requests make no record.
+
+The list returns the metadata of each record: the time, request id, user, endpoint, model, status, token counts and duration. The list does not return the prompt.
 
 ```bash
 curl "$BASE/admin/audit?user=bob&limit=20" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
@@ -266,9 +269,37 @@ curl "$BASE/admin/audit?user=bob&limit=20" -H "Cookie: __datatailr_user_cookie__
 
 The filters are `user`, `model`, `since`, `until`, `limit` and `offset`. The values of `since` and `until` are a day like `2026-11-10` or an ISO 8601 time. The default `limit` is 100 and the largest is 1000. The newest records come first.
 
+A model load or delete record has the field `event` (`model_switch`, `engine_reload` or `model_delete`) and the field `detail` with the revision or the error. A request record has `event` and `detail` set to `null`.
+
+To read the prompt, open one record. Give the request id from the list and the UTC day of the record time. The day must have the form `YYYY-MM-DD`:
+
+```bash
+curl "$BASE/admin/audit/records/<request_id>?day=2026-11-10" \
+  -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+```
+
+The answer has the fields of the list row and the field `prompt`. If prompt retention removed the prompt, `prompt` is `null` and `prompt_deleted` is `true`. The errors are:
+
+- 400 `invalid_time`: `day` is missing or has another form.
+- 404 `record_not_found`: the day has no record with this id.
+- 502 `prompt_unreadable`: the prompt file exists and the service cannot read it.
+- 403 `admin_required`: the caller is not an admin.
+
 To see the users in the log with their first and last request, call `/admin/audit/users`.
 
 The user of a model switch or model delete record is the admin who started it. At startup and after an automatic reload, the user is `system`.
+
+### Prompt retention
+
+By default the service keeps all prompts. To delete old prompts, set `LLM_PROMPT_RETENTION_DAYS` to a whole number from 1 to 36500 and deploy the service again:
+
+```bash
+LLM_PROMPT_RETENTION_DAYS=30 python deploy.py service
+```
+
+The service then deletes the prompts of each UTC day that ended more than 30 days ago. It checks one time each hour. The metadata of the records stays, so the list and the usage totals do not change. Opening a record whose prompt is deleted gives `prompt_deleted: true`. Any other value stops the service at the start, with an error that names the variable.
+
+Files of the old layout hold the metadata and the prompt together. Retention does not delete them.
 
 ## Read the usage metrics
 
@@ -279,7 +310,7 @@ curl "$BASE/admin/usage?group_by=model&since=2026-11-01" \
   -H "Cookie: __datatailr_user_cookie__=$TOKEN"
 ```
 
-The filters are `since`, `until`, `user` and `model`. Both days are included. The value of `group_by` is `user` (the default), `model` or `day`.
+The filters are `since`, `until`, `user` and `model`. The values of `since` and `until` are days in the form `YYYY-MM-DD`, and both days are included. The value of `group_by` is `user` (the default), `model` or `day`.
 
 Each row has the request count, the failed request count, the prompt, completion and total tokens, and the time of the last request.
 
@@ -290,7 +321,7 @@ To read one user with the split by model and by day, call `/admin/usage/bob`. Ea
 The admin app is a web page for the admins of the service. It is the second job that `deploy.py` deploys. It has three tabs:
 
 - Usage: requests, failed requests and tokens, by user, by model and by day.
-- Audit: the audit log, with filters for user, model and time.
+- Audit: the audit log, with filters for user, model and time. A click on a row loads the full record with its prompt.
 - Models: the engine state and the cached models. An admin switches the model, follows the progress and deletes cached weights.
 
 The app keeps no data. It calls the service by its internal URL. The app takes this URL from the service name, so `LLM Service` gives `http://llm-service`. If you deploy the app alone with `python deploy.py app`, set the same `LLM_SERVICE_NAME` as for the deploy of the service. Otherwise the app calls a service that does not exist.
@@ -311,13 +342,23 @@ All data is in blob storage, under the root directory in `LLM_BLOB_ROOT`:
 <root>/models/<org>--<name>/<revision>/<files>
 <root>/models/<org>--<name>/<revision>/.complete    # the file list, written last
 <root>/state/active.json                             # the active model
-<root>/audit/YYYY-MM-DD/<time>-<id>.jsonl
-<root>/usage/YYYY-MM-DD.json                         # totals of one finished day
+<root>/audit/<day>/segments/<time>-<id>.jsonl        # metadata of one flush
+<root>/audit/<day>/parts/<bucket>.jsonl              # metadata of one 10 minute bucket
+<root>/audit/<day>/day.jsonl                         # metadata of one finished day
+<root>/prompts/<day>/<time>-<id>.jsonl               # prompts of one flush
+<root>/usage/<day>.json                              # totals of one finished day
+<root>/usage/<day>.partial.json                      # checkpoint of the current day
 ```
 
 The service writes `.complete` after the last weight file. The marker lists each file with its size. An upload that stops half way is not used. When the service downloads a model from blob storage, it downloads only the listed files and checks their sizes. If a file is missing or has the wrong size, the load fails with an error that names the file.
 
-The audit files are the source of truth. The usage totals come from them. If you delete a daily usage file, the service builds it again from the audit files.
+A flush writes the prompts first, then the metadata. The service merges the metadata of each 10 minutes into one part file, and the parts of a finished day into one day file. The merges run in the background. A bucket merges 1 to 2 minutes after its end, and a day 15 to 16 minutes after its end. A `<day>` is a UTC day like `2026-11-11`. A `<bucket>` is the date, the hour and the tens digit of the minute, like `20261111T140`. The prompts live in their own folder, so a list of the audit log never reads them. The design document [docs/audit-storage-design.md](docs/audit-storage-design.md) describes the layout.
+
+Files of the old layout, `audit/<day>/<time>-<id>.jsonl` with the full records, stay readable. The service never merges or changes them. Their records show in the list and count in the usage totals.
+
+The metadata files are the source of truth. The usage totals come from them. If you delete a daily usage file, the service builds it again from the metadata files.
+
+The service writes a checkpoint of the usage totals of the current day to `usage/<day>.partial.json`. It writes at most one time each 60 seconds, and at a clean stop. At a start, the service reads for each day the daily file if it exists. Otherwise it reads the checkpoint and the metadata that came after it. Without a checkpoint, it reads all metadata of the day. So a start reads a small number of files, also on a busy day.
 
 ## Known limits
 
@@ -327,8 +368,14 @@ The audit files are the source of truth. The usage totals come from them. If you
 - At startup, the service reads the usage totals from blob storage. If that read fails, the service does not start, and the platform restarts it.
 - The service serves one model at a time. A switch stops the old model.
 - An admin who calls the service directly can name any admin in `X-LLM-Acting-User`.
-- The audit log stores each prompt in full. It does not store the answers.
-- The service keeps audit files in memory after the first read and reads new files in parallel. The first query after a start still reads every file of the days in its range.
+- The audit log stores each prompt in full. It does not store the answers. A prompt is not searchable. The filters work on metadata.
+- One service instance writes the audit log. Two instances on one `LLM_BLOB_ROOT` are not supported.
+- A day file is read in one piece. The design fits about 300,000 requests a day.
+- A blob write that fails after the blob was written leaves the records in the buffer. The next flush writes them again under a new segment name, so they appear two times.
+- The merges assume that a blob write is atomic. A reader never sees half a file.
+- A clock that steps back across a restart can give a new segment a name that is not greater than the last checkpoint. A crash before the next checkpoint then loses those rows from the usage totals.
+- A stop of the service waits for a merge that runs at that moment.
+- A late record for a day whose daily usage file exists counts in memory at once. The service writes it to the daily file at the next flusher cycle. A crash between the two loses it from the usage totals.
 - Token counts for a stream come from the last chunk. The service asks vLLM for that chunk. It removes the chunk again if the client did not ask for it.
 - There are no rate limits and no quotas for each user.
 - The platform does not start GPU nodes. You must start one.

@@ -50,13 +50,16 @@ llm_service/
 ├── requirements-dev.txt   # tests: pytest, fastapi, httpx (no vllm, no GPU)
 ├── docs/
 │   ├── design.md          # this document
+│   ├── audit-storage-design.md
 │   └── admin-app-design.md
 ├── admin_app/             # the admin app: FastAPI backend and one page
 ├── gateway/
 │   ├── app.py             # FastAPI routes and main(port)
 │   ├── config.py          # configuration from environment variables
 │   ├── identity.py        # user from X-Datatailr-User, admin check
-│   ├── audit.py           # audit records, JSONL files in blob storage
+│   ├── audit.py           # audit buffer, flush, reads and the record lookup
+│   ├── audit_layout.py    # file names, buckets and the split of a record
+│   ├── audit_merge.py     # merges of segments and parts, prompt retention
 │   ├── usage.py           # usage totals by user, model and day
 │   ├── weights.py         # local disk and blob storage weight cache
 │   ├── engine.py          # start, stop and health of the vLLM process
@@ -110,9 +113,10 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 |---|---|
 | `POST /admin/model` | Body `{"model": "org/name", "revision": "main"}`. Starts a switch and returns 202. `revision` is optional. |
 | `GET /admin/model` | The active model, the served model, the switch state and the last switch error. `rolling_back` is the model that a rollback loads now, or null. |
-| `GET /admin/audit` | Audit entries, newest first. Filters: `user`, `model`, `since`, `until`, `limit`, `offset`. |
+| `GET /admin/audit` | Audit entries, newest first, without the prompt. Filters: `user`, `model`, `since`, `until`, `limit`, `offset`. |
+| `GET /admin/audit/records/{request_id}?day=YYYY-MM-DD` | One full record with its prompt. `day` is the UTC day of the record time. The errors are 400 `invalid_time`, 404 `record_not_found` and 502 `prompt_unreadable`. |
 | `GET /admin/audit/users` | The users in the log, with the first and last request time of each. |
-| `GET /admin/usage` | Usage totals. Filters: `since`, `until`, `user`, `model`. `group_by` is `user` (default), `model` or `day`. |
+| `GET /admin/usage` | Usage totals. Filters: `since`, `until` (days in the form `YYYY-MM-DD`), `user`, `model`. `group_by` is `user` (default), `model` or `day`. |
 | `GET /admin/usage/{user}` | The totals of one user, by model and by day. |
 | `DELETE /admin/models/{model}` | Removes the stored revisions of a model from blob storage, with or without a `.complete` marker. The query parameter `revision` limits it to one revision. Returns 200 with `{"deleted": [...]}`. The errors are 404 `model_not_found`, 409 `model_in_use`, 400 `invalid_model` and 500 `delete_failed`. One audit record has the event `model_delete`. |
 
@@ -175,8 +179,12 @@ Blob storage layout, under a root set by `LLM_BLOB_ROOT` (default `llm-service`)
 <root>/models/<org>--<name>/<revision>/<files>
 <root>/models/<org>--<name>/<revision>/.complete    # the file list, written last
 <root>/state/active.json                             # {"model", "revision"}
-<root>/audit/YYYY-MM-DD/<time>-<id>.jsonl
-<root>/usage/YYYY-MM-DD.json                         # totals of one finished day
+<root>/audit/<day>/segments/<time>-<id>.jsonl        # metadata of one flush
+<root>/audit/<day>/parts/<bucket>.jsonl              # metadata of one 10 minute bucket
+<root>/audit/<day>/day.jsonl                         # metadata of one finished day
+<root>/prompts/<day>/<time>-<id>.jsonl               # prompts of one flush
+<root>/usage/<day>.json                              # totals of one finished day
+<root>/usage/<day>.partial.json                      # checkpoint of the current day
 ```
 
 To get a model on local disk, `weights.py` does these steps:
@@ -315,29 +323,49 @@ full. The log does not store the model answer.
 
 The gateway writes the record after the response ends, so it holds the status
 and the token counts. Records go to an in-memory buffer. A flusher task wakes
-every 0.25 seconds. It flushes the buffer to a new JSONL file in blob storage
-when 5 seconds have passed since the last flush, or when the buffer holds 100
-records. It also flushes at shutdown. After a failed flush, it waits the full 5
-seconds before the next attempt. Each file is written once, so no file is ever
-appended to or rewritten.
+every 0.25 seconds. It flushes the buffer 5 seconds after the last flush, or when
+the buffer holds 100 records. It also flushes at shutdown.
+After a failed flush, it waits the full 5 seconds before the next attempt.
 
-The gateway keeps each audit file in memory after the first read, up to 20000
-files, and reads new files with 8 threads. Each query still lists the files of a
-day, so a new file shows at once. The first query after a start still reads
-every file of the days in its range.
+A flush splits each record in two parts. The prompt goes to a prompt file under
+`prompts/<day>/`. The metadata goes to a segment file under
+`audit/<day>/segments/`. Metadata is the record without the prompt, plus the
+fields `event`, `detail`, `seg` and `prompt_ref`. The flush writes the prompt
+file first. The segment file is the commit: a record exists when its metadata
+exists. Each file is written once.
+
+After each flush, the flusher thread merges the metadata, at most one time each
+minute. The segments of a finished 10 minute bucket become one part file. The
+parts of a finished day become one day file. A bucket merges 1 to 2 minutes
+after its end, and a day 15 to 16 minutes after its end. A reader skips a row
+whose `seg` it already read, so a merge that stops half way loses no record and
+counts none twice. Files of the old layout, with the full records, stay
+readable and are never merged.
+
+The gateway keeps the metadata rows of the files in memory, up to 1,000,000
+rows, and drops the least recently used file first. It keeps no prompts there.
+
+`GET /admin/audit` reads the metadata of the days in the requested range, plus
+the buffer, and applies the filters. It reads no prompt. It reads the days
+newest first, and it stops when it has `offset + limit` matching records.
+During a flush, the records that the flush writes stay visible to queries. A
+query shows each record once. `GET /admin/audit/records/{request_id}` reads
+the one prompt file that holds the prompt of one record.
+
+An admin can set `LLM_PROMPT_RETENTION_DAYS`. The flusher then deletes the
+prompt folders of the days that ended more than that many days ago. The
+metadata stays. A record whose prompt is deleted answers with `prompt_deleted`.
 
 In normal operation, a kill of the container loses the records of at most
 about the last 5 seconds. During a blob storage outage, the records wait in
 memory. A kill then loses all records since the outage began. The README
 states this.
 
-`GET /admin/audit` reads the files of the days in the requested range, plus the
-buffer, and applies the filters. It reads the days newest first, and it stops
-when it has `offset + limit` matching records. During a flush, the records
-that the flush writes stay visible to queries. A query shows each record once.
-
 A stored line that is not a JSON object with a valid `ts` and a string `user`
 is skipped with a warning.
+
+The document [audit-storage-design.md](audit-storage-design.md) gives the
+layout, the merge rules, the read rules and the limits in full.
 
 ## Usage metrics
 
@@ -349,11 +377,18 @@ last request time. Each new record updates them.
 
 The container has no persistent disk, so the totals live in blob storage too.
 When a day ends, the gateway writes the totals of that day to
-`<root>/usage/YYYY-MM-DD.json`. At startup, the gateway reads those daily
-files, and rebuilds only the days that have no file (normally the current day)
-from the audit files. The startup time therefore does not grow with the size
-of the audit log. The audit files stay the source of truth: if a daily file is
-deleted, the gateway rebuilds it.
+`<root>/usage/<day>.json`. For the current day, the gateway writes a
+checkpoint to `<root>/usage/<day>.partial.json`. The checkpoint holds the
+totals of the rows that a flush wrote and the name of the last such segment
+(`through`). The gateway writes it at most one time each 60 seconds and at a
+clean stop.
+
+At startup, for each day, the gateway reads the daily file if it exists.
+Otherwise it reads the checkpoint and adds the rows whose segment name is
+greater than `through`. Without a checkpoint, it reads all metadata of the day.
+So the startup time does not grow with the size of the audit log. The metadata
+files stay the source of truth: if a daily file is deleted, the gateway
+rebuilds it.
 
 ### Token counts for streaming requests
 
@@ -386,6 +421,7 @@ they do not block request handling.
 | `LLM_BLOB_ROOT` | `llm-service` | Root directory in blob storage. |
 | `LLM_HF_TOKEN_KEY` | not set | Secret store key of the Hugging Face token. |
 | `LLM_VLLM_ARGS` | not set | Extra arguments for `vllm serve`. |
+| `LLM_PROMPT_RETENTION_DAYS` | not set | Days to keep prompts in the audit log. A whole number from 1 to 36500. |
 | `LLM_ENVIRONMENT` | `dev` | Platform environment. |
 | `LLM_ADMIN_APP_NAME` | `LLM Service Admin` | Name of the admin app. |
 
@@ -399,8 +435,9 @@ FastAPI application that answers like vLLM) and an in-memory blob store replace
 the real ones. The tests cover:
 
 - identity and the admin check,
-- audit records, the flush, and the audit filters,
-- usage totals and the rebuild at startup,
+- audit records, the flush, the merges, the record lookup and the audit filters,
+- prompt retention,
+- usage totals, the checkpoint and the start,
 - the weight cache: local hit, blob storage hit, Hugging Face download, an
   interrupted upload, the manifest check, and the deletion of unused local
   copies,
