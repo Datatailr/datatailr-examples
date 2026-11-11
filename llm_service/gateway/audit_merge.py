@@ -71,7 +71,8 @@ class AuditMerger:
     most for the write of one merged file.
     `merge` lists only the day folders that can have work: the first merge after a start finds
     them with one listing of `audit/`, and `flushed` adds the day of each new segment. With
-    `retention_days` None, `retain` keeps all prompts.
+    `retention_days` None, `retain` keeps all prompts. `flushed` and `retain` share the
+    retention state under a lock of its own. Neither holds it during blob I/O.
     """
 
     def __init__(
@@ -97,7 +98,12 @@ class AuditMerger:
         self._queue: list[str] = []  # days of the last check that wait for retention
         self._pending: list[str] | None = None  # prompt files of the head of the queue to delete
         self._failures: dict[str, int] = {}  # prompt file -> failed calls in a row
+        self._listed_flushes = 0  # `_retain_flushes` of the head of the queue at its listing
         self._cleaned: set[str] = set()  # days whose prompt folder is deleted
+        self._retain_flushes: dict[str, int] = {}  # day -> flushes that wrote to it, for retention
+        # Guards `_cleaned` and `_retain_flushes`. `flushed` takes it under `log.flush_lock`.
+        # `retain` never holds it during blob I/O and never takes `flush_lock` while it holds it.
+        self._retain_lock = threading.Lock()
 
     def tick(self) -> None:
         """Merge at most one time each minute, then delete old prompts. Never raise.
@@ -116,11 +122,17 @@ class AuditMerger:
     def flushed(self, day: str, seg: str, rows: list[dict]) -> None:
         """Note that a flush wrote the segment `seg` to `day`. Do no I/O. Never raise.
 
-        It has the signature of `AuditLog.flushed_listeners`.
+        It has the signature of `AuditLog.flushed_listeners`. The flush can have written a
+        prompt file of `day`, also when retention cleaned `day` before. So the day is not
+        clean any more. When retention works on `day` at this time, it lists the day again.
+        Else the next hourly check finds it, because that check reads `log.days()` again.
         """
         with self._work_lock:
             self._work.add(day)
             self._flushes[day] = self._flushes.get(day, 0) + 1
+        with self._retain_lock:
+            self._cleaned.discard(day)
+            self._retain_flushes[day] = self._retain_flushes.get(day, 0) + 1
 
     def _time(self) -> datetime:
         now = self._now()
@@ -288,7 +300,8 @@ class AuditMerger:
         newest first. While the queue is not empty, the next call goes on with it without a
         wait. One call makes at most `RETAIN_DELETES_PER_CALL` deletes and lists at most
         `RETAIN_LISTINGS_PER_CALL` prompt folders. See `_retain_day`. A failed listing of
-        `audit/` waits for the next hourly check. Never raise.
+        `audit/` waits for the next hourly check. A flush into a cleaned day makes the day not
+        clean, see `flushed`. Never raise.
         """
         if self._retention_days is None:
             return
@@ -299,10 +312,13 @@ class AuditMerger:
                     return
                 self._last_retain = now
                 limit = timedelta(days=self._retention_days)
+                days = self._log.days()
+                with self._retain_lock:
+                    cleaned = set(self._cleaned)
                 self._queue = [
                     day
-                    for day in sorted(self._log.days(), reverse=True)
-                    if day not in self._cleaned and self._past(day, limit, now)
+                    for day in sorted(days, reverse=True)
+                    if day not in cleaned and self._past(day, limit, now)
                 ]
                 self._pending = None
             budget = [RETAIN_DELETES_PER_CALL, RETAIN_LISTINGS_PER_CALL]
@@ -320,12 +336,15 @@ class AuditMerger:
         `DELETE_WORKERS` threads. `budget` holds the deletes and the listings that are left
         for this call. A file whose delete failed stays in the list and is tried at the next
         call. When the same file fails `RETAIN_TRIES` calls in a row, the rest of the day
-        waits for the next hourly check. The day is cleaned when its list is empty.
+        waits for the next hourly check. The day is cleaned when its list is empty and no flush
+        wrote to the day since the listing. After such a flush, the day is listed again at once.
         """
         if self._pending is None:
             if budget[1] == 0:
                 return False
             budget[1] -= 1
+            with self._retain_lock:
+                self._listed_flushes = self._retain_flushes.get(day, 0)
             try:
                 self._pending = self._store.ls(prompts_dir(self._root, day))
             except Exception as error:
@@ -345,8 +364,15 @@ class AuditMerger:
         if deleted or not self._pending:
             self._log.prompt_cache_drop(day)
         if not self._pending:
-            self._cleaned.add(day)
-            self._next_day()
+            with self._retain_lock:
+                clean = self._retain_flushes.get(day, 0) == self._listed_flushes
+                if clean:
+                    self._cleaned.add(day)
+            if clean:
+                self._next_day()
+            else:
+                self._pending = None  # a flush wrote to the day after the listing
+                self._failures = {}
             return True
         if not failed:
             return True

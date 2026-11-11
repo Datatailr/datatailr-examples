@@ -828,3 +828,90 @@ def test_a_cancelled_maintenance_loop_does_not_wait_for_a_running_tick():
         release.set()  # the worker thread ends by itself
 
     asyncio.run(scenario())
+
+
+# Retention and late flushes
+
+
+def test_a_late_flush_into_a_cleaned_day_makes_the_next_hourly_check_delete_its_prompts():
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
+    put_day(store, "2026-11-08")
+    merger.retain()
+    assert "2026-11-08" in merger._cleaned
+    write(log, rec("alice", "2026-11-08T13:00:00.000Z"))  # after a long outage
+    (late,) = store.ls(prompts_dir(ROOT, "2026-11-08"))
+    assert "2026-11-08" not in merger._cleaned
+    clock.when = at(11, 2, 0)
+    merger.retain()
+    assert not store.exists(late)
+    assert "2026-11-08" in merger._cleaned
+    assert store.exists(day_path(ROOT, "2026-11-08"))
+
+
+class PausedDelete(Store):
+    """A store whose delete of `paused` waits for `release`. `deleting` is set at that delete."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.paused: str | None = None
+        self.deleting = threading.Event()
+        self.release = threading.Event()
+
+    def delete(self, path):
+        if path == self.paused:
+            self.deleting.set()
+            assert self.release.wait(5)
+        super().delete(path)
+
+
+def test_a_flush_during_a_retention_delete_keeps_the_day_from_being_cleaned():
+    store = PausedDelete()
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2, store=store)
+    day = "2026-11-08"
+    store.paused = put_day(store, day)
+    late = prompt_path(ROOT, day, "20261111T010000.000000-bb")
+    retaining = threading.Thread(target=merger.retain)
+    retaining.start()
+    try:
+        assert store.deleting.wait(5)
+        store.put(late, "{}\n")  # a flush writes the prompt file, then calls the listeners
+        with log.flush_lock:
+            merger.flushed(day, "20261111T010000.000000-bb", [])
+        store.fail_delete = {late}
+    finally:
+        store.release.set()
+        retaining.join(5)
+    assert not retaining.is_alive()
+    assert not store.exists(store.paused)
+    assert store.exists(late)
+    assert day not in merger._cleaned
+    assert prompt_listings(store).count(prompts_dir(ROOT, day)) == 2  # the day is listed again
+    store.fail_delete = set()
+    clock.when = at(11, 1, 1)
+    merger.retain()
+    assert not store.exists(late)
+    assert day in merger._cleaned
+
+
+def test_flushed_does_not_wait_for_a_retention_delete():
+    store = PausedDelete()
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2, store=store)
+    store.paused = put_day(store, "2026-11-08")
+    retaining = threading.Thread(target=merger.retain)
+    retaining.start()
+    try:
+        assert store.deleting.wait(5)
+
+        def flush_listener():
+            with log.flush_lock:
+                merger.flushed("2026-11-08", "20261111T010000.000000-bb", [])
+
+        flushing = threading.Thread(target=flush_listener)
+        flushing.start()
+        flushing.join(1)
+        assert not flushing.is_alive()
+        assert retaining.is_alive()  # the delete still waits
+    finally:
+        store.release.set()
+        retaining.join(5)
+    assert not retaining.is_alive()
