@@ -188,3 +188,22 @@ def test_stop_kills_grandchild_that_holds_the_pipe(tmp_path):
 
 def test_stop_when_not_running_does_nothing():
     asyncio.run(VllmEngine(8001, []).stop())
+
+
+def test_stop_treats_a_permission_error_as_a_gone_group(monkeypatch):
+    # On macOS, killpg can raise PermissionError for a group whose members
+    # have all exited.
+    def refuse(pid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    async def run() -> None:
+        engine = VllmEngine(_free_port(), [])
+        engine._proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "pass", start_new_session=True
+        )
+        await engine._proc.wait()
+        monkeypatch.setattr(os, "killpg", refuse)
+        await asyncio.wait_for(engine.stop(), 10)
+        assert engine._proc is None and not engine.alive()
+
+    asyncio.run(run())

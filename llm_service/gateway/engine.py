@@ -173,10 +173,14 @@ class VllmEngine:
                 await asyncio.sleep(self._poll_interval)
 
     def _signal_group(self, pid: int, sig: int) -> bool:
-        """Signal the process group. Return false when the group is gone."""
+        """Signal the process group. Return false when the group is gone.
+
+        On macOS, `killpg` can raise `PermissionError` for a group whose
+        members have all exited. That error also means that the group is gone.
+        """
         try:
             os.killpg(pid, sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return False
         return True
 
