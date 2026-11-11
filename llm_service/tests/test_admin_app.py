@@ -353,3 +353,9 @@ def test_page_sends_a_json_content_type_on_its_post():
     text = (STATIC_DIR / "app.js").read_text()
     posts = re.findall(r"method: 'POST'[^}]*}", text)
     assert posts and all("'Content-Type': 'application/json'" in post for post in posts)
+
+
+def test_every_call_asks_for_a_new_connection(client, service):
+    # The auth proxy of the platform signs only the first request of a connection.
+    client.get("/api/status", headers=ALICE)
+    assert [request.headers["Connection"] for request in service.requests] == ["close", "close"]

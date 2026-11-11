@@ -46,7 +46,9 @@ class ServiceClient:
             response = await self._http.request(
                 method,
                 self._base_url + path,
-                headers={ACTING_USER_HEADER: viewer},
+                # The auth proxy of the platform signs only the first request of a
+                # connection. A new connection for each request keeps every call signed.
+                headers={ACTING_USER_HEADER: viewer, "Connection": "close"},
                 params=kept,
                 json=json,
                 timeout=timeout,
