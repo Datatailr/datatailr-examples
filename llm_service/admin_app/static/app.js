@@ -318,13 +318,40 @@ async function loadAudit() {
     ? `Records ${fmt(state.offset + 1)} to ${fmt(state.offset + rows.length)}` : '';
 }
 
+/** The UTC day of an ISO time such as `2026-11-11T09:30:00Z`. The record files are kept by UTC day. */
+const utcDay = iso => new Date(iso).toISOString().slice(0, 10);
+
+/** Show the dialog with a note and a body. A body of `null` leaves the JSON empty. */
+function showRecord(note, body) {
+  $('record-note').textContent = note;
+  $('record-note').hidden = !note;
+  $('record-json').textContent = body === null ? '' : JSON.stringify(body, null, 2);
+  if (!$('record-dialog').open) $('record-dialog').showModal();
+}
+
+/** Open the dialog for a list row. The list has no prompt, so the page loads the full record. */
+async function openRecord(row) {
+  const call = nextCall('record');
+  if (!row.request_id) {
+    showRecord('This record has no id. The page shows the fields of the list.', row);
+    return;
+  }
+  showRecord('Loading the record.', null);
+  // A later click or a closed dialog makes this answer stale.
+  const stale = () => call !== state.calls.record || !$('record-dialog').open;
+  try {
+    const record = await api(`api/audit/records/${encodeURIComponent(row.request_id)}${query({day: utcDay(row.ts)})}`);
+    if (stale()) return;
+    showRecord(record.prompt_deleted ? 'The prompt of this record is deleted.' : '', record);
+  } catch (error) {
+    if (stale()) return;
+    showRecord(error instanceof ApiError ? error.message : String(error), row);
+  }
+}
+
 function auditRow(record) {
-  const open = () => {
-    $('record-json').textContent = JSON.stringify(record, null, 2);
-    $('record-dialog').showModal();
-  };
-  const event = record.prompt && typeof record.prompt === 'object' && !Array.isArray(record.prompt)
-    ? record.prompt.event : null;
+  const open = () => openRecord(record);
+  const event = typeof record.event === 'string' ? record.event : null;
   const ok = record.status >= 200 && record.status < 300;
   return el('tr', {tabindex: '0', onclick: open,
                    onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } }},

@@ -359,3 +359,52 @@ def test_every_call_asks_for_a_new_connection(client, service):
     # The auth proxy of the platform signs only the first request of a connection.
     client.get("/api/status", headers=ALICE)
     assert [request.headers["Connection"] for request in service.requests] == ["close", "close"]
+
+
+def test_audit_record_forwards_the_day_for_the_viewer(client, service):
+    record = {"request_id": "req-1", "prompt": "hi"}
+    service.answers[("GET", "/admin/audit/records/req-1")] = (200, record)
+    response = client.get("/api/audit/records/req-1?day=2026-11-11&evil=1", headers=ALICE)
+    assert response.status_code == 200
+    assert response.json() == record
+    assert len(service.requests) == 1
+    sent = service.requests[0]
+    assert sent.headers["X-LLM-Acting-User"] == "alice"
+    assert dict(sent.url.params) == {"day": "2026-11-11"}
+
+
+def test_audit_record_without_day_sends_no_param(client, service):
+    client.get("/api/audit/records/req-1", headers=ALICE)
+    assert dict(service.requests[0].url.params) == {}
+
+
+@pytest.mark.parametrize("request_id", ["..", ".", "a/b", "a%2Fb", "x/../y"])
+def test_audit_record_rejects_unusable_ids(client, service, request_id):
+    # The test client removes literal dot segments, so send them percent-encoded.
+    response = client.get("/api/audit/records/" + request_id.replace(".", "%2e"), headers=ALICE)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_record"
+    assert service.requests == []
+
+
+def test_audit_record_rejects_an_empty_id(client, service):
+    response = client.get("/api/audit/records/", headers=ALICE)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_record"
+    assert service.requests == []
+
+
+def test_audit_record_quotes_the_id_as_one_segment(client, service):
+    client.get("/api/audit/records/re%3Fq%23%20%25", headers=ALICE)
+    assert service.requests[0].url.raw_path.decode() == "/admin/audit/records/re%3Fq%23%20%25"
+
+
+@pytest.mark.parametrize(
+    ("status", "code"), [(404, "record_not_found"), (502, "prompt_unreadable"), (403, "admin_required")]
+)
+def test_audit_record_passes_errors_through(client, service, status, code):
+    body = {"error": {"message": "no", "type": "x", "code": code}}
+    service.answers[("GET", "/admin/audit/records/req-1")] = (status, body)
+    response = client.get("/api/audit/records/req-1?day=2026-11-11", headers=ALICE)
+    assert response.status_code == status
+    assert response.json() == body

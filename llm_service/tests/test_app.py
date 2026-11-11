@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import re
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -18,6 +20,7 @@ from llm_service.tests.fakes import FakeEngine, fake_vllm_app
 
 ALICE = {"X-Datatailr-User": "alice"}
 BOB = {"X-Datatailr-User": "bob"}
+ACTING = "X-LLM-Acting-User"
 CHAT = "/v1/chat/completions"
 HI = {"model": "org/a", "messages": [{"role": "user", "content": "hi"}]}
 
@@ -58,7 +61,16 @@ def plain_download(model: str, revision: str, target: Path) -> None:
     (target / "config.json").write_text("{}")
 
 
-def make_app(tmp_path, engine=None, store=None, http=None, download=plain_download, **config_args):
+def make_app(
+    tmp_path,
+    engine=None,
+    store=None,
+    http=None,
+    download=plain_download,
+    now=None,
+    maintenance_interval=None,
+    **config_args,
+):
     store = store or MemoryBlobStore()
     engine = engine or FakeEngine()
     config = Config(
@@ -69,7 +81,12 @@ def make_app(tmp_path, engine=None, store=None, http=None, download=plain_downlo
         transport=httpx.ASGITransport(app=fake_vllm_app()), base_url="http://engine"
     )
     admin = AdminCheck("alice", "admins", lambda group: ["carol"])
-    return create_app(config, store, engine, admin, download, http)
+    extra = {}
+    if now is not None:
+        extra["now"] = now
+    if maintenance_interval is not None:
+        extra["maintenance_interval"] = maintenance_interval
+    return create_app(config, store, engine, admin, download, http, **extra)
 
 
 def wait_for(client, predicate, timeout=10.0):
@@ -97,6 +114,11 @@ def audit_records(client, **params):
     return client.get("/admin/audit", headers=ALICE, params=params).json()["data"]
 
 
+def full_record(client, row):
+    """Return the full record of a list row, with its prompt. The list has no prompts."""
+    return client.app.state.audit.record(row["ts"][:10], row["request_id"])
+
+
 def test_health_needs_no_user(tmp_path):
     with TestClient(make_app(tmp_path)) as c:
         r = c.get("/health")
@@ -108,7 +130,9 @@ def test_chat_completion_roundtrip_and_audit(client):
     r = client.post(CHAT, headers=BOB, json=HI)
     assert r.status_code == 200 and r.headers["x-request-id"]
     rec = client.get("/admin/audit?user=bob", headers=ALICE).json()["data"][0]
-    assert rec["prompt"] == {"messages": [{"role": "user", "content": "hi"}]}
+    assert not {"prompt", "seg", "prompt_ref"} & set(rec)
+    assert rec["event"] is None and rec["detail"] is None
+    assert full_record(client, rec)["prompt"] == {"messages": [{"role": "user", "content": "hi"}]}
     assert rec["total_tokens"] == 5 and rec["prompt_tokens"] == 3 and rec["completion_tokens"] == 2
     assert rec["request_id"] == r.headers["x-request-id"]
     assert rec["status"] == 200 and rec["endpoint"] == CHAT and rec["model"] == "org/a"
@@ -156,7 +180,7 @@ def test_non_json_and_non_object_body_is_400_and_audited(client, content):
     assert r.json()["error"]["code"] == "invalid_json"
     rec = audit_records(client, user="bob")[0]
     assert rec["status"] == 400 and rec["request_id"] == r.headers["x-request-id"]
-    assert rec["prompt"] == {} and rec["total_tokens"] is None
+    assert full_record(client, rec)["prompt"] == {} and rec["total_tokens"] is None
 
 
 def test_503_with_retry_after_while_loading(tmp_path):
@@ -202,7 +226,7 @@ def test_dead_engine_is_reloaded_once_and_audited_as_system(tmp_path):
         wait_ready(c)
         assert c.post(CHAT, headers=BOB, json={**HI, "model": "org/b"}).status_code == 200
         events = [e for e in audit_records(c, model="org/b") if e["endpoint"] == "/admin/model"]
-        assert [(e["user"], e["prompt"]["event"], e["status"]) for e in events] == [
+        assert [(e["user"], e["event"], e["status"]) for e in events] == [
             ("system", "engine_reload", 200),
             ("alice", "model_switch", 200),
         ]
@@ -338,6 +362,7 @@ ADMIN_ROUTES = [
     ("GET", "/admin/model", {}),
     ("GET", "/admin/audit", {}),
     ("GET", "/admin/audit/users", {}),
+    ("GET", "/admin/audit/records/abc?day=2026-11-10", {}),
     ("GET", "/admin/usage", {}),
     ("GET", "/admin/usage/bob", {}),
 ]
@@ -362,7 +387,10 @@ def test_switch_model_202_then_ready_and_event_in_audit(client):
     assert len(events) == 1
     event = events[0]
     assert event["user"] == "alice" and event["status"] == 200
-    assert event["prompt"] == {"event": "model_switch", "revision": "v2", "error": None}
+    assert event["event"] == "model_switch" and event["detail"] == {"revision": "v2", "error": None}
+    assert "prompt" not in event
+    prompt = full_record(client, event)["prompt"]
+    assert prompt == {"event": "model_switch", "revision": "v2", "error": None}
     assert event["total_tokens"] is None
     assert client.post(CHAT, headers=BOB, json={**HI, "model": "org/b"}).status_code == 200
 
@@ -380,7 +408,7 @@ def test_failed_switch_is_audited_with_status_500(tmp_path):
         assert c.post("/admin/model", headers=ALICE, json={"model": "org/b"}).status_code == 202
         status = wait_for(c, lambda s: s["error"] is not None)
         events = [r for r in audit_records(c, model="org/b") if r["endpoint"] == "/admin/model"]
-        assert events[0]["status"] == 500 and events[0]["prompt"]["error"] == status["error"]
+        assert events[0]["status"] == 500 and events[0]["detail"]["error"] == status["error"]
 
 
 def test_switch_invalid_name_400_and_conflict_409(tmp_path):
@@ -452,6 +480,8 @@ def test_usage_rejects_bad_group_by_and_bad_days(client):
     assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_group_by"
     r = client.get("/admin/usage?since=yesterday", headers=ALICE)
     assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_time"
+    r = client.get("/admin/usage?since=20261110", headers=ALICE)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_time"
 
 
 def test_usage_me_returns_only_the_caller(client):
@@ -480,7 +510,7 @@ def test_shutdown_flushes_the_audit_log(tmp_path):
     with TestClient(make_app(tmp_path, store=store)) as c:
         wait_ready(c)
         c.post(CHAT, headers=BOB, json=HI)
-    files = store.ls("llm-service/audit")
+    files = [path for path in store.ls("llm-service/audit") if path.endswith(".jsonl")]
     text = "".join(store.get(f).decode() for f in files)
     assert any(json.loads(line)["user"] == "bob" for line in text.splitlines())
 
@@ -517,14 +547,14 @@ def test_openai_sdk_shape_of_errors(tmp_path):
 
 
 class OutageStore(MemoryBlobStore):
-    """A store whose audit and usage writes fail. It records the writing threads."""
+    """A store whose audit, prompt and usage writes fail. It records the writing threads."""
 
     def __init__(self) -> None:
         super().__init__()
         self.threads: list[int] = []
 
     def put(self, path: str, data) -> None:
-        if "/audit/" in path or "/usage/" in path:
+        if "/audit/" in path or "/prompts/" in path or "/usage/" in path:
             self.threads.append(threading.get_ident())
             time.sleep(0.01)
             raise OSError("storage is down")
@@ -565,7 +595,7 @@ def test_completions_and_embeddings_are_forwarded_and_audited(client, path, body
     r = client.post(path, headers=BOB, json=body)
     assert r.status_code == 200 and r.json()["usage"]["total_tokens"] == 5
     rec = audit_records(client, user="bob")[0]
-    assert rec["endpoint"] == path and rec["prompt"] == prompt
+    assert rec["endpoint"] == path and full_record(client, rec)["prompt"] == prompt
     assert rec["status"] == 200 and rec["total_tokens"] == 5
     assert rec["request_id"] == r.headers["x-request-id"]
 
@@ -606,9 +636,6 @@ def test_read_hf_token_failure_logs_the_key_and_environment(caplog):
     assert "hf_token" in message and "pre" in message and "secret not found" in message
 
 
-ACTING = "X-LLM-Acting-User"
-
-
 def test_acting_user_must_be_admin_too(client):
     r = client.get("/admin/model", headers=ALICE | {ACTING: "bob"})
     assert r.status_code == 403 and r.json()["error"]["code"] == "admin_required"
@@ -635,7 +662,7 @@ def test_admin_acting_user_is_accepted(client):
 def test_switch_is_audited_under_the_acting_user(client):
     client.post("/admin/model", json={"model": "org/other"}, headers=ALICE | {ACTING: "carol"})
     wait_ready(client)
-    events = [r for r in audit_records(client) if r["prompt"].get("event") == "model_switch"]
+    events = [r for r in audit_records(client) if r["event"] == "model_switch"]
     assert events[0]["user"] == "carol"
 
 
@@ -650,7 +677,7 @@ def test_bad_acting_user_is_400(client, name):
 def test_empty_acting_user_means_the_caller(client, headers):
     client.post("/admin/model", json={"model": "org/other"}, headers=ALICE | headers)
     wait_ready(client)
-    events = [r for r in audit_records(client) if r["prompt"].get("event") == "model_switch"]
+    events = [r for r in audit_records(client) if r["event"] == "model_switch"]
     assert events[0]["user"] == "alice"
 
 
@@ -672,7 +699,7 @@ def model_ids(client):
 
 
 def delete_events(client):
-    return [r for r in audit_records(client) if r["prompt"].get("event") == "model_delete"]
+    return [r for r in audit_records(client) if r["event"] == "model_delete"]
 
 
 @pytest.fixture
@@ -689,7 +716,7 @@ def test_delete_cached_model_removes_it_and_is_audited(two_models):
     assert "org/other" not in model_ids(client)
     rec = delete_events(client)[0]
     assert rec["user"] == "carol" and rec["endpoint"] == "/admin/models" and rec["model"] == "org/other"
-    assert rec["prompt"]["revisions"] == ["main"] and rec["status"] == 200
+    assert rec["detail"]["revisions"] == ["main"] and rec["status"] == 200
     assert rec["total_tokens"] is None
 
 
@@ -786,7 +813,7 @@ def test_delete_one_revision_keeps_the_others(two_models):
     assert r.status_code == 200 and r.json() == {"deleted": [{"model": "org/other", "revision": "v2"}]}
     entry = [m for m in client.get("/v1/models", headers=BOB).json()["data"] if m["id"] == "org/other"][0]
     assert entry["revisions"] == ["main"]
-    assert delete_events(client)[0]["prompt"]["revisions"] == ["v2"]
+    assert delete_events(client)[0]["detail"]["revisions"] == ["v2"]
 
 
 def test_delete_all_revisions_without_the_parameter(two_models):
@@ -834,7 +861,7 @@ def test_delete_storage_error_is_500_audits_the_removed_revisions_and_frees_the_
         assert error["code"] == "delete_failed" and error["type"] == "server_error"
         assert "OSError" in error["message"] and "org--other" not in error["message"]
         rec = delete_events(c)[0]
-        assert rec["status"] == 500 and rec["prompt"]["revisions"] == ["main"]
+        assert rec["status"] == 500 and rec["detail"]["revisions"] == ["main"]
         assert c.app.state.manager.removing == set()
         store.broken = None
         switch_and_wait(c, "org/other", "v2")
@@ -920,7 +947,7 @@ def test_a_second_delete_removes_what_a_failed_delete_left(tmp_path):
         assert r.status_code == 200
         assert r.json() == {"deleted": [{"model": "org/other", "revision": "main"}]}
         assert store.ls("llm-service/models/org--other") == []
-        assert delete_events(c)[0]["prompt"]["revisions"] == ["main"]
+        assert delete_events(c)[0]["detail"]["revisions"] == ["main"]
 
 
 def test_delete_removes_leftovers_without_a_marker(client):
@@ -932,7 +959,7 @@ def test_delete_removes_leftovers_without_a_marker(client):
     r = client.delete("/admin/models/org/x", headers=ALICE)
     assert r.json() == {"deleted": [{"model": "org/x", "revision": "main"}]}
     assert store.ls("llm-service/models/org--x") == []
-    assert [e["prompt"]["revisions"] for e in delete_events(client)] == [["main"], ["v2"]]
+    assert [e["detail"]["revisions"] for e in delete_events(client)] == [["main"], ["v2"]]
     r = client.delete("/admin/models/org/x", headers=ALICE)
     assert r.status_code == 404 and r.json()["error"]["code"] == "model_not_found"
 
@@ -975,3 +1002,244 @@ def test_models_list_size_is_null_when_no_size_is_known(client):
     store.put("llm-service/models/org--b/main/.complete", "not json")
     entry = client.get("/v1/models/org/b", headers=BOB).json()
     assert entry["revisions"] == ["main"] and entry["size_bytes"] is None
+
+
+# Record endpoint
+
+def _record_url(row, day=None):
+    return f"/admin/audit/records/{row['request_id']}?day={day or row['ts'][:10]}"
+
+
+def _bob_row(client):
+    client.post(CHAT, headers=BOB, json=HI)
+    return audit_records(client, user="bob")[0]
+
+
+def test_list_rows_have_no_prompt_seg_or_prompt_ref(client):
+    row = _bob_row(client)
+    assert not {"prompt", "seg", "prompt_ref"} & set(row)
+    assert "event" in row
+
+
+def test_record_endpoint_returns_a_buffered_record_with_its_prompt(client):
+    row = _bob_row(client)
+    r = client.get(_record_url(row), headers=ALICE)
+    assert r.status_code == 200
+    assert r.json()["prompt"] == {"messages": [{"role": "user", "content": "hi"}]}
+    assert r.json()["request_id"] == row["request_id"]
+
+
+def test_record_endpoint_returns_a_stored_record_with_its_prompt(client):
+    row = _bob_row(client)
+    client.app.state.audit.flush()
+    r = client.get(_record_url(row), headers=ALICE)
+    assert r.status_code == 200
+    assert r.json()["prompt"] == {"messages": [{"role": "user", "content": "hi"}]}
+
+
+def test_record_endpoint_returns_an_event(client):
+    row = next(r for r in audit_records(client) if r["endpoint"] == "/admin/model")
+    client.app.state.audit.flush()
+    r = client.get(_record_url(row), headers=ALICE)
+    assert r.status_code == 200
+    assert r.json()["prompt"]["event"] == "model_switch"
+
+
+def test_record_endpoint_unknown_id_is_404(client):
+    r = client.get("/admin/audit/records/nope?day=2026-11-10", headers=ALICE)
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "record_not_found"
+    assert set(r.json()["error"]) == {"message", "type", "code"}
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["", "?day=", "?day=garbage", "?day=2026-13-40", "?day=20261110", "?day=2026-W45-2", "?day=2026-11-31"],
+)
+def test_record_endpoint_bad_or_missing_day_is_400(client, query):
+    r = client.get("/admin/audit/records/abc" + query, headers=ALICE)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_time"
+
+
+def test_record_endpoint_reports_a_deleted_prompt(tmp_path):
+    store = MemoryBlobStore()
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        row = _bob_row(c)
+        c.app.state.audit.flush()
+        for path in store.ls("llm-service/prompts"):
+            store.delete(path)
+        r = c.get(_record_url(row), headers=ALICE)
+        assert r.status_code == 200
+        assert r.json()["prompt_deleted"] is True and r.json()["prompt"] is None
+
+
+def test_record_endpoint_unreadable_prompt_is_502_without_a_path(tmp_path):
+    store = MemoryBlobStore()
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        row = _bob_row(c)
+        c.app.state.audit.flush()
+        for path in store.ls("llm-service/prompts"):
+            store.put(path, b"not json at all")
+        r = c.get(_record_url(row), headers=ALICE)
+        assert r.status_code == 502
+        error = r.json()["error"]
+        assert (error["type"], error["code"]) == ("server_error", "prompt_unreadable")
+        assert "llm-service" not in error["message"] and "/" not in error["message"]
+
+
+def test_record_endpoint_rejects_a_non_admin_and_a_bad_acting_user(client):
+    row = _bob_row(client)
+    assert client.get(_record_url(row), headers=BOB).status_code == 403
+    assert client.get(_record_url(row)).status_code == 401
+    r = client.get(_record_url(row), headers=ALICE | {ACTING: "bob"})
+    assert r.status_code == 403 and "acting user" in r.json()["error"]["message"]
+    assert client.get(_record_url(row), headers=ALICE | {ACTING: "carol"}).status_code == 200
+
+
+def test_audit_users_route_is_not_taken_by_the_record_route(client):
+    r = client.get("/admin/audit/users", headers=ALICE)
+    assert r.status_code == 200 and "data" in r.json()
+
+
+# Wiring of the merger and the checkpoint
+
+
+class Clock:
+    """A clock that tests move forward."""
+
+    def __init__(self) -> None:
+        self.value = datetime(2026, 11, 10, 12, 0, 1, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, **kwargs) -> None:
+        self.value += timedelta(**kwargs)
+
+
+def test_the_maintenance_task_merges_and_shutdown_writes_the_checkpoint(tmp_path):
+    store, clock = MemoryBlobStore(), Clock()
+    app = make_app(tmp_path, store=store, now=clock, flush_interval=0.05, maintenance_interval=0.05)
+    with TestClient(app) as c:
+        wait_ready(c)
+        for _ in range(3):
+            assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        c.app.state.audit.flush()  # the segment gets the stamp of the first clock value
+        clock.advance(minutes=12)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if any("/audit/2026-11-10/parts/" in p for p in store.ls("llm-service/audit")):
+                break
+            time.sleep(0.05)
+        files = store.ls("llm-service/audit")
+        assert any("/audit/2026-11-10/parts/" in p for p in files), files
+        rows = audit_records(c, user="bob")
+        assert len(rows) == 3
+    assert "llm-service/usage/2026-11-10.partial.json" in store.ls("llm-service/usage")
+
+
+def test_shutdown_does_not_run_the_merger(tmp_path):
+    store, clock = MemoryBlobStore(), Clock()
+    app = make_app(tmp_path, store=store, now=clock, flush_interval=60)
+    with TestClient(app) as c:
+        wait_ready(c)
+        c.post(CHAT, headers=BOB, json=HI)
+        clock.advance(minutes=12)
+    files = store.ls("llm-service/audit")
+    assert files and not any("/parts/" in p for p in files)
+
+
+def test_shutdown_checkpoint_ignores_the_60_second_limit(tmp_path):
+    store, clock = MemoryBlobStore(), Clock()
+    app = make_app(tmp_path, store=store, now=clock, flush_interval=0.05)
+    path = "llm-service/usage/2026-11-10.partial.json"
+    with TestClient(app) as c:
+        wait_ready(c)
+        c.post(CHAT, headers=BOB, json=HI)
+        c.app.state.audit.flush()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and path not in store.ls("llm-service/usage"):
+            time.sleep(0.05)
+        assert path in store.ls("llm-service/usage")
+        before = json.loads(store.get(path))
+        clock.advance(seconds=5)
+        c.post(CHAT, headers=BOB, json=HI)
+        c.app.state.audit.flush()
+    after = json.loads(store.get(path))
+    assert after["through"] > before["through"]
+    assert after["rows"] != before["rows"]
+
+
+def test_the_start_logs_the_cost_of_the_usage_load(tmp_path, caplog):
+    store = MemoryBlobStore()
+    store.put("llm-service/audit/2026-11-09/day.jsonl", "")
+    with caplog.at_level("INFO", logger="llm_service.app"):
+        with TestClient(make_app(tmp_path, store=store)) as c:
+            wait_ready(c)
+    lines = [m for m in caplog.messages if m.startswith("usage totals loaded in ")]
+    assert len(lines) == 1
+    assert re.fullmatch(r"usage totals loaded in \d+\.\d s for 1 days", lines[0])
+
+
+@pytest.mark.parametrize("step", ["close_days", "checkpoint"])
+def test_a_failed_flusher_step_names_the_step(tmp_path, caplog, step):
+    with caplog.at_level("WARNING", logger="llm_service.app"):
+        with TestClient(make_app(tmp_path, flush_interval=0.05)) as c:
+            wait_ready(c)
+
+            def broken(*args, **kwargs):
+                raise RuntimeError("simulated step failure")
+
+            setattr(c.app.state.usage, step, broken)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if any("simulated step failure" in m for m in caplog.messages):
+                    break
+                time.sleep(0.05)
+            delattr(c.app.state.usage, step)  # the class method again, for the shutdown
+    assert f"the flusher step {step} failed: simulated step failure" in caplog.messages
+
+
+class BlockedDeletes(MemoryBlobStore):
+    """A memory store whose deletes of segments wait for `release`. `deleting` is set at the first one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.deleting = threading.Event()
+        self.release = threading.Event()
+
+    def delete(self, path):
+        if "/segments/" in path:
+            self.deleting.set()
+            assert self.release.wait(10)
+        super().delete(path)
+
+
+def test_the_flusher_runs_while_a_merge_deletes_its_inputs(tmp_path):
+    store, clock = BlockedDeletes(), Clock()
+    app = make_app(tmp_path, store=store, now=clock, flush_interval=0.05, maintenance_interval=0.05)
+    path = "llm-service/usage/2026-11-10.partial.json"
+    try:
+        with TestClient(app) as c:
+            wait_ready(c)
+            c.post(CHAT, headers=BOB, json=HI)
+            c.app.state.audit.flush()  # the segment gets the stamp of the first clock value
+            clock.advance(minutes=12)
+            assert store.deleting.wait(10)  # the merge waits in its delete
+            before = store.ls("llm-service/audit/2026-11-10/segments")
+            assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if len(store.ls("llm-service/audit/2026-11-10/segments")) > len(before):
+                    break
+                time.sleep(0.05)
+            assert len(store.ls("llm-service/audit/2026-11-10/segments")) > len(before)
+            store.release.set()
+            task = c.app.state.maintenance_task
+        assert task.done()
+    finally:
+        store.release.set()
+    assert path in store.ls("llm-service/usage")

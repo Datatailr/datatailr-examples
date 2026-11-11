@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Protocol
 
@@ -35,18 +36,21 @@ class BlobStore(Protocol):
 
 
 class MemoryBlobStore:
-    """Dict backed blob store for tests and local runs."""
+    """Dict backed blob store for tests and local runs. Threads can share it."""
 
     def __init__(self) -> None:
         self._files: dict[str, bytes] = {}
+        self._lock = threading.Lock()  # guards `_files`
 
     def put(self, path: str, data: bytes | str) -> None:
         if isinstance(data, str):
             data = data.encode("utf-8")
-        self._files[path] = data
+        with self._lock:
+            self._files[path] = data
 
     def get(self, path: str) -> bytes:
-        return self._files[path]
+        with self._lock:
+            return self._files[path]
 
     def put_file(self, path: str, local: Path) -> None:
         self.put(path, Path(local).read_bytes())
@@ -58,13 +62,16 @@ class MemoryBlobStore:
 
     def ls(self, prefix: str) -> list[str]:
         directory = prefix.rstrip("/") + "/"
-        return sorted(p for p in self._files if p.startswith(directory))
+        with self._lock:
+            return sorted(p for p in self._files if p.startswith(directory))
 
     def exists(self, path: str) -> bool:
-        return path in self._files
+        with self._lock:
+            return path in self._files
 
     def delete(self, path: str) -> None:
-        self._files.pop(path, None)
+        with self._lock:
+            self._files.pop(path, None)
 
 
 class DatatailrBlobStore:
