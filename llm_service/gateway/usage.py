@@ -110,7 +110,7 @@ class UsageTotals:
 
     def _rebuild_day(self, day: str) -> list[dict]:
         totals: dict[tuple[str, str], dict] = {}
-        for record in self._audit.records_for_day(day):
+        for record in self._audit.rows_for_day(day):
             parts = self._parse(record)
             if parts is None:
                 continue

@@ -97,6 +97,11 @@ def audit_records(client, **params):
     return client.get("/admin/audit", headers=ALICE, params=params).json()["data"]
 
 
+def full_record(client, row):
+    """Return the full record of a list row, with its prompt. The list has no prompts."""
+    return client.app.state.audit.record(row["ts"][:10], row["request_id"])
+
+
 def test_health_needs_no_user(tmp_path):
     with TestClient(make_app(tmp_path)) as c:
         r = c.get("/health")
@@ -108,7 +113,9 @@ def test_chat_completion_roundtrip_and_audit(client):
     r = client.post(CHAT, headers=BOB, json=HI)
     assert r.status_code == 200 and r.headers["x-request-id"]
     rec = client.get("/admin/audit?user=bob", headers=ALICE).json()["data"][0]
-    assert rec["prompt"] == {"messages": [{"role": "user", "content": "hi"}]}
+    assert not {"prompt", "seg", "prompt_ref"} & set(rec)
+    assert rec["event"] is None and rec["detail"] is None
+    assert full_record(client, rec)["prompt"] == {"messages": [{"role": "user", "content": "hi"}]}
     assert rec["total_tokens"] == 5 and rec["prompt_tokens"] == 3 and rec["completion_tokens"] == 2
     assert rec["request_id"] == r.headers["x-request-id"]
     assert rec["status"] == 200 and rec["endpoint"] == CHAT and rec["model"] == "org/a"
@@ -156,7 +163,7 @@ def test_non_json_and_non_object_body_is_400_and_audited(client, content):
     assert r.json()["error"]["code"] == "invalid_json"
     rec = audit_records(client, user="bob")[0]
     assert rec["status"] == 400 and rec["request_id"] == r.headers["x-request-id"]
-    assert rec["prompt"] == {} and rec["total_tokens"] is None
+    assert full_record(client, rec)["prompt"] == {} and rec["total_tokens"] is None
 
 
 def test_503_with_retry_after_while_loading(tmp_path):
@@ -202,7 +209,7 @@ def test_dead_engine_is_reloaded_once_and_audited_as_system(tmp_path):
         wait_ready(c)
         assert c.post(CHAT, headers=BOB, json={**HI, "model": "org/b"}).status_code == 200
         events = [e for e in audit_records(c, model="org/b") if e["endpoint"] == "/admin/model"]
-        assert [(e["user"], e["prompt"]["event"], e["status"]) for e in events] == [
+        assert [(e["user"], e["event"], e["status"]) for e in events] == [
             ("system", "engine_reload", 200),
             ("alice", "model_switch", 200),
         ]
@@ -362,7 +369,10 @@ def test_switch_model_202_then_ready_and_event_in_audit(client):
     assert len(events) == 1
     event = events[0]
     assert event["user"] == "alice" and event["status"] == 200
-    assert event["prompt"] == {"event": "model_switch", "revision": "v2", "error": None}
+    assert event["event"] == "model_switch" and event["detail"] == {"revision": "v2", "error": None}
+    assert "prompt" not in event
+    prompt = full_record(client, event)["prompt"]
+    assert prompt == {"event": "model_switch", "revision": "v2", "error": None}
     assert event["total_tokens"] is None
     assert client.post(CHAT, headers=BOB, json={**HI, "model": "org/b"}).status_code == 200
 
@@ -380,7 +390,7 @@ def test_failed_switch_is_audited_with_status_500(tmp_path):
         assert c.post("/admin/model", headers=ALICE, json={"model": "org/b"}).status_code == 202
         status = wait_for(c, lambda s: s["error"] is not None)
         events = [r for r in audit_records(c, model="org/b") if r["endpoint"] == "/admin/model"]
-        assert events[0]["status"] == 500 and events[0]["prompt"]["error"] == status["error"]
+        assert events[0]["status"] == 500 and events[0]["detail"]["error"] == status["error"]
 
 
 def test_switch_invalid_name_400_and_conflict_409(tmp_path):
@@ -517,14 +527,14 @@ def test_openai_sdk_shape_of_errors(tmp_path):
 
 
 class OutageStore(MemoryBlobStore):
-    """A store whose audit and usage writes fail. It records the writing threads."""
+    """A store whose audit, prompt and usage writes fail. It records the writing threads."""
 
     def __init__(self) -> None:
         super().__init__()
         self.threads: list[int] = []
 
     def put(self, path: str, data) -> None:
-        if "/audit/" in path or "/usage/" in path:
+        if "/audit/" in path or "/prompts/" in path or "/usage/" in path:
             self.threads.append(threading.get_ident())
             time.sleep(0.01)
             raise OSError("storage is down")
@@ -565,7 +575,7 @@ def test_completions_and_embeddings_are_forwarded_and_audited(client, path, body
     r = client.post(path, headers=BOB, json=body)
     assert r.status_code == 200 and r.json()["usage"]["total_tokens"] == 5
     rec = audit_records(client, user="bob")[0]
-    assert rec["endpoint"] == path and rec["prompt"] == prompt
+    assert rec["endpoint"] == path and full_record(client, rec)["prompt"] == prompt
     assert rec["status"] == 200 and rec["total_tokens"] == 5
     assert rec["request_id"] == r.headers["x-request-id"]
 
@@ -635,7 +645,7 @@ def test_admin_acting_user_is_accepted(client):
 def test_switch_is_audited_under_the_acting_user(client):
     client.post("/admin/model", json={"model": "org/other"}, headers=ALICE | {ACTING: "carol"})
     wait_ready(client)
-    events = [r for r in audit_records(client) if r["prompt"].get("event") == "model_switch"]
+    events = [r for r in audit_records(client) if r["event"] == "model_switch"]
     assert events[0]["user"] == "carol"
 
 
@@ -650,7 +660,7 @@ def test_bad_acting_user_is_400(client, name):
 def test_empty_acting_user_means_the_caller(client, headers):
     client.post("/admin/model", json={"model": "org/other"}, headers=ALICE | headers)
     wait_ready(client)
-    events = [r for r in audit_records(client) if r["prompt"].get("event") == "model_switch"]
+    events = [r for r in audit_records(client) if r["event"] == "model_switch"]
     assert events[0]["user"] == "alice"
 
 
@@ -672,7 +682,7 @@ def model_ids(client):
 
 
 def delete_events(client):
-    return [r for r in audit_records(client) if r["prompt"].get("event") == "model_delete"]
+    return [r for r in audit_records(client) if r["event"] == "model_delete"]
 
 
 @pytest.fixture
@@ -689,7 +699,7 @@ def test_delete_cached_model_removes_it_and_is_audited(two_models):
     assert "org/other" not in model_ids(client)
     rec = delete_events(client)[0]
     assert rec["user"] == "carol" and rec["endpoint"] == "/admin/models" and rec["model"] == "org/other"
-    assert rec["prompt"]["revisions"] == ["main"] and rec["status"] == 200
+    assert rec["detail"]["revisions"] == ["main"] and rec["status"] == 200
     assert rec["total_tokens"] is None
 
 
@@ -786,7 +796,7 @@ def test_delete_one_revision_keeps_the_others(two_models):
     assert r.status_code == 200 and r.json() == {"deleted": [{"model": "org/other", "revision": "v2"}]}
     entry = [m for m in client.get("/v1/models", headers=BOB).json()["data"] if m["id"] == "org/other"][0]
     assert entry["revisions"] == ["main"]
-    assert delete_events(client)[0]["prompt"]["revisions"] == ["v2"]
+    assert delete_events(client)[0]["detail"]["revisions"] == ["v2"]
 
 
 def test_delete_all_revisions_without_the_parameter(two_models):
@@ -834,7 +844,7 @@ def test_delete_storage_error_is_500_audits_the_removed_revisions_and_frees_the_
         assert error["code"] == "delete_failed" and error["type"] == "server_error"
         assert "OSError" in error["message"] and "org--other" not in error["message"]
         rec = delete_events(c)[0]
-        assert rec["status"] == 500 and rec["prompt"]["revisions"] == ["main"]
+        assert rec["status"] == 500 and rec["detail"]["revisions"] == ["main"]
         assert c.app.state.manager.removing == set()
         store.broken = None
         switch_and_wait(c, "org/other", "v2")
@@ -920,7 +930,7 @@ def test_a_second_delete_removes_what_a_failed_delete_left(tmp_path):
         assert r.status_code == 200
         assert r.json() == {"deleted": [{"model": "org/other", "revision": "main"}]}
         assert store.ls("llm-service/models/org--other") == []
-        assert delete_events(c)[0]["prompt"]["revisions"] == ["main"]
+        assert delete_events(c)[0]["detail"]["revisions"] == ["main"]
 
 
 def test_delete_removes_leftovers_without_a_marker(client):
@@ -932,7 +942,7 @@ def test_delete_removes_leftovers_without_a_marker(client):
     r = client.delete("/admin/models/org/x", headers=ALICE)
     assert r.json() == {"deleted": [{"model": "org/x", "revision": "main"}]}
     assert store.ls("llm-service/models/org--x") == []
-    assert [e["prompt"]["revisions"] for e in delete_events(client)] == [["main"], ["v2"]]
+    assert [e["detail"]["revisions"] for e in delete_events(client)] == [["main"], ["v2"]]
     r = client.delete("/admin/models/org/x", headers=ALICE)
     assert r.status_code == 404 and r.json()["error"]["code"] == "model_not_found"
 
