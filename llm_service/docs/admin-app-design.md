@@ -94,7 +94,7 @@ If vLLM fails to start the new model, the service loads the previous model again
 
 ### Audit record of a delete
 
-A delete makes one audit record, in the form of the model switch record: `endpoint` is `/admin/models`, `model` is the model name, `prompt` is `{"event": "model_delete", "revisions": [...]}`, `status` is 200, the token fields are null. The user is the admin user from `require_admin`. If a removal fails, the record has status 500, and `revisions` lists only the revisions removed before the error.
+A delete makes one audit record, in the form of the model switch record. Its fields: `endpoint` is `/admin/models`, `model` is the model name, `prompt` is `{"event": "model_delete", "revisions": [...]}`, `status` is 200, the token fields are null. The user is the admin user from `require_admin`. If a removal fails, the record has status 500, and `revisions` lists only the revisions removed before the error.
 
 ### Size of a cached model
 

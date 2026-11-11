@@ -2,7 +2,7 @@
 
 ## Goal
 
-The audit log stays in blob storage, and the service stays fast when the log grows. A restart takes seconds. The audit table and the usage totals read no prompts. Prompts have their own files and their own retention.
+The audit log stays in blob storage, and the service stays fast when the log grows. A start lists `audit/` and `usage/` one time each. It reads one small usage file for each past day, eight at a time. Its time grows slowly with the number of days, not with the load of a day. The audit table and the usage totals read no prompts. Prompts have their own files and their own retention.
 
 ## The problem today
 
@@ -88,9 +88,9 @@ The flush interval and the flush size stay as they are: 5 seconds and 100 record
 
 ## Merges
 
-The flusher thread runs the merge after a flush. The merge runs at most one time each minute. It holds the flush lock, so no flush runs during a merge.
+The flusher thread runs the merge after a flush. The merge runs at most one time each minute. It holds the flush lock for the listing of a day folder. It also holds it for the reads, the write and the cache update of each merged file. It releases the lock before it deletes the inputs, so a flush can run during the deletes. The merge reads its inputs eight at a time and deletes them eight at a time.
 
-The merge lists only the day folders that have work. The first merge after a start lists `audit/` one time and notes each folder that has a segment or a part. After that, each flush adds its day to the set. A folder leaves the set when it holds no segment and no part after a merge.
+The merge lists only the day folders that have work. The first merge after a start lists `audit/` one time and notes each folder that has a segment or a part. After that, each flush adds its day to the set. A folder leaves the set when it holds no segment and no part after a merge. A flush that writes to the folder after the listing of the merge keeps it in the set.
 
 A bucket merges 1 to 2 minutes after its end, and a day merges 15 to 16 minutes after its end. The wait comes from the delay of the rules below plus the one minute between two merges.
 
@@ -100,7 +100,7 @@ The last flusher cycle at a stop does not merge. A stop of the service waits for
 
 A bucket is ready when its 10 minutes ended at least 1 minute ago. For each ready bucket of each day folder in the set:
 
-1. Read the segments of the bucket in name order. Most come from the memory cache.
+1. Read the segments of the bucket in name order. Most come from the memory cache. The service reads the others eight at a time.
 2. Write `audit/<day>/parts/<bucket>.jsonl` with all rows.
 3. Delete the segments of the bucket.
 
@@ -112,11 +112,12 @@ A day is ready when it ended at least 15 minutes ago, it has at least one part, 
 2. Write `audit/<day>/day.jsonl`.
 3. Delete the parts.
 
-A late record can still arrive in a day folder that has a day file. It makes a new segment, then a new part. The next merge writes the day file again with the old rows and the new rows, then deletes the part. The day file is the only file that the service writes more than one time.
+A late record can still arrive in a day folder that has a day file. It makes a new segment, then a new part. The next merge writes the day file again with the old rows and the new rows, then deletes the part. In normal operation, the day file is the only audit file that the service writes more than one time.
 
 ### Failures
 
 - A failed write in step 2 changes nothing. The merge runs again at the next cycle.
+- A flush can run between step 2 and step 3. It writes new segments only, and it never touches a merged file or its inputs.
 - A stop between step 2 and step 3 leaves the merged file and its inputs. The reader handles this with the rule in [Reads](#reads), and the next merge deletes the inputs.
 - A merge never changes a row, so a row keeps its `seg`.
 - A folder name that is not a day, or a file name that is not a bucket, has no end time. The merge skips it and logs one warning.
@@ -137,7 +138,7 @@ The `seg` check makes a row count one time when a merged file and its inputs bot
 
 ### Old layout
 
-A file directly in `audit/<day>/` holds full records. The reader builds metadata rows from it: it moves `prompt.event` to `event`, the rest of an event prompt to `detail`, and it sets `prompt_ref` to the file and the line. It reads the prompt from the same file when an admin opens the record. The service does not merge or change these files.
+A file directly in `audit/<day>/` holds full records. The reader builds metadata rows from it. It moves `prompt.event` to `event` and the rest of an event prompt to `detail`. It sets `prompt_ref` to the file and the line. It reads the prompt from the same file when an admin opens the record. The service does not merge or change these files.
 
 ### Memory cache
 
@@ -165,13 +166,15 @@ The rows have the form of the daily file. The checkpoint holds only flushed rows
 
 ### Start
 
-For each day folder:
+The start lists `usage/` one time. The listing shows which days have a daily file and which days have a partial file. The start makes no `exists` call. It reads the daily files eight at a time. Then, for each day folder:
 
 1. If `usage/<day>.json` exists, use it. This is today's behavior.
 2. Otherwise, if `usage/<day>.partial.json` exists, use its rows. Then read the metadata of the day and add each row whose `seg` is greater than `through`.
 3. Otherwise, read all metadata of the day.
 
 Step 2 reads the files that hold rows after `through`. In the worst case these are the segments of the last minute and one part. A day that got a late record adds its day file. It never reads files of the old layout, because they are older than every segment. The rows of old files count in the totals through step 3 or through the partial file.
+
+The first start after the upgrade reads every old layout file of the days without a daily usage file, as the old version did. It then writes the daily files of the finished days. Later starts use the daily files and the checkpoint.
 
 ### Finished days
 
@@ -183,9 +186,17 @@ A new deploy variable `LLM_PROMPT_RETENTION_DAYS`. It is not set by default, and
 
 The value is a whole number from 1 to 36500. Any other value stops the service at the start, with an error that names the variable.
 
-When it is set to N, the flusher deletes each folder `prompts/<day>/` whose day ended more than N days ago. The test is strict. A day that ended exactly N days ago stays. The check runs one time each hour. One flusher cycle handles at most 20 days, and the next cycle goes on with the rest. The last cycle at a stop skips retention. The metadata stays.
+When it is set to N, the flusher deletes the prompt files of each day that ended more than N days ago. The test is strict. A day that ended exactly N days ago stays. The metadata stays.
 
-The flusher takes the day names from the day folders of `audit/`. It never lists all of `prompts/`. It remembers the days that it cleaned, so each hour it lists only the days that newly passed the limit.
+A new check starts at most one time each hour. It queues the days past the limit that are not clean yet, newest first. The flusher works on the day at the head of the queue:
+
+1. It lists `prompts/<day>/` one time and keeps the list of its files in memory.
+2. Each flusher cycle deletes the next files of that list, eight at a time.
+3. When every file of the list is deleted, the day is clean. The flusher then goes on with the next day.
+
+One flusher cycle deletes at most 64 prompt files and lists at most 20 prompt folders. The next cycle goes on with the rest. On the platform, a cycle with retention work takes a few seconds more. A file whose delete fails stays in the list, and the next cycle tries it again. When the same file fails in three cycles in a row, the day waits for the next hourly check. The last cycle at a stop skips retention.
+
+The flusher takes the day names from the day folders of `audit/`. It never lists all of `prompts/`. It keeps the set of clean days in memory, so each hourly check lists only the days that newly passed the limit. After a restart, the set is empty. The first check then lists the prompt folder of each day past the limit again, at most 20 for each flusher cycle.
 
 A record whose prompt file is gone answers with `"prompt": null` and `"prompt_deleted": true`. The answer has `prompt_deleted` only in this case.
 
@@ -203,7 +214,7 @@ New. It returns one full record: the fields of the list row plus `prompt`. So th
 
 - `day` is the UTC day of the record time. It is required, in the form `YYYY-MM-DD` only. 400 `invalid_time` if it is missing or has another form.
 - 404 `record_not_found` if the day has no record with this id.
-- 502 `prompt_unreadable` if the prompt file exists and the read fails, or if its line does not hold the record. A file of the old layout that is missing gives the same error.
+- 502 `prompt_unreadable` if the prompt file exists and the read fails, or if its line does not hold the record. A missing file of the old layout gives the same error.
 - 403 `admin_required` for a caller who is not an admin. The acting user rule applies.
 
 ### `GET /admin/audit/users`, usage endpoints
@@ -220,9 +231,9 @@ No change in the answers. The days `since` and `until` of the usage endpoints ac
 
 - One service instance writes the log. Two instances on one blob root are not supported. This is true today.
 - A day file with N rows is read in one piece. The design fits about 300,000 requests a day. Above that, the day file gets large and needs a split.
-- A crash loses the records that wait in the buffer, at most 5 seconds of them. This is true today.
+- A crash loses the records that wait in the buffer. A flush runs every 5 seconds. The write of a merged file or a retention step can delay one flush by a few seconds.
 - A prompt is not searchable. The filters work on metadata.
-- A blob write can fail after the blob was written. The records then stay in the buffer. The next flush writes them again under a new segment name, so they appear two times.
+- A blob write can fail after the blob was written. The records then stay in the buffer. The next flush writes them again under a new segment name, so they appear two times in the lists. The usage totals count such a record one time. A restart before the next checkpoint reads both copies and counts it two times.
 - The merges assume that a blob write is atomic. A reader never sees half a file.
 - A clock that steps back across a restart can give a new segment a name that is not greater than the last checkpoint. A crash before the next checkpoint then loses those rows from the usage totals.
 - A stop of the service waits for a merge that runs at that moment.
@@ -231,10 +242,10 @@ No change in the answers. The days `since` and `until` of the usage endpoints ac
 ## Testing
 
 - Flush: prompt file before segment file, the two failure cases, and the write-through cache.
-- Merges: parts and day files, a late record in a finished day, a stop between the write and the deletes, and no merge of a bucket that is not ready.
+- Merges: parts and day files, a late record in a finished day, and no merge of a bucket that is not ready. A stop between the write and the deletes. A flush during the deletes.
 - Reads: the `seg` rule with duplicated inputs, the old layout, the order of records, and a list that makes no prompt read.
-- Usage: the checkpoint holds only flushed rows, a start from a checkpoint reads only later rows, and the three start cases.
-- Retention: deletion after N days, the answer for a deleted prompt, and no deletion when the variable is not set.
+- Usage: the checkpoint holds only flushed rows, and a start from a checkpoint reads only later rows. The three start cases. One listing of `usage/` at a start.
+- Retention: deletion after N days, and no deletion when the variable is not set. The limit of 64 deletes and 20 listings for each cycle. A failed delete. The answer for a deleted prompt.
 - API: the new endpoint with its error cases, and the list without prompts.
 - Admin app: the new route and the record dialog.
 - On an installation: a load run that writes a few thousand records, then a restart, with the start time and the audit page time measured.

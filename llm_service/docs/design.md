@@ -29,8 +29,8 @@ The example is one Datatailr `Service`. Two processes run in its container:
 2. The engine, `vllm serve`, a child process of the gateway on `127.0.0.1`.
 
 vLLM is an open source inference server. It implements the OpenAI API and
-batches concurrent requests on the GPU. The gateway forwards `/v1/*` to vLLM
-and adds the parts that vLLM does not have: user identity, the audit log, the
+batches concurrent requests on the GPU. The gateway forwards `/v1/*` to vLLM.
+It adds the parts that vLLM does not have: user identity, the audit log, the
 usage metrics, the weight cache and the model switch.
 
 ```
@@ -89,7 +89,7 @@ The model list has one entry for each model id. Each entry has the OpenAI
 fields `id`, `object`, `created` and `owned_by`, and four extra fields:
 
 - `status`: `loading` for the model that loads, `active` for the model that
-  vLLM serves now, and `cached` for a model that is only in blob storage. If one id has two
+  vLLM serves now, and `cached` for a model only in blob storage. If one id has two
   states, `loading` comes before `active`, and `active` comes before `cached`.
 - `revision`: the loading or active revision. For a cached model, it is the
   first cached revision.
@@ -132,10 +132,10 @@ so the platform does not restart the service while a model loads.
 
 ## Identity and admin
 
-The platform adds a signed `X-Datatailr-User` header to each request, at the
-edge for outside clients and through the auth proxy for jobs inside the
-platform. The gateway reads the user name from that header. The platform checks
-the service ACL before the request reaches the gateway.
+The platform adds a signed `X-Datatailr-User` header to each request. It adds
+the header at the edge for outside clients, and through the auth proxy for jobs
+inside the platform. The gateway reads the user name from that header. The
+platform checks the service ACL before the request reaches the gateway.
 
 An admin is one of:
 
@@ -217,8 +217,8 @@ environment, and it continues without a token. Public models still load.
 
 `GET /v1/models` lists the directories that have a `.complete` marker.
 
-After a successful load, the gateway deletes the local copies of the other
-models in a worker thread, so the node disk does not fill up. It never deletes
+After a successful load, a worker thread of the gateway deletes the local
+copies of the other models. So the node disk does not fill up. It never deletes
 the active model or a model that loads. The blob storage copies stay.
 
 ## Model switch
@@ -332,34 +332,42 @@ A flush splits each record in two parts. The prompt goes to a prompt file under
 `audit/<day>/segments/`. Metadata is the record without the prompt, plus the
 fields `event`, `detail`, `seg` and `prompt_ref`. The flush writes the prompt
 file first. The segment file is the commit: a record exists when its metadata
-exists. Each file is written once.
+exists. A flush writes each prompt file and each segment file one time. A merge
+writes the day file again when a late record arrives for a finished day.
 
 After each flush, the flusher thread merges the metadata, at most one time each
-minute. The segments of a finished 10 minute bucket become one part file. The
-parts of a finished day become one day file. A bucket merges 1 to 2 minutes
-after its end, and a day 15 to 16 minutes after its end. A reader skips a row
-whose `seg` it already read, so a merge that stops half way loses no record and
-counts none twice. Files of the old layout, with the full records, stay
-readable and are never merged.
+minute. The merge holds the flush lock for the write of a merged file, not for
+the deletes of its inputs. It reads and deletes eight files at a time. The
+segments of a finished 10 minute bucket become one part file. The parts of a
+finished day become one day file. A bucket merges 1 to 2 minutes after its end,
+and a day 15 to 16 minutes after its end. A reader skips a row whose `seg` it
+already read, so a merge that stops half way loses no record and counts none
+twice. Files of the old layout, with the full records, stay readable and are
+never merged.
 
 The gateway keeps the metadata rows of the files in memory, up to 1,000,000
-rows, and drops the least recently used file first. It keeps no prompts there.
+rows, and drops the least recently used file first. At that size, the cache
+uses about 2 GB of memory. It keeps no prompts there.
 
 `GET /admin/audit` reads the metadata of the days in the requested range, plus
 the buffer, and applies the filters. It reads no prompt. It reads the days
 newest first, and it stops when it has `offset + limit` matching records.
 During a flush, the records that the flush writes stay visible to queries. A
-query shows each record once. `GET /admin/audit/records/{request_id}` reads
-the one prompt file that holds the prompt of one record.
+query shows each record once. `GET /admin/audit/records/{request_id}` lists
+the day, reads the metadata files of the day that are not in memory, and reads
+one prompt file.
 
 An admin can set `LLM_PROMPT_RETENTION_DAYS`. The flusher then deletes the
-prompt folders of the days that ended more than that many days ago. The
-metadata stays. A record whose prompt is deleted answers with `prompt_deleted`.
+prompt files of the days that ended more than that many days ago. One flusher
+cycle deletes at most 64 prompt files, eight at a time, and lists at most 20
+prompt folders. The metadata stays. A record whose prompt is deleted answers
+with `prompt_deleted`.
 
-In normal operation, a kill of the container loses the records of at most
-about the last 5 seconds. During a blob storage outage, the records wait in
-memory. A kill then loses all records since the outage began. The README
-states this.
+In normal operation, a kill of the container loses the records since the last
+flush. A flush runs every 5 seconds. The write of a merged file or a retention
+step can delay one flush by a few seconds. During a blob storage outage, the
+records wait in memory. A kill then loses all records since the outage began.
+The README states this.
 
 A stored line that is not a JSON object with a valid `ts` and a string `user`
 is skipped with a warning.
@@ -371,9 +379,9 @@ layout, the merge rules, the read rules and the limits in full.
 
 The usage totals come from the audit records. There is no second store.
 
-`usage.py` keeps totals in memory with the key `(day, user, model)`: request
-count, failed request count, prompt tokens, completion tokens, total tokens and
-last request time. Each new record updates them.
+`usage.py` keeps totals in memory with the key `(day, user, model)`. The totals
+are: request count, failed request count, prompt tokens, completion tokens,
+total tokens and last request time. Each new record updates them.
 
 The container has no persistent disk, so the totals live in blob storage too.
 When a day ends, the gateway writes the totals of that day to
@@ -386,8 +394,12 @@ clean stop.
 At startup, for each day, the gateway reads the daily file if it exists.
 Otherwise it reads the checkpoint and adds the rows whose segment name is
 greater than `through`. Without a checkpoint, it reads all metadata of the day.
-So the startup time does not grow with the size of the audit log. The metadata
-files stay the source of truth: if a daily file is deleted, the gateway
+The startup lists `audit/` and `usage/` one time each. It reads one small usage
+file for each past day, eight at a time. So the startup time grows slowly with
+the number of days, not with the load of a day. The first start after the
+upgrade reads every old layout file of the days without a daily usage file, as
+the old version did. Later starts use the daily files and the checkpoint. The
+metadata files stay the source of truth: if a daily file is deleted, the gateway
 rebuilds it.
 
 ### Token counts for streaming requests
@@ -396,7 +408,7 @@ vLLM reports token counts for a streaming request only if the request asks for
 them. For each streaming request, the gateway sets
 `stream_options.include_usage` to true and reads the counts from the last
 chunk. If the client did not ask for that chunk, the gateway removes it from
-the stream, so the client gets the same stream as from OpenAI.
+the stream. The client then gets the same stream as from OpenAI.
 
 ## Concurrency
 
