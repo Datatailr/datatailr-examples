@@ -400,10 +400,16 @@ def create_app(
             for name in found:
                 await asyncio.to_thread(weights.remove, model_id, name)
                 removed.append(name)
-        except BaseException:
+        except Exception as error:
             status = 500
-            raise
+            logger.warning("could not delete %s: %s", model_id, error)
+            raise ApiError(
+                500, "server_error", "delete_failed",
+                f"could not delete the model {model_id!r} ({type(error).__name__})",
+            ) from None
         finally:
+            # A cancelled request frees the mark while the worker thread may still
+            # remove. This is safe: `WeightCache.ensure` and `remove` share one lock.
             manager.end_remove(model_id, found)
             write_audit(
                 {

@@ -612,3 +612,64 @@ def test_end_remove_allows_the_switch_again(tmp_path):
         assert mgr.active["model"] == "org/b"
 
     asyncio.run(run())
+
+
+class HoldingEngine(FakeEngine):
+    """A fake engine. Its `start` of `held` waits for `gate` after `armed` is set."""
+
+    def __init__(self, held: str) -> None:
+        super().__init__()
+        self.held = held
+        self.armed = False
+        self.waiting = threading.Event()
+        self.gate = threading.Event()
+
+    async def start(self, model_dir: Path, served_name: str) -> None:
+        if self.armed and served_name == self.held:
+            self.waiting.set()
+            await asyncio.to_thread(self.gate.wait, 10)
+        await super().start(model_dir, served_name)
+
+
+def test_begin_remove_refuses_the_model_of_a_rollback(tmp_path):
+    async def run():
+        mgr, _, store, _ = _make(tmp_path)
+        engine = HoldingEngine("org/a")
+        mgr._engine = engine
+        await mgr.startup()
+        engine.armed = True
+        engine.fail_on = {"org/b"}
+        task = mgr.request_switch("org/b")
+        while not engine.waiting.is_set():
+            await asyncio.sleep(0.01)
+        # The rollback to org/a runs: it is not active, serving or target.
+        assert mgr.active is None and mgr.serving is None and mgr.target is None
+        with pytest.raises(ModelInUse):
+            mgr.begin_remove("org/a", ["main"])
+        engine.gate.set()
+        await task
+        assert mgr.state == "ready" and mgr.rolling_back is None
+        with pytest.raises(ModelInUse):  # active again
+            mgr.begin_remove("org/a", ["main"])
+        mgr.begin_remove("org/b", ["main"])
+
+    asyncio.run(run())
+
+
+def test_rollback_mark_is_cleared_when_the_rollback_fails(tmp_path):
+    async def run():
+        mgr, engine, store, _ = _make(tmp_path)
+        await mgr.startup()
+        engine.fail_on = {"org/a", "org/b"}
+        await mgr.request_switch("org/b")
+        assert mgr.state == "failed" and mgr.rolling_back is None
+        mgr.begin_remove("org/a", ["main"])
+
+    asyncio.run(run())
+
+
+def test_begin_remove_message_names_a_removal(tmp_path):
+    mgr, *_ = _make(tmp_path)
+    mgr.begin_remove("org/b", ["main"])
+    with pytest.raises(ModelInUse, match="being removed"):
+        mgr.begin_remove("org/b", ["main"])

@@ -29,6 +29,7 @@ class ModelManager:
     that loads. `serving` is the model that the engine serves right now, or
     None when the engine serves no healthy model. During the weight fetch of
     an admin switch, `serving` is the old model and the state is `loading`.
+    `rolling_back` is the previous model while a failed switch reloads it.
     `removing` holds the (model, revision) pairs that a delete removes now.
     """
 
@@ -53,6 +54,7 @@ class ModelManager:
         self.target: dict | None = None
         self.error: str | None = None
         self.serving: dict | None = None
+        self.rolling_back: dict | None = None
         self.removing: set[tuple[str, str]] = set()
 
     @property
@@ -120,21 +122,23 @@ class ModelManager:
     def begin_remove(self, model: str, revisions: list[str]) -> None:
         """Mark revisions of a model as being removed.
 
-        Raise `ModelInUse` if one of them is the active, serving or target
-        model, or is already being removed. Nothing is marked in that case.
+        Raise `ModelInUse` if one of them is the active, serving, target or
+        rollback model, or is already being removed. Nothing is marked in that case.
         Call `end_remove` when the removal ends. The check and the mark run
         without an `await`, so no switch can start between them.
         """
         pairs = {(model, revision) for revision in revisions}
         busy = {
             (entry["model"], entry["revision"])
-            for entry in (self.active, self.serving, self.target)
+            for entry in (self.active, self.serving, self.target, self.rolling_back)
             if entry
         }
-        taken = (pairs & busy) | (pairs & self.removing)
-        if taken:
-            name, revision = sorted(taken)[0]
+        if pairs & busy:
+            name, revision = sorted(pairs & busy)[0]
             raise ModelInUse(f"{name} {revision} is in use")
+        if pairs & self.removing:
+            name, revision = sorted(pairs & self.removing)[0]
+            raise ModelInUse(f"{name} {revision} is being removed")
         self.removing |= pairs
 
     def end_remove(self, model: str, revisions: list[str]) -> None:
@@ -247,18 +251,22 @@ class ModelManager:
         self.active = None
         self.state = "failed"
         if previous is not None:
+            self.rolling_back = dict(previous)
             try:
-                model_dir = await asyncio.to_thread(
-                    self._weights.ensure, previous["model"], previous["revision"]
-                )
-                await self._engine.start(model_dir, previous["model"])
-            except Exception as exc:  # noqa: BLE001
-                log.error("rollback to %s failed: %s", previous["model"], exc)
-            else:
-                self.active = dict(previous)
-                self.serving = dict(previous)
-                self.state = "ready"
-                await self._save_active()
+                try:
+                    model_dir = await asyncio.to_thread(
+                        self._weights.ensure, previous["model"], previous["revision"]
+                    )
+                    await self._engine.start(model_dir, previous["model"])
+                except Exception as exc:  # noqa: BLE001
+                    log.error("rollback to %s failed: %s", previous["model"], exc)
+                else:
+                    self.active = dict(previous)
+                    self.serving = dict(previous)
+                    self.state = "ready"
+                    await self._save_active()
+            finally:
+                self.rolling_back = None
         self._emit(wanted, "failed", error, trigger)
 
     def _emit(

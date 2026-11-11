@@ -828,6 +828,9 @@ def test_delete_storage_error_is_500_audits_the_removed_revisions_and_frees_the_
         store.broken = "org--other/v2/"
         r = c.delete("/admin/models/org/other", headers=ALICE)
         assert r.status_code == 500
+        error = r.json()["error"]
+        assert error["code"] == "delete_failed" and error["type"] == "server_error"
+        assert "OSError" in error["message"] and "org--other" not in error["message"]
         rec = delete_events(c)[0]
         assert rec["status"] == 500 and rec["prompt"]["revisions"] == ["main"]
         assert c.app.state.manager.removing == set()
@@ -841,3 +844,37 @@ def test_models_list_has_size_bytes(two_models):
     assert all(isinstance(m["size_bytes"], int) and m["size_bytes"] > 0 for m in data)
     one = two_models.get("/v1/models/org/other", headers=BOB).json()
     assert one["size_bytes"] == data[1]["size_bytes"]
+
+
+class RollbackEngine(FakeEngine):
+    """A fake engine. `org/other` fails to start. `org/a` waits for `gate` once `armed`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_on = {"org/other"}
+        self.armed = False
+        self.waiting = threading.Event()
+        self.gate = threading.Event()
+
+    async def start(self, model_dir: Path, served_name: str) -> None:
+        if self.armed and served_name == "org/a":
+            self.waiting.set()
+            await asyncio.to_thread(self.gate.wait, 10)
+        await super().start(model_dir, served_name)
+
+
+def test_delete_the_model_of_a_running_rollback_is_409(tmp_path):
+    engine = RollbackEngine()
+    try:
+        with TestClient(make_app(tmp_path, engine)) as c:
+            wait_ready(c)
+            engine.armed = True
+            c.post("/admin/model", headers=ALICE, json={"model": "org/other"})
+            assert engine.waiting.wait(10)
+            r = c.delete("/admin/models/org/a", headers=ALICE)
+            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            engine.gate.set()
+            wait_ready(c)
+            assert "org/a" in model_ids(c)
+    finally:
+        engine.gate.set()
