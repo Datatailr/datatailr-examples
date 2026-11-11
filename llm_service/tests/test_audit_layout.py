@@ -180,21 +180,24 @@ def test_split_does_not_share_detail():
 def test_join_request_round_trip():
     record = request_record()
     row, line = layout.split_record(record, "s", 0)
-    assert layout.join_record(row, line["prompt"]) == record
+    assert layout.join_record(row, line["prompt"]) == {**record, "event": None, "detail": None}
 
 
 @pytest.mark.parametrize("prompt", EVENTS)
 def test_join_event_round_trip(prompt):
     record = event_record(copy.deepcopy(prompt))
     row, line = layout.split_record(record, "s", None)
-    assert layout.join_record(row, line) == record
+    joined = layout.join_record(row, line)
+    assert joined == {**record, "event": prompt["event"], "detail": row["detail"]}
+    assert joined["prompt"] == prompt
 
 
 def test_join_deleted():
     row, _ = layout.split_record(request_record(), "s", 0)
     joined = layout.join_record(row, None, deleted=True)
     assert joined["prompt_deleted"] is True
-    assert "prompt" not in joined
+    assert joined["prompt"] is None
+    assert layout.join_record(row, None)["prompt"] is None
     assert "prompt_deleted" not in layout.join_record(row, {"a": 1})
     assert layout.join_record(row, {"a": 1})["prompt"] == {"a": 1}
 

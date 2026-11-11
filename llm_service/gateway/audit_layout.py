@@ -156,16 +156,16 @@ def public_row(row: dict) -> dict:
 
 
 def join_record(row: dict, prompt: dict | None, deleted: bool = False) -> dict:
-    """Return the full record for the API: the row as it was before the split, plus its prompt.
+    """Return the full record for the API: the public row plus its prompt.
 
-    The storage fields `seg` and `prompt_ref` and the split fields `event` and `detail` are
-    removed. An event builds its prompt from `event` and `detail`. A request uses `prompt`,
-    which is left out when it is None. `prompt_deleted` is added only when `deleted` is true.
+    The row keeps `event` and `detail`, so a list row and a full record have the same metadata
+    fields. An event builds its prompt from `event` and `detail`. A request uses `prompt`, which
+    can be None. `prompt_deleted` is added only when `deleted` is true.
     """
-    record = {key: value for key, value in public_row(row).items() if key not in ("event", "detail")}
+    record = public_row(row)
     if row.get("event") is not None:
         record["prompt"] = {_EVENT_KEY: row["event"], **(row.get("detail") or {})}
-    elif prompt is not None:
+    else:
         record["prompt"] = prompt
     if deleted:
         record["prompt_deleted"] = True
