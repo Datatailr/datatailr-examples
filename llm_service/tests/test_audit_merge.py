@@ -35,26 +35,37 @@ def at(day: int, hour: int, minute: int, second: int = 0, micro: int = 0) -> dat
 
 
 class Store(MemoryBlobStore):
-    """A memory store that records `ls` calls and fails chosen writes and deletes."""
+    """A memory store that records `ls`, `get` and `delete` calls and fails chosen writes and deletes."""
 
     def __init__(self) -> None:
         super().__init__()
         self.ls_calls: list[str] = []
+        self.gets: list[str] = []
+        self.deletes: list[str] = []
         self.fail_put = lambda path: False
         self.fail_delete: set[str] = set()
+        self._calls_lock = threading.Lock()
 
     def put(self, path, data):
         if self.fail_put(path):
             raise OSError("simulated write failure")
         super().put(path, data)
 
+    def get(self, path):
+        with self._calls_lock:
+            self.gets.append(path)
+        return super().get(path)
+
     def delete(self, path):
+        with self._calls_lock:
+            self.deletes.append(path)
         if path in self.fail_delete:
             raise OSError("simulated delete failure")
         super().delete(path)
 
     def ls(self, prefix):
-        self.ls_calls.append(prefix)
+        with self._calls_lock:
+            self.ls_calls.append(prefix)
         return super().ls(prefix)
 
 
@@ -424,20 +435,100 @@ def test_retain_starts_no_new_check_before_the_hour():
     assert not store.exists(newer)
 
 
-def test_retain_tries_a_failed_day_again_at_the_next_hourly_check():
+def put_prompts(store, day: str, count: int) -> list[str]:
+    """Write a day file and `count` prompt files for `day`. Return the prompt paths."""
+    store.put(day_path(ROOT, day), dump_lines([rec("alice", f"{day}T12:00:00.000Z")]))
+    paths = [prompt_path(ROOT, day, f"20261101T120000.{n:06d}-aa") for n in range(count)]
+    for path in paths:
+        store.put(path, "{}\n")
+    return paths
+
+
+def test_retain_tries_a_failed_delete_again_at_the_next_call_without_a_new_listing():
     clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
     old = put_day(store, "2026-11-08")
     store.fail_delete = {old}
     merger.retain()
+    assert store.exists(old)
+    assert "2026-11-08" not in merger._cleaned
+    store.fail_delete = set()
+    store.ls_calls.clear()
+    clock.when = at(11, 1, 1)
+    merger.retain()
+    assert not store.exists(old)
+    assert store.ls_calls == []
+    assert "2026-11-08" in merger._cleaned
+
+
+def test_retain_drops_a_day_after_three_failed_calls_and_the_next_hourly_check_cleans_it():
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
+    stuck = put_day(store, "2026-11-08")
+    older = put_prompts(store, "2026-11-07", 3)
+    store.fail_delete = {stuck}
+    for _ in range(3):
+        merger.retain()
+    assert store.deletes.count(stuck) == 3
+    assert store.exists(stuck)
+    assert "2026-11-08" not in merger._cleaned
+    assert not any(store.exists(path) for path in older)  # the next day goes on
+    assert "2026-11-07" in merger._cleaned
     store.fail_delete = set()
     store.ls_calls.clear()
     clock.when = at(11, 1, 59)
     merger.retain()
-    assert store.exists(old)
+    assert store.exists(stuck)
     assert store.ls_calls == []
     clock.when = at(11, 2, 0)
     merger.retain()
-    assert not store.exists(old)
+    assert not store.exists(stuck)
+    assert "2026-11-08" in merger._cleaned
+
+
+def test_one_retain_call_makes_at_most_64_deletes_and_20_folder_listings():
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
+    put_prompts(store, "2026-11-08", 100)
+    store.deletes.clear()
+    merger.retain()
+    assert len(store.deletes) == 64
+    first = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    for n in range(30):  # folders with a day file and no prompt file
+        day = (first + timedelta(days=n)).strftime("%Y-%m-%d")
+        store.put(day_path(ROOT, day), dump_lines([rec("alice", f"{day}T12:00:00.000Z")]))
+    clock.when = at(11, 2, 0)
+    merger.retain()  # it ends the 36 files that are left of 2026-11-08
+    store.ls_calls.clear()
+    store.deletes.clear()
+    clock.when = at(11, 3, 0)
+    merger.retain()
+    assert len(prompt_listings(store)) == 20
+    assert len(store.ls_calls) <= 21  # plus one listing of `audit/` for the check
+    assert all(not call.rstrip("/").endswith("/prompts") for call in store.ls_calls)
+
+
+def test_a_folder_of_200_files_is_cleaned_in_four_calls_with_one_listing():
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
+    paths = put_prompts(store, "2026-11-08", 200)
+    dropped = []
+    log.prompt_cache_drop = dropped.append
+    store.ls_calls.clear()
+    left = []
+    for _ in range(4):
+        assert "2026-11-08" not in merger._cleaned
+        merger.retain()
+        left.append(sum(store.exists(path) for path in paths))
+    assert left == [136, 72, 8, 0]
+    assert prompt_listings(store) == [prompts_dir(ROOT, "2026-11-08")]
+    assert "2026-11-08" in merger._cleaned
+    assert dropped and dropped[-1] == "2026-11-08"
+    assert len(store.deletes) == 200
+
+
+def test_retain_logs_the_files_it_deleted(caplog):
+    clock, store, log, merger = make(at(11, 1, 0), retention_days=2)
+    put_prompts(store, "2026-11-08", 70)
+    with caplog.at_level(logging.INFO, logger="llm_service.audit"):
+        merger.retain()
+    assert "retention deleted 64 prompt files of 2026-11-08, 6 left" in caplog.messages
 
 
 # Cost of the merges

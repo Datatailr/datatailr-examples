@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -34,7 +36,10 @@ BUCKET_DELAY = timedelta(minutes=1)  # a bucket is ready this long after its 10 
 DAY_DELAY = timedelta(minutes=15)  # a day is ready this long after it ends
 MERGE_INTERVAL = timedelta(minutes=1)  # the shortest time between two merges of `tick`
 RETAIN_INTERVAL = timedelta(hours=1)  # the time between two retention checks
-RETAIN_DAYS_PER_CALL = 20  # prompt folders that one `retain` call deletes at most
+RETAIN_DELETES_PER_CALL = 64  # prompt files that one `retain` call deletes at most
+RETAIN_LISTINGS_PER_CALL = 20  # prompt folders that one `retain` call lists at most
+RETAIN_TRIES = 3  # calls in a row that a prompt file can fail before its day waits
+DELETE_WORKERS = 8  # threads that delete merged inputs or prompt files
 
 
 class _Folder:
@@ -82,6 +87,8 @@ class AuditMerger:
         self._warned: set[str] = set()  # names without an end time that got a warning
         self._last_retain: datetime | None = None  # time of the last retention check
         self._queue: list[str] = []  # days of the last check that wait for retention
+        self._pending: list[str] | None = None  # prompt files of the head of the queue to delete
+        self._failures: dict[str, int] = {}  # prompt file -> failed calls in a row
         self._cleaned: set[str] = set()  # days whose prompt folder is deleted
 
     def tick(self) -> None:
@@ -250,14 +257,14 @@ class AuditMerger:
     # Prompt retention
 
     def retain(self) -> None:
-        """Delete the prompt folder of each day that ended more than `retention_days` days ago.
+        """Delete the prompt files of each day that ended more than `retention_days` days ago.
 
         A check runs at most one time each hour. It takes the day names from `log.days()`,
         which lists `audit/`, and queues the days past the limit that are not cleaned yet,
-        newest first. One call deletes the folders of at most `RETAIN_DAYS_PER_CALL` days.
-        While the queue is not empty, the next call goes on with it without a wait. A day
-        whose delete failed is tried again at the next hourly check. A failed listing of
-        `audit/` also waits for the next hourly check. Never raise.
+        newest first. While the queue is not empty, the next call goes on with it without a
+        wait. One call makes at most `RETAIN_DELETES_PER_CALL` deletes and lists at most
+        `RETAIN_LISTINGS_PER_CALL` prompt folders. See `_retain_day`. A failed listing of
+        `audit/` waits for the next hourly check. Never raise.
         """
         if self._retention_days is None:
             return
@@ -273,32 +280,87 @@ class AuditMerger:
                     for day in sorted(self._log.days(), reverse=True)
                     if day not in self._cleaned and self._past(day, limit, now)
                 ]
-            batch = self._queue[:RETAIN_DAYS_PER_CALL]
-            self._queue = self._queue[RETAIN_DAYS_PER_CALL:]
-            for day in batch:
-                if self._delete_prompts(day):
-                    self._cleaned.add(day)
+                self._pending = None
+            budget = [RETAIN_DELETES_PER_CALL, RETAIN_LISTINGS_PER_CALL]
+            while self._queue and budget[0] > 0:
+                if not self._retain_day(self._queue[0], budget):
+                    break
         except Exception as error:
             logger.warning("prompt retention stopped: %s", error)
+
+    def _retain_day(self, day: str, budget: list[int]) -> bool:
+        """Do one retention step on `day`, the head of the queue. Return False to end the call.
+
+        The first step lists the prompt folder of the day and keeps the list of its files.
+        Each step deletes the next files of that list, at most `budget[0]` of them, with
+        `DELETE_WORKERS` threads. `budget` holds the deletes and the listings that are left
+        for this call. A file whose delete failed stays in the list and is tried at the next
+        call. When the same file fails `RETAIN_TRIES` calls in a row, the rest of the day
+        waits for the next hourly check. The day is cleaned when its list is empty.
+        """
+        if self._pending is None:
+            if budget[1] == 0:
+                return False
+            budget[1] -= 1
+            try:
+                self._pending = self._store.ls(prompts_dir(self._root, day))
+            except Exception as error:
+                logger.warning("cannot list the prompts of %s: %s", day, error)
+                self._next_day()
+                return True
+            self._failures = {}
+        batch = self._pending[: budget[0]]
+        budget[0] -= len(batch)
+        failed = self._delete_many(batch, "prompt file")
+        self._pending = [path for path in batch if path in failed] + self._pending[len(batch) :]
+        deleted = len(batch) - len(failed)
+        if deleted:
+            logger.info(
+                "retention deleted %d prompt files of %s, %d left", deleted, day, len(self._pending)
+            )
+        if deleted or not self._pending:
+            self._log.prompt_cache_drop(day)
+        if not self._pending:
+            self._cleaned.add(day)
+            self._next_day()
+            return True
+        if not failed:
+            return True
+        self._failures = {path: self._failures.get(path, 0) + 1 for path in failed}
+        if max(self._failures.values()) >= RETAIN_TRIES:
+            logger.warning("prompt retention of %s stops until the next hourly check", day)
+            self._next_day()
+            return True
+        return False
+
+    def _next_day(self) -> None:
+        """Remove the head of the retention queue and forget its list of files."""
+        self._queue.pop(0)
+        self._pending = None
+        self._failures = {}
 
     def _past(self, day: str, limit: timedelta, now: datetime) -> bool:
         """Return True when `day` ended more than `limit` before `now`."""
         end = self._end(day_end, day)
         return end is not None and now > end + limit
 
-    def _delete_prompts(self, day: str) -> bool:
-        """Delete the prompt files of `day`. Return True when every delete worked."""
-        try:
-            paths = self._store.ls(prompts_dir(self._root, day))
-        except Exception as error:
-            logger.warning("cannot list the prompts of %s: %s", day, error)
-            return False
-        done = True
-        for path in paths:
+    def _delete_many(self, paths: list[str], kind: str) -> set[str]:
+        """Delete `paths` with `DELETE_WORKERS` threads. Return the paths whose delete failed.
+
+        Each failed delete is logged with one warning that names `kind`.
+        """
+
+        def delete(path: str) -> bool:
             try:
                 self._store.delete(path)
+                return True
             except Exception as error:
-                logger.warning("cannot delete the prompt file %s: %s", path, error)
-                done = False
-        self._log.prompt_cache_drop(day)
-        return done
+                logger.warning("cannot delete the %s %s: %s", kind, path, error)
+                return False
+
+        if len(paths) < 2:
+            results = [delete(path) for path in paths]
+        else:
+            with ThreadPoolExecutor(max_workers=min(DELETE_WORKERS, len(paths))) as pool:
+                results = list(pool.map(delete, paths))
+        return {path for path, ok in zip(paths, results) if not ok}
