@@ -41,7 +41,7 @@ function el(tag, props = {}, ...children) {
 const fmt = value => (value === null || value === undefined ? '-' : number.format(value));
 
 function fmtSize(bytes) {
-  if (bytes === null || bytes === undefined) return '-';
+  if (bytes === null || bytes === undefined) return 'unknown';
   const gb = bytes / 1024 ** 3;
   if (gb >= 1) return `${gb.toLocaleString(undefined, {maximumFractionDigits: 1})} GB`;
   return `${(bytes / 1024 ** 2).toLocaleString(undefined, {maximumFractionDigits: 1})} MB`;
@@ -188,6 +188,13 @@ function barChart(id, color, horizontal, shortLabel) {
   });
 }
 
+/** Turn the charts off after a failure. The tiles and the tables still work. */
+function chartsFailed() {
+  state.chartsOff = true;
+  document.querySelector('.charts').hidden = true;
+  showBanner('The charts could not load. The numbers and tables still work.');
+}
+
 function setChart(chart, labels, values) {
   chart.data.labels = labels;
   chart.data.datasets[0].data = values;
@@ -219,11 +226,15 @@ async function loadUsage() {
   $('tile-tokens').textContent = fmt(sum('total_tokens'));
   $('tile-users').textContent = fmt(users.data.length);
   if (!state.chartsOff) {
-    state.charts.days ||= barChart('chart-days', COLORS.bar, false, label => label.slice(5));
-    state.charts.models ||= barChart('chart-models', COLORS.bar2, true,
-                                     label => shorten(label.split('/').pop(), 24));
-    setChart(state.charts.days, ...daySeries(days.data, range.since, range.until));
-    setChart(state.charts.models, models.data.map(row => row.model), models.data.map(row => row.total_tokens));
+    try {
+      state.charts.days ||= barChart('chart-days', COLORS.bar, false, label => label.slice(5));
+      state.charts.models ||= barChart('chart-models', COLORS.bar2, true,
+                                       label => shorten(label.split('/').pop(), 24));
+      setChart(state.charts.days, ...daySeries(days.data, range.since, range.until));
+      setChart(state.charts.models, models.data.map(row => row.model), models.data.map(row => row.total_tokens));
+    } catch {
+      chartsFailed();  // only once: the charts stay off after this
+    }
   }
   replaceRows($('users-body'), users.data.map(userRow), 7, 'No requests in this range.');
   if (state.detailUser) await loadDetail(state.detailUser);
@@ -336,11 +347,15 @@ function pageAudit(step) {
 
 // ---- models
 
+/** True while a switch runs or a failed switch loads the previous model again. */
+const busy = engine => engine.state === 'loading' || Boolean(engine.rolling_back);
+
 function showHeader(engine) {
   const loading = engine.state === 'loading';
   $('serving-text').textContent = loading && engine.target ? `Loading ${modelText(engine.target)}`
+    : engine.rolling_back ? `Loading ${modelText(engine.rolling_back)} again`
     : engine.serving ? modelText(engine.serving) : 'The service serves no model.';
-  $('serving-dot').className = `dot ${engine.state}`;
+  $('serving-dot').className = `dot ${busy(engine) ? 'loading' : engine.state}`;
 }
 
 function showStatus({engine, models}) {
@@ -351,6 +366,9 @@ function showStatus({engine, models}) {
   $('st-target').textContent = engine.target ? modelText(engine.target) : 'No switch runs.';
   $('st-error').textContent = engine.error || 'None';
   $('st-error').classList.toggle('bad', Boolean(engine.error));
+  $('st-rollback-row').hidden = !engine.rolling_back;
+  $('st-rollback').textContent = engine.rolling_back
+    ? `The service loads ${modelText(engine.rolling_back)} again after a failed switch.` : '-';
   replaceRows($('models-body'), models.map(modelRow), 5, 'The service has no cached model.');
   setBusy(state.polling);
 }
@@ -387,7 +405,7 @@ function setBusy(busy) {
 async function loadStatus() {
   const status = await api('api/status');
   showStatus(status);
-  if (status.engine.state === 'loading') startPoll();
+  if (busy(status.engine)) startPoll();
   return status;
 }
 
@@ -406,7 +424,8 @@ function stopPoll() {
   setBusy(false);
 }
 
-/** Read the state until the switch ends. Stop after MAX_POLL_FAILURES failed reads in a row. */
+/** Read the state until the switch and a rollback after it end. Stop after MAX_POLL_FAILURES failed
+ * reads in a row. */
 async function poll() {
   state.pollTimer = null;
   let status;
@@ -424,7 +443,7 @@ async function poll() {
   }
   state.pollFailures = 0;
   showStatus(status);
-  if (status.engine.state === 'loading') {
+  if (busy(status.engine)) {
     state.pollTimer = setTimeout(poll, POLL_MS);
     return;
   }
@@ -432,17 +451,17 @@ async function poll() {
   reportSwitch(status.engine);
 }
 
-/** Say how the switch ended. A successful load clears the error, so an error means a failed switch,
- * also when the state is `ready` again with the old model. */
+/** Say how the switch ended. The poll ends only after a rollback, so no rollback runs now. A
+ * successful load clears the error, so an error means a failed switch, also when the state is
+ * `ready` again with the old model. */
 function reportSwitch(engine) {
-  const rollback = engine.state === 'failed' ? ' A rollback may still run. Use Reload to read the state again.' : '';
   if (engine.error) {
     const now = engine.serving ? `The service still serves ${modelText(engine.serving)}.` : 'The service serves no model.';
-    showBanner(`The switch failed: ${engine.error.replace(/[.\s]+$/, '')}. ${now}${rollback}`);
+    showBanner(`The switch failed: ${engine.error.replace(/[.\s]+$/, '')}. ${now}`);
   } else if (engine.state === 'ready') {
     showBanner(servingText(engine), 'ok');
   } else {
-    showBanner(`The switch ended in the state ${engine.state}. ${servingText(engine)}${rollback}`);
+    showBanner(`The switch ended in the state ${engine.state}. ${servingText(engine)}`);
   }
 }
 
@@ -534,10 +553,7 @@ async function start() {
   $('viewer').textContent = me.user;
   $('topbar').hidden = false;
   $('main').hidden = false;
-  if (state.chartsOff) {
-    document.querySelector('.charts').hidden = true;
-    showBanner('The charts could not load. The numbers and tables still work.');
-  }
+  if (state.chartsOff) chartsFailed();
   for (const button of document.querySelectorAll('[data-range]')) {
     button.setAttribute('aria-pressed', String(button.dataset.range === state.range));
   }
