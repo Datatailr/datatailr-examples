@@ -333,3 +333,11 @@ def test_upload_writes_the_marker_after_the_files(tmp_path):
     f = Fixture(tmp_path, OrderStore())
     f.cache.ensure("org/m", "main")
     assert f.store.order[-1] == MARKER and f.store.order.count(MARKER) == 1
+
+
+def test_blob_fetch_of_an_empty_manifest_creates_the_directory(fx):
+    fx.store.put(MARKER, json.dumps({"files": []}))
+    path = fx.cache.ensure("org/m", "main")
+    assert path == fx.local / "org--m" / "main"
+    assert (path / ".complete").exists()
+    assert fx.calls == 0  # the blob copy was used, not Hugging Face

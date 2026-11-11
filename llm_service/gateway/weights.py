@@ -131,6 +131,8 @@ class WeightCache:
 
     def _fetch_from_blob(self, blob_dir: str, files: list[dict], target: Path) -> None:
         try:
+            # Create the directory first. A manifest without files creates none.
+            target.mkdir(parents=True, exist_ok=True)
             for entry in files:
                 relative, size = entry["path"], entry["size"]
                 local = target / relative
