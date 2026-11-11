@@ -122,8 +122,12 @@ class AuditLog:
         """Write the buffered records to blob storage.
 
         On a store error the records stay in the buffer and a warning is logged.
-        Return True when the buffer is empty afterwards, False when records were kept.
-        While the flush runs, the records stay visible to queries as in-flight records.
+        A record that `json.dumps` cannot write is dropped with a warning that
+        names its `request_id`, so it cannot block later flushes. On any other
+        error, the unwritten records go back to the buffer and a warning is
+        logged. Return True when the buffer is empty afterwards, False when
+        records were kept. While the flush runs, the records stay visible to
+        queries as in-flight records.
         """
         with self._flush_lock:
             with self._lock:
@@ -131,28 +135,53 @@ class AuditLog:
                 self._inflight = pending
             if not pending:
                 return True
-            by_day: dict[str, list[dict]] = {}
-            for record in pending:
-                by_day.setdefault(_day_of(record["ts"]), []).append(record)
-            stamp = self._now().astimezone(timezone.utc).strftime("%H%M%S.%f")
-            failed: list[dict] = []
-            for day, records in sorted(by_day.items()):
-                path = f"{self._prefix}/{day}/{stamp}-{uuid.uuid4().hex}.jsonl"
-                body = "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in records)
+            done: set[int] = set()  # ids of the written and the dropped records
+            try:
+                self._write(pending, done)
+            except Exception as error:
+                logger.warning("audit flush stopped, keeping the unwritten records: %s", error)
+            finally:
+                kept = [record for record in pending if id(record) not in done]
+                with self._lock:
+                    self._buffer = kept + self._buffer
+                    self._inflight = []
+            return not kept
+
+    def _write(self, pending: list[dict], done: set[int]) -> None:
+        """Write `pending` as one file for each day. Add the handled records to `done`."""
+        by_day: dict[str, list[dict]] = {}
+        for record in pending:
+            by_day.setdefault(_day_of(record["ts"]), []).append(record)
+        stamp = self._now().astimezone(timezone.utc).strftime("%H%M%S.%f")
+        for day, records in sorted(by_day.items()):
+            lines = []
+            written = []
+            for record in records:
                 try:
-                    self._store.put(path, body)
-                except Exception as error:
+                    lines.append(json.dumps(record, separators=(",", ":")) + "\n")
+                except (TypeError, ValueError, RecursionError) as error:
                     logger.warning(
-                        "audit flush failed for %s, keeping %d records: %s",
-                        day,
-                        len(records),
+                        "dropping the audit record %s, it cannot be written as JSON: %s",
+                        record.get("request_id"),
                         error,
                     )
-                    failed.extend(records)
-            with self._lock:
-                self._buffer = failed + self._buffer
-                self._inflight = []
-            return not failed
+                    done.add(id(record))
+                    continue
+                written.append(record)
+            if not written:
+                continue
+            path = f"{self._prefix}/{day}/{stamp}-{uuid.uuid4().hex}.jsonl"
+            try:
+                self._store.put(path, "".join(lines))
+            except Exception as error:
+                logger.warning(
+                    "audit flush failed for %s, keeping %d records: %s",
+                    day,
+                    len(written),
+                    error,
+                )
+                continue
+            done.update(id(record) for record in written)
 
     def _day_files(self, day: str) -> list[str]:
         return self._store.ls(f"{self._prefix}/{day}")

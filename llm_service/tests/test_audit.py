@@ -454,3 +454,52 @@ def test_query_puts_the_later_record_first_on_the_same_time():
     log.add(rec("bob", T))
     log.add(rec("carol", T))
     assert [r["user"] for r in log.query()] == ["carol", "bob", "alice"]
+
+
+def _stored(store) -> list[dict]:
+    return [
+        json.loads(line)
+        for path in store.ls("root/audit")
+        for line in store.get(path).decode().splitlines()
+    ]
+
+
+def test_record_that_json_cannot_write_is_dropped_with_a_warning(caplog):
+    store, log = make()
+    bad = rec("bob", T)
+    bad["prompt"] = {"input": object()}
+    log.add(rec("alice", T))
+    log.add(bad)
+    log.add(rec("carol", "2026-11-11T08:00:00.000Z"))
+    with caplog.at_level(logging.WARNING, logger="llm_service.audit"):
+        assert log.flush() is True
+    assert any(bad["request_id"] in m for m in caplog.messages)
+    assert sorted(r["user"] for r in _stored(store)) == ["alice", "carol"]
+    assert log._buffered() == []  # the bad record does not block later flushes
+    log.add(rec("dave", T))
+    assert log.flush() is True
+    assert sorted(r["user"] for r in _stored(store)) == ["alice", "carol", "dave"]
+
+
+def test_unexpected_error_during_flush_keeps_all_records(caplog):
+    calls = []
+
+    def now():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("clock broke")
+        return utc_now()
+
+    store = MemoryBlobStore()
+    log = AuditLog(store, "root", now=now)
+    log.add(rec("alice", T))
+    log.add(rec("bob", T))
+    with caplog.at_level(logging.WARNING, logger="llm_service.audit"):
+        assert log.flush() is False
+    assert any("clock broke" in m for m in caplog.messages)
+    assert log._inflight == []
+    assert [r["user"] for r in log._buffered()] == ["alice", "bob"]
+    assert store.ls("root/audit") == []
+    assert log.flush() is True
+    assert sorted(r["user"] for r in _stored(store)) == ["alice", "bob"]
+    assert log._buffered() == []
