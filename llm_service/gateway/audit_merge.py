@@ -151,7 +151,7 @@ class AuditMerger:
                     continue
                 if not folder.segments and not folder.parts:
                     with self._work_lock:
-                        # A flush after the listing wrote a segment that the listing missed.
+                        # Keep the day when a flush wrote to it after the listing.
                         if self._flushes.get(day, 0) == flushes:
                             self._work.discard(day)
                             self._flushes.pop(day, None)
