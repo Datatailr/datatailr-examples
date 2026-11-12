@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Callable
 
 import httpx
@@ -24,6 +24,8 @@ from llm_service.gateway.audit_merge import MAINTENANCE_INTERVAL, AuditMerger, r
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
 from llm_service.gateway.identity import AccessCheck, AdminCheck, acting_user_from_headers, user_from_headers
+from llm_service.gateway.limiter import LimitExceeded, Limiter
+from llm_service.gateway.limits import LimitStore
 from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.proxy import forward, prompt_of
 from llm_service.gateway.storage import BlobStore
@@ -101,6 +103,14 @@ def create_app(
     client = http or httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
     audit = AuditLog(store, config.blob_root, config.flush_size, now=now)
     usage = UsageTotals(store, config.blob_root, audit, lambda: iso(now())[:10], now=now)
+    limits = LimitStore(store, config.blob_root)
+
+    def seconds_to_midnight() -> float:
+        current = now()
+        midnight = current.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        return (midnight - current).total_seconds()
+
+    limiter = Limiter(usage.tokens_today, seconds_to_midnight)
     merger = AuditMerger(store, config.blob_root, audit, now, config.prompt_retention_days)
     stopping = threading.Event()  # set before the last flusher cycle, which forces the checkpoint
     weights = WeightCache(store, config.blob_root, config.local_dir, download)
@@ -165,6 +175,7 @@ def create_app(
         started = time.monotonic()
         days = await asyncio.to_thread(usage.load)
         logger.info("usage totals loaded in %.1f s for %d days", time.monotonic() - started, days)
+        await asyncio.to_thread(limits.load)
         audit.listeners.append(usage.record)
         audit.flushed_listeners.append(usage.flushed)
         audit.flushed_listeners.append(merger.flushed)
@@ -206,6 +217,8 @@ def create_app(
     app.state.manager = manager
     app.state.audit = audit
     app.state.usage = usage
+    app.state.limits = limits
+    app.state.limiter = limiter
 
     # Error bodies
 
@@ -317,7 +330,16 @@ def create_app(
             body: dict | None = None
             model: str | None = None
 
+            slot = False  # True while the limiter holds a slot of this request
+
+            def release_slot() -> None:
+                nonlocal slot
+                if slot:
+                    slot = False
+                    limiter.release(user)
+
             def record(status: int, usage_counts: dict | None = None) -> None:
+                release_slot()
                 counts = usage_counts or {}
                 entry = {
                     "request_id": request_id,
@@ -384,7 +406,26 @@ def create_app(
                     )
                 )
 
-            response = await forward(client, engine.base_url, path, body, record)
+            user_admin = await asyncio.to_thread(admin.is_admin, user)
+            user_limits, _ = limits.limits_for(user, user_admin)
+            try:
+                limiter.acquire(user, user_limits)
+            except LimitExceeded as exceeded:
+                return refuse(
+                    ApiError(
+                        429,
+                        "rate_limit_error",
+                        exceeded.code,
+                        exceeded.message,
+                        {"Retry-After": str(exceeded.retry_after)},
+                    )
+                )
+            slot = True
+            try:
+                response = await forward(client, engine.base_url, path, body, record)
+            except BaseException:
+                release_slot()
+                raise
             response.headers["x-request-id"] = request_id
             return response
 

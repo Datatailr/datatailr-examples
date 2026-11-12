@@ -376,6 +376,16 @@ class UsageTotals:
             with self._lock:
                 self._stale_partials.discard(day)
 
+    def tokens_today(self, user: str) -> int:
+        """Return the total tokens of `user` for the current UTC day. Reads memory only."""
+        today = self._today()
+        with self._lock:
+            return sum(
+                entry["total_tokens"]
+                for (day, name, _), entry in self._totals.items()
+                if day == today and name == user
+            )
+
     def summary(
         self,
         since: str | None,

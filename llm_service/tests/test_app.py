@@ -1409,3 +1409,248 @@ def test_descriptor_needs_a_platform_user(client):
     r = client.get(SERVICE)
     assert r.status_code == 401
     assert r.json()["error"]["code"] == "missing_user"
+
+
+# Limits
+
+LIMITS_PATH = "llm-service/limits.json"
+
+
+class HeldEngine:
+    """The engine side of the app. A request waits for `gate` while `hold` is true."""
+
+    def __init__(self) -> None:
+        self.hold = False
+        self.gate = threading.Event()
+        self.entered = threading.Event()
+        self.fail = False
+
+    def transport(self) -> httpx.MockTransport:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if self.fail:
+                raise httpx.ConnectError("engine is gone")
+            if self.hold:
+                self.entered.set()
+                await asyncio.to_thread(self.gate.wait, 10)
+            body = json.loads(request.content)
+            if body.get("stream"):
+                data = (
+                    b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+                    b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=data)
+            return httpx.Response(
+                200, json={"id": "x", "choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}
+            )
+
+        return httpx.MockTransport(handler)
+
+
+def limited_client(tmp_path, limits, engine=None, now=None):
+    """Return a started TestClient whose store holds the limits file `limits` (a dict, bytes or None)."""
+    store = MemoryBlobStore()
+    if limits is not None:
+        store.put(LIMITS_PATH, limits if isinstance(limits, bytes) else json.dumps(limits))
+    engine = engine or HeldEngine()
+    http = httpx.AsyncClient(transport=engine.transport(), base_url="http://engine")
+    return TestClient(make_app(tmp_path, store=store, http=http, now=now)), engine
+
+
+def user_limits(**fields):
+    return {"users": {"bob": fields}}
+
+
+def parallel_of(client, user="bob"):
+    return client.app.state.limiter.use(user)["parallel_requests"]
+
+
+def test_requests_per_minute_limit_gives_429(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=1))
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 429
+        assert r.json()["error"] == {
+            "message": "You reached the limit of 1 requests in one minute.",
+            "type": "rate_limit_error",
+            "code": "requests_per_minute",
+        }
+        assert 1 <= int(r.headers["Retry-After"]) <= 60
+        assert r.headers["x-request-id"]
+
+
+def test_refused_request_has_an_audit_record_and_counts_as_failed(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=1))
+    with c:
+        wait_ready(c)
+        c.post(CHAT, headers=BOB, json=HI)
+        r = c.post(CHAT, headers=BOB, json=HI)
+        rec = audit_records(c, user="bob")[0]
+        assert rec["status"] == 429 and rec["request_id"] == r.headers["x-request-id"]
+        assert rec["total_tokens"] is None
+        total = c.app.state.usage.summary(None, None, "bob", None)[0]
+        assert total["requests"] == 2 and total["failed_requests"] == 1 and total["total_tokens"] == 5
+
+
+def test_tokens_per_day_limit_gives_429_after_use(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(tokens_per_day=5))
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 429
+        error = r.json()["error"]
+        assert error["code"] == "tokens_per_day" and error["type"] == "rate_limit_error"
+        assert error["message"] == "You reached the limit of 5 tokens in one day."
+        assert int(r.headers["Retry-After"]) >= 1
+
+
+def test_tokens_per_day_retry_after_is_the_time_to_utc_midnight(tmp_path):
+    clock = lambda: datetime(2026, 11, 12, 23, 0, 0, tzinfo=timezone.utc)  # noqa: E731
+    c, _ = limited_client(tmp_path, user_limits(tokens_per_day=5), now=clock)
+    with c:
+        wait_ready(c)
+        c.post(CHAT, headers=BOB, json=HI)
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 429 and r.headers["Retry-After"] == "3600"
+
+
+def test_parallel_requests_limit_gives_429_while_a_request_is_held(tmp_path):
+    c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        engine.hold = True
+        first = []
+        worker = threading.Thread(target=lambda: first.append(c.post(CHAT, headers=BOB, json=HI)))
+        worker.start()
+        assert engine.entered.wait(10)
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 429 and r.json()["error"]["code"] == "parallel_requests"
+        assert r.headers["Retry-After"] == "1"
+        assert parallel_of(c) == 1
+        engine.gate.set()
+        worker.join(10)
+        assert first[0].status_code == 200
+        assert parallel_of(c) == 0
+        engine.hold = False
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+
+
+def test_parallel_counter_is_zero_after_complete_and_streamed_answers(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert parallel_of(c) == 0
+        assert c.post(CHAT, headers=BOB, json={**HI, "stream": True}).status_code == 200
+        assert parallel_of(c) == 0
+
+
+def test_parallel_counter_is_zero_after_an_engine_failure(tmp_path):
+    c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        engine.fail = True
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 502
+        assert parallel_of(c) == 0
+
+
+def test_parallel_counter_is_zero_after_a_client_leaves_a_stream(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        sent = []
+
+        async def drop():
+            proceed = asyncio.Event()
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": CHAT,
+                "raw_path": CHAT.encode(),
+                "query_string": b"",
+                "headers": [(b"x-datatailr-user", b"bob"), (b"content-type", b"application/json")],
+                "client": ("127.0.0.1", 1),
+                "server": ("test", 80),
+            }
+            payload = json.dumps({**HI, "stream": True}).encode()
+            given = False
+
+            async def receive():
+                nonlocal given
+                if not given:
+                    given = True
+                    return {"type": "http.request", "body": payload, "more_body": False}
+                await proceed.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                sent.append(message)
+                if message["type"] == "http.response.body" and message.get("body"):
+                    proceed.set()
+                    await asyncio.sleep(0.05)
+
+            await c.app(scope, receive, send)
+
+        c.portal.call(drop)
+        assert any(m.get("body") for m in sent)
+        assert parallel_of(c) == 0
+        assert audit_records(c, user="bob")[0]["status"] in (200, 499)
+
+
+def test_refused_model_never_takes_or_releases_a_slot(tmp_path):
+    c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        r = c.post(CHAT, headers=BOB, json={**HI, "model": "org/other"})
+        assert r.status_code == 404 and parallel_of(c) == 0
+        engine.hold = True
+        worker = threading.Thread(target=lambda: c.post(CHAT, headers=BOB, json=HI))
+        worker.start()
+        assert engine.entered.wait(10)
+        assert c.post(CHAT, headers=BOB, json={**HI, "model": "org/other"}).status_code == 404
+        assert parallel_of(c) == 1  # the refused request did not release the slot of the held one
+        engine.gate.set()
+        worker.join(10)
+        assert parallel_of(c) == 0
+
+
+def test_admin_without_an_entry_has_no_limit_even_with_a_default(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": {"requests_per_minute": 1, "tokens_per_day": None, "parallel_requests": None}})
+    with c:
+        wait_ready(c)
+        for _ in range(3):
+            assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 429
+
+
+def test_acting_user_counts_for_the_acting_user(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=1))
+    with c:
+        wait_ready(c)
+        acting = {**ALICE, ACTING: "bob"}
+        assert c.post(CHAT, headers=acting, json=HI).status_code == 200
+        assert c.post(CHAT, headers=acting, json=HI).status_code == 429
+        assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200  # alice has no limit
+
+
+def test_without_a_limits_file_each_request_passes(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        for _ in range(5):
+            assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+
+
+def test_a_broken_limits_file_lets_the_service_start(tmp_path):
+    c, _ = limited_client(tmp_path, b"{not json")
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.app.state.limits.limits_for("bob", False)[1] == "none"

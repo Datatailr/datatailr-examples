@@ -773,3 +773,20 @@ def test_load_lists_usage_once_and_reads_each_daily_file_without_exists():
     by_day = {row["day"]: row for row in usage.summary(None, None, None, None, "day")}
     assert {day: by_day[day]["requests"] for day in days} == {day: n + 1 for n, day in enumerate(days)}
     assert usage.summary(None, None, None, None)[0]["requests"] == sum(range(1, 41))
+
+
+def test_tokens_today_counts_only_the_current_day_of_the_user():
+    _, audit, usage, _ = make(today=D2)
+    seed(audit)
+    audit.add(rec("alice", T2, model="m2", prompt=1, completion=1))
+    assert usage.tokens_today("alice") == 15 + 25 + 2
+    assert usage.tokens_today("bob") == 0  # bob has use on the day before only
+    assert usage.tokens_today("nobody") == 0
+
+
+def test_tokens_today_follows_the_day_of_the_clock():
+    _, audit, usage, state = make(today=D2)
+    seed(audit)
+    state["today"] = D1
+    assert usage.tokens_today("bob") == 2
+    assert usage.tokens_today("alice") == 0
