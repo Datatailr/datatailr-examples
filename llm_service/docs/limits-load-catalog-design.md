@@ -326,7 +326,7 @@ A change of the catalog writes an audit event `catalog_change`.
 
 ## Known limits
 
-- The token budget is checked before a request, so a user can pass it by the size of the requests that run at that moment.
+- The service checks the token budget before a request. So a user can pass it by the size of the requests in flight.
 - A restart clears the request window, the parallel counters and the points that are not in blob storage yet. This is at most 5 minutes of points.
 - The limits are for each service. A user with access to two services has two budgets.
 - The percentiles of a merged history point are the maximum of the merged minutes, not a true percentile of the longer time.

@@ -461,7 +461,7 @@ curl -X DELETE http://llm-service/admin/limits/users/alice
 The errors are:
 
 - 400 `invalid_limit`: the body is not JSON, or it has an unknown field, a wrong type or a number outside the range. The default body lacks a field, or the body of a user is empty.
-- 400 `invalid_user`: the user name is longer than 256 characters or has a control character.
+- 400 `invalid_user`: the user name is empty, is longer than 256 characters or has a control character.
 - 403: the caller is not an admin.
 - 404 `limit_not_found`: the user has no entry. This applies to the delete.
 - 502 `storage_unavailable`: the service cannot read or write the limits file.
@@ -506,7 +506,7 @@ The platform signs each call of the app as the user who deployed the app. The se
 Each viewer needs access to a service to see anything from it. The service checks this for the viewer, with `LLM_ACCESS_GROUP`. If the service does not answer this check, the page shows "The service did not answer." for it. The Usage tab then names that service as a service without numbers.
 
 - Each user with access sees the Usage tab with their own numbers, and the Connect tab. The Connect tab has the card "Your limits".
-- An admin of a service also sees the numbers of all users of that service, the Audit tab, the Models tab and the Limits tab. An admin switches the model and deletes cached weights in the Models tab. An admin sets limits in the Limits tab.
+- An admin of a service also sees the numbers of all users of that service. An admin also sees the Audit, Models and Limits tabs. An admin switches the model and deletes cached weights in the Models tab. An admin sets limits in the Limits tab.
 - With "All services" picked, the Usage tab shows totals over all services, by user, by service and by day. A line names each service whose numbers are missing. Another line names each service where the viewer sees only their own numbers.
 - The Audit, Models and Limits tabs work with one service. With "All services" they ask the viewer to pick one.
 

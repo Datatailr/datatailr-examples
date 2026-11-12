@@ -1169,8 +1169,8 @@ const ownValue = (object, key) => (object && Object.hasOwn(object, key) ? object
 const noLimit = value => value === null || value === undefined;
 const limitText = value => (noLimit(value) ? 'No limit' : fmt(value));
 
-/** "Try again in N seconds." for a wait of N seconds, or an empty text without a wait. */
-const waitText = wait => (wait === null || wait === undefined ? ''
+/** "Try again in N seconds." for a wait of N seconds, or an empty text without a wait or for a wait of 0. */
+const waitText = wait => (wait === null || wait === undefined || wait === 0 ? ''
   : `Try again in ${fmt(wait)} ${wait === 1 ? 'second' : 'seconds'}.`);
 
 /** True for the 404 of a service without the limit endpoints. The 404 of an unknown service is another error. */
@@ -1353,7 +1353,12 @@ async function saveUserLimits(event) {
   event.preventDefault();
   const service = state.service;
   const user = $('limits-user').value.trim();
-  if (!service || !user) return;
+  if (!service) return;
+  if (!user) {
+    $('limits-user-status').textContent = 'Type a user name.';
+    $('limits-user').focus();
+    return;
+  }
   const body = userLimitBody(Object.fromEntries(LIMITS.map(({name}) => [name, {
     mode: $(`limits-user-${name}-mode`).value, value: $(`limits-user-${name}`).value}])));
   if (!body) {

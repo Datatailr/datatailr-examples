@@ -135,6 +135,12 @@ def _service_path(prefix: str, value: str) -> str | None:
     return prefix + "/".join(quote(segment, safe="") for segment in segments)
 
 
+def _user_path(prefix: str, user: str) -> str | None:
+    """Build the service path of one user. Return None for a bad name: empty, a dot segment or a slash."""
+    path = _service_path(prefix, user)
+    return None if path is None or "/" in user else path
+
+
 def create_app(
     registry: Registry,
     owner: str,
@@ -495,8 +501,8 @@ def create_app(
 
     @app.put("/api/services/{name}/limits/users/{user:path}")
     async def set_user_limits(name: str, user: str, request: Request) -> JSONResponse:
-        path = _service_path("/admin/limits/users/", user)
-        if path is None or "/" in user:
+        path = _user_path("/admin/limits/users/", user)
+        if path is None:
             return _error(400, "invalid_user", "The user name is not valid.", "invalid_request_error")
         if not _is_json(request):
             return _error(
@@ -510,8 +516,8 @@ def create_app(
 
     @app.delete("/api/services/{name}/limits/users/{user:path}")
     async def delete_user_limits(name: str, user: str, request: Request) -> JSONResponse:
-        path = _service_path("/admin/limits/users/", user)
-        if path is None or "/" in user:
+        path = _user_path("/admin/limits/users/", user)
+        if path is None:
             return _error(400, "invalid_user", "The user name is not valid.", "invalid_request_error")
         return await call(request, name, "DELETE", path)
 

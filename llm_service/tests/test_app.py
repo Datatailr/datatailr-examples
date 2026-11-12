@@ -1490,7 +1490,7 @@ def test_requests_per_minute_limit_gives_429(tmp_path):
         r = c.post(CHAT, headers=BOB, json=HI)
         assert r.status_code == 429
         assert r.json()["error"] == {
-            "message": "You reached the limit of 1 requests in one minute.",
+            "message": "You reached the limit of 1 request in one minute.",
             "type": "rate_limit_error",
             "code": "requests_per_minute",
         }
@@ -1668,6 +1668,7 @@ def test_acting_user_counts_for_the_acting_user(tmp_path):
         acting = {**ALICE, ACTING: "bob"}
         assert c.post(CHAT, headers=acting, json=HI).status_code == 200
         assert c.post(CHAT, headers=acting, json=HI).status_code == 429
+        assert c.app.state.limiter.use("alice")["requests_last_minute"] == 0  # the two requests count for bob
         assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200  # alice has no limit
 
 
@@ -1964,7 +1965,7 @@ def test_a_user_name_is_stripped_and_a_long_name_at_the_limit_is_fine(tmp_path):
         assert sorted(c.app.state.limits.users()) == sorted(["bob", "x" * 256])
 
 
-def test_a_bad_body_is_checked_before_the_user_name_is_stored(tmp_path):
+def test_a_bad_user_name_is_refused_before_the_body_is_read(tmp_path):
     c, _ = limited_client(tmp_path, None)
     with c:
         wait_ready(c)

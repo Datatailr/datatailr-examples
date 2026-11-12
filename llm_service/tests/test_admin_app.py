@@ -815,6 +815,20 @@ def test_page_shows_the_effective_limits_of_the_service():
     assert "$('limits-unloaded').hidden = answer.loaded !== false;" in body
 
 
+def test_a_blank_user_name_in_the_limits_form_shows_a_message():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("async function saveUserLimits("):text.index("function askRemove(")]
+    assert "$('limits-user-status').textContent = 'Type a user name.';" in body
+    assert "if (!service || !user) return;" not in body
+
+
+def test_the_limits_texts_name_the_utc_day_and_the_selects_have_no_data_limit():
+    page = (STATIC_DIR / "index.html").read_text()
+    assert "Tokens per UTC day" not in page and "data-limit" not in page
+    assert '<dt>Tokens per day (UTC)</dt>' in page
+    assert '<th scope="col" class="num">Tokens per day (UTC)</th>' in page
+
+
 def test_page_passes_retry_after_of_a_chat_error():
     text = (STATIC_DIR / "app.js").read_text()
     body = text[text.index("async function streamChat("):text.index("function chatTurn(")]
@@ -857,7 +871,7 @@ def test_page_limit_helpers(tmp_path):
         "          h.myLimitsNote({limits: {tokens_per_day: 5}, loaded: true}),\n"
         "          h.myLimitsNote({limits: {tokens_per_day: 5}})],\n"
         "  waits: ['17', '0', '', null, 'soon', '1.5', '123456'].map(h.retryWait),\n"
-        "  texts: [h.waitText(1), h.waitText(17), h.waitText(null)],\n"
+        "  texts: [h.waitText(1), h.waitText(17), h.waitText(null), h.waitText(0)],\n"
         "  missing: [missing(404, 'not_found'), missing(404, null), missing(404, 'unknown_service'),\n"
         "            missing(502, 'service_unreachable'), h.limitsMissing(new Error('x'))],\n"
         "}));\n"
@@ -877,7 +891,7 @@ def test_page_limit_helpers(tmp_path):
     unloaded = "The service did not read the limits file. No limit applies now. The service tries again."
     assert result["notes"] == [unloaded, "You have no limit on this service.", "", ""]
     assert result["waits"] == [17, 0, None, None, None, None, None]
-    assert result["texts"] == ["Try again in 1 second.", "Try again in 17 seconds.", ""]
+    assert result["texts"] == ["Try again in 1 second.", "Try again in 17 seconds.", "", ""]
     assert result["missing"] == [True, True, False, False, False]
 
 
@@ -1509,6 +1523,18 @@ def test_a_bad_user_name_in_the_limits_routes_makes_no_call(client, fakes, user)
         response = client.request(method, f"/api/services/svc/limits/users/{user}", json={}, headers=ALICE)
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "invalid_user"
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize("user, status", [(".", 400), ("..", 405)])
+def test_a_literal_dot_user_segment_in_the_limits_routes_makes_no_call(client, fakes, user, status):
+    # The test client removes a literal dot segment: "users/." becomes "users/", and "users/.." becomes
+    # "limits". So the route gets an empty user name, or the path of the limits list.
+    for method in ("PUT", "DELETE"):
+        response = client.request(method, f"/api/services/svc/limits/users/{user}", json={}, headers=ALICE)
+        assert response.status_code == status, method
+        if status == 400:
+            assert response.json()["error"]["code"] == "invalid_user"
     assert fakes.calls() == []
 
 

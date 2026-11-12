@@ -234,7 +234,7 @@ if (!location.pathname.endsWith('/')) {
       <p class="caption" id="my-limits-note" role="status" hidden></p>
       <dl class="status" id="my-limits-list">
         <div><dt>Requests per minute</dt><dd id="my-requests_per_minute">-</dd></div>
-        <div><dt>Tokens per UTC day</dt><dd id="my-tokens_per_day">-</dd></div>
+        <div><dt>Tokens per day (UTC)</dt><dd id="my-tokens_per_day">-</dd></div>
         <div><dt>Parallel requests</dt><dd id="my-parallel_requests">-</dd></div>
         <div class="wide"><dt>Source</dt><dd id="my-limits-source">-</dd></div>
       </dl>
@@ -358,7 +358,7 @@ if (!location.pathname.endsWith('/')) {
       <h2>Default limits</h2>
       <form class="toolbar" id="limits-default-form">
         <label>Requests per minute <input type="number" id="limits-default-requests_per_minute" min="1" max="1000000000" step="1" placeholder="No limit"></label>
-        <label>Tokens per day <input type="number" id="limits-default-tokens_per_day" min="1" max="1000000000" step="1" placeholder="No limit"></label>
+        <label>Tokens per day (UTC) <input type="number" id="limits-default-tokens_per_day" min="1" max="1000000000" step="1" placeholder="No limit"></label>
         <label>Parallel requests <input type="number" id="limits-default-parallel_requests" min="1" max="1000000000" step="1" placeholder="No limit"></label>
         <button type="submit" id="limits-default-save">Save</button>
       </form>
@@ -375,7 +375,7 @@ if (!location.pathname.endsWith('/')) {
         <table class="grid">
           <thead><tr>
             <th scope="col">User</th><th scope="col" class="num">Requests per minute</th>
-            <th scope="col" class="num">Tokens per day</th><th scope="col" class="num">Parallel requests</th>
+            <th scope="col" class="num">Tokens per day (UTC)</th><th scope="col" class="num">Parallel requests</th>
             <th scope="col" class="num">Requests in the last minute</th><th scope="col" class="num">Tokens today</th>
             <th scope="col" class="num">Parallel requests now</th><th scope="col">Actions</th>
           </tr></thead>
@@ -387,19 +387,19 @@ if (!location.pathname.endsWith('/')) {
         <label>User <input type="text" id="limits-user" required maxlength="256" autocomplete="off" placeholder="user name"></label>
         <fieldset class="choice">
           <legend>Requests per minute</legend>
-          <select id="limits-user-requests_per_minute-mode" aria-label="Requests per minute: kind of value" data-limit="requests_per_minute">
+          <select id="limits-user-requests_per_minute-mode" aria-label="Requests per minute: kind of value">
             <option value="default">Default</option><option value="none">No limit</option><option value="number">Number</option>
           </select>
           <input type="number" id="limits-user-requests_per_minute" min="1" max="1000000000" step="1" required disabled aria-label="Requests per minute: number"></fieldset>
         <fieldset class="choice">
-          <legend>Tokens per day</legend>
-          <select id="limits-user-tokens_per_day-mode" aria-label="Tokens per day: kind of value" data-limit="tokens_per_day">
+          <legend>Tokens per day (UTC)</legend>
+          <select id="limits-user-tokens_per_day-mode" aria-label="Tokens per day (UTC): kind of value">
             <option value="default">Default</option><option value="none">No limit</option><option value="number">Number</option>
           </select>
-          <input type="number" id="limits-user-tokens_per_day" min="1" max="1000000000" step="1" required disabled aria-label="Tokens per day: number"></fieldset>
+          <input type="number" id="limits-user-tokens_per_day" min="1" max="1000000000" step="1" required disabled aria-label="Tokens per day (UTC): number"></fieldset>
         <fieldset class="choice">
           <legend>Parallel requests</legend>
-          <select id="limits-user-parallel_requests-mode" aria-label="Parallel requests: kind of value" data-limit="parallel_requests">
+          <select id="limits-user-parallel_requests-mode" aria-label="Parallel requests: kind of value">
             <option value="default">Default</option><option value="none">No limit</option><option value="number">Number</option>
           </select>
           <input type="number" id="limits-user-parallel_requests" min="1" max="1000000000" step="1" required disabled aria-label="Parallel requests: number"></fieldset>

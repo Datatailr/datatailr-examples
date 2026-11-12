@@ -296,3 +296,22 @@ def test_acquire_trims_the_calling_user_between_sweeps(env):
     env.limiter.acquire("bob", NONE)
     env.now += 0.2
     env.limiter.acquire("alice", limits(requests_per_minute=1))
+
+
+@pytest.mark.parametrize(
+    "fields, setup, message",
+    [
+        ({"requests_per_minute": 1}, "acquire", "You reached the limit of 1 request in one minute."),
+        ({"parallel_requests": 1}, "acquire", "You reached the limit of 1 parallel request."),
+        ({"tokens_per_day": 1}, "tokens", "You reached the limit of 1 token in one day."),
+    ],
+)
+def test_a_limit_of_1_has_a_singular_message(env, fields, setup, message):
+    lim = limits(**fields)
+    if setup == "acquire":
+        env.limiter.acquire("alice", lim)
+    else:
+        env.tokens["alice"] = 1
+    with pytest.raises(LimitExceeded) as info:
+        env.limiter.acquire("alice", lim)
+    assert info.value.message == message

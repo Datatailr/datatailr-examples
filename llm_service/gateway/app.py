@@ -24,10 +24,10 @@ from llm_service.gateway.audit_merge import MAINTENANCE_INTERVAL, AuditMerger, r
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
 from llm_service.gateway.identity import (
-    MAX_ACTING_USER_LENGTH,
     AccessCheck,
     AdminCheck,
     acting_user_from_headers,
+    check_user_name,
     user_from_headers,
 )
 from llm_service.gateway.limiter import LimitExceeded, Limiter
@@ -513,19 +513,12 @@ def create_app(
 
     # Admin API
 
-    def check_user_name(name: str) -> str:
-        """Return the stripped user name. Raise `ApiError` if it is empty, too long or has a control character."""
-        name = name.strip()
-        problem = None
-        if not name:
-            problem = "the user name is empty"
-        elif len(name) > MAX_ACTING_USER_LENGTH:
-            problem = f"the user name is longer than {MAX_ACTING_USER_LENGTH} characters"
-        elif any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
-            problem = "the user name has a control character"
-        if problem:
-            raise ApiError(400, "invalid_request_error", "invalid_user", problem)
-        return name
+    def entry_user(name: str) -> str:
+        """Return the stripped user name of a limits entry. Raise `ApiError` with `invalid_user` if it is bad."""
+        try:
+            return check_user_name(name)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_user", str(error)) from None
 
     async def limits_body(request: Request) -> object:
         """Return the parsed JSON body. A body that is not JSON gives None, which `check_limits` refuses."""
@@ -534,7 +527,9 @@ def create_app(
         except (ValueError, RecursionError):
             return None
 
-    async def change_limits(target: str, admin_user: str, change: Callable[[], tuple[dict | None, dict | None]]) -> dict | None:
+    async def change_limits(
+        target: str, admin_user: str, change: Callable[[], tuple[dict | None, dict | None]]
+    ) -> dict | None:
         """Run a store change in a thread and audit it. The change returns the old and the new value."""
         try:
             old, new = await asyncio.to_thread(change)
@@ -590,7 +585,7 @@ def create_app(
 
     @app.put("/admin/limits/users/{name}")
     async def put_user_limits(name: str, request: Request, admin_user: str = Depends(require_admin)) -> dict:
-        name = check_user_name(name)
+        name = entry_user(name)
         body = await limits_body(request)
 
         def change():
@@ -600,7 +595,7 @@ def create_app(
 
     @app.delete("/admin/limits/users/{name}")
     async def delete_user_limits(name: str, admin_user: str = Depends(require_admin)) -> dict:
-        name = check_user_name(name)
+        name = entry_user(name)
 
         def change():
             try:

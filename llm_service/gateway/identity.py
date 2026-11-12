@@ -34,6 +34,21 @@ ACTING_USER_HEADER = "X-LLM-Acting-User"
 MAX_ACTING_USER_LENGTH = 256
 
 
+def check_user_name(name: str, label: str = "the user name") -> str:
+    """Return the stripped user name. Raise `ValueError` if it is empty, too long or has a control character.
+
+    `label` names the name in the message of the error.
+    """
+    name = name.strip()
+    if not name:
+        raise ValueError(f"{label} is empty")
+    if len(name) > MAX_ACTING_USER_LENGTH:
+        raise ValueError(f"{label} is longer than {MAX_ACTING_USER_LENGTH} characters")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
+        raise ValueError(f"{label} has a control character")
+    return name
+
+
 def acting_user_from_headers(headers: Mapping[str, str]) -> str | None:
     """Return the acting user name from the request headers.
 
@@ -43,11 +58,7 @@ def acting_user_from_headers(headers: Mapping[str, str]) -> str | None:
     name = (headers.get(ACTING_USER_HEADER) or "").strip()
     if not name:
         return None
-    if len(name) > MAX_ACTING_USER_LENGTH:
-        raise ValueError(f"the acting user name is longer than {MAX_ACTING_USER_LENGTH} characters")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
-        raise ValueError("the acting user name has a control character")
-    return name
+    return check_user_name(name, "the acting user name")
 
 
 class AdminCheck:

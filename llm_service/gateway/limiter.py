@@ -29,6 +29,11 @@ class _UserState:
         self.in_flight = 0
 
 
+def _count(number: int, word: str) -> str:
+    """Return "1 request" for 1, else "N requests"."""
+    return f"{number} {word}" if number == 1 else f"{number} {word}s"
+
+
 def _seconds_up(value: float) -> int:
     return max(1, math.ceil(value))
 
@@ -75,7 +80,7 @@ class Limiter:
         limit = limits.get("parallel_requests")
         if limit is not None and in_flight >= limit:
             raise LimitExceeded(
-                "parallel_requests", limit, 1, f"You reached the limit of {limit} parallel requests."
+                "parallel_requests", limit, 1, f"You reached the limit of {_count(limit, 'parallel request')}."
             )
         limit = limits.get("requests_per_minute")
         if limit is not None and recent >= limit:
@@ -84,7 +89,10 @@ class Limiter:
             else:
                 wait = int(WINDOW_SECONDS)
             raise LimitExceeded(
-                "requests_per_minute", limit, wait, f"You reached the limit of {limit} requests in one minute."
+                "requests_per_minute",
+                limit,
+                wait,
+                f"You reached the limit of {_count(limit, 'request')} in one minute.",
             )
         limit = limits.get("tokens_per_day")
         if limit is not None and self._tokens_today(user) >= limit:
@@ -92,7 +100,7 @@ class Limiter:
                 "tokens_per_day",
                 limit,
                 _seconds_up(self._seconds_to_midnight()),
-                f"You reached the limit of {limit} tokens in one day.",
+                f"You reached the limit of {_count(limit, 'token')} in one day.",
             )
 
         if state is None:
