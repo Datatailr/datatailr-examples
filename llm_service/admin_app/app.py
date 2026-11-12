@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from llm_service.admin_app.client import ServiceClient, ServiceUnreachable
 from llm_service.admin_app.registry import BlobManualStore, Registry, platform_listing, valid_name
+from llm_service.admin_app.usage_merge import SUM_FIELDS, merge_rows, own_rows
 from llm_service.gateway.identity import user_from_headers
 
 log = logging.getLogger(__name__)
@@ -32,6 +33,8 @@ ROLE_CACHE_SECONDS = 30.0
 READY_WAIT_SECONDS = 10.0
 BAD_NAME = "The service name has 1 to 63 characters from a-z, 0-9 and -."
 UNREACHABLE = "The LLM service did not give a valid answer."
+USAGE_GROUPS = ("user", "model", "day", "service")
+USAGE_TOO_SLOW = "The LLM service did not answer in time."
 TOO_SLOW = "The LLM service did not answer in time. The action may still finish. Use Reload to see the state."
 
 
@@ -353,6 +356,103 @@ def create_app(
         if path is None or "/" in request_id:
             return _error(400, "invalid_record", "The record id is not valid.", "invalid_request_error")
         return await call(request, name, "GET", path, params=_query(request, ("day",)))
+
+    def usage_rows(body: object, group_by: str) -> list[dict]:
+        """Check the rows of an admin usage answer. Raise `ValueError` for a bad shape."""
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("data is not a list")
+        key = "day" if group_by == "service" else group_by
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get(key), str):
+                raise ValueError("bad row")
+            for field in SUM_FIELDS:
+                value = row.get(field)
+                if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                    raise ValueError("bad count")
+        return rows
+
+    def own_usage(detail: object, viewer: str, group_by: str, user: str | None, model: str | None) -> list[dict]:
+        """Build the rows of a viewer who is not an admin, and apply the filters of the request."""
+        if not isinstance(detail, dict):
+            raise ValueError("detail is not an object")
+        if user is not None and user != viewer:
+            return []
+        # The detail has no totals for a model by day, so a model filter by day cannot apply.
+        # The other groups take the model rows and add them up.
+        if model is not None and group_by == "day":
+            return []
+        if model is None:
+            rows = own_rows(detail, viewer, "day" if group_by == "service" else group_by)
+        else:
+            rows = [r for r in own_rows(detail, viewer, "model") if r.get("model") == model]
+            if group_by != "model":
+                key = "day" if group_by == "service" else group_by
+                rows = [{**r, key: viewer if key == "user" else "all"} for r in rows]
+                rows = merge_rows({"own": rows}, key)
+        return usage_rows({"data": rows}, group_by)
+
+    async def one_usage(
+        viewer: str, name: str, admin: bool, group_by: str, params: dict[str, str | None]
+    ) -> tuple[list[dict] | None, str | None]:
+        """Return `(rows, None)` for one service, or `(None, error text)`. A cancel passes through."""
+        try:
+            if admin:
+                asked = {**params, "group_by": "day" if group_by == "service" else group_by}
+                call = service.request(name, "GET", "/admin/usage", viewer, params=asked, timeout=TIMEOUT_SECONDS)
+            else:
+                asked = {"since": params["since"], "until": params["until"]}
+                call = service.request(name, "GET", "/v1/usage/me", viewer, params=asked, timeout=TIMEOUT_SECONDS)
+            status, body = await asyncio.wait_for(call, TIMEOUT_SECONDS)
+            if status != 200:
+                return None, UNREACHABLE
+            if admin:
+                return usage_rows(body, group_by), None
+            return own_usage(body, viewer, group_by, params["user"], params["model"]), None
+        except asyncio.TimeoutError:
+            return None, USAGE_TOO_SLOW
+        except ServiceUnreachable:
+            return None, UNREACHABLE
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None, UNREACHABLE
+        except Exception:  # one bad service must not fail the others. A cancel passes through.
+            log.exception("The usage call to the service %s failed.", name)
+            return None, UNREACHABLE
+
+    @app.get("/api/usage")
+    async def usage(request: Request) -> JSONResponse:
+        viewer = viewer_or_error(request)
+        if isinstance(viewer, JSONResponse):
+            return viewer
+        group_by = request.query_params.get("group_by", "user")
+        if group_by not in USAGE_GROUPS:
+            return _error(
+                400, "invalid_group_by", "group_by is user, model, day or service.", "invalid_request_error"
+            )
+        raw = request.query_params.get("services")
+        if raw:
+            wanted = raw.split(",")
+            if not all(valid_name(n) and registry.get(n) is not None for n in wanted):
+                return _error(400, "invalid_service", BAD_NAME, "invalid_request_error")
+            entries = [e for e in registry.entries() if e.name in set(wanted)]
+        else:
+            entries = [e for e in registry.entries() if e.state == "ok"]
+        found = await asyncio.gather(*(roles(viewer, e.name) for e in entries))
+        chosen = [(e.name, role["admin"]) for e, role in zip(entries, found) if role["access"]]
+        params = {name: request.query_params.get(name) or None for name in ("since", "until", "user", "model")}
+        results = await asyncio.gather(*(one_usage(viewer, n, admin, group_by, params) for n, admin in chosen))
+        services = []
+        per_service = {}
+        for (name, admin), (rows, error) in zip(chosen, results):
+            row = {"name": name, "scope": "all" if admin else "own", "ok": error is None}
+            if error is not None:
+                row["error"] = error
+            else:
+                per_service[name] = rows
+            services.append(row)
+        if chosen and not per_service:
+            return _error(502, "service_unreachable", UNREACHABLE)
+        return JSONResponse({"data": merge_rows(per_service, group_by), "services": services})
 
     @app.get("/")
     async def index() -> FileResponse:

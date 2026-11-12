@@ -321,7 +321,7 @@ def test_delete_is_for_the_owner_only(client, store):
 
 
 def test_the_old_routes_are_gone(client, fakes):
-    for path in ("/api/me", "/api/status", "/api/usage", "/api/audit", "/api/audit/users"):
+    for path in ("/api/me", "/api/status", "/api/audit", "/api/audit/users"):
         assert client.get(path, headers=ALICE).status_code in (404, 405), path
     assert client.post("/api/model", json={}, headers=ALICE).status_code in (404, 405)
     assert fakes.requests == []
@@ -793,3 +793,204 @@ def test_the_lifespan_runs_and_stops_the_registry(fakes, registry):
     with TestClient(create_app(registry, "alice", http)) as test_client:
         test_client.portal.call(registry.wait_ready, 10.0)
         assert len(registry.entries()) == 2
+
+
+def _usage_row(key_name, key, requests=1, total=30):
+    return {
+        key_name: key,
+        "requests": requests,
+        "failed_requests": 0,
+        "prompt_tokens": 10,
+        "completion_tokens": 20,
+        "total_tokens": total,
+        "last_request": "2026-01-01T00:00:00Z",
+    }
+
+
+def _me_detail(user, total=40):
+    return {
+        "user": user,
+        "totals": _usage_row("user", user, requests=4, total=total),
+        "by_model": [_usage_row("model", "m1", requests=3, total=30), _usage_row("model", "m2", total=10)],
+        "by_day": [_usage_row("day", "2026-01-02", requests=3, total=30), _usage_row("day", "2026-01-01", total=10)],
+    }
+
+
+def _usage_calls(fakes):
+    return [r for r in fakes.calls() if r.url.path in ("/admin/usage", "/v1/usage/me")]
+
+
+def test_usage_merges_two_admin_services(client, fakes):
+    # bob is admin of svc-two. Make alice admin of both.
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": [_usage_row("user", "alice", total=100)]})
+    fakes.hosts["svc-two"].answers[("GET", "/admin/usage")] = (
+        200,
+        {"data": [_usage_row("user", "alice", total=50), _usage_row("user", "bob", total=7)]},
+    )
+    client.portal.call(client.app.state.registry.refresh)
+    response = client.get("/api/usage?since=2026-01-01&until=2026-01-31&user=&group_by=user", headers=ALICE)
+    assert response.status_code == 200
+    body = response.json()
+    assert [r["user"] for r in body["data"]] == ["alice", "bob"]
+    assert body["data"][0]["total_tokens"] == 150
+    assert body["services"] == [
+        {"name": "svc", "scope": "all", "ok": True},
+        {"name": "svc-two", "scope": "all", "ok": True},
+    ]
+    sent = _usage_calls(fakes)
+    assert {r.url.host for r in sent} == {"svc", "svc-two"}
+    assert all(r.url.params["since"] == "2026-01-01" for r in sent)
+    assert all(r.url.params["group_by"] == "user" for r in sent)
+    assert all(r.headers["Connection"] == "close" for r in sent)
+
+
+def test_usage_uses_own_numbers_for_a_viewer_who_is_not_admin(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": [_usage_row("user", "alice", total=100)]})
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    response = client.get("/api/usage", headers=ALICE)
+    body = response.json()
+    assert [s["scope"] for s in body["services"]] == ["all", "own"]
+    assert body["data"][0]["total_tokens"] == 140
+    by_path = {r.url.host: r.url.path for r in _usage_calls(fakes)}
+    assert by_path == {"svc": "/admin/usage", "svc-two": "/v1/usage/me"}
+
+
+def test_usage_filters_apply_in_the_app_for_a_viewer_who_is_not_admin(client, fakes):
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    other = client.get("/api/usage?services=svc-two&user=bob", headers=ALICE).json()
+    assert other["data"] == []
+    assert other["services"] == [{"name": "svc-two", "scope": "own", "ok": True}]
+    by_model = client.get("/api/usage?services=svc-two&group_by=model&model=m2", headers=ALICE).json()
+    assert [r["model"] for r in by_model["data"]] == ["m2"]
+    by_user = client.get("/api/usage?services=svc-two&model=m2", headers=ALICE).json()
+    assert [(r["user"], r["total_tokens"]) for r in by_user["data"]] == [("alice", 10)]
+    by_service = client.get("/api/usage?services=svc-two&group_by=service&model=m2", headers=ALICE).json()
+    assert [(r["service"], r["total_tokens"]) for r in by_service["data"]] == [("svc-two", 10)]
+
+
+def test_usage_group_by_service_calls_with_day_and_adds_up(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (
+        200,
+        {"data": [_usage_row("day", "2026-01-01", requests=2, total=10), _usage_row("day", "2026-01-02", total=20)]},
+    )
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    body = client.get("/api/usage?group_by=service", headers=ALICE).json()
+    by_service = {r["service"]: r for r in body["data"]}
+    assert by_service["svc"]["requests"] == 3
+    assert by_service["svc"]["total_tokens"] == 30
+    assert by_service["svc-two"]["total_tokens"] == 40
+    assert all(r.url.params["group_by"] == "day" for r in _usage_calls(fakes) if r.url.path == "/admin/usage")
+
+
+def test_usage_a_failed_service_is_reported_and_the_rest_merge(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": [_usage_row("user", "alice")]})
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (500, {"error": {}})
+    response = client.get("/api/usage", headers=ALICE)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["data"]) == 1
+    assert body["services"][0] == {"name": "svc", "scope": "all", "ok": True}
+    failed = body["services"][1]
+    assert failed["ok"] is False and failed["scope"] == "own"
+    assert failed["error"] == "The LLM service did not give a valid answer."
+
+
+@pytest.mark.parametrize("bad", [{"data": "x"}, {"data": [{"user": "a", "requests": "many"}]}, [], {"data": [1]}])
+def test_usage_a_malformed_body_fails_that_service_only(client, fakes, bad):
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, bad)
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    body = client.get("/api/usage", headers=ALICE).json()
+    assert [s["ok"] for s in body["services"]] == [False, True]
+    assert body["data"][0]["user"] == "alice"
+
+
+def test_usage_all_failed_is_502(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (500, {})
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (500, {})
+    response = client.get("/api/usage", headers=ALICE)
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "service_unreachable"
+
+
+def test_usage_an_unexpected_error_fails_one_service_only(client, fakes, monkeypatch):
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": [_usage_row("user", "alice")]})
+    original = app_module.ServiceClient.request
+
+    async def broken(self, service, method, path, viewer, **options):
+        if path == "/v1/usage/me":
+            raise RuntimeError("boom")
+        return await original(self, service, method, path, viewer, **options)
+
+    monkeypatch.setattr(app_module.ServiceClient, "request", broken)
+    body = client.get("/api/usage", headers=ALICE).json()
+    assert [s["ok"] for s in body["services"]] == [True, False]
+
+
+def test_usage_a_slow_service_times_out_after_30_seconds(client, fakes, monkeypatch):
+    seen = []
+    real = asyncio.wait_for
+
+    async def spy(awaitable, timeout):
+        seen.append(timeout)
+        return await real(awaitable, timeout)
+
+    monkeypatch.setattr(app_module.asyncio, "wait_for", spy)
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": []})
+    client.get("/api/usage?services=svc", headers=ALICE)
+    assert 30.0 in seen
+
+
+def test_usage_services_limits_the_calls(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": []})
+    body = client.get("/api/usage?services=svc", headers=ALICE).json()
+    assert [s["name"] for s in body["services"]] == ["svc"]
+    assert {r.url.host for r in _usage_calls(fakes)} == {"svc"}
+
+
+@pytest.mark.parametrize("value", ["svc,Bad", "nope", "svc,,svc-two", "svc,evil.example.com", "a" * 64])
+def test_usage_a_bad_or_unknown_service_is_400_and_calls_nothing(client, fakes, value):
+    response = client.get("/api/usage", params={"services": value}, headers=ALICE)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_service"
+    assert fakes.requests == []
+
+
+@pytest.mark.parametrize("value", ["service,", "total", "USER", ""])
+def test_usage_a_bad_group_by_is_400(client, fakes, value):
+    response = client.get("/api/usage", params={"group_by": value}, headers=ALICE)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_group_by"
+    assert fakes.requests == []
+
+
+def test_usage_without_access_makes_no_usage_call(client, fakes):
+    fakes.hosts["svc"].users.clear()
+    fakes.hosts["svc"].admins.clear()
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    body = client.get("/api/usage", headers=ALICE).json()
+    assert [s["name"] for s in body["services"]] == ["svc-two"]
+    assert {r.url.host for r in _usage_calls(fakes)} == {"svc-two"}
+    # A requested service without access is left out and has no error.
+    named = client.get("/api/usage?services=svc,svc-two", headers=ALICE)
+    assert named.status_code == 200
+    assert [s["name"] for s in named.json()["services"]] == ["svc-two"]
+
+
+def test_usage_without_access_to_any_service_is_200_and_empty(client, fakes):
+    response = client.get("/api/usage", headers={"X-Datatailr-User": "carol"})
+    assert response.status_code == 200
+    assert response.json() == {"data": [], "services": []}
+    assert _usage_calls(fakes) == []
+
+
+def test_usage_needs_a_platform_user(client, fakes):
+    assert client.get("/api/usage").status_code == 401
+    assert fakes.requests == []
+
+
+def test_usage_keeps_the_registry_order_in_services(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": []})
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    body = client.get("/api/usage?services=svc-two,svc", headers=ALICE).json()
+    assert [s["name"] for s in body["services"]] == ["svc", "svc-two"]
