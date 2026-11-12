@@ -12,7 +12,8 @@ Environment variables read at deploy time (all are optional):
     LLM_MEMORY          memory of the container (default 24g)
     LLM_CPU             CPU count of the container (default 4)
     LLM_ADMIN_GROUP     platform group whose members are admins
-    LLM_ACCESS_GROUP    platform group that gets read and access permission
+    LLM_ACCESS_GROUP    platform group that gets read and access permission. The service
+                        container gets it too. The service uses it to check the acting user.
     LLM_BLOB_ROOT       root directory in blob storage (default llm-service)
     LLM_HF_TOKEN_KEY    secret store key of the Hugging Face token, for gated models
     LLM_VLLM_ARGS       extra arguments for `vllm serve`
@@ -24,7 +25,9 @@ The service sets `vram`, so the platform runs it on a GPU node. The platform
 does not start GPU nodes. Start one before you deploy.
 
 The platform signs the calls of the admin app as the user who deploys it. This
-user must be an admin of the service.
+user must be an admin of each service that the app shows. The app finds the
+services in its environment. It also reads the name of the service that this
+script deploys from the variable LLM_SERVICES.
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ from llm_service.deploy_config import (  # noqa: E402
     deploy_targets,
     resources,
     service_env,
-    service_url,
+    service_host,
 )
 from llm_service.gateway.app import main  # noqa: E402
 
@@ -99,7 +102,10 @@ def build_service(env=os.environ) -> Service:
 
 
 def build_app(env=os.environ) -> App:
-    """Build the admin app job. It calls the service by its internal URL."""
+    """Build the admin app job. LLM_SERVICES names the service that this script deploys.
+
+    The app finds other services by itself. See the README.
+    """
     import llm_service.admin_app.app as admin_app_module
 
     arguments = {}
@@ -113,7 +119,7 @@ def build_app(env=os.environ) -> App:
         environment=ENVIRONMENT,
         resources=Resources(memory="512m", cpu=0.5),
         python_requirements=ADMIN_APP_REQUIREMENTS,
-        env_vars={"LLM_SERVICE_URL": service_url(SERVICE_NAME)},
+        env_vars={"LLM_SERVICES": service_host(SERVICE_NAME)},
         **arguments,
     )
 

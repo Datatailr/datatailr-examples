@@ -291,6 +291,8 @@ Testing area:
 - The app finds services in its own environment only.
 - A user name is one key over all services. The platform has one user directory, so this is correct.
 - The combined chart shows totals for each day, not for each service and day together.
+- A viewer who is not an admin of a service gets no numbers from it for a model filter by day. `GET /v1/usage/me` has no such split.
+- Without `LLM_ACCESS_GROUP`, only admins can use a service through the app.
 
 ## Out of scope
 

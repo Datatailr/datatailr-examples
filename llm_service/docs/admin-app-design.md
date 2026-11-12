@@ -1,5 +1,7 @@
 # LLM service admin app: design
 
+> The app now works with many services. [multi-service-app-design.md](multi-service-app-design.md) holds the current routes and the identity rules. This document describes the first version.
+
 ## Goal
 
 The admin app is a web page for the admins of the LLM service. An admin sees who uses the service and how much, reads the audit log, and manages the models. The app keeps no data. It reads everything from the endpoints of the service.
