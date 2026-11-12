@@ -570,6 +570,20 @@ def test_page_offers_the_names_of_the_next_task():
         assert name in text, name
 
 
+def test_page_drops_late_answers_and_errors_of_a_load():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "if (error instanceof StaleAnswer) return false;" in text
+    for name in ("usage", "detail", "audit", "status"):
+        assert f"current('{name}', call, service," in text, name
+
+
+@pytest.mark.parametrize("name", ["app.js", "index.html", "app.css"])
+def test_page_prose_follows_the_rules(name):
+    text = (STATIC_DIR / name).read_text()
+    assert not re.search(r"\b(should|would|may|might|could)\b", text, re.IGNORECASE)
+    assert "n't" not in text and "—" not in text
+
+
 def _timeout(request: httpx.Request) -> float:
     return request.extensions["timeout"]["read"]
 

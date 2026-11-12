@@ -119,12 +119,31 @@ function showBanner(message, kind = 'error') {
   $('banner').hidden = false;
 }
 
-/** Run a load and show its error in the banner. The last data stays on screen. */
+/** The answer or the error of a call that is no longer current. `guarded` drops it. */
+class StaleAnswer extends Error {}
+
+/** Await `request`, the call number `call` of `name` for `service`. Throw StaleAnswer for its
+ * answer and for its error when a newer call of `name` started or the picked service changed. */
+async function current(name, call, service, request) {
+  const stale = () => call !== state.calls[name] || service !== state.service;
+  try {
+    const answer = await request;
+    if (stale()) throw new StaleAnswer();
+    return answer;
+  } catch (error) {
+    if (stale()) throw new StaleAnswer();
+    throw error;
+  }
+}
+
+/** Run a load and show its error in the banner. The last data stays on screen. A stale answer
+ * shows nothing. */
 async function guarded(work) {
   try {
     await work();
     return true;
   } catch (error) {
+    if (error instanceof StaleAnswer) return false;
     showBanner(error instanceof ApiError ? error.message : String(error));
     return false;
   }
@@ -138,7 +157,13 @@ const LOADERS = {usage: loadUsage, audit: loadAudit, models: loadStatus};
  * and `<tab>-content` swap. `admin`: the tab shows only for an admin of the picked service. */
 const TAB_RULES = {usage: {}, audit: {one: true, admin: true}, models: {one: true, admin: true}};
 
-const tabShown = tab => !(TAB_RULES[tab].admin && state.service && !currentRole().admin);
+/** An admin tab shows for an admin of the picked service. With "All services", it shows for an
+ * admin of at least one service. */
+function tabShown(tab) {
+  if (!TAB_RULES[tab].admin) return true;
+  if (state.service) return currentRole().admin;
+  return Boolean(state.services && state.services.services.some(entry => entry.admin));
+}
 
 function writeHash() {
   const hash = `#${state.tab}${state.service ? `/${encodeURIComponent(state.service)}` : ''}`;
@@ -313,7 +338,8 @@ async function refreshServices() {
   if (!showAccess()) return;
   selectService(state.service);
   selectTab(state.tab);
-  showServing();
+  // During a switch, the poll shows the newer state of the engine in the header.
+  if (!state.polling) showServing();
 }
 
 function onHashChange() {
@@ -399,7 +425,7 @@ function barChart(id, color, horizontal, shortLabel) {
 function chartsFailed() {
   state.chartsOff = true;
   document.querySelector('.charts').hidden = true;
-  showBanner('The charts could not load. The numbers and tables still work.');
+  showBanner('The charts did not load. The numbers and tables still work.');
 }
 
 function setChart(chart, labels, values) {
@@ -428,9 +454,8 @@ async function loadUsage() {
   const service = state.service;
   const range = usageRange();
   $('range-text').textContent = range.since && range.until ? `${range.since} to ${range.until}, UTC days` : '';
-  const [users, days, models, services] = await Promise.all(['user', 'day', 'model', 'service'].map(
-    group => api(`api/usage${query({...range, services: service, group_by: group})}`)));
-  if (call !== state.calls.usage || service !== state.service) return;
+  const [users, days, models, services] = await current('usage', call, service, Promise.all(
+    ['user', 'day', 'model', 'service'].map(group => api(`api/usage${query({...range, services: service, group_by: group})}`))));
   const sum = key => users.data.reduce((total, row) => total + row[key], 0);
   $('tile-requests').textContent = fmt(sum('requests'));
   $('tile-failed').textContent = fmt(sum('failed_requests'));
@@ -494,8 +519,8 @@ async function loadDetail(user) {
   const call = nextCall('detail');
   const service = state.service;
   if (!service) return;
-  const detail = await api(`${servicePath(`usage/${encodeURIComponent(user)}`, service)}${query(usageRange())}`);
-  if (call !== state.calls.detail || service !== state.service) return;
+  const detail = await current('detail', call, service,
+    api(`${servicePath(`usage/${encodeURIComponent(user)}`, service)}${query(usageRange())}`));
   state.detailUser = user;
   for (const row of $('users-body').rows) row.classList.toggle('selected', row.cells[0].textContent === user);
   $('detail-user').textContent = user;
@@ -543,8 +568,8 @@ async function loadAudit() {
   if (!state.auditUsersRead) await loadAuditUsers(service);
   const filters = {user: $('audit-user').value.trim(), model: $('audit-model').value.trim(),
                    since: isoTime($('audit-since').value), until: isoTime($('audit-until').value)};
-  const answer = await api(`${servicePath('audit', service)}${query({...filters, limit: PAGE_SIZE, offset: state.offset})}`);
-  if (call !== state.calls.audit || service !== state.service) return;
+  const answer = await current('audit', call, service,
+    api(`${servicePath('audit', service)}${query({...filters, limit: PAGE_SIZE, offset: state.offset})}`));
   const rows = answer.data;
   replaceRows($('audit-body'), rows.map(auditRow), 7, 'No records match the filters.');
   $('audit-newer').disabled = state.offset === 0;
@@ -670,8 +695,7 @@ async function loadStatus() {
   const service = state.service;
   if (!service) return;
   const call = nextCall('status');
-  const status = await api(servicePath('status', service));
-  if (call !== state.calls.status || service !== state.service) return;
+  const status = await current('status', call, service, api(servicePath('status', service)));
   showStatus(status);
   if (busy(status.engine)) startPoll();
 }
@@ -710,7 +734,7 @@ async function poll(run) {
       state.pollTimer = setTimeout(() => poll(run), POLL_MS);
     } else {
       stopPoll();
-      showBanner(`The page could not read the state of the service: ${error.message} Use Reload to read it again.`);
+      showBanner(`The page did not get the state of the service: ${error.message} Use Reload to read it again.`);
     }
     return;
   }
