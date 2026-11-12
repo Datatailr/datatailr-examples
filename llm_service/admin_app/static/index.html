@@ -28,12 +28,17 @@ if (!location.pathname.endsWith('/')) {
     </svg>
     <span>LLM Service Admin</span>
   </div>
-  <div class="serving" id="serving" title="The model that the service serves now">
+  <div class="picker">
+    <label>Service <select id="service-picker"></select></label>
+    <button type="button" class="ghost" id="services-toggle" aria-expanded="false"
+            aria-controls="services-panel">Services</button>
+  </div>
+  <div class="serving" id="serving" title="The model that the picked service serves now" hidden>
     <span class="dot" id="serving-dot"></span><span id="serving-text">Reading the state</span>
   </div>
   <div class="who">
     <span class="caption">Signed in as</span> <b id="viewer"></b>
-    <button type="button" class="ghost" id="reload" title="Read the data of this tab again">Reload</button>
+    <button type="button" class="ghost" id="reload" title="Read the list of services and the data of this tab again">Reload</button>
   </div>
 </header>
 
@@ -42,8 +47,36 @@ if (!location.pathname.endsWith('/')) {
   <button type="button" class="ghost small" id="banner-close" aria-label="Close the message">Close</button>
 </div>
 
-<section class="denied" id="denied" hidden>
-  <p>You are not an admin of the LLM service.</p>
+<section class="card services-panel" id="services-panel" aria-labelledby="services-title" hidden>
+  <div class="card-head">
+    <h2 id="services-title">Services</h2>
+    <button type="button" class="ghost small" id="services-close">Close</button>
+  </div>
+  <p class="caption" id="services-listing" hidden>The platform listing of services failed. Only the configured and the added names show.</p>
+  <div class="scroll">
+    <table class="grid">
+      <thead><tr>
+        <th scope="col">Name</th><th scope="col">Source</th><th scope="col">State</th>
+        <th scope="col">Detail</th><th scope="col">Model</th><th scope="col">Your role</th>
+        <th scope="col" id="services-actions-head" hidden>Actions</th>
+      </tr></thead>
+      <tbody id="services-body"></tbody>
+    </table>
+  </div>
+  <form class="toolbar add" id="service-add" hidden>
+    <label>Add a service <input type="text" id="service-add-name" placeholder="service-name" required
+           maxlength="63" autocomplete="off"
+           title="1 to 63 characters from a-z, 0-9 and -"></label>
+    <button type="submit">Add</button>
+    <span class="caption">The app checks the name at once.</span>
+  </form>
+</section>
+
+<section class="denied" id="no-access" hidden>
+  <div class="message">
+    <p>You have access to no LLM service.</p>
+    <ul id="no-access-list"></ul>
+  </div>
 </section>
 
 <main id="main" hidden>
@@ -68,6 +101,7 @@ if (!location.pathname.endsWith('/')) {
       </div>
       <span class="caption" id="range-text"></span>
     </div>
+    <p class="note" id="usage-note" role="status" hidden></p>
 
     <div class="tiles">
       <div class="tile"><div class="label">Requests</div><div class="value" id="tile-requests">-</div></div>
@@ -88,7 +122,7 @@ if (!location.pathname.endsWith('/')) {
     </div>
 
     <div class="card">
-      <h2>Users <span class="caption">Select a row to see the numbers of that user.</span></h2>
+      <h2>Users <span class="caption" id="users-hint">Select a row to see the numbers of that user.</span></h2>
       <div class="scroll">
         <table class="grid clickable">
           <thead><tr>
@@ -98,6 +132,21 @@ if (!location.pathname.endsWith('/')) {
             <th scope="col">Last request</th>
           </tr></thead>
           <tbody id="users-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Services</h2>
+      <div class="scroll">
+        <table class="grid">
+          <thead><tr>
+            <th scope="col">Service</th><th scope="col" class="num">Requests</th>
+            <th scope="col" class="num">Failed</th><th scope="col" class="num">Prompt tokens</th>
+            <th scope="col" class="num">Completion tokens</th><th scope="col" class="num">Total tokens</th>
+            <th scope="col">Last request</th>
+          </tr></thead>
+          <tbody id="services-usage-body"></tbody>
         </table>
       </div>
     </div>
@@ -130,6 +179,8 @@ if (!location.pathname.endsWith('/')) {
 
   <!-- Audit -->
   <section class="panel" role="tabpanel" id="panel-audit" aria-labelledby="tab-audit" hidden>
+    <p class="card pick" id="audit-pick" hidden>Pick one service in the bar to see its audit records.</p>
+    <div class="panel" id="audit-content">
     <form class="toolbar filters" id="audit-form">
       <label>User <input type="text" id="audit-user" list="audit-users" placeholder="All users" autocomplete="off"></label>
       <datalist id="audit-users"></datalist>
@@ -158,10 +209,13 @@ if (!location.pathname.endsWith('/')) {
         <button type="button" class="ghost" id="audit-older">Older</button>
       </div>
     </div>
+    </div>
   </section>
 
   <!-- Models -->
   <section class="panel" role="tabpanel" id="panel-models" aria-labelledby="tab-models" hidden>
+    <p class="card pick" id="models-pick" hidden>Pick one service in the bar to see its models.</p>
+    <div class="panel" id="models-content">
     <div class="card">
       <h2>Engine</h2>
       <dl class="status">
@@ -195,6 +249,7 @@ if (!location.pathname.endsWith('/')) {
         <button type="submit" id="serve-submit">Serve</button>
       </form>
       <p class="caption">The service downloads the model if it has no copy, then loads it.</p>
+    </div>
     </div>
   </section>
 </main>

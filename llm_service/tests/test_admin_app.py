@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -538,6 +539,35 @@ def test_page_has_no_html_sinks():
         text = (STATIC_DIR / name).read_text()
         for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"):
             assert sink not in text, (name, sink)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_page_script_parses():
+    subprocess.run(["node", "--check", str(STATIC_DIR / "app.js")], check=True, capture_output=True)
+
+
+PAGE_IDS = (
+    "service-picker", "services-toggle", "services-panel", "services-body", "services-listing",
+    "service-add", "service-add-name", "no-access", "no-access-list", "usage-note",
+    "services-usage-body", "audit-pick", "audit-content", "models-pick", "models-content",
+)
+
+
+@pytest.mark.parametrize("element_id", PAGE_IDS)
+def test_page_has_the_elements_of_many_services(element_id):
+    assert f'id="{element_id}"' in (STATIC_DIR / "index.html").read_text()
+
+
+def test_page_calls_no_removed_route():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert not re.search(r"['`]api/(?:me|status|model|models|audit)\b", text)
+    assert "api/usage/" not in text
+
+
+def test_page_offers_the_names_of_the_next_task():
+    text = (STATIC_DIR / "app.js").read_text()
+    for name in ("function servicePath(", "function currentRole(", "service: null", "services: null"):
+        assert name in text, name
 
 
 def _timeout(request: httpx.Request) -> float:

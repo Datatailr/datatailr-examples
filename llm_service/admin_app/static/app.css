@@ -75,8 +75,10 @@ label { display: inline-flex; align-items: center; gap: 8px; color: var(--muted)
 .dot.failed { background: var(--red); }
 @keyframes pulse { 50% { opacity: .35; } }
 .who { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.picker { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.picker select { max-width: 280px; }
 
-/* ---- banner and the text for a viewer who is not an admin */
+/* ---- banner, Services panel and the text for a viewer without access */
 
 .banner {
   display: flex; align-items: center; gap: 12px; margin: 16px 24px 0;
@@ -85,11 +87,21 @@ label { display: inline-flex; align-items: center; gap: 8px; color: var(--muted)
 .banner span { flex: 1; overflow-wrap: anywhere; }
 .banner.error { background: var(--red-dim); border-color: rgba(242, 109, 109, .45); }
 .banner.ok { background: var(--green-dim); border-color: rgba(63, 185, 124, .45); }
-.denied { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-.denied p {
-  padding: 28px 36px; background: var(--panel); border: 1px solid var(--border);
-  border-radius: var(--radius); font-size: 16px;
+.denied { min-height: 70vh; display: grid; place-items: center; padding: 24px; }
+.denied .message {
+  max-width: 720px; padding: 28px 36px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius);
 }
+.denied p { font-size: 16px; margin-bottom: 12px; }
+.denied ul { padding-left: 20px; color: var(--muted); overflow-wrap: anywhere; }
+.denied li b { color: var(--text); font-family: var(--mono); font-weight: 500; }
+.services-panel { margin: 16px 24px 0; }
+.services-panel .add { padding-top: 14px; }
+.note {
+  padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(226, 180, 68, .4);
+  background: var(--yellow-dim); overflow-wrap: anywhere;
+}
+.pick { color: var(--muted); }
 
 /* ---- tabs and layout */
 
@@ -167,6 +179,9 @@ table.grid caption { text-align: left; font-size: 12px; color: var(--muted); pad
 .pill.bad, .badge.failed { background: var(--red-dim); color: var(--red); }
 .badge.loading { background: var(--yellow-dim); color: var(--yellow); }
 .badge.cached { background: var(--blue-dim); color: #8db6ff; }
+.badge.state-ok { background: var(--green-dim); color: var(--green); }
+.badge.state-no_access { background: var(--yellow-dim); color: var(--yellow); }
+.badge.state-unreachable, .badge.state-not_llm { background: var(--red-dim); color: var(--red); }
 
 /* ---- engine status */
 
@@ -204,7 +219,8 @@ pre.json {
 @media (max-width: 600px) {
   .topbar { padding: 10px 16px; }
   main { padding: 14px 16px 40px; }
-  .banner { margin: 12px 16px 0; }
+  .banner, .services-panel { margin: 12px 16px 0; }
+  .picker select { max-width: 60vw; }
   .who { margin-left: 0; }
   .tile .value { font-size: 22px; }
   .tiles { grid-template-columns: 1fr 1fr; gap: 10px; }

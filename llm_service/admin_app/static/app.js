@@ -1,8 +1,9 @@
-/* LLM Service Admin: the page. Three tabs (usage, audit, models) over the JSON API of the app.
+/* LLM Service Admin: the page. A service picker and three tabs (usage, audit, models) over the
+ * JSON API of the app.
  *
  * The platform serves the app under a path prefix, so every URL is relative to BASE, the
  * location of the page. Text from the service goes into the page with textContent or as an
- * attribute value, never as HTML. */
+ * attribute value, never as HTML. The URL hash is `#<tab>` or `#<tab>/<service>`. */
 
 'use strict';
 
@@ -15,7 +16,10 @@ const COLORS = {bar: '#4c8dff', bar2: '#36c2b4', grid: 'rgba(56, 66, 82, .55)', 
 
 const $ = id => document.getElementById(id);
 const number = new Intl.NumberFormat();
-const state = {tab: null, range: '30', loaded: {}, offset: 0, polling: false, pollTimer: null, pollFailures: 0,
+// `service` is the picked service, or null for "All services". `services` is the answer of
+// `GET api/services`. A request of a tab keeps the service of its start and drops a late answer.
+const state = {tab: null, service: null, services: null, range: '30', loaded: {}, offset: 0,
+               polling: false, pollTimer: null, pollFailures: 0, pollService: null,
                detailUser: null, chartsOff: false,
                charts: {}, pendingDelete: null, auditUsersRead: false, calls: {}};
 
@@ -95,6 +99,20 @@ const query = params => {
 /** A model id such as `org/name` as a path, with each segment encoded. */
 const modelPath = id => id.split('/').map(encodeURIComponent).join('/');
 
+/** The path of a route of a service, relative to BASE. The default is the picked service. */
+function servicePath(path, service = state.service) {
+  return `api/services/${encodeURIComponent(service)}/${path}`;
+}
+
+/** The entry of the service `name` in the list of services, or undefined. */
+const entryOf = name => (state.services ? state.services.services.find(entry => entry.name === name) : undefined);
+
+/** The role of the viewer on the picked service. With "All services", no role. */
+function currentRole() {
+  const entry = state.service ? entryOf(state.service) : undefined;
+  return {access: Boolean(entry && entry.access), admin: Boolean(entry && entry.admin)};
+}
+
 function showBanner(message, kind = 'error') {
   $('banner-text').textContent = message;
   $('banner').className = `banner ${kind}`;
@@ -116,31 +134,220 @@ async function guarded(work) {
 
 const TABS = ['usage', 'audit', 'models'];
 const LOADERS = {usage: loadUsage, audit: loadAudit, models: loadStatus};
+/** `one`: the tab works on one service. With "All services", the elements `<tab>-pick` (a note)
+ * and `<tab>-content` swap. `admin`: the tab shows only for an admin of the picked service. */
+const TAB_RULES = {usage: {}, audit: {one: true, admin: true}, models: {one: true, admin: true}};
+
+const tabShown = tab => !(TAB_RULES[tab].admin && state.service && !currentRole().admin);
+
+function writeHash() {
+  const hash = `#${state.tab}${state.service ? `/${encodeURIComponent(state.service)}` : ''}`;
+  if (location.hash !== hash) history.replaceState(null, '', hash);
+}
+
+/** The tab and the service in the URL hash. */
+function readHash() {
+  const [tab, service] = location.hash.slice(1).split('/');
+  try {
+    return {tab, service: service ? decodeURIComponent(service) : null};
+  } catch {
+    return {tab, service: null};
+  }
+}
 
 function selectTab(name, focus = false) {
-  if (!TABS.includes(name)) name = 'usage';
+  if (!TABS.includes(name) || !tabShown(name)) name = 'usage';
   state.tab = name;
   for (const tab of TABS) {
     const button = $(`tab-${tab}`);
     const active = tab === name;
+    button.hidden = !tabShown(tab);
     button.setAttribute('aria-selected', String(active));
     button.tabIndex = active ? 0 : -1;
     $(`panel-${tab}`).hidden = !active;
     if (active && focus) button.focus();
   }
-  if (location.hash !== `#${name}`) history.replaceState(null, '', `#${name}`);
-  if (!state.loaded[name]) {
+  const pick = Boolean(TAB_RULES[name].one) && !state.service;
+  if (TAB_RULES[name].one) {
+    $(`${name}-pick`).hidden = !pick;
+    $(`${name}-content`).hidden = pick;
+  }
+  writeHash();
+  if (!pick && !state.loaded[name]) {
     state.loaded[name] = true;
     guarded(LOADERS[name]);
   }
 }
 
 function tabKeys(event) {
-  const index = TABS.indexOf(state.tab);
-  const moves = {ArrowRight: index + 1, ArrowLeft: index - 1, Home: 0, End: TABS.length - 1};
+  const shown = TABS.filter(tabShown);
+  const index = shown.indexOf(state.tab);
+  const moves = {ArrowRight: index + 1, ArrowLeft: index - 1, Home: 0, End: shown.length - 1};
   if (!(event.key in moves)) return;
   event.preventDefault();
-  selectTab(TABS[(moves[event.key] + TABS.length) % TABS.length], true);
+  selectTab(shown[(moves[event.key] + shown.length) % shown.length], true);
+}
+
+// ---- services
+
+/** Read the list of services. Return false when a newer read started meanwhile. */
+async function loadServices() {
+  const call = nextCall('services');
+  const answer = await api('api/services');
+  if (call !== state.calls.services) return false;
+  state.services = answer;
+  $('viewer').textContent = answer.user;
+  showPicker();
+  showServicesPanel();
+  return true;
+}
+
+const stateText = value => String(value).replace(/_/g, ' ');
+const roleText = entry => (entry.admin ? 'admin' : entry.access ? 'user' : 'no access');
+
+function showPicker() {
+  const options = [el('option', {value: '', text: 'All services'})];
+  for (const entry of state.services.services) {
+    const text = entry.state === 'ok' ? `${entry.name} (ok, ${roleText(entry)})` : `${entry.name} (${stateText(entry.state)})`;
+    options.push(el('option', {value: entry.name, text, disabled: entry.access ? null : ''}));
+  }
+  $('service-picker').replaceChildren(...options);
+  $('service-picker').value = state.service ?? '';
+}
+
+function showServicesPanel() {
+  const {services, owner, listing} = state.services;
+  $('services-listing').hidden = listing !== 'failed';
+  $('service-add').hidden = !owner;
+  $('services-actions-head').hidden = !owner;
+  replaceRows($('services-body'), services.map(serviceEntryRow), owner ? 7 : 6, 'The app knows no LLM service.');
+}
+
+function serviceEntryRow(entry) {
+  let actions = null;
+  if (state.services.owner) {
+    actions = el('td', {}, entry.source === 'manual'
+      ? el('button', {type: 'button', className: 'small danger-ghost', text: 'Remove',
+                      'aria-label': `Remove ${entry.name} from the added services`,
+                      onclick: () => removeService(entry.name)})
+      : null);
+  }
+  return el('tr', {},
+    el('th', {scope: 'row', className: 'mono', text: entry.name}),
+    el('td', {text: entry.source}),
+    el('td', {}, el('span', {className: `badge state-${entry.state}`, text: stateText(entry.state)})),
+    el('td', {className: entry.detail ? null : 'muted', text: entry.detail || '-'}),
+    el('td', {className: 'mono', text: entry.model || '-'}),
+    el('td', {text: entry.state === 'ok' ? roleText(entry) : '-'}),
+    actions);
+}
+
+/** The reason why the viewer cannot use a service. */
+const noAccessReason = entry => entry.detail
+  || (entry.state === 'ok' ? 'The service gives you no access.' : `The service has the state ${stateText(entry.state)}.`);
+
+/** Show the tabs if the viewer has access to a service, else one message. Return true for access. */
+function showAccess() {
+  const {services, listing} = state.services;
+  const any = services.some(entry => entry.access);
+  $('main').hidden = !any;
+  $('no-access').hidden = any;
+  if (any) return true;
+  selectService(null);
+  const items = services.map(entry => el('li', {}, el('b', {text: entry.name}), `: ${noAccessReason(entry)}`));
+  if (!services.length) items.push(el('li', {text: 'The app knows no LLM service.'}));
+  if (listing === 'failed') items.push(el('li', {text: 'The platform listing of services failed.'}));
+  $('no-access-list').replaceChildren(...items);
+  return false;
+}
+
+/** The served model of the picked service in the header. Nothing for "All services". */
+function showServing() {
+  const entry = state.service ? entryOf(state.service) : undefined;
+  $('serving').hidden = !entry;
+  if (!entry) return;
+  $('serving-text').textContent = entry.model || 'The service serves no model.';
+  $('serving-dot').className = `dot ${entry.engine || ''}`;
+}
+
+/** Pick the service `name`, or "All services" for null or a name without access. Return true
+ * if the pick changed. The caller then selects the tab, which loads its data. */
+function selectService(name) {
+  const entry = name ? entryOf(name) : undefined;
+  const next = entry && entry.access ? entry.name : null;
+  $('service-picker').value = next ?? '';
+  if (next === state.service) return false;
+  state.service = next;
+  clearServiceData();
+  showServing();
+  return true;
+}
+
+/** Remove the data of the last service from the page, so it never shows under another name. */
+function clearServiceData() {
+  stopPoll();
+  state.loaded = {};
+  state.offset = 0;
+  state.auditUsersRead = false;
+  state.detailUser = null;
+  state.pendingDelete = null;
+  $('detail').hidden = true;
+  for (const id of ['record-dialog', 'confirm-dialog']) if ($(id).open) $(id).close();
+  for (const id of ['tile-requests', 'tile-failed', 'tile-tokens', 'tile-users']) $(id).textContent = '-';
+  for (const chart of Object.values(state.charts)) setChart(chart, [], []);
+  $('usage-note').hidden = true;
+  for (const id of ['users-body', 'services-usage-body', 'audit-body', 'audit-users', 'models-body']) {
+    $(id).replaceChildren();
+  }
+  $('audit-form').reset();
+  $('audit-page').textContent = '';
+  for (const id of ['st-state', 'st-serving', 'st-target', 'st-error']) $(id).textContent = '-';
+  $('st-state').className = 'badge';
+  $('st-error').classList.remove('bad');
+  $('st-rollback-row').hidden = true;
+}
+
+/** Read the list of services again and show what depends on it. */
+async function refreshServices() {
+  if (!await loadServices()) return;
+  if (!showAccess()) return;
+  selectService(state.service);
+  selectTab(state.tab);
+  showServing();
+}
+
+function onHashChange() {
+  if ($('main').hidden) return;
+  const {tab, service} = readHash();
+  selectService(service);
+  selectTab(tab);
+}
+
+function toggleServices(open) {
+  $('services-panel').hidden = !open;
+  $('services-toggle').setAttribute('aria-expanded', String(open));
+}
+
+async function addService(event) {
+  event.preventDefault();
+  const name = $('service-add-name').value.trim();
+  await guarded(async () => {
+    const entry = await api('api/services', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                             body: JSON.stringify({name})});
+    $('service-add-name').value = '';
+    const detail = entry.detail ? ` ${entry.detail}` : '';
+    showBanner(`The app added ${entry.name}. Its state is ${stateText(entry.state)}.${detail}`,
+               entry.state === 'ok' ? 'ok' : 'error');
+    await refreshServices();
+  });
+}
+
+async function removeService(name) {
+  await guarded(async () => {
+    await api(`api/services/${encodeURIComponent(name)}`, {method: 'DELETE'});
+    showBanner(`The app removed ${name} from the added services.`, 'ok');
+    await refreshServices();
+  });
 }
 
 // ---- usage
@@ -213,13 +420,17 @@ function daySeries(rows, since, until) {
   return [days, days.map(d => totals.get(d) || 0)];
 }
 
+/** The detail of a user needs one service and an admin of it. */
+const detailOn = () => Boolean(state.service) && currentRole().admin;
+
 async function loadUsage() {
   const call = nextCall('usage');
+  const service = state.service;
   const range = usageRange();
   $('range-text').textContent = range.since && range.until ? `${range.since} to ${range.until}, UTC days` : '';
-  const [users, days, models] = await Promise.all(['user', 'day', 'model'].map(
-    group => api(`api/usage${query({...range, group_by: group})}`)));
-  if (call !== state.calls.usage) return;
+  const [users, days, models, services] = await Promise.all(['user', 'day', 'model', 'service'].map(
+    group => api(`api/usage${query({...range, services: service, group_by: group})}`)));
+  if (call !== state.calls.usage || service !== state.service) return;
   const sum = key => users.data.reduce((total, row) => total + row[key], 0);
   $('tile-requests').textContent = fmt(sum('requests'));
   $('tile-failed').textContent = fmt(sum('failed_requests'));
@@ -236,15 +447,34 @@ async function loadUsage() {
       chartsFailed();  // only once: the charts stay off after this
     }
   }
-  replaceRows($('users-body'), users.data.map(userRow), 7, 'No requests in this range.');
-  if (state.detailUser) await loadDetail(state.detailUser);
+  const detail = detailOn();
+  $('users-hint').hidden = !detail;
+  replaceRows($('users-body'), users.data.map(row => usageRow('user', row, detail)), 7, 'No requests in this range.');
+  replaceRows($('services-usage-body'), services.data.map(row => usageRow('service', row, false)), 7,
+              'No requests in this range.');
+  showUsageNote(users.services);
+  if (state.detailUser && detail) await loadDetail(state.detailUser);
 }
 
-function userRow(row) {
+/** Name each service without numbers and each service where the viewer sees only the own numbers. */
+function showUsageNote(services) {
+  const parts = services.filter(entry => !entry.ok)
+    .map(entry => `No numbers from ${entry.name}: ${entry.error || 'the call failed.'}`);
+  const own = services.filter(entry => entry.ok && entry.scope === 'own').map(entry => entry.name);
+  if (own.length) parts.push(`You see only your own numbers from ${own.join(', ')}.`);
+  $('usage-note').textContent = parts.join(' ');
+  $('usage-note').hidden = !parts.length;
+}
+
+/** A row of a usage table by `key` (user or service). A row of a user can open the detail. */
+function usageRow(key, row, opens) {
   const open = () => guarded(() => loadDetail(row.user));
-  return el('tr', {tabindex: '0', className: row.user === state.detailUser ? 'selected' : null, onclick: open,
-                   onkeydown: event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); } }},
-    el('th', {scope: 'row', text: row.user}),
+  const props = opens
+    ? {tabindex: '0', className: row.user === state.detailUser ? 'selected' : null, onclick: open,
+       onkeydown: event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); } }}
+    : {};
+  return el('tr', props,
+    el('th', {scope: 'row', text: row[key]}),
     el('td', {className: 'num', text: fmt(row.requests)}),
     el('td', {className: row.failed_requests ? 'num bad' : 'num', text: fmt(row.failed_requests)}),
     el('td', {className: 'num', text: fmt(row.prompt_tokens)}),
@@ -262,8 +492,10 @@ function smallRow(key, row) {
 
 async function loadDetail(user) {
   const call = nextCall('detail');
-  const detail = await api(`api/usage/${encodeURIComponent(user)}${query(usageRange())}`);
-  if (call !== state.calls.detail) return;
+  const service = state.service;
+  if (!service) return;
+  const detail = await api(`${servicePath(`usage/${encodeURIComponent(user)}`, service)}${query(usageRange())}`);
+  if (call !== state.calls.detail || service !== state.service) return;
   state.detailUser = user;
   for (const row of $('users-body').rows) row.classList.toggle('selected', row.cells[0].textContent === user);
   $('detail-user').textContent = user;
@@ -293,23 +525,26 @@ const isoTime = value => (value ? new Date(value).toISOString() : '');
 
 /** Fill the suggestions of the user filter. The filter also takes free text, so a failure only
  * shows a banner. Reload tries again. */
-async function loadAuditUsers() {
+async function loadAuditUsers(service) {
   state.auditUsersRead = true;
   try {
-    const answer = await api('api/audit/users');
+    const answer = await api(servicePath('audit/users', service));
+    if (service !== state.service) return;
     $('audit-users').replaceChildren(...answer.data.map(row => el('option', {value: row.user})));
   } catch (error) {
-    showBanner(`The page could not read the list of users: ${error.message}`);
+    if (service === state.service) showBanner(`The page did not get the list of users: ${error.message}`);
   }
 }
 
 async function loadAudit() {
+  const service = state.service;
+  if (!service) return;
   const call = nextCall('audit');
-  if (!state.auditUsersRead) await loadAuditUsers();
+  if (!state.auditUsersRead) await loadAuditUsers(service);
   const filters = {user: $('audit-user').value.trim(), model: $('audit-model').value.trim(),
                    since: isoTime($('audit-since').value), until: isoTime($('audit-until').value)};
-  const answer = await api(`api/audit${query({...filters, limit: PAGE_SIZE, offset: state.offset})}`);
-  if (call !== state.calls.audit) return;
+  const answer = await api(`${servicePath('audit', service)}${query({...filters, limit: PAGE_SIZE, offset: state.offset})}`);
+  if (call !== state.calls.audit || service !== state.service) return;
   const rows = answer.data;
   replaceRows($('audit-body'), rows.map(auditRow), 7, 'No records match the filters.');
   $('audit-newer').disabled = state.offset === 0;
@@ -332,15 +567,17 @@ function showRecord(note, body) {
 /** Open the dialog for a list row. The list has no prompt, so the page loads the full record. */
 async function openRecord(row) {
   const call = nextCall('record');
+  const service = state.service;
   if (!row.request_id) {
     showRecord('This record has no id. The page shows the fields of the list.', row);
     return;
   }
   showRecord('Loading the record.', null);
-  // A later click or a closed dialog makes this answer stale.
-  const stale = () => call !== state.calls.record || !$('record-dialog').open;
+  // A later click, a closed dialog or another service makes this answer stale.
+  const stale = () => call !== state.calls.record || !$('record-dialog').open || service !== state.service;
   try {
-    const record = await api(`api/audit/records/${encodeURIComponent(row.request_id)}${query({day: utcDay(row.ts)})}`);
+    const record = await api(`${servicePath(`audit/records/${encodeURIComponent(row.request_id)}`, service)}` +
+                             query({day: utcDay(row.ts)}));
     if (stale()) return;
     showRecord(record.prompt_deleted ? 'The prompt of this record is deleted.' : '', record);
   } catch (error) {
@@ -430,22 +667,29 @@ function setBusy(busy) {
 }
 
 async function loadStatus() {
-  const status = await api('api/status');
+  const service = state.service;
+  if (!service) return;
+  const call = nextCall('status');
+  const status = await api(servicePath('status', service));
+  if (call !== state.calls.status || service !== state.service) return;
   showStatus(status);
   if (busy(status.engine)) startPoll();
-  return status;
 }
 
+/** Poll the state of the picked service. A stop or a new poll makes the answers of the old poll stale. */
 function startPoll() {
   if (state.polling) return;
   state.polling = true;
   state.pollFailures = 0;
+  state.pollService = state.service;
   setBusy(true);
-  state.pollTimer = setTimeout(poll, POLL_MS);
+  const run = nextCall('poll');
+  state.pollTimer = setTimeout(() => poll(run), POLL_MS);
 }
 
 function stopPoll() {
   clearTimeout(state.pollTimer);
+  nextCall('poll');
   state.pollTimer = null;
   state.polling = false;
   setBusy(false);
@@ -453,25 +697,28 @@ function stopPoll() {
 
 /** Read the state until the switch and a rollback after it end. Stop after MAX_POLL_FAILURES failed
  * reads in a row. */
-async function poll() {
+async function poll(run) {
   state.pollTimer = null;
+  const stale = () => run !== state.calls.poll;
   let status;
   try {
-    status = await api('api/status');
+    status = await api(servicePath('status', state.pollService));
   } catch (error) {
+    if (stale()) return;
     state.pollFailures += 1;
     if (state.pollFailures < MAX_POLL_FAILURES) {
-      state.pollTimer = setTimeout(poll, POLL_MS);
+      state.pollTimer = setTimeout(() => poll(run), POLL_MS);
     } else {
       stopPoll();
       showBanner(`The page could not read the state of the service: ${error.message} Use Reload to read it again.`);
     }
     return;
   }
+  if (stale()) return;
   state.pollFailures = 0;
   showStatus(status);
   if (busy(status.engine)) {
-    state.pollTimer = setTimeout(poll, POLL_MS);
+    state.pollTimer = setTimeout(() => poll(run), POLL_MS);
     return;
   }
   stopPoll();
@@ -493,11 +740,13 @@ function reportSwitch(engine) {
 }
 
 async function serve(model, revision) {
+  const service = state.service;
   setBusy(true);
   const done = await guarded(async () => {
-    await api('api/model', {method: 'POST', headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({model, revision})});
-    showBanner(`The service loads ${model} @ ${revision}.`, 'ok');
+    await api(servicePath('model', service), {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                              body: JSON.stringify({model, revision})});
+    showBanner(`The service ${service} loads ${model} @ ${revision}.`, 'ok');
+    if (service !== state.service) return;
     startPoll();  // first, so the poll runs even if the next read fails
     await loadStatus();
   });
@@ -505,7 +754,7 @@ async function serve(model, revision) {
 }
 
 function askDelete(model, revision) {
-  state.pendingDelete = {model, revision};
+  state.pendingDelete = {model, revision, service: state.service};
   $('confirm-text').textContent =
     `Delete the cached weights of ${model} at revision ${revision}? The service removes them from blob storage. ` +
     'A later switch to this model downloads them again.';
@@ -513,13 +762,14 @@ function askDelete(model, revision) {
 }
 
 async function confirmDelete() {
-  const {model, revision} = state.pendingDelete;
+  const {model, revision, service} = state.pendingDelete;
   $('confirm-dialog').close();
   setBusy(true);
   await guarded(async () => {
-    await api(`api/models/${modelPath(model)}${query({revision})}`, {method: 'DELETE'});
-    showBanner(`The service deleted ${model} @ ${revision}.`, 'ok');
+    await api(`${servicePath(`models/${modelPath(model)}`, service)}${query({revision})}`, {method: 'DELETE'});
+    showBanner(`The service ${service} deleted ${model} @ ${revision}.`, 'ok');
   });
+  if (service !== state.service) return;
   setBusy(state.polling);
   guarded(loadStatus);
 }
@@ -529,12 +779,15 @@ async function confirmDelete() {
 function wire() {
   for (const tab of TABS) $(`tab-${tab}`).addEventListener('click', () => selectTab(tab));
   document.querySelector('[role="tablist"]').addEventListener('keydown', tabKeys);
-  $('reload').addEventListener('click', () => {
-    $('banner').hidden = true;
-    if (state.tab === 'audit') state.auditUsersRead = false;
-    guarded(LOADERS[state.tab]);
-    if (state.tab !== 'models') guarded(loadStatus);  // the header shows the served model
+  $('reload').addEventListener('click', reload);
+  $('service-picker').addEventListener('change', () => {
+    selectService($('service-picker').value || null);
+    selectTab(state.tab);
   });
+  window.addEventListener('hashchange', onHashChange);
+  $('services-toggle').addEventListener('click', () => toggleServices($('services-panel').hidden));
+  $('services-close').addEventListener('click', () => { toggleServices(false); $('services-toggle').focus(); });
+  $('service-add').addEventListener('submit', addService);
   $('banner-close').addEventListener('click', () => { $('banner').hidden = true; });
   for (const button of document.querySelectorAll('[data-range]')) {
     button.addEventListener('click', () => setRange(button.dataset.range));
@@ -559,6 +812,16 @@ function wire() {
   }
 }
 
+/** Read the list of services and the data of the tab again. */
+async function reload() {
+  $('banner').hidden = true;
+  state.loaded = {};
+  state.auditUsersRead = false;
+  await guarded(refreshServices);
+  // If the list failed, the tab still reads its data again.
+  if (!$('main').hidden && !state.loaded[state.tab]) selectTab(state.tab);
+}
+
 async function start() {
   wire();
   try {
@@ -566,26 +829,21 @@ async function start() {
   } catch {
     state.chartsOff = true;  // without Chart.js, the tiles and tables still work
   }
-  let me;
+  const wanted = readHash();
   try {
-    me = await api('api/me');
+    await loadServices();
   } catch (error) {
     showBanner(error.message);
     return;
   }
-  if (!me.admin) {
-    $('denied').hidden = false;
-    return;
-  }
-  $('viewer').textContent = me.user;
   $('topbar').hidden = false;
-  $('main').hidden = false;
   if (state.chartsOff) chartsFailed();
   for (const button of document.querySelectorAll('[data-range]')) {
     button.setAttribute('aria-pressed', String(button.dataset.range === state.range));
   }
-  selectTab(location.hash.slice(1));
-  if (state.tab !== 'models') guarded(loadStatus);
+  if (!showAccess()) return;
+  selectService(wanted.service);
+  selectTab(wanted.tab);
 }
 
 document.addEventListener('DOMContentLoaded', start);
