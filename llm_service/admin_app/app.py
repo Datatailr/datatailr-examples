@@ -50,7 +50,7 @@ USAGE_GROUPS = ("user", "model", "day", "service")
 MODEL_BY_DAY = "The model filter by day needs an admin of the service."
 UNKNOWN_SERVICE = "This service is unknown."
 USAGE_TOO_SLOW = "The LLM service did not answer in time."
-TOO_SLOW = "The LLM service did not answer in time. The action may still finish. Use Reload to see the state."
+TOO_SLOW = "The LLM service did not answer in time. The action can still finish. Use Reload to see the state."
 
 
 class NeedsAdmin(Exception):
@@ -126,8 +126,8 @@ def _query(request: Request, names: tuple[str, ...]) -> dict:
 def _service_path(prefix: str, value: str) -> str | None:
     """Build a service path and encode each segment once, so the slashes stay.
 
-    Return None when a segment is empty, `.` or `..`. The HTTP client would
-    remove such a segment and reach a route outside the prefix.
+    Return None when a segment is empty, `.` or `..`. The HTTP client
+    removes such a segment and reach a route outside the prefix.
     """
     segments = value.split("/")
     if any(segment in ("", ".", "..") for segment in segments):

@@ -53,8 +53,8 @@ class AdminCheck:
     """Decide whether a user is an admin.
 
     The owner is always an admin. Members of the admin group are admins too.
-    The group members are cached for `ttl` seconds. After a failed lookup, the
-    last known members stay in use for 10 seconds, or no members if there are none.
+    The group members are cached for `ttl` seconds. A failed lookup gives no
+    members, and the next lookup comes 10 seconds later at the earliest.
     """
 
     def __init__(
@@ -88,14 +88,17 @@ class AdminCheck:
         now = self._clock()
         if self._fetched_at is not None and now - self._fetched_at < self._ttl:
             return self._cached
-        # A failed lookup waits 10 seconds, so a slow group service does not get a call for each request.
+        # After a failed lookup the group has no members, and the next lookup waits
+        # 10 seconds. So a removed member never keeps a right during an outage.
         if self._failed_at is not None and now - self._failed_at < FAILED_LOOKUP_SECONDS:
-            return self._cached
+            return set()
         try:
             self._cached = set(self._members(self._group))
         except Exception:
+            self._cached = set()
+            self._fetched_at = None
             self._failed_at = now
-            return self._cached
+            return set()
         self._fetched_at = now
         self._failed_at = None
         return self._cached
@@ -106,7 +109,7 @@ class AccessCheck:
 
     An admin has access. A member of `group` has access too. Without a group, only
     admins have access. The group members are cached for `ttl` seconds. A failed
-    lookup keeps the last known members for 10 seconds, or no members if there are none.
+    lookup means no access, and the next lookup comes 10 seconds later at the earliest.
     """
 
     def __init__(

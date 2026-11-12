@@ -112,7 +112,7 @@ def create_app(
             record["ts"] = iso(now())
             audit.add(record)
         except Exception as error:
-            logger.warning("could not write an audit record: %s", error)
+            logger.warning("the write of an audit record failed: %s", error)
 
     def on_event(event: dict) -> None:
         failed = event["result"] != "ok"
@@ -506,13 +506,13 @@ def create_app(
                 removed.append(name)
         except Exception as error:
             status = 500
-            logger.warning("could not delete %s: %s", model_id, error)
+            logger.warning("the delete of %s failed: %s", model_id, error)
             raise ApiError(
                 500, "server_error", "delete_failed",
-                f"could not delete the model {model_id!r} ({type(error).__name__})",
+                f"the delete of the model {model_id!r} failed ({type(error).__name__})",
             ) from None
         finally:
-            # A cancelled request frees the mark while the worker thread may still
+            # A cancelled request frees the mark while the worker thread can still
             # remove. This is safe: `WeightCache.ensure` and `remove` share one lock.
             manager.end_remove(model_id, found)
             write_audit(
@@ -616,7 +616,7 @@ def read_hf_token(key: str | None, environment: str, get_secret) -> str | None:
         return get_secret(key)
     except Exception as error:
         logger.error(
-            "could not read the Hugging Face token from the secret %r in the environment %r: %s. "
+            "the read of the Hugging Face token from the secret %r in the environment %r failed: %s. "
             "The service continues without a token, so only public models load.",
             key,
             environment,

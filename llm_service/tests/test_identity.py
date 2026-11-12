@@ -145,7 +145,7 @@ def test_access_group_members_are_cached_for_60_seconds():
     assert len(calls) == 2
 
 
-def test_a_failed_group_lookup_is_cached_for_10_seconds_and_keeps_the_last_members():
+def test_a_failed_group_lookup_means_no_members_and_waits_10_seconds():
     calls, now, failing = [], [0.0], [False]
 
     def members(group):
@@ -157,16 +157,22 @@ def test_a_failed_group_lookup_is_cached_for_10_seconds_and_keeps_the_last_membe
     check = AdminCheck("alice", "llm-admins", members, clock=lambda: now[0])
     assert check.is_admin("carol") and len(calls) == 1
     now[0], failing[0] = 61.0, True
-    assert check.is_admin("carol") and len(calls) == 2  # the last known members stay in use
+    assert not check.is_admin("carol") and len(calls) == 2  # the member loses the right at once
+    assert check.is_admin("alice")  # the owner needs no lookup
     now[0] = 70.0
-    assert check.is_admin("carol") and len(calls) == 2  # no new lookup within 10 seconds
-    now[0] = 72.0
-    assert check.is_admin("carol") and len(calls) == 3
-    now[0], failing[0] = 83.0, False
-    assert check.is_admin("carol") and len(calls) == 4
+    assert not check.is_admin("carol") and len(calls) == 2  # no new lookup within 10 seconds
+    for retry in range(1, 6):  # a long outage never brings the old member back
+        now[0] = 61.0 + 11.0 * retry
+        assert not check.is_admin("carol") and len(calls) == 2 + retry
+        now[0] += 5.0
+        assert not check.is_admin("carol") and len(calls) == 2 + retry
+    now[0], failing[0] = 130.0, False
+    assert check.is_admin("carol") and len(calls) == 8
+    now[0] = 189.0
+    assert check.is_admin("carol") and len(calls) == 8  # a good lookup is cached for 60 seconds
 
 
-def test_a_failed_first_lookup_means_no_members_for_10_seconds():
+def test_a_failed_access_lookup_means_no_access_and_waits_10_seconds():
     calls, now = [], [0.0]
 
     def boom(group):

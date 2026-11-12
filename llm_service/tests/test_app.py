@@ -504,7 +504,7 @@ def test_audit_failure_does_not_fail_the_request(client, caplog):
     with caplog.at_level("WARNING", logger="llm_service.app"):
         r = client.post(CHAT, headers=BOB, json=HI)
     assert r.status_code == 200
-    assert any("could not write an audit record" in m for m in caplog.messages)
+    assert any("the write of an audit record failed" in m for m in caplog.messages)
 
 
 def test_shutdown_flushes_the_audit_log(tmp_path):

@@ -430,7 +430,7 @@ def test_retain_starts_no_new_check_before_the_hour():
     old = put_day(store, "2026-11-08")
     merger.retain()
     assert not store.exists(old)
-    newer = put_day(store, "2026-11-07")  # a day that a new check would clean
+    newer = put_day(store, "2026-11-07")  # a new check cleans this day
     store.ls_calls.clear()
     clock.when = at(11, 1, 59, 59, 999999)
     merger.retain()

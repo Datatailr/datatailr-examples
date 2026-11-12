@@ -778,27 +778,27 @@ def test_switch_and_delete_wait_longer_than_other_calls(client, service):
     "method, path, kwargs",
     [("POST", "/api/services/svc/model", {"json": {"model": "org/name"}}), ("DELETE", "/api/services/svc/models/org/name", {})],
 )
-def test_a_slow_switch_or_delete_says_that_it_may_still_finish(client, service, method, path, kwargs):
+def test_a_slow_switch_or_delete_says_that_it_can_still_finish(client, service, method, path, kwargs):
     service.error = httpx.ReadTimeout("slow")
     response = client.request(method, path, headers=ALICE, **kwargs)
     assert response.status_code == 502
     error = response.json()["error"]
     assert error["code"] == "service_unreachable"
-    assert "in time" in error["message"] and "may still finish" in error["message"]
+    assert "in time" in error["message"] and "can still finish" in error["message"]
 
 
 def test_a_slow_read_keeps_the_plain_message(client, service):
     service.error = httpx.ReadTimeout("slow")
     response = client.get("/api/services/svc/audit", headers=ALICE)
     assert response.status_code == 502
-    assert "may still finish" not in response.json()["error"]["message"]
+    assert "can still finish" not in response.json()["error"]["message"]
 
 
 def test_a_refused_connection_on_a_switch_keeps_the_plain_message(client, service):
     service.error = httpx.ConnectError("refused")
     response = client.post("/api/services/svc/model", json={"model": "org/name"}, headers=ALICE)
     assert response.status_code == 502
-    assert "may still finish" not in response.json()["error"]["message"]
+    assert "can still finish" not in response.json()["error"]["message"]
 
 
 @pytest.mark.parametrize("name", ["   ", "\t"])

@@ -41,7 +41,7 @@ def validate_model_name(model: str) -> str:
     """Return `model` if it has the form `org/name`. Else raise `ValueError`."""
     parts = model.split("/")
     # "--" joins org and name in paths. A part must not contain it or end with
-    # "-", or the joined path could not be split back into the same parts.
+    # "-", or the split of the joined path does not give the same parts.
     if len(parts) != 2 or not all(
         _valid_part(p) and "--" not in p and not p.endswith("-") for p in parts
     ):
@@ -208,7 +208,7 @@ class WeightCache:
                     try:
                         shutil.rmtree(revision_dir)
                     except OSError as exc:
-                        log.warning("could not delete %s: %s", revision_dir, exc)
+                        log.warning("the delete of %s failed: %s", revision_dir, exc)
                 try:
                     model_dir.rmdir()  # only an empty directory goes
                 except OSError:
@@ -269,7 +269,7 @@ class WeightCache:
         try:
             files = self._read_manifest(marker)
         except Exception as exc:  # noqa: BLE001
-            log.warning("could not read the marker %s: %s", marker, exc)
+            log.warning("the read of the marker %s failed: %s", marker, exc)
             return None
         if files is None:
             return None

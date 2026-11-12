@@ -15,7 +15,7 @@ class ServiceUnreachable(Exception):
     """The service did not answer, or it answered with a body that is not JSON.
 
     `sent` is True when the service got the request but did not answer in
-    time. The action of the request may still finish then.
+    time. The action of the request can still finish then.
     """
 
     def __init__(self, message: str, sent: bool = False) -> None:

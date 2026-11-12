@@ -95,7 +95,7 @@ An acting user has access in these cases:
 
 Without `LLM_ACCESS_GROUP`, only admins have access. This matches the access list that `deploy.py` builds: without the group, only the deploying user has access.
 
-The group members are cached for 60 seconds, with the same class that caches the admin group. After a failed lookup, the class keeps the last known members for 10 seconds. Without known members, a failed lookup means no access. The same rule applies to the admin group.
+The group members are cached for 60 seconds, with the same class that caches the admin group. A failed lookup means no access, and the service tries again after 10 seconds. The same rule applies to the admin group. The owner stays an admin, because that check needs no lookup.
 
 ## The app backend
 
