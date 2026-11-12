@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from llm_service.admin_app.chat import ChatError, chat_request
-from llm_service.admin_app.client import ServiceClient, ServiceUnreachable
+from llm_service.admin_app.client import ServiceClient, ServiceUnreachable, retry_after_headers
 from llm_service.admin_app.registry import BlobManualStore, Registry, platform_listing, valid_name
 from llm_service.admin_app.usage_merge import SUM_FIELDS, merge_rows, own_rows
 from llm_service.gateway.identity import user_from_headers
@@ -113,9 +113,9 @@ def _error(status: int, code: str, message: str, kind: str = "server_error") -> 
     return JSONResponse({"error": {"message": message, "type": kind, "code": code}}, status_code=status)
 
 
-def _reply(result: tuple[int, object]) -> JSONResponse:
-    status, body = result
-    return JSONResponse(body, status_code=status)
+def _reply(result: tuple[int, object] | tuple[int, object, dict[str, str]]) -> JSONResponse:
+    status, body = result[0], result[1]
+    return JSONResponse(body, status_code=status, headers=result[2] if len(result) > 2 else None)
 
 
 def _query(request: Request, names: tuple[str, ...]) -> dict:
@@ -244,8 +244,10 @@ def create_app(
 
     async def fetch(
         request: Request, name: str, method: str, path: str, action: bool = False, **options
-    ) -> tuple[int, object] | JSONResponse:
+    ) -> tuple[int, object, dict[str, str]] | JSONResponse:
         """Call the service `name` for the viewer. Return the answer, or an error response to send.
+
+        The answer is the status, the body and the headers to pass on.
 
         `action` marks a switch or a delete. It waits longer. Its timeout message
         says that the action can still finish.
@@ -258,7 +260,7 @@ def create_app(
             return refused
         try:
             timeout = ACTION_TIMEOUT_SECONDS if action else TIMEOUT_SECONDS
-            return await service.request(name, method, path, viewer, timeout=timeout, **options)
+            return await service.request_with_headers(name, method, path, viewer, timeout=timeout, **options)
         except ServiceUnreachable as error:
             return _error(502, "service_unreachable", TOO_SLOW if action and error.sent else UNREACHABLE)
 
@@ -424,7 +426,9 @@ def create_app(
                         await stack.aclose()
                         return _error(502, "service_unreachable", UNREACHABLE)
                     await stack.aclose()
-                    return JSONResponse(error_body, status_code=response.status_code)
+                    return JSONResponse(
+                        error_body, status_code=response.status_code, headers=retry_after_headers(response.headers)
+                    )
         except TimeoutError:
             log.warning("The chat call to the service %s passed the time limit before the answer started.", name)
             await stack.aclose()
@@ -468,6 +472,48 @@ def create_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             background=BackgroundTask(stack.aclose),
         )
+
+    @app.get("/api/services/{name}/limits")
+    async def limits(name: str, request: Request) -> JSONResponse:
+        return await call(request, name, "GET", "/admin/limits")
+
+    @app.get("/api/services/{name}/limits/me")
+    async def limits_of_me(name: str, request: Request) -> JSONResponse:
+        return await call(request, name, "GET", "/v1/limits/me")
+
+    @app.put("/api/services/{name}/limits/default")
+    async def set_default_limits(name: str, request: Request) -> JSONResponse:
+        if not _is_json(request):
+            return _error(
+                415, "unsupported_media_type", "The request body must be application/json.", "invalid_request_error"
+            )
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
+        return await call(request, name, "PUT", "/admin/limits/default", json=body)
+
+    @app.put("/api/services/{name}/limits/users/{user:path}")
+    async def set_user_limits(name: str, user: str, request: Request) -> JSONResponse:
+        path = _service_path("/admin/limits/users/", user)
+        if path is None or "/" in user:
+            return _error(400, "invalid_user", "The user name is not valid.", "invalid_request_error")
+        if not _is_json(request):
+            return _error(
+                415, "unsupported_media_type", "The request body must be application/json.", "invalid_request_error"
+            )
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
+        return await call(request, name, "PUT", path, json=body)
+
+    @app.delete("/api/services/{name}/limits/users/{user:path}")
+    async def delete_user_limits(name: str, user: str, request: Request) -> JSONResponse:
+        path = _service_path("/admin/limits/users/", user)
+        if path is None or "/" in user:
+            return _error(400, "invalid_user", "The user name is not valid.", "invalid_request_error")
+        return await call(request, name, "DELETE", path)
 
     @app.delete("/api/services/{name}/models/{model_id:path}")
     async def delete_model(name: str, model_id: str, request: Request) -> JSONResponse:

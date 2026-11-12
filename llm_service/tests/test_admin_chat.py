@@ -227,6 +227,24 @@ def test_the_service_error_passes_through(client, backend):
     assert response.json() == error
 
 
+def test_retry_after_of_a_429_passes_through(client, backend):
+    error = {"error": {"message": "slow", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}
+    backend.build = lambda request: httpx.Response(429, json=error, headers={"Retry-After": "17", "X-Other": "yes"})
+    response = post(client)
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "17"
+    assert "x-other" not in response.headers
+    assert response.json() == error
+
+
+@pytest.mark.parametrize("value", ["soon", "123456"])
+def test_a_bad_retry_after_is_dropped_in_the_chat_route(client, backend, value):
+    backend.build = lambda request: httpx.Response(429, json={"error": {}}, headers={"Retry-After": value})
+    response = post(client)
+    assert response.status_code == 429
+    assert "retry-after" not in response.headers
+
+
 def test_a_403_of_the_service_passes_through(client, backend):
     error = {"error": {"message": "no access", "type": "permission_error", "code": "access_denied"}}
     backend.build = lambda request: httpx.Response(403, json=error)

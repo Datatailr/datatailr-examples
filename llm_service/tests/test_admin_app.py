@@ -28,6 +28,7 @@ class FakeService:
         self.admins = set(admins)
         self.users = set(users)  # users with access who are not admins
         self.answers: dict[tuple[str, str], tuple[int, object]] = {}
+        self.answer_headers: dict[tuple[str, str], dict[str, str]] = {}
         self.error: Exception | None = None
         self.raw: bytes | None = None
         self.caller_admin = True
@@ -61,7 +62,7 @@ class FakeService:
             return httpx.Response(200, content=self.raw)
         if (request.method, path) in self.answers:
             status, body = self.answers[(request.method, path)]
-            return httpx.Response(status, json=body)
+            return httpx.Response(status, json=body, headers=self.answer_headers.get((request.method, path)))
         if path == "/v1/service":
             return httpx.Response(200, json=self.descriptor(request.headers.get("X-LLM-Acting-User")))
         return httpx.Response(200, json={})
@@ -1336,3 +1337,94 @@ def test_page_shows_no_stale_model_after_a_fresh_answer():
     script = (STATIC_DIR / "app.js").read_text()
     assert "showConnect(service, activeModel(answer), entry.engine)" in script
     assert "activeModel(answer) || entry.model" not in script
+
+
+LIMITS_BODY = {"default": {"requests_per_minute": 5}, "users": {"bob": {"tokens_per_day": 9}}}
+ERROR_429 = {"error": {"message": "slow down", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}
+
+LIMIT_ROUTES = [
+    ("GET", "/api/services/svc-two/limits", None, "GET", "/admin/limits"),
+    ("PUT", "/api/services/svc-two/limits/default", {"requests_per_minute": 3}, "PUT", "/admin/limits/default"),
+    ("PUT", "/api/services/svc-two/limits/users/carol", {"tokens_per_day": 7}, "PUT", "/admin/limits/users/carol"),
+    ("DELETE", "/api/services/svc-two/limits/users/carol", None, "DELETE", "/admin/limits/users/carol"),
+    ("GET", "/api/services/svc-two/limits/me", None, "GET", "/v1/limits/me"),
+]
+
+
+@pytest.mark.parametrize("method,route,body,service_method,service_path", LIMIT_ROUTES)
+def test_each_limits_route_reaches_its_service_endpoint(client, fakes, method, route, body, service_method, service_path):
+    fakes.hosts["svc-two"].answers[(service_method, service_path)] = (200, LIMITS_BODY)
+    response = client.request(method, route, json=body, headers=ALICE)
+    assert response.status_code == 200
+    assert response.json() == LIMITS_BODY
+    sent = fakes.calls()
+    assert len(sent) == 1
+    assert (sent[0].url.host, sent[0].method, sent[0].url.path) == ("svc-two", service_method, service_path)
+    assert sent[0].headers["X-LLM-Acting-User"] == "alice"
+    assert sent[0].headers["Connection"] == "close"
+    if body is not None:
+        assert json.loads(sent[0].content) == body
+
+
+@pytest.mark.parametrize("route", ["/limits/default", "/limits/users/carol"])
+def test_the_limits_put_routes_need_json(client, fakes, route):
+    response = client.put("/api/services/svc/" + route.lstrip("/"), content=b"{}", headers={**ALICE, "Content-Type": "text/plain"})
+    assert response.status_code == 415
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize("route", ["/limits/default", "/limits/users/carol"])
+def test_the_limits_put_routes_need_valid_json(client, fakes, route):
+    response = client.put(
+        "/api/services/svc/" + route.lstrip("/"), content=b"{oops", headers={**ALICE, "Content-Type": "application/json"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_json"
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize("user", ["a%2Fb", "%2E", "%2E%2E", "%2Fx", "x%2F"])
+def test_a_bad_user_name_in_the_limits_routes_makes_no_call(client, fakes, user):
+    for method in ("PUT", "DELETE"):
+        response = client.request(method, f"/api/services/svc/limits/users/{user}", json={}, headers=ALICE)
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_user"
+    assert fakes.calls() == []
+
+
+def test_the_limits_routes_of_an_unknown_service_are_404(client, fakes):
+    for method, route, body, *_ in LIMIT_ROUTES:
+        response = client.request(method, route.replace("svc-two", "nope"), json=body, headers=ALICE)
+        assert response.status_code == 404
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize("status,error", [(403, ERROR_403), (429, ERROR_429)])
+def test_a_limits_error_of_the_service_passes_through(client, fakes, status, error):
+    fakes.hosts["svc-two"].answers[("GET", "/admin/limits")] = (status, error)
+    response = client.get("/api/services/svc-two/limits", headers=ALICE)
+    assert response.status_code == status
+    assert response.json() == error
+
+
+def test_retry_after_of_a_service_429_reaches_the_client(client, fakes):
+    fakes.hosts["svc-two"].answers[("GET", "/v1/limits/me")] = (429, ERROR_429)
+    fakes.hosts["svc-two"].answer_headers[("GET", "/v1/limits/me")] = {"Retry-After": "17", "X-Other": "yes"}
+    response = client.get("/api/services/svc-two/limits/me", headers=ALICE)
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "17"
+    assert "x-other" not in response.headers
+
+
+@pytest.mark.parametrize("value", ["soon", "123456", "-1", "1.5", "", "1 2", "Wed, 21 Oct 2026 07:28:00 GMT"])
+def test_a_retry_after_that_is_not_1_to_5_digits_is_dropped(client, fakes, value):
+    fakes.hosts["svc-two"].answers[("GET", "/v1/limits/me")] = (429, ERROR_429)
+    fakes.hosts["svc-two"].answer_headers[("GET", "/v1/limits/me")] = {"Retry-After": value}
+    response = client.get("/api/services/svc-two/limits/me", headers=ALICE)
+    assert response.status_code == 429
+    assert "retry-after" not in response.headers
+
+
+def test_a_response_without_retry_after_has_none(client, fakes):
+    fakes.hosts["svc-two"].answers[("GET", "/v1/limits/me")] = (429, ERROR_429)
+    assert "retry-after" not in client.get("/api/services/svc-two/limits/me", headers=ALICE).headers
