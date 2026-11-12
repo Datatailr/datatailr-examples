@@ -382,7 +382,7 @@ An admin protects the service from one heavy user with limits. A limit is a maxi
 | `tokens_per_day` | The total tokens of the user in the current UTC day. |
 | `parallel_requests` | The requests of the user in flight now. |
 
-Each value is null or a whole number from 1 to 1,000,000,000. Null means no limit. The value 0 is not valid. To block a user, set `requests_per_minute` to 1, or remove the access of the user on the platform.
+Each value is null or a whole number from 1 to 1,000,000,000. Null means no limit. The value 0 is not valid. To block a user, an admin removes the access of the user on the platform.
 
 The limits apply to `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. They apply to the effective user, so a request from the testing area of the app counts for the viewer.
 
@@ -394,9 +394,9 @@ The service looks up the limits of a user in this order:
 2. For an admin without an entry: no limit.
 3. For each other user: the default.
 
-Without a limits file, no user has a limit, and the service works as before. The service keeps the limits in `limits.json` under `LLM_BLOB_ROOT`. It reads the file at the start. A broken file means no limits, and the service logs an error. The next change of the limits through the API replaces the broken file.
+Without a limits file, no user has a limit, and the service works as before. The service keeps the limits in `limits.json` under `LLM_BLOB_ROOT`. It reads the file at the start. A broken file means no limits, and the service logs an error. The next PUT through the API replaces the broken file. A DELETE of an entry on a broken file gets 404 and writes nothing.
 
-If the read at the start fails because of a storage error, the service also applies no limits. Each change then gets 502 `storage_unavailable` until a read works. The service reads the file again at each change.
+If the read at the start fails because of a storage error, the service also applies no limits. Each change then gets 502 `storage_unavailable` until a read works. The service reads the file again at each change, but only while the last read failed.
 
 ### The 429 answer
 
@@ -459,7 +459,8 @@ curl -X DELETE http://llm-service/admin/limits/users/alice
 
 The errors are:
 
-- 400 `invalid_limit`: the body has an unknown field, a wrong type or a number outside the range.
+- 400 `invalid_limit`: the body is not JSON, or it has an unknown field, a wrong type or a number outside the range. The default body lacks a field, or the body of a user is empty.
+- 400 `invalid_user`: the user name is longer than 256 characters or has a control character.
 - 403: the caller is not an admin.
 - 404 `limit_not_found`: the user has no entry. This applies to the delete.
 - 502 `storage_unavailable`: the service cannot read or write the limits file.
@@ -572,7 +573,7 @@ The first start after the upgrade reads every old layout file of the days withou
 - A late record for a day whose daily usage file exists counts in memory at once. The service writes it to the daily file at the next flusher cycle. A crash between the two loses it from the usage totals.
 - Token counts for a stream come from the last chunk. The service asks vLLM for that chunk. It removes the chunk again if the client did not ask for it.
 - The token budget passes by the size of the requests in flight. The service checks `tokens_per_day` before a request, and the service knows the tokens of a request only at its end. So a user can pass the budget with parallel requests. The next request is refused.
-- A restart of the service clears the request window and the parallel counter. The token budget stays, because it comes from the usage totals.
+- A restart of the service clears the request window and the parallel counter. The token budget stays, because it comes from the usage totals. A crash can lose the tokens of the last seconds, as it does for the usage numbers.
 - The limits are for each service. Each service has its own limits file, and the app shows the limits of the picked service.
 - The platform does not start GPU nodes. You must start one.
 
