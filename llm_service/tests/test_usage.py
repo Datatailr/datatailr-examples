@@ -858,3 +858,17 @@ def test_tokens_today_matches_the_full_scan_after_the_day_changes():
     assert usage.tokens_today("alice") == 40
     audit.add(rec("alice", T3, prompt=1, completion=1))
     assert usage.tokens_today("alice") == 42 == _scan(usage, "alice")
+
+
+def test_tokens_today_matches_the_totals_with_two_file_rows_of_one_user_and_model():
+    store, audit, _, _ = make(today=D2)
+    audit.add(rec("alice", T2))
+    audit.flush()
+    row = {"user": "alice", "model": "m1", "requests": 1, "failed_requests": 0, "prompt_tokens": 10,
+           "completion_tokens": 5, "last_request": T2}
+    rows = [{**row, "total_tokens": 15}, {**row, "total_tokens": 7}]
+    store.put(f"{ROOT}/usage/{D2}.json", json.dumps({"day": D2, "rows": rows}))
+    _, _, usage, _ = make(today=D2, store=store)
+    usage.tokens_today("alice")  # the running total of the day exists before the load
+    usage.load()
+    assert usage.tokens_today("alice") == _scan(usage, "alice") == 7

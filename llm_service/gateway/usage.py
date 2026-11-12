@@ -183,11 +183,16 @@ class UsageTotals:
             _add(entry, row)
             self._totals[(day, row["user"], row["model"])] = entry
         if day == self._tokens_day:
-            self._day_tokens = {}
-            for row in rows:
-                self._count_tokens(row["user"], row["total_tokens"])
+            self._rebuild_day_tokens()
         if self._newest is None or day > self._newest:
             self._newest = day
+
+    def _rebuild_day_tokens(self) -> None:
+        """Build the running totals of `_tokens_day` from the entries of `_totals`. Hold the lock."""
+        self._day_tokens = {}
+        for (day, name, _), entry in self._totals.items():
+            if day == self._tokens_day:
+                self._count_tokens(name, entry["total_tokens"])
 
     def _count_tokens(self, user: str, tokens: int) -> None:
         """Add `tokens` to the running total of `user` on `_tokens_day`. Hold the lock."""
@@ -398,10 +403,7 @@ class UsageTotals:
         with self._lock:
             if today != self._tokens_day:
                 self._tokens_day = today
-                self._day_tokens = {}
-                for (day, name, _), entry in self._totals.items():
-                    if day == today:
-                        self._count_tokens(name, entry["total_tokens"])
+                self._rebuild_day_tokens()
             return self._day_tokens.get(user, 0)
 
     def summary(

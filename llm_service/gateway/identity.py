@@ -68,6 +68,7 @@ class AdminCheck:
     The group members are cached for `ttl` seconds. A failed lookup gives no
     members, and the next lookup comes 10 seconds later at the earliest.
     One thread at a time refreshes the group. The other callers use the last members meanwhile.
+    Before the first lookup ends, they wait for its result.
     """
 
     def __init__(
@@ -86,7 +87,7 @@ class AdminCheck:
         self._cached: set[str] = set()
         self._fetched_at: float | None = None
         self._failed_at: float | None = None
-        self._lock = threading.Lock()  # guards the cache fields, never held for a lookup
+        self._lock = threading.Condition()  # guards the cache fields, never held for a lookup
         self._refreshing = False
 
     def is_admin(self, user: str) -> bool:
@@ -109,6 +110,10 @@ class AdminCheck:
             if self._failed_at is not None and now - self._failed_at < FAILED_LOOKUP_SECONDS:
                 return set()
             if self._refreshing:  # another thread looks the group up now
+                # Without an earlier lookup there are no last members, so wait for this one.
+                if self._fetched_at is None and self._failed_at is None:
+                    while self._refreshing:
+                        self._lock.wait()
                 return self._cached
             self._refreshing = True
         members: set[str] | None = None
@@ -127,6 +132,7 @@ class AdminCheck:
                     self._cached = members
                     self._fetched_at = now
                     self._failed_at = None
+                self._lock.notify_all()
         return members if members is not None else set()
 
 

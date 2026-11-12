@@ -236,6 +236,8 @@ fieldset.choice legend { float: left; margin-right: 8px; color: var(--muted); fo
 .limit-form + .caption { margin-top: 10px; }
 #limits-user { width: 200px; }
 #limits-body td.muted { font-style: italic; }
+/* The column titles of the users table wrap, so the table fits a wide window without a scroll. */
+#limits-cards .grid thead th { white-space: normal; vertical-align: bottom; }
 
 /* ---- dialogs */
 

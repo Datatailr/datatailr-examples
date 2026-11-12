@@ -61,6 +61,7 @@ class LimitStore:
         self._default: dict | None = None
         self._users: dict[str, dict] = {}
         self._loaded = False  # False after a read that failed for a reason other than content
+        self._read_error: str | None = None  # the text of the last read error, None after a good read
 
     def load(self) -> None:
         """Read the file. A missing or broken file means no limits.
@@ -77,10 +78,15 @@ class LimitStore:
             raw = self._store.get(self._path)
         except KeyError:
             default, users = None, {}
+            self._read_error = None
         except Exception as exc:  # noqa: BLE001
-            logger.error("cannot read %s, no limits apply: %s", self._path, exc)
+            # A lasting error logs one line. A new text or a good read in between logs again.
+            if str(exc) != self._read_error:
+                logger.error("cannot read %s, no limits apply: %s", self._path, exc)
+            self._read_error = str(exc)
             default, users, loaded = None, {}, False
         else:
+            self._read_error = None
             try:
                 default, users = self._parse(raw)
             except (ValueError, TypeError, RecursionError) as exc:

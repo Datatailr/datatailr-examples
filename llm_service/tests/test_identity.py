@@ -1,4 +1,5 @@
 import sys
+import time
 import types
 
 import pytest
@@ -269,3 +270,73 @@ def test_the_acting_user_header_uses_the_same_rules_with_its_own_words():
         acting_user_from_headers({"X-LLM-Acting-User": "x" * 257})
     with pytest.raises(ValueError, match="the acting user name has a control character"):
         acting_user_from_headers({"X-LLM-Acting-User": "a\x00b"})
+
+
+def _first_lookup_race(fail):
+    """Start a first lookup that waits, then 8 callers. Return the lookups, the answers and the first answer."""
+    import threading
+
+    calls = []
+    started, release = threading.Event(), threading.Event()
+
+    def members(group):
+        calls.append(group)
+        started.set()
+        release.wait(10)
+        if fail:
+            raise RuntimeError("kv down")
+        return ["carol"]
+
+    check = AdminCheck("alice", "llm-admins", members, clock=lambda: 0.0)
+    first_answer = []
+    first = threading.Thread(target=lambda: first_answer.append(check.is_admin("carol")))
+    first.start()
+    assert started.wait(10)
+    answers = []
+    others = [threading.Thread(target=lambda: answers.append(check.is_admin("carol"))) for _ in range(8)]
+    for thread in others:
+        thread.start()
+    time.sleep(0.1)
+    assert answers == []  # the callers wait for the first lookup
+    release.set()
+    for thread in [first, *others]:
+        thread.join(10)
+    return calls, answers, first_answer
+
+
+def test_the_callers_wait_for_the_first_lookup_and_get_its_members():
+    calls, answers, first = _first_lookup_race(fail=False)
+    assert len(calls) == 1
+    assert first == [True] and answers == [True] * 8
+
+
+def test_the_callers_wake_when_the_first_lookup_fails_and_get_no_members():
+    calls, answers, first = _first_lookup_race(fail=True)
+    assert len(calls) == 1
+    assert first == [False] and answers == [False] * 8
+
+
+def test_a_refresh_after_a_failure_gives_the_other_callers_no_members_at_once():
+    import threading
+
+    calls, now = [], [0.0]
+    started, release = threading.Event(), threading.Event()
+
+    def members(group):
+        calls.append(group)
+        if len(calls) == 1:
+            raise RuntimeError("kv down")
+        started.set()
+        release.wait(10)
+        return ["carol"]
+
+    check = AdminCheck("alice", "llm-admins", members, clock=lambda: now[0])
+    assert not check.is_admin("carol")
+    now[0] = 11.0
+    first = threading.Thread(target=check.is_admin, args=("carol",))
+    first.start()
+    assert started.wait(10)
+    assert not check.is_admin("carol")  # no wait, no members
+    release.set()
+    first.join(10)
+    assert check.is_admin("carol") and len(calls) == 2

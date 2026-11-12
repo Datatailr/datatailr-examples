@@ -428,3 +428,34 @@ def test_retry_load_never_raises(caplog):
     limits._load = lambda: 1 / 0  # an error that the read itself does not catch
     assert limits.retry_load() is False
     assert limits.loaded() is False
+
+
+def test_a_lasting_read_error_logs_one_line_until_its_text_changes_or_a_read_works(caplog):
+    class Errors(MemoryBlobStore):
+        error = "storage down"
+
+        def get(self, path):
+            if self.error:
+                raise OSError(self.error)
+            return super().get(path)
+
+    store = Errors()
+    limits = LimitStore(store, ROOT)
+
+    def errors():
+        return [r for r in caplog.records if r.levelno == logging.ERROR]
+
+    with caplog.at_level(logging.ERROR):
+        limits.load()
+        for _ in range(3):
+            assert limits.retry_load() is False
+        assert len(errors()) == 1
+        store.error = "timeout"
+        limits.retry_load()
+        limits.retry_load()
+        assert len(errors()) == 2 and "timeout" in errors()[-1].getMessage()
+        store.error = None
+        assert limits.retry_load() is True
+        store.error = "timeout"
+        limits.load()
+        assert len(errors()) == 3  # a good read came between
