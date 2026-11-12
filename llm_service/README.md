@@ -140,6 +140,17 @@ print(reply.choices[0].message.content)
 
 If you omit `model`, the service uses the model that it serves now. If you name another model, the service returns the error `model_not_found` with status 404.
 
+### A conversation in the terminal
+
+The service keeps no memory between requests. The script `chat.py` keeps the conversation and sends it with each request, so the model sees all earlier turns.
+
+```bash
+pip install openai
+python chat.py
+```
+
+Type a prompt and press Enter. The command `/reset` starts a new conversation. The top of the file lists the environment variables, for example `LLM_MODEL` and `LLM_SYSTEM_PROMPT`.
+
 ## Use from outside Datatailr
 
 A client outside the platform must send an API token of a platform user. The platform edge reads the token from the `__datatailr_user_cookie__` cookie. It does not read the `Authorization: Bearer` header.
