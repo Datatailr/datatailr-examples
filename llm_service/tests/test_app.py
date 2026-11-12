@@ -1332,3 +1332,80 @@ def test_the_flusher_runs_while_a_merge_deletes_its_inputs(tmp_path):
     finally:
         store.release.set()
     assert path in store.ls("llm-service/usage")
+
+
+SERVICE = "/v1/service"
+
+
+def test_descriptor_for_a_plain_caller(tmp_path):
+    app = make_app(tmp_path, job_name="llm-service", environment="dev")
+    with TestClient(app) as c:
+        wait_ready(c)
+        r = c.get(SERVICE, headers=BOB)
+    assert r.status_code == 200
+    assert r.json() == {
+        "api": "datatailr-llm-service",
+        "api_version": 1,
+        "name": "llm-service",
+        "environment": "dev",
+        "state": "ready",
+        "model": "org/a",
+        "user": "bob",
+        "admin": False,
+        "caller_admin": False,
+    }
+
+
+def test_descriptor_names_default_to_unknown(client):
+    body = client.get(SERVICE, headers=BOB).json()
+    assert body["name"] == "unknown" and body["environment"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "headers, user, admin, caller_admin",
+    [
+        (ALICE, "alice", True, True),
+        (ALICE | {ACTING: "bob"}, "bob", False, True),
+        (ALICE | {ACTING: "carol"}, "carol", True, True),
+        (BOB, "bob", False, False),
+    ],
+)
+def test_descriptor_admin_flags(client, headers, user, admin, caller_admin):
+    body = client.get(SERVICE, headers=headers).json()
+    assert (body["user"], body["admin"], body["caller_admin"]) == (user, admin, caller_admin)
+    assert "acting_user" not in body
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        BOB | {ACTING: "alice"},
+        ALICE | {ACTING: "dave"},
+        ALICE | {ACTING: "bad\nname"},
+    ],
+)
+def test_descriptor_never_fails_on_the_acting_user(client, headers):
+    r = client.get(SERVICE, headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    caller = headers["X-Datatailr-User"]
+    assert body["acting_user"] == "refused"
+    assert body["user"] == caller
+    assert body["admin"] == body["caller_admin"] == (caller == "alice")
+
+
+def test_descriptor_model_is_null_while_nothing_is_served(tmp_path):
+    engine = GatedEngine({"org/a"})
+    try:
+        with TestClient(make_app(tmp_path, engine=engine)) as c:
+            body = c.get(SERVICE, headers=ALICE).json()
+            engine.gate.set()
+        assert body["model"] is None and body["state"] != "ready"
+    finally:
+        engine.gate.set()
+
+
+def test_descriptor_needs_a_platform_user(client):
+    r = client.get(SERVICE)
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "missing_user"

@@ -37,6 +37,9 @@ OPENAI_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings")
 MAX_AUDIT_LIMIT = 1000
 DAY_FORM = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
+SERVICE_API = "datatailr-llm-service"
+SERVICE_API_VERSION = 1
+
 
 class ApiError(Exception):
     """An error that becomes the OpenAI style error body."""
@@ -275,6 +278,32 @@ def create_app(
     @app.get("/health")
     async def health() -> PlainTextResponse:
         return PlainTextResponse("OK")
+
+    @app.get("/v1/service")
+    async def service_descriptor(request: Request, caller: str = Depends(current_user)) -> dict:
+        """Describe this service. A refused acting user never fails the call."""
+        refused = False
+        try:
+            user = await resolve_effective(request, caller)
+        except ApiError:
+            user, refused = caller, True
+        user_admin = await asyncio.to_thread(admin.is_admin, user)
+        caller_admin = user_admin if user == caller else await asyncio.to_thread(admin.is_admin, caller)
+        serving = manager.serving
+        body = {
+            "api": SERVICE_API,
+            "api_version": SERVICE_API_VERSION,
+            "name": config.job_name,
+            "environment": config.environment,
+            "state": manager.status()["state"],
+            "model": serving["model"] if serving else None,
+            "user": user,
+            "admin": user_admin,
+            "caller_admin": caller_admin,
+        }
+        if refused:
+            body["acting_user"] = "refused"
+        return body
 
     # OpenAI API
 

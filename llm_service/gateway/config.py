@@ -40,6 +40,8 @@ class Config:
     flush_interval: float = 5.0
     flush_size: int = 100
     prompt_retention_days: int | None = None
+    job_name: str = "unknown"
+    environment: str = "unknown"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Config":
@@ -55,4 +57,6 @@ class Config:
             local_dir=Path(env.get("LLM_LOCAL_DIR") or "/tmp/llm-service"),
             engine_port=int(env.get("LLM_ENGINE_PORT") or 8001),
             prompt_retention_days=_retention_days(env.get("LLM_PROMPT_RETENTION_DAYS")),
+            job_name=env.get("DATATAILR_JOB_NAME") or cls.job_name,
+            environment=env.get("DATATAILR_JOB_ENVIRONMENT") or cls.environment,
         )
