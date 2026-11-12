@@ -624,7 +624,7 @@ function examples(name, model) {
 function showConnect(name, model, engine) {
   const outside = outsideBaseUrl(name);
   $('conn-internal').textContent = internalBaseUrl(name);
-  $('conn-outside').textContent = outside || 'Known only on the platform';
+  $('conn-outside').textContent = outside || 'The page knows this URL only on the platform.';
   $('conn-outside-note').hidden = Boolean(outside);
   $('conn-model').textContent = model || 'The service serves no model.';
   $('conn-engine').textContent = engine ? stateText(engine) : 'unknown';
@@ -723,6 +723,8 @@ async function streamChat(service, body, signal, onText) {
   }
   if (!response.ok) {
     const data = await response.json().catch(() => null);
+    // A stop during the read of the error body is a stop, not an error of the service.
+    if (signal.aborted) throw new DOMException('You stopped the answer.', 'AbortError');
     const message = data && data.error && data.error.message;
     throw new ApiError(typeof message === 'string' ? message : `The admin app answered ${response.status}.`);
   }
@@ -730,36 +732,41 @@ async function streamChat(service, body, signal, onText) {
   const decoder = new TextDecoder();
   let rest = '';
   let usage = null;
-  for (;;) {
-    let part;
-    try {
-      part = await reader.read();
-    } catch (error) {
-      if (error.name === 'AbortError') throw error;
-      throw new ApiError('The stream of the answer broke.');
-    }
-    rest += part.done ? decoder.decode() : decoder.decode(part.value, {stream: true});
-    const split = splitLines(part.done ? `${rest}\n` : rest);
-    rest = split.rest;
-    for (const line of split.lines) {
-      if (!line.startsWith('data:')) continue;
-      const data = line.slice(5).trim();
-      if (data === '[DONE]') return usage;
-      let chunk;
+  try {
+    for (;;) {
+      let part;
       try {
-        chunk = JSON.parse(data);
-      } catch {
-        continue;
+        part = await reader.read();
+      } catch (error) {
+        if (error.name === 'AbortError') throw error;
+        throw new ApiError('The stream of the answer broke.');
       }
-      if (chunk && chunk.error) {
-        const message = chunk.error.message;
-        throw new ApiError(typeof message === 'string' ? message : 'The service reported an error.');
+      rest += part.done ? decoder.decode() : decoder.decode(part.value, {stream: true});
+      const split = splitLines(part.done ? `${rest}\n` : rest);
+      rest = split.rest;
+      for (const line of split.lines) {
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') return usage;
+        let chunk;
+        try {
+          chunk = JSON.parse(data);
+        } catch {
+          continue;
+        }
+        if (chunk && chunk.error) {
+          const message = chunk.error.message;
+          throw new ApiError(typeof message === 'string' ? message : 'The service reported an error.');
+        }
+        if (chunk && chunk.usage) usage = chunk.usage;
+        const content = chunk?.choices?.[0]?.delta?.content;
+        if (typeof content === 'string' && content) onText(content);
       }
-      if (chunk && chunk.usage) usage = chunk.usage;
-      const content = chunk?.choices?.[0]?.delta?.content;
-      if (typeof content === 'string' && content) onText(content);
+      if (part.done) throw new ApiError('The stream ended before the service finished the answer.');
     }
-    if (part.done) throw new ApiError('The stream ended before the service finished the answer.');
+  } finally {
+    // Release the stream at each end: the last event, an error or a stop.
+    reader.cancel().catch(() => {});
   }
 }
 

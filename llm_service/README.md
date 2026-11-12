@@ -210,7 +210,7 @@ The header `X-LLM-Acting-User` applies to `/admin/*` and to these endpoints: `/v
 
 `GET /v1/service` never fails because of the header. If a rule fails there, the effective user is the caller and the body has `"acting_user": "refused"`.
 
-Usage numbers and audit records count the effective user. The service caches the members of `LLM_ACCESS_GROUP` for 60 seconds. A failed lookup means no access.
+Usage numbers and audit records count the effective user. The service caches the members of `LLM_ACCESS_GROUP` for 60 seconds. After a failed lookup, the service keeps the last known members for 10 seconds. Without known members, a failed lookup means no access.
 
 ## Switch the model
 

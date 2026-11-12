@@ -143,3 +143,39 @@ def test_access_group_members_are_cached_for_60_seconds():
     now[0] = 61
     check.has_access("bob")
     assert len(calls) == 2
+
+
+def test_a_failed_group_lookup_is_cached_for_10_seconds_and_keeps_the_last_members():
+    calls, now, failing = [], [0.0], [False]
+
+    def members(group):
+        calls.append(group)
+        if failing[0]:
+            raise RuntimeError("kv down")
+        return ["carol"]
+
+    check = AdminCheck("alice", "llm-admins", members, clock=lambda: now[0])
+    assert check.is_admin("carol") and len(calls) == 1
+    now[0], failing[0] = 61.0, True
+    assert check.is_admin("carol") and len(calls) == 2  # the last known members stay in use
+    now[0] = 70.0
+    assert check.is_admin("carol") and len(calls) == 2  # no new lookup within 10 seconds
+    now[0] = 72.0
+    assert check.is_admin("carol") and len(calls) == 3
+    now[0], failing[0] = 83.0, False
+    assert check.is_admin("carol") and len(calls) == 4
+
+
+def test_a_failed_first_lookup_means_no_members_for_10_seconds():
+    calls, now = [], [0.0]
+
+    def boom(group):
+        calls.append(group)
+        raise RuntimeError("kv down")
+
+    access = AccessCheck(AdminCheck("alice", None, boom), "team", boom, clock=lambda: now[0])
+    assert not access.has_access("bob") and calls == ["team"]
+    now[0] = 9.0
+    assert not access.has_access("bob") and calls == ["team"]
+    now[0] = 11.0
+    assert not access.has_access("bob") and calls == ["team", "team"]

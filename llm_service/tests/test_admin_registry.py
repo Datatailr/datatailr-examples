@@ -116,6 +116,12 @@ def test_service_url():
     assert service_url("llm-service") == "http://llm-service"
 
 
+@pytest.mark.parametrize("bad", ["evil.example.com", "a/b", "", "UP", "a" * 64, None])
+def test_service_url_refuses_a_bad_name(bad):
+    with pytest.raises(ValueError):
+        service_url(bad)
+
+
 def test_probe_sends_plain_get_with_connection_close(services, clock):
     probe_one(services, clock, (200, descriptor()))
     request = services.requests[0]
@@ -359,6 +365,19 @@ def test_add_manual_bad_name_raises_and_calls_nothing(services, clock, bad):
     assert reg.store.saved == []
 
 
+def test_add_and_remove_keep_only_valid_manual_names(services, clock):
+    services.answers["new"] = (200, descriptor())
+    reg = make(services, clock, manual=["old", "Bad.Name", "a/b"])
+    asyncio.run(reg.add_manual("new"))
+    assert reg.manual_names() == ["old", "new"]
+    reg.store.names = ["old", "Bad.Name", "new"]
+    assert asyncio.run(reg.remove_manual("new")) is True
+    assert reg.manual_names() == ["old"]
+    reg.store.names = ["old", "UP"]
+    assert asyncio.run(reg.remove_manual("missing")) is False
+    assert reg.manual_names() == ["old"]
+
+
 def test_remove_manual(services, clock):
     services.answers["man"] = (200, descriptor())
     reg = make(services, clock, manual=["man", "other"])
@@ -577,3 +596,64 @@ def test_unexpected_probe_error_is_unreachable_and_others_continue(services, clo
 
 def test_module_does_not_import_datatailr_at_import():
     assert "datatailr" not in vars(registry)
+
+
+def test_configured_and_manual_names_show_before_a_slow_listing(services, clock):
+    import threading
+
+    for name in ("conf", "man", "fnd"):
+        services.answers[name] = (200, descriptor(name=name))
+    release = threading.Event()
+    reg = make(services, clock, configured=["conf"], manual=["man"])
+
+    def slow_listing():
+        release.wait(10)
+        return ["fnd"]
+
+    reg._listing = slow_listing
+
+    async def go():
+        task = asyncio.create_task(reg.refresh())
+        try:
+            ready = await reg.wait_ready(5)
+            early = states(reg)
+        finally:
+            release.set()
+        await task
+        return ready, early
+
+    ready, early = asyncio.run(go())
+    assert ready is True
+    assert early == {"conf": ("configured", "ok"), "man": ("manual", "ok")}
+    assert states(reg) == {"conf": ("configured", "ok"), "fnd": ("found", "ok"), "man": ("manual", "ok")}
+
+
+def test_found_entries_stay_while_the_next_listing_runs(services, clock):
+    import threading
+
+    for name in ("conf", "fnd"):
+        services.answers[name] = (200, descriptor(name=name))
+    reg = make(services, clock, configured=["conf"], found=["fnd"])
+    refresh(reg)
+    release = threading.Event()
+    seen = []
+
+    def slow_listing():
+        release.wait(10)
+        return ["fnd"]
+
+    reg._listing = slow_listing
+
+    async def go():
+        task = asyncio.create_task(reg.refresh())
+        try:
+            while len(services.requests) < 3:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.01)
+            seen.append(states(reg))
+        finally:
+            release.set()
+        await task
+
+    asyncio.run(go())
+    assert seen == [{"conf": ("configured", "ok"), "fnd": ("found", "ok")}]

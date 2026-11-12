@@ -170,7 +170,8 @@ The platform checks the access of the caller at its edge. It cannot check the
 acting user, so the service does. An acting user has access if the user is an
 admin or a member of the group in `LLM_ACCESS_GROUP`. Without that variable,
 only admins have access. The gateway caches the group members for 60 seconds.
-A failed lookup means no access. `deploy.py` passes `LLM_ACCESS_GROUP` to the
+After a failed lookup, the gateway keeps the last known members for 10 seconds.
+Without known members, a failed lookup means no access. `deploy.py` passes `LLM_ACCESS_GROUP` to the
 service container.
 
 ### Outside clients

@@ -716,11 +716,10 @@ def test_non_admin_caller_with_acting_user_is_refused_on_v1(client, method, path
     kwargs = {"json": HI} if method == "post" else {}
     r = getattr(client, method)(path, headers=BOB | {ACTING: "bob"}, **kwargs)
     assert r.status_code == 403
-    assert r.json()["error"] == {
-        "message": r.json()["error"]["message"],
-        "type": "permission_error",
-        "code": "acting_user_not_allowed",
-    }
+    error = r.json()["error"]
+    assert set(error) == {"message", "type", "code"}
+    assert (error["type"], error["code"]) == ("permission_error", "acting_user_not_allowed")
+    assert isinstance(error["message"], str) and error["message"]
 
 
 @pytest.mark.parametrize("method, path", [("post", CHAT), ("get", "/v1/models"), ("get", "/v1/usage/me")])
@@ -1382,6 +1381,7 @@ def test_descriptor_admin_flags(client, headers, user, admin, caller_admin):
         BOB | {ACTING: "alice"},
         ALICE | {ACTING: "dave"},
         ALICE | {ACTING: "bad\nname"},
+        ALICE | {ACTING: "x" * 257},
     ],
 )
 def test_descriptor_never_fails_on_the_acting_user(client, headers):
@@ -1400,7 +1400,7 @@ def test_descriptor_model_is_null_while_nothing_is_served(tmp_path):
         with TestClient(make_app(tmp_path, engine=engine)) as c:
             body = c.get(SERVICE, headers=ALICE).json()
             engine.gate.set()
-        assert body["model"] is None and body["state"] != "ready"
+        assert body["model"] is None and body["state"] == "loading"
     finally:
         engine.gate.set()
 

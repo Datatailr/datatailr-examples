@@ -95,7 +95,7 @@ An acting user has access in these cases:
 
 Without `LLM_ACCESS_GROUP`, only admins have access. This matches the access list that `deploy.py` builds: without the group, only the deploying user has access.
 
-The group members are cached for 60 seconds, with the same class that caches the admin group. A failed lookup means no access.
+The group members are cached for 60 seconds, with the same class that caches the admin group. After a failed lookup, the class keeps the last known members for 10 seconds. Without known members, a failed lookup means no access. The same rule applies to the admin group.
 
 ## The app backend
 
@@ -122,13 +122,13 @@ A probe is one `GET /v1/service` call without an acting user, with a timeout of 
 
 A background task runs each 60 seconds:
 
-1. It builds the candidate names from three sources: the configured names, the manual names and the platform listing.
-2. It probes the candidates, 10 at a time.
-3. It replaces the registry in one step.
+1. It probes the configured names and the manual names, 10 at a time, and publishes them. The found entries of the last run stay.
+2. It runs the platform listing. This call can take 30 seconds.
+3. It probes the new names of the listing, 10 at a time, and replaces the registry in one step.
 
 A found name with the state `not_llm` or `unreachable` is not shown, and the task probes it again only after 10 minutes. Configured and manual names always show, with their state.
 
-The first run starts with the app. `GET /api/services` waits for the first run, for 10 seconds at most.
+The first run starts with the app. `GET /api/services` waits for step 1 of the first run, for 10 seconds at most. A slow listing does not hold the page.
 
 ### Sources of names
 
@@ -194,12 +194,14 @@ New routes:
 
 `GET /api/usage` takes the parameters `since`, `until`, `user`, `model`, `group_by` and `services`. `services` is a list of names with commas. Without it, the app uses all `ok` services to which the viewer has access.
 
+`since` and `until` are real days in the form `YYYY-MM-DD`. The app checks them before any call. Another value gets 400 `invalid_time`.
+
 For each service, the app picks the call by the role of the viewer:
 
 - The viewer is an admin of the service: `GET /admin/usage` with the parameters.
 - The viewer is not an admin: `GET /v1/usage/me` with `since` and `until`. The app turns the answer into rows of the same form, with the viewer as the only user.
 
-The calls run in parallel. The app adds the field `service` to each row and merges rows:
+The calls run in parallel. Each call has a total limit of 10 seconds. A slower service fails with `ok` false. For a viewer who is not an admin, a model filter by day needs no call, because the service has no such split. The app adds the field `service` to each row and merges rows:
 
 - `group_by=user`, `model` or `day`: rows with the same key from different services become one row. The app adds up the requests, the failed requests and the token counts.
 - `group_by=service`: one row for each service. This value exists only in the app. The app calls each service with `group_by=day` and adds up the rows.
@@ -283,7 +285,7 @@ Testing area:
 - Service: unit tests for the descriptor and for each rule of the effective user on a `/v1/*` endpoint. Other tests cover the access check with and without the group, and the `via` field of the audit record.
 - Registry: unit tests for each probe result, the three sources, a failed listing, the 10 minute pause and the name check.
 - App backend: tests with the FastAPI test client and fake services behind `httpx.MockTransport`. They cover the registry routes, the owner rule, each moved route and an unknown service. They cover the combined usage with an admin service, a non-admin service and a failed service. They cover the chat route with its limits and a stream.
-- The page has no automated test. Check it in a browser on a real installation: the picker, the combined usage, each example, the testing area, and a viewer who is not an admin.
+- The page has no automated test. Check it in a browser on a real installation. Check the picker, the combined usage, each example and the testing area. Also check a viewer who is not an admin.
 - First step of the work: make sure that `dt job ls` runs inside an app container. If it does not, the listing source stays off and the README says so.
 
 ## Known limits

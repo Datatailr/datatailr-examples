@@ -30,7 +30,9 @@ def valid_name(name: object) -> bool:
 
 
 def service_url(name: str) -> str:
-    """Return the internal URL of the service `name`."""
+    """Return the internal URL of the service `name`. Raise `ValueError` for a bad name."""
+    if not valid_name(name):
+        raise ValueError("The service name is not valid.")
     return "http://" + name
 
 
@@ -151,30 +153,42 @@ class Registry:
             await self._refresh()
 
     async def _refresh(self) -> None:
+        """Probe the configured and manual names and publish them. Then add the names of the listing.
+
+        The listing can take 30 seconds, so the first page load does not wait for it.
+        """
         manual = await self._load_manual()
-        found = await self._find()
         sources: dict[str, str] = {}
-        for source, names in (("found", found), ("manual", manual), ("configured", self._configured)):
+        for source, names in (("manual", manual), ("configured", self._configured)):
             for name in names:
                 sources[name] = source  # a later source has the higher priority
+        own = await self._probe_all(sorted(sources), sources)
+        # The found entries of the last refresh stay until the listing answers again.
+        kept = {n: e for n, e in self._entries.items() if e.source == "found" and n not in sources}
+        self._entries = {**kept, **{entry.name: entry for entry in own}}
+        self._ready.set()
+
+        found = [name for name in await self._find() if name not in sources]
         now = self._clock()
-        self._paused = {n: t for n, t in self._paused.items() if sources.get(n) == "found" and now - t < self._retry_after}
-        candidates = [n for n in sorted(sources) if n not in self._paused]
+        self._paused = {n: t for n, t in self._paused.items() if n in found and now - t < self._retry_after}
+        candidates = [n for n in sorted(set(found)) if n not in self._paused]
+        entries = {entry.name: entry for entry in own}
+        for entry in await self._probe_all(candidates, {name: "found" for name in candidates}):
+            if entry.state in ("not_llm", "unreachable"):
+                self._paused[entry.name] = entry.checked_at
+            else:
+                entries[entry.name] = entry
+        self._entries = entries
+
+    async def _probe_all(self, names: list[str], sources: dict[str, str]) -> list[Entry]:
+        """Probe `names`, at most `concurrency` at a time."""
         gate = asyncio.Semaphore(self._concurrency)
 
         async def probe(name: str) -> Entry:
             async with gate:
                 return await self._probe(name, sources[name])
 
-        probed = await asyncio.gather(*(probe(name) for name in candidates))
-        entries = {}
-        for entry in probed:
-            if entry.source == "found" and entry.state in ("not_llm", "unreachable"):
-                self._paused[entry.name] = entry.checked_at
-            else:
-                entries[entry.name] = entry
-        self._entries = entries
-        self._ready.set()
+        return await asyncio.gather(*(probe(name) for name in names))
 
     async def run(self, interval: float = 60.0) -> None:
         """Refresh every `interval` seconds. Log errors and keep going."""
@@ -182,7 +196,7 @@ class Registry:
             try:
                 await self.refresh()
             except Exception:
-                log.exception("The service registry could not refresh.")
+                log.exception("The refresh of the service registry failed.")
             self._ready.set()
             await asyncio.sleep(interval)
 
@@ -209,7 +223,7 @@ class Registry:
         if not valid_name(name):
             raise ValueError("The service name has 1 to 63 characters from a-z, 0-9 and -.")
         async with self._lock:
-            names = await asyncio.to_thread(self._manual_store.load)
+            names = [n for n in await asyncio.to_thread(self._manual_store.load) if valid_name(n)]
             if name not in names:
                 names = [*names, name]
                 await asyncio.to_thread(self._manual_store.save, names)
@@ -222,7 +236,7 @@ class Registry:
     async def remove_manual(self, name: str) -> bool:
         """Remove a manual name. Return False if it was not in the list."""
         async with self._lock:
-            names = await asyncio.to_thread(self._manual_store.load)
+            names = [n for n in await asyncio.to_thread(self._manual_store.load) if valid_name(n)]
             if name not in names:
                 self._manual = names
                 return False
@@ -238,7 +252,7 @@ class Registry:
         try:
             names = await asyncio.to_thread(self._manual_store.load)
         except Exception:
-            log.exception("The manual service list could not load.")
+            log.exception("The load of the manual service list failed.")
             return self._manual
         self._manual = [name for name in names if valid_name(name)]
         return self._manual

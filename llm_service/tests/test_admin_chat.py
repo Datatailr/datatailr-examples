@@ -51,6 +51,11 @@ def test_model_and_temperature_pass_and_other_keys_drop():
     }
 
 
+def test_the_limits_of_max_tokens_and_temperature_are_accepted():
+    built = chat_request({"messages": MESSAGES, "max_tokens": 1, "temperature": 2})
+    assert (built["max_tokens"], built["temperature"]) == (1, 2)
+
+
 def test_a_message_keeps_only_role_and_content():
     built = chat_request({"messages": [{"role": "system", "content": "x", "name": "n", "tool_calls": []}]})
     assert built["messages"] == [{"role": "system", "content": "x"}]
@@ -132,7 +137,9 @@ class ChatBackend:
 
     def __init__(self, fakes):
         self.fakes = fakes
-        self.build = lambda request: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=RecordedStream([SSE]))
+        self.build = lambda request: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=RecordedStream([SSE])
+        )
         self.chat_requests: list[httpx.Request] = []
 
     def __call__(self, request):
@@ -399,7 +406,7 @@ def test_a_gone_client_closes_the_response_of_the_service(registry, backend, mon
 
         await asyncio.wait_for(app(scope, receive, send), 10)
         assert held
-        # Check before asyncio.run closes the open generators, which would close the body too.
+        # Check before asyncio.run closes the open generators. That close also closes the body.
         assert body.closed
 
     asyncio.run(drive())

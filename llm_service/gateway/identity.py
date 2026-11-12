@@ -7,6 +7,7 @@ import time
 from typing import Callable, Mapping
 
 USER_HEADER = "x-datatailr-user"
+FAILED_LOOKUP_SECONDS = 10.0
 
 
 def user_from_headers(headers: Mapping[str, str]) -> str | None:
@@ -52,8 +53,8 @@ class AdminCheck:
     """Decide whether a user is an admin.
 
     The owner is always an admin. Members of the admin group are admins too.
-    The group members are cached for `ttl` seconds. A failed lookup means
-    that the user is not an admin.
+    The group members are cached for `ttl` seconds. After a failed lookup, the
+    last known members stay in use for 10 seconds, or no members if there are none.
     """
 
     def __init__(
@@ -71,6 +72,7 @@ class AdminCheck:
         self._clock = clock
         self._cached: set[str] = set()
         self._fetched_at: float | None = None
+        self._failed_at: float | None = None
 
     def is_admin(self, user: str) -> bool:
         """Return True when the user is the owner or an admin group member."""
@@ -86,11 +88,16 @@ class AdminCheck:
         now = self._clock()
         if self._fetched_at is not None and now - self._fetched_at < self._ttl:
             return self._cached
+        # A failed lookup waits 10 seconds, so a slow group service does not get a call for each request.
+        if self._failed_at is not None and now - self._failed_at < FAILED_LOOKUP_SECONDS:
+            return self._cached
         try:
             self._cached = set(self._members(self._group))
         except Exception:
-            return set()
+            self._failed_at = now
+            return self._cached
         self._fetched_at = now
+        self._failed_at = None
         return self._cached
 
 
@@ -99,7 +106,7 @@ class AccessCheck:
 
     An admin has access. A member of `group` has access too. Without a group, only
     admins have access. The group members are cached for `ttl` seconds. A failed
-    lookup means no access.
+    lookup keeps the last known members for 10 seconds, or no members if there are none.
     """
 
     def __init__(

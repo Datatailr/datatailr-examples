@@ -126,6 +126,11 @@ def service(fakes):
     return fakes.hosts["svc"]
 
 
+async def _refresh_done(registry):
+    async with registry._lock:
+        pass
+
+
 @pytest.fixture
 def make_client(fakes, registry):
     clients = []
@@ -136,6 +141,8 @@ def make_client(fakes, registry):
         test_client.__enter__()
         clients.append(test_client)
         test_client.portal.call(registry.wait_ready, 10.0)
+        # The first refresh publishes the configured names before the listing ends. Wait for its end.
+        test_client.portal.call(_refresh_done, registry)
         fakes.requests.clear()
         for fake in fakes.hosts.values():
             fake.requests.clear()
@@ -263,7 +270,7 @@ def test_a_role_answer_that_is_not_200_is_an_error_and_not_no_access(client, fak
     assert (first["access"], first["role_error"]) == (None, "The service did not answer.")
 
 
-def test_a_refused_acting_user_stays_no_access(client, fakes):
+def test_a_refused_acting_user_stays_no_access(client):
     first = client.get("/api/services", headers=CAROL).json()["services"][0]
     assert (first["access"], first["admin"]) == (False, False)
     assert "role_error" not in first
@@ -321,7 +328,7 @@ def test_post_adds_and_probes_a_name(client, fakes, store):
     assert client.get("/api/services/extra/audit", headers=ALICE).status_code == 200
 
 
-def test_an_empty_owner_matches_no_one(make_client, store):
+def test_an_empty_owner_matches_no_one(make_client):
     client = make_client(owner="")
     assert client.post("/api/services", json={"name": "extra"}, headers=ALICE).status_code == 403
     assert client.delete("/api/services/extra", headers=ALICE).status_code == 403
@@ -364,19 +371,19 @@ def test_delete_removes_a_manual_name(client, fakes, store):
     assert client.get("/api/services/extra/audit", headers=ALICE).status_code == 404
 
 
-def test_delete_of_a_name_that_is_not_manual_is_404(client, store):
+def test_delete_of_a_name_that_is_not_manual_is_404(client):
     response = client.delete("/api/services/svc", headers=ALICE)
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "unknown_service"
 
 
-def test_delete_with_a_bad_name_is_400(client, store):
+def test_delete_with_a_bad_name_is_400(client):
     response = client.delete("/api/services/Evil.Name", headers=ALICE)
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_service"
 
 
-def test_delete_is_for_the_owner_only(client, store):
+def test_delete_is_for_the_owner_only(client):
     assert client.delete("/api/services/svc", headers=BOB).status_code == 403
 
 
@@ -680,7 +687,7 @@ def test_connect_tab_comes_after_usage():
 
 @pytest.mark.parametrize(
     "element_id, attributes",
-    [("chat-temperature", ('min="0"', 'max="2"', 'step="0.1"', 'value="0.7"')),
+    [("chat-temperature", ('min="0"', 'max="2"', 'step="any"', 'value="0.7"')),
      ("chat-max-tokens", ('min="1"', 'max="4096"', 'step="1"', 'value="512"'))],
 )
 def test_chat_fields_have_the_limits_of_the_app(element_id, attributes):
@@ -704,6 +711,16 @@ def test_page_streams_the_answer_with_stop():
     text = (STATIC_DIR / "app.js").read_text()
     for name in ("new AbortController()", ".abort()", "getReader()", "'[DONE]'", "delta"):
         assert name in text, name
+
+
+def test_page_cancels_the_reader_and_reports_a_stop_before_an_error_body():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("async function streamChat("):text.index("function chatTurn(")]
+    assert re.search(r"finally \{\s*(//[^\n]*\s*)?reader\.cancel\(\)", body)
+    assert "if (signal.aborted)" in body
+    assert body.index("if (signal.aborted)") < body.index("data.error.message")
+    assert "The page knows this URL only on the platform." in text
+    assert "Known only on the platform" not in text
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
@@ -910,7 +927,7 @@ def test_default_app_reads_the_environment():
 
 
 def test_default_app_without_variables_has_no_services():
-    # No lifespan here: it would start the real store and the real platform listing.
+    # No lifespan here. A lifespan starts the real store and the real platform listing.
     built = default_app({})
     assert built.state.registry._configured == []
     assert built.state.owner == ""
@@ -1133,18 +1150,50 @@ def test_usage_an_unexpected_error_fails_one_service_only(client, fakes, monkeyp
     assert [s["ok"] for s in body["services"]] == [True, False]
 
 
-def test_usage_a_slow_service_times_out_after_30_seconds(client, fakes, monkeypatch):
-    seen = []
-    real = asyncio.wait_for
+def test_usage_a_hanging_service_times_out_and_the_others_merge(client, fakes, monkeypatch):
+    assert app_module.USAGE_TIMEOUT_SECONDS == 10.0
+    monkeypatch.setattr(app_module, "USAGE_TIMEOUT_SECONDS", 0.05)
+    original = fakes.hosts["svc"]
 
-    async def spy(awaitable, timeout):
-        seen.append(timeout)
-        return await real(awaitable, timeout)
+    async def hang(request):
+        if request.url.path == "/admin/usage":
+            await asyncio.sleep(5)
+        return original(request)
 
-    monkeypatch.setattr(app_module.asyncio, "wait_for", spy)
+    fakes.hosts["svc"] = hang
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    started = time.monotonic()
+    response = client.get("/api/usage", headers=ALICE)
+    assert time.monotonic() - started < 2
+    assert response.status_code == 200
+    body = response.json()
+    assert body["services"] == [
+        {"name": "svc", "scope": "all", "ok": False, "error": "The LLM service did not answer in time."},
+        {"name": "svc-two", "scope": "own", "ok": True},
+    ]
+    assert [(r["user"], r["total_tokens"]) for r in body["data"]] == [("alice", 40)]
+
+
+def test_usage_sends_the_filters_to_an_admin_service(client, fakes):
     fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": []})
-    client.get("/api/usage?services=svc", headers=ALICE)
-    assert 30.0 in seen
+    query = "services=svc&since=2026-01-01&until=2026-01-31&model=org/model&user=bob&group_by=model"
+    assert client.get(f"/api/usage?{query}", headers=ALICE).status_code == 200
+    (sent,) = _usage_calls(fakes)
+    assert dict(sent.url.params) == {
+        "since": "2026-01-01", "until": "2026-01-31", "model": "org/model", "user": "bob", "group_by": "model",
+    }
+
+
+@pytest.mark.parametrize(
+    "name, value", [("since", "2026-02-30"), ("until", "2026-1-01"), ("since", "yesterday"),
+                    ("until", "2026-01-01T00:00:00Z"), ("since", "20260101")],
+)
+def test_usage_a_bad_day_is_400_and_calls_nothing(client, fakes, name, value):
+    response = client.get("/api/usage", params={name: value}, headers=ALICE)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_time"
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert fakes.requests == []
 
 
 def test_usage_services_limits_the_calls(client, fakes):
@@ -1236,6 +1285,7 @@ def test_usage_model_filter_by_day_fails_a_service_of_a_viewer_who_is_not_admin(
     assert len(body["data"]) == 1
     only = client.get("/api/usage?group_by=day&model=m1&services=svc-two", headers=ALICE)
     assert only.status_code == 502
+    assert [r for r in _usage_calls(fakes) if r.url.path == "/v1/usage/me"] == []
 
 
 def test_usage_a_listed_service_that_is_not_ok_is_reported_and_not_called(client, fakes):
@@ -1258,7 +1308,7 @@ def test_usage_a_listed_service_that_is_not_ok_is_reported_and_not_called(client
     assert alone.json()["services"][0]["ok"] is False
 
 
-def test_usage_an_unknown_valid_name_says_unknown(client, fakes):
+def test_usage_an_unknown_valid_name_says_unknown(client):
     response = client.get("/api/usage?services=nope", headers=ALICE)
     assert response.status_code == 400
     error = response.json()["error"]

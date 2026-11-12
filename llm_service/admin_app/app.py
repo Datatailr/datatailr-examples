@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,6 +30,9 @@ log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TIMEOUT_SECONDS = 30.0
+# The total limit of the usage call of one service. A slow service must not hold the merged answer.
+USAGE_TIMEOUT_SECONDS = 10.0
+DAY_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 # A switch or a delete can wait for the weight cache lock while another model downloads.
 ACTION_TIMEOUT_SECONDS = 300.0
 # One limit for the whole chat answer, and the timeout of each step of the call.
@@ -54,6 +59,19 @@ class NeedsAdmin(Exception):
 
 def _clock() -> float:
     return time.monotonic()
+
+
+def _valid_day(value: str | None) -> bool:
+    """Return True for None and for a real day in the form YYYY-MM-DD."""
+    if value is None:
+        return True
+    if DAY_PATTERN.fullmatch(value) is None:
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -229,8 +247,8 @@ def create_app(
     ) -> tuple[int, object] | JSONResponse:
         """Call the service `name` for the viewer. Return the answer, or an error response to send.
 
-        `action` marks a switch or a delete. It waits longer, and a timeout says
-        that the action may still finish.
+        `action` marks a switch or a delete. It waits longer. Its timeout message
+        says that the action can still finish.
         """
         viewer = viewer_or_error(request)
         if isinstance(viewer, JSONResponse):
@@ -517,14 +535,18 @@ def create_app(
         viewer: str, name: str, admin: bool, group_by: str, params: dict[str, str | None]
     ) -> tuple[list[dict] | None, str | None]:
         """Return `(rows, None)` for one service, or `(None, error text)`. A cancel passes through."""
+        # The own numbers have no model split by day, so the call cannot help.
+        if not admin and params["model"] is not None and group_by == "day":
+            return None, MODEL_BY_DAY
         try:
+            limit = USAGE_TIMEOUT_SECONDS
             if admin:
                 asked = {**params, "group_by": "day" if group_by == "service" else group_by}
-                call = service.request(name, "GET", "/admin/usage", viewer, params=asked, timeout=TIMEOUT_SECONDS)
+                call = service.request(name, "GET", "/admin/usage", viewer, params=asked, timeout=limit)
             else:
                 asked = {"since": params["since"], "until": params["until"]}
-                call = service.request(name, "GET", "/v1/usage/me", viewer, params=asked, timeout=TIMEOUT_SECONDS)
-            status, body = await asyncio.wait_for(call, TIMEOUT_SECONDS)
+                call = service.request(name, "GET", "/v1/usage/me", viewer, params=asked, timeout=limit)
+            status, body = await asyncio.wait_for(call, limit)
             if status != 200:
                 return None, UNREACHABLE
             if admin:
@@ -563,6 +585,11 @@ def create_app(
             return _error(
                 400, "invalid_group_by", "group_by is user, model, day or service.", "invalid_request_error"
             )
+        params = {name: request.query_params.get(name) or None for name in ("since", "until", "user", "model")}
+        if not (_valid_day(params["since"]) and _valid_day(params["until"])):
+            return _error(
+                400, "invalid_time", "since and until are real days in the form YYYY-MM-DD.", "invalid_request_error"
+            )
         raw = request.query_params.get("services")
         skipped: dict[str, str] = {}
         if raw:
@@ -584,7 +611,6 @@ def create_app(
             if role["access"] is None:
                 skipped[entry.name] = role["error"]
         per_service = {}
-        params = {name: request.query_params.get(name) or None for name in ("since", "until", "user", "model")}
         results = await asyncio.gather(*(one_usage(viewer, n, admin, group_by, params) for n, admin in chosen))
         rows_of = {}
         for (name, admin), (rows, error) in zip(chosen, results):

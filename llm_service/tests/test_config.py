@@ -64,3 +64,8 @@ def test_prompt_retention_days_upper_bound():
 def test_access_group():
     assert Config.from_env({"LLM_ACCESS_GROUP": "team"}).access_group == "team"
     assert Config.from_env({"LLM_ACCESS_GROUP": ""}).access_group is None
+
+
+def test_job_name_and_environment():
+    c = Config.from_env({"DATATAILR_JOB_NAME": "llm-service", "DATATAILR_JOB_ENVIRONMENT": "dev"})
+    assert c.job_name == "llm-service" and c.environment == "dev"
