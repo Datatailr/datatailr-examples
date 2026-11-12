@@ -1682,3 +1682,287 @@ def test_a_broken_limits_file_lets_the_service_start(tmp_path):
         wait_ready(c)
         assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
         assert c.app.state.limits.limits_for("bob", False)[1] == "none"
+
+
+# Limit endpoints
+
+ALL_NONE = {"requests_per_minute": None, "tokens_per_day": None, "parallel_requests": None}
+FULL = {"requests_per_minute": 5, "tokens_per_day": 1000, "parallel_requests": 2}
+
+
+def limit_events(client):
+    return [r for r in audit_records(client, limit=1000) if r["event"] == "limits_change"]
+
+
+def test_limits_me_for_a_user_with_an_entry_and_the_use_after_a_request(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=10, tokens_per_day=100))
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        body = c.get("/v1/limits/me", headers=BOB).json()
+        assert body == {
+            "user": "bob",
+            "limits": {"requests_per_minute": 10, "tokens_per_day": 100, "parallel_requests": None},
+            "use": {"requests_last_minute": 1, "tokens_today": 5, "parallel_requests": 0},
+            "source": "user",
+        }
+
+
+def test_limits_me_for_a_user_on_the_default(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": FULL})
+    with c:
+        wait_ready(c)
+        body = c.get("/v1/limits/me", headers=BOB).json()
+        assert body["limits"] == FULL and body["source"] == "default"
+
+
+def test_limits_me_for_an_admin_and_without_a_file(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": FULL})
+    with c:
+        wait_ready(c)
+        body = c.get("/v1/limits/me", headers=ALICE).json()
+        assert body["user"] == "alice" and body["limits"] == ALL_NONE and body["source"] == "admin"
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        body = c.get("/v1/limits/me", headers=BOB).json()
+        assert body["limits"] == ALL_NONE and body["source"] == "none"
+
+
+def test_limits_me_follows_the_acting_user(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=3))
+    with c:
+        wait_ready(c)
+        body = c.get("/v1/limits/me", headers={**ALICE, ACTING: "bob"}).json()
+        assert body["user"] == "bob" and body["limits"]["requests_per_minute"] == 3
+        assert c.get("/v1/limits/me", headers={**BOB, ACTING: "alice"}).status_code == 403
+        assert c.get("/v1/limits/me").status_code == 401
+
+
+LIMIT_ROUTES = [
+    ("GET", "/admin/limits", {}),
+    ("PUT", "/admin/limits/default", {"json": FULL}),
+    ("PUT", "/admin/limits/users/bob", {"json": {"parallel_requests": 1}}),
+    ("DELETE", "/admin/limits/users/bob", {}),
+]
+
+
+@pytest.mark.parametrize("method,path,kwargs", LIMIT_ROUTES)
+def test_limit_admin_endpoints_need_an_admin(tmp_path, method, path, kwargs):
+    c, _ = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        r = c.request(method, path, headers=BOB, **kwargs)
+        assert r.status_code == 403
+        assert r.json()["error"]["code"] == "admin_required"
+        assert c.request(method, path, **kwargs).status_code == 401
+        assert c.app.state.limits.users() == {"bob": {"parallel_requests": 1}}
+
+
+def test_get_limits_shows_default_entries_and_use(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": FULL, "users": {"carol": {"tokens_per_day": 9}}})
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        body = c.get("/admin/limits", headers=ALICE).json()
+        assert body["default"] == FULL
+        assert body["users"] == {"carol": {"tokens_per_day": 9}}
+        assert body["use"]["bob"] == {"requests_last_minute": 1, "tokens_today": 5, "parallel_requests": 0}
+        assert body["use"]["carol"] == {"requests_last_minute": 0, "tokens_today": 0, "parallel_requests": 0}
+
+
+def test_get_limits_without_a_file(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        assert c.get("/admin/limits", headers=ALICE).json() == {"default": None, "users": {}, "use": {}}
+
+
+def test_put_default_changes_the_answer_and_the_enforcement_at_once(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        r = c.put("/admin/limits/default", headers=ALICE, json={**ALL_NONE, "requests_per_minute": 2})
+        assert r.status_code == 200 and r.json() == {**ALL_NONE, "requests_per_minute": 2}
+        assert c.get("/admin/limits", headers=ALICE).json()["default"]["requests_per_minute"] == 2
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 429
+        assert c.get("/v1/limits/me", headers=BOB).json()["source"] == "default"
+
+
+def test_put_user_and_delete_user_change_the_enforcement_at_once(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        r = c.put("/admin/limits/users/bob", headers=ALICE, json={"requests_per_minute": 1})
+        assert r.status_code == 200 and r.json() == {"requests_per_minute": 1}
+        assert c.get("/admin/limits", headers=ALICE).json()["users"] == {"bob": {"requests_per_minute": 1}}
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 429
+        r = c.delete("/admin/limits/users/bob", headers=ALICE)
+        assert r.status_code == 200 and r.json() == {"removed": "bob"}
+        assert c.get("/admin/limits", headers=ALICE).json()["users"] == {}
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+
+
+def test_the_changes_reach_the_limits_file(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        c.put("/admin/limits/default", headers=ALICE, json=FULL)
+        c.put("/admin/limits/users/bob", headers=ALICE, json={"tokens_per_day": None})
+        stored = json.loads(c.app.state.limits._store.get(LIMITS_PATH))
+        assert stored == {"default": FULL, "users": {"bob": {"tokens_per_day": None}}}
+
+
+def test_delete_of_a_missing_entry_is_404(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        r = c.delete("/admin/limits/users/bob", headers=ALICE)
+        assert r.status_code == 404
+        assert r.json()["error"] == {
+            "message": r.json()["error"]["message"],
+            "type": "invalid_request_error",
+            "code": "limit_not_found",
+        }
+        assert limit_events(c) == []
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        ("/admin/limits/default", {"requests_per_minute": 1}),
+        ("/admin/limits/default", {**FULL, "extra": 1}),
+        ("/admin/limits/default", {**FULL, "requests_per_minute": 0}),
+        ("/admin/limits/default", {**FULL, "requests_per_minute": True}),
+        ("/admin/limits/default", {**FULL, "tokens_per_day": "5"}),
+        ("/admin/limits/users/bob", {}),
+        ("/admin/limits/users/bob", {"nope": 1}),
+        ("/admin/limits/users/bob", {"parallel_requests": 1_000_000_001}),
+    ],
+)
+def test_a_bad_limits_body_is_400_invalid_limit(tmp_path, path, body):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        r = c.put(path, headers=ALICE, json=body)
+        assert r.status_code == 400
+        error = r.json()["error"]
+        assert error["code"] == "invalid_limit" and error["type"] == "invalid_request_error"
+        assert error["message"]
+        assert c.app.state.limits.default() is None and c.app.state.limits.users() == {}
+        assert limit_events(c) == []
+
+
+@pytest.mark.parametrize("path", ["/admin/limits/default", "/admin/limits/users/bob"])
+@pytest.mark.parametrize("content", [b"hello", b"[1]", b"", b"5", b"[" * 100000])
+def test_a_body_that_is_not_a_json_object_is_400_invalid_limit(tmp_path, path, content):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        r = c.put(path, headers=ALICE, content=content)
+        assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_limit"
+
+
+@pytest.mark.parametrize("name", ["x" * 257, "a%09b", "a%7Fb", "%20%20"])
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
+def test_a_bad_user_name_is_400_invalid_user(tmp_path, name, method):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        kwargs = {"json": {"parallel_requests": 1}} if method == "PUT" else {}
+        r = c.request(method, f"/admin/limits/users/{name}", headers=ALICE, **kwargs)
+        assert r.status_code == 400
+        error = r.json()["error"]
+        assert error["code"] == "invalid_user" and error["type"] == "invalid_request_error"
+        assert c.app.state.limits.users() == {}
+
+
+def test_a_user_name_is_stripped_and_a_long_name_at_the_limit_is_fine(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        assert c.put("/admin/limits/users/%20bob%20", headers=ALICE, json={"parallel_requests": 1}).status_code == 200
+        assert c.put(f"/admin/limits/users/{'x' * 256}", headers=ALICE, json={"parallel_requests": 1}).status_code == 200
+        assert sorted(c.app.state.limits.users()) == sorted(["bob", "x" * 256])
+
+
+def test_a_bad_body_is_checked_before_the_user_name_is_stored(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        r = c.put("/admin/limits/users/a%09b", headers=ALICE, json={"nope": 1})
+        assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_user"
+
+
+class FailingLimitsStore(MemoryBlobStore):
+    """A store that refuses each write of the limits file while `fail` is true."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+
+    def put(self, path, data):
+        if self.fail and path == LIMITS_PATH:
+            raise OSError("the store is down")
+        super().put(path, data)
+
+
+@pytest.mark.parametrize("method,path,kwargs", LIMIT_ROUTES[1:])
+def test_a_failed_write_is_502_and_changes_nothing(tmp_path, method, path, kwargs):
+    store = FailingLimitsStore()
+    store.put(LIMITS_PATH, json.dumps({"default": FULL, "users": {"bob": {"parallel_requests": 1}}}))
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    with TestClient(make_app(tmp_path, store=store, http=http)) as c:
+        wait_ready(c)
+        store.fail = True
+        r = c.request(method, path, headers=ALICE, **kwargs)
+        assert r.status_code == 502
+        error = r.json()["error"]
+        assert error["code"] == "storage_unavailable" and error["type"] == "server_error"
+        assert c.app.state.limits.default() == FULL
+        assert c.app.state.limits.users() == {"bob": {"parallel_requests": 1}}
+        assert limit_events(c) == []
+
+
+def test_a_limits_file_that_could_not_be_read_gives_502(tmp_path):
+    class UnreadableStore(MemoryBlobStore):
+        def get(self, path):
+            if path == LIMITS_PATH:
+                raise OSError("the store is down")
+            return super().get(path)
+
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    with TestClient(make_app(tmp_path, store=UnreadableStore(), http=http)) as c:
+        wait_ready(c)
+        r = c.put("/admin/limits/default", headers=ALICE, json=FULL)
+        assert r.status_code == 502 and r.json()["error"]["code"] == "storage_unavailable"
+
+
+def test_each_change_is_audited_with_old_and_new(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        c.put("/admin/limits/default", headers=ALICE, json=FULL)
+        c.put("/admin/limits/default", headers={**ALICE, ACTING: "carol"}, json=ALL_NONE)
+        c.put("/admin/limits/users/bob", headers=ALICE, json={"tokens_per_day": 7})
+        c.put("/admin/limits/users/bob", headers=ALICE, json={"tokens_per_day": 8})
+        c.delete("/admin/limits/users/bob", headers=ALICE)
+        events = sorted(limit_events(c), key=lambda e: e["ts"])
+        assert len(events) == 5
+        assert all(e["endpoint"] == "/admin/limits" and e["status"] == 200 for e in events)
+        details = [(e["user"], e["detail"]) for e in events]
+        assert sorted(details, key=json.dumps) == sorted(
+            [
+                ("alice", {"target": "default", "old": None, "new": FULL}),
+                ("carol", {"target": "default", "old": FULL, "new": ALL_NONE}),
+                ("alice", {"target": "bob", "old": None, "new": {"tokens_per_day": 7}}),
+                ("alice", {"target": "bob", "old": {"tokens_per_day": 7}, "new": {"tokens_per_day": 8}}),
+                ("alice", {"target": "bob", "old": {"tokens_per_day": 8}, "new": None}),
+            ],
+            key=json.dumps,
+        )
+        prompt = full_record(c, events[0])["prompt"]
+        assert prompt["event"] == "limits_change" and set(prompt) == {"event", "target", "old", "new"}

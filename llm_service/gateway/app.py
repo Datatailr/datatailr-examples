@@ -23,9 +23,15 @@ from llm_service.gateway.audit import AuditLog, PromptUnreadable, iso, parse_tim
 from llm_service.gateway.audit_merge import MAINTENANCE_INTERVAL, AuditMerger, run_maintenance
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
-from llm_service.gateway.identity import AccessCheck, AdminCheck, acting_user_from_headers, user_from_headers
+from llm_service.gateway.identity import (
+    MAX_ACTING_USER_LENGTH,
+    AccessCheck,
+    AdminCheck,
+    acting_user_from_headers,
+    user_from_headers,
+)
 from llm_service.gateway.limiter import LimitExceeded, Limiter
-from llm_service.gateway.limits import LimitStore
+from llm_service.gateway.limits import InvalidLimit, LimitStore, StorageUnavailable
 from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.proxy import forward, prompt_of
 from llm_service.gateway.storage import BlobStore
@@ -491,7 +497,102 @@ def create_app(
         _check_day("until", until)
         return await asyncio.to_thread(usage.user_detail, user, since, until)
 
+    @app.get("/v1/limits/me")
+    async def limits_me(user: str = Depends(effective_user)) -> dict:
+        user_admin = await asyncio.to_thread(admin.is_admin, user)
+        user_limits, source = limits.limits_for(user, user_admin)
+        return {"user": user, "limits": user_limits, "use": limiter.use(user), "source": source}
+
     # Admin API
+
+    def check_user_name(name: str) -> str:
+        """Return the stripped user name. Raise `ApiError` if it is empty, too long or has a control character."""
+        name = name.strip()
+        problem = None
+        if not name:
+            problem = "the user name is empty"
+        elif len(name) > MAX_ACTING_USER_LENGTH:
+            problem = f"the user name is longer than {MAX_ACTING_USER_LENGTH} characters"
+        elif any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
+            problem = "the user name has a control character"
+        if problem:
+            raise ApiError(400, "invalid_request_error", "invalid_user", problem)
+        return name
+
+    async def limits_body(request: Request) -> object:
+        """Return the parsed JSON body. A body that is not JSON gives None, which `check_limits` refuses."""
+        try:
+            return json.loads(await request.body())
+        except (ValueError, RecursionError):
+            return None
+
+    async def change_limits(target: str, admin_user: str, change: Callable[[], tuple[dict | None, dict | None]]) -> dict | None:
+        """Run a store change in a thread and audit it. The change returns the old and the new value."""
+        try:
+            old, new = await asyncio.to_thread(change)
+        except InvalidLimit as error:
+            raise ApiError(400, "invalid_request_error", "invalid_limit", str(error)) from None
+        except StorageUnavailable as error:
+            raise ApiError(502, "server_error", "storage_unavailable", str(error)) from None
+        write_audit(
+            {
+                "user": admin_user,
+                "endpoint": "/admin/limits",
+                "model": None,
+                "stream": False,
+                "prompt": {"event": "limits_change", "target": target, "old": old, "new": new},
+                "status": 200,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "duration_ms": None,
+            }
+        )
+        return new
+
+    @app.get("/admin/limits")
+    async def get_limits(admin_user: str = Depends(require_admin)) -> dict:
+        entries = limits.users()
+        names = sorted(set(limiter.active_users()) | set(entries))
+        return {
+            "default": limits.default(),
+            "users": entries,
+            "use": {name: limiter.use(name) for name in names},
+        }
+
+    @app.put("/admin/limits/default")
+    async def put_default_limits(request: Request, admin_user: str = Depends(require_admin)) -> dict:
+        body = await limits_body(request)
+
+        def change():
+            return limits.set_default(body), body
+
+        return await change_limits("default", admin_user, change)
+
+    @app.put("/admin/limits/users/{name}")
+    async def put_user_limits(name: str, request: Request, admin_user: str = Depends(require_admin)) -> dict:
+        name = check_user_name(name)
+        body = await limits_body(request)
+
+        def change():
+            return limits.set_user(name, body), body
+
+        return await change_limits(name, admin_user, change)
+
+    @app.delete("/admin/limits/users/{name}")
+    async def delete_user_limits(name: str, admin_user: str = Depends(require_admin)) -> dict:
+        name = check_user_name(name)
+
+        def change():
+            try:
+                return limits.remove_user(name), None
+            except KeyError:
+                raise ApiError(
+                    404, "invalid_request_error", "limit_not_found", f"the user {name!r} has no limits entry"
+                ) from None
+
+        await change_limits(name, admin_user, change)
+        return {"removed": name}
 
     @app.get("/admin/model")
     async def get_model(admin_user: str = Depends(require_admin)) -> dict:
