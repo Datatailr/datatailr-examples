@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Callable, Mapping
 
@@ -55,6 +56,7 @@ class AdminCheck:
     The owner is always an admin. Members of the admin group are admins too.
     The group members are cached for `ttl` seconds. A failed lookup gives no
     members, and the next lookup comes 10 seconds later at the earliest.
+    One thread at a time refreshes the group. The other callers use the last members meanwhile.
     """
 
     def __init__(
@@ -73,6 +75,8 @@ class AdminCheck:
         self._cached: set[str] = set()
         self._fetched_at: float | None = None
         self._failed_at: float | None = None
+        self._lock = threading.Lock()  # guards the cache fields, never held for a lookup
+        self._refreshing = False
 
     def is_admin(self, user: str) -> bool:
         """Return True when the user is the owner or an admin group member."""
@@ -86,22 +90,33 @@ class AdminCheck:
 
     def _group_members(self) -> set[str]:
         now = self._clock()
-        if self._fetched_at is not None and now - self._fetched_at < self._ttl:
-            return self._cached
-        # After a failed lookup the group has no members, and the next lookup waits
-        # 10 seconds. So a removed member never keeps a right during an outage.
-        if self._failed_at is not None and now - self._failed_at < FAILED_LOOKUP_SECONDS:
-            return set()
+        with self._lock:
+            if self._fetched_at is not None and now - self._fetched_at < self._ttl:
+                return self._cached
+            # After a failed lookup the group has no members, and the next lookup waits
+            # 10 seconds. So a removed member never keeps a right during an outage.
+            if self._failed_at is not None and now - self._failed_at < FAILED_LOOKUP_SECONDS:
+                return set()
+            if self._refreshing:  # another thread looks the group up now
+                return self._cached
+            self._refreshing = True
+        members: set[str] | None = None
         try:
-            self._cached = set(self._members(self._group))
+            members = set(self._members(self._group))
         except Exception:
-            self._cached = set()
-            self._fetched_at = None
-            self._failed_at = now
-            return set()
-        self._fetched_at = now
-        self._failed_at = None
-        return self._cached
+            members = None
+        finally:
+            with self._lock:
+                self._refreshing = False
+                if members is None:
+                    self._cached = set()
+                    self._fetched_at = None
+                    self._failed_at = now
+                else:
+                    self._cached = members
+                    self._fetched_at = now
+                    self._failed_at = None
+        return members if members is not None else set()
 
 
 class AccessCheck:

@@ -374,3 +374,24 @@ def test_deeply_nested_json_is_a_broken_file(caplog):
     assert limits.default() is None
     assert limits.users() == {}
     assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1
+
+
+class CountingGet(MemoryBlobStore):
+    def __init__(self):
+        super().__init__()
+        self.gets = 0
+
+    def get(self, path):
+        self.gets += 1
+        return super().get(path)
+
+
+def test_needs_admin_only_for_a_user_without_an_entry_while_a_default_exists():
+    store = CountingGet()
+    limits, _ = make({"default": FULL, "users": {"bob": {"tokens_per_day": 1}}}, store=store)
+    gets = store.gets
+    assert limits.needs_admin("carol") is True
+    assert limits.needs_admin("bob") is False
+    assert store.gets == gets  # no storage call
+    assert make({"users": {"bob": {"tokens_per_day": 1}}})[0].needs_admin("carol") is False
+    assert make()[0].needs_admin("carol") is False

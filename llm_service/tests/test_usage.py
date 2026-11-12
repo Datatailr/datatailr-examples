@@ -790,3 +790,71 @@ def test_tokens_today_follows_the_day_of_the_clock():
     state["today"] = D1
     assert usage.tokens_today("bob") == 2
     assert usage.tokens_today("alice") == 0
+
+
+def _scan(usage, user):
+    """The old full scan: the total tokens of `user` on the current day."""
+    today = usage._today()
+    rows = usage.summary(today, today, user, None)
+    return rows[0]["total_tokens"] if rows else 0
+
+
+class ScanSpy(dict):
+    """A totals dict that counts the full scans."""
+
+    scans = 0
+
+    def items(self):
+        ScanSpy.scans += 1
+        return super().items()
+
+    def __iter__(self):
+        ScanSpy.scans += 1
+        return super().__iter__()
+
+
+def test_tokens_today_reads_no_full_scan_after_the_first_call():
+    _, audit, usage, _ = make(today=D2)
+    seed(audit)
+    usage.tokens_today("alice")
+    usage._totals = ScanSpy(usage._totals)
+    ScanSpy.scans = 0
+    audit.add(rec("alice", T3, prompt=3, completion=4))
+    assert usage.tokens_today("alice") == 15 + 25 + 7
+    assert ScanSpy.scans == 0
+
+
+def test_tokens_today_matches_the_full_scan_after_records():
+    _, audit, usage, _ = make(today=D2)
+    assert usage.tokens_today("alice") == 0
+    seed(audit)
+    audit.add(rec("carol", T2, prompt=None, completion=None))
+    audit.add(rec("alice", T2, endpoint="/admin/model"))
+    for user in ("alice", "bob", "carol", "nobody"):
+        assert usage.tokens_today(user) == _scan(usage, user), user
+    assert usage.tokens_today("alice") == 40
+
+
+def test_tokens_today_matches_the_full_scan_after_a_load():
+    store, audit, usage, _ = make(today=D2)
+    seed(audit)
+    audit.flush()
+    _, audit2, usage2, _ = make(today=D2, store=store)
+    usage2.tokens_today("alice")  # the cache of the day exists before the load
+    usage2.load()
+    for user in ("alice", "bob", "nobody"):
+        assert usage2.tokens_today(user) == _scan(usage2, user), user
+    assert usage2.tokens_today("alice") == 40
+
+
+def test_tokens_today_matches_the_full_scan_after_the_day_changes():
+    _, audit, usage, state = make(today=D1)
+    seed(audit)
+    assert usage.tokens_today("bob") == 2
+    assert usage.tokens_today("alice") == 0
+    state["today"] = D2
+    for user in ("alice", "bob"):
+        assert usage.tokens_today(user) == _scan(usage, user), user
+    assert usage.tokens_today("alice") == 40
+    audit.add(rec("alice", T3, prompt=1, completion=1))
+    assert usage.tokens_today("alice") == 42 == _scan(usage, "alice")

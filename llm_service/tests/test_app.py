@@ -1471,6 +1471,9 @@ def limited_client(tmp_path, limits, engine=None, now=None):
     return TestClient(make_app(tmp_path, store=store, http=http, now=now)), engine
 
 
+FULL_LIMITS = {"requests_per_minute": 5, "tokens_per_day": 1000, "parallel_requests": 2}
+
+
 def user_limits(**fields):
     return {"users": {"bob": fields}}
 
@@ -1666,6 +1669,39 @@ def test_acting_user_counts_for_the_acting_user(tmp_path):
         assert c.post(CHAT, headers=acting, json=HI).status_code == 200
         assert c.post(CHAT, headers=acting, json=HI).status_code == 429
         assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200  # alice has no limit
+
+
+class CountedAdmin:
+    """Count the admin lookups of each user by `AdminCheck.is_admin`."""
+
+    def __init__(self, monkeypatch):
+        self.users = []
+        real = AdminCheck.is_admin
+
+        def is_admin(check, user):
+            self.users.append(user)
+            return real(check, user)
+
+        monkeypatch.setattr(AdminCheck, "is_admin", is_admin)
+
+
+@pytest.mark.parametrize(
+    "limits, lookups",
+    [
+        (None, 0),
+        (user_limits(requests_per_minute=5), 0),
+        ({"default": FULL_LIMITS, "users": {"bob": {"tokens_per_day": 9}}}, 0),
+        ({"default": FULL_LIMITS}, 1),
+    ],
+)
+def test_a_request_looks_up_the_admin_right_only_when_it_changes_the_limits(tmp_path, monkeypatch, limits, lookups):
+    counted = CountedAdmin(monkeypatch)
+    c, _ = limited_client(tmp_path, limits)
+    with c:
+        wait_ready(c)
+        counted.users.clear()
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert counted.users == ["bob"] * lookups
 
 
 def test_without_a_limits_file_each_request_passes(tmp_path):

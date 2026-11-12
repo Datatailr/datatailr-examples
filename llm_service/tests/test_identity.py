@@ -185,3 +185,66 @@ def test_a_failed_access_lookup_means_no_access_and_waits_10_seconds():
     assert not access.has_access("bob") and calls == ["team"]
     now[0] = 11.0
     assert not access.has_access("bob") and calls == ["team", "team"]
+
+
+def test_one_caller_refreshes_the_group_and_the_others_use_the_last_members():
+    import threading
+
+    calls, now = [], [0.0]
+    started, release = threading.Event(), threading.Event()
+
+    def members(group):
+        calls.append(group)
+        if len(calls) > 1:
+            started.set()
+            release.wait(10)
+            return ["carol", "dave"]
+        return ["carol"]
+
+    check = AdminCheck("alice", "llm-admins", members, clock=lambda: now[0])
+    assert check.is_admin("carol") and len(calls) == 1
+    now[0] = 61.0  # the cache ended
+    first = threading.Thread(target=check.is_admin, args=("carol",))
+    first.start()
+    assert started.wait(10)
+    answers = []
+    others = [threading.Thread(target=lambda: answers.append(check.is_admin("carol"))) for _ in range(8)]
+    for thread in others:
+        thread.start()
+    for thread in others:
+        thread.join(10)
+    assert answers == [True] * 8  # the last members during the refresh
+    assert not check.is_admin("dave")
+    release.set()
+    first.join(10)
+    assert len(calls) == 2
+    assert check.is_admin("dave") and len(calls) == 2
+
+
+def test_a_failed_refresh_still_means_no_members_for_the_next_callers():
+    import threading
+
+    calls, now = [], [0.0]
+    started, release = threading.Event(), threading.Event()
+
+    def members(group):
+        calls.append(group)
+        if len(calls) > 1:
+            started.set()
+            release.wait(10)
+            raise RuntimeError("kv down")
+        return ["carol"]
+
+    check = AdminCheck("alice", "llm-admins", members, clock=lambda: now[0])
+    assert check.is_admin("carol")
+    now[0] = 61.0
+    first = threading.Thread(target=check.is_admin, args=("carol",))
+    first.start()
+    assert started.wait(10)
+    release.set()
+    first.join(10)
+    assert not check.is_admin("carol") and len(calls) == 2
+    now[0] = 70.0
+    assert not check.is_admin("carol") and len(calls) == 2  # the retry waits 10 seconds
+    now[0] = 72.0
+    assert not check.is_admin("carol") and len(calls) == 3

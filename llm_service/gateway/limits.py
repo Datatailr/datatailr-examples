@@ -161,6 +161,14 @@ class LimitStore:
                 old, self._users = self._users[name], users
             return old
 
+    def needs_admin(self, user: str) -> bool:
+        """Return True when the admin right changes the limits of `user`. Reads memory only.
+
+        That is the case for a user without an entry while a default exists.
+        """
+        with self._lock:
+            return user not in self._users and self._default is not None
+
     def limits_for(self, user: str, is_admin: bool) -> tuple[dict, str]:
         """Return the three limits of `user` and where they come from.
 

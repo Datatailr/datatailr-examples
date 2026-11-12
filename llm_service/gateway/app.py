@@ -412,7 +412,8 @@ def create_app(
                     )
                 )
 
-            user_admin = await asyncio.to_thread(admin.is_admin, user)
+            # Only a user without an entry, while a default exists, needs the admin lookup.
+            user_admin = limits.needs_admin(user) and await asyncio.to_thread(admin.is_admin, user)
             user_limits, _ = limits.limits_for(user, user_admin)
             try:
                 limiter.acquire(user, user_limits)
