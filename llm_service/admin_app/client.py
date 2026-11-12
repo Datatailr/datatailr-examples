@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
+
 import httpx
 
 from llm_service.admin_app.registry import service_url, valid_name
@@ -66,3 +69,35 @@ class ServiceClient:
             raise ServiceUnreachable(str(error), sent=True) from error
         except (httpx.HTTPError, ValueError) as error:
             raise ServiceUnreachable(str(error)) from error
+
+    @contextlib.asynccontextmanager
+    async def stream(
+        self,
+        service: str,
+        path: str,
+        viewer: str | None,
+        *,
+        json: object | None = None,
+        timeout: float,
+    ) -> AsyncIterator[httpx.Response]:
+        """Send a POST to the service `service` and give the response before its body is read.
+
+        The response closes when the block ends, whatever the cause. `viewer`
+        and `timeout` work as in `request`. Raise `ValueError` for a bad service
+        name. Raise `ServiceUnreachable` for a transport error before the response starts.
+        """
+        if not valid_name(service):
+            raise ValueError("The service name is not valid.")
+        headers = {"Connection": "close"}
+        if viewer is not None:
+            headers[ACTING_USER_HEADER] = viewer
+        async with contextlib.AsyncExitStack() as stack:
+            try:
+                response = await stack.enter_async_context(
+                    self._http.stream("POST", service_url(service) + path, headers=headers, json=json, timeout=timeout)
+                )
+            except (httpx.ReadTimeout, httpx.WriteTimeout) as error:
+                raise ServiceUnreachable(str(error), sent=True) from error
+            except httpx.HTTPError as error:
+                raise ServiceUnreachable(str(error)) from error
+            yield response

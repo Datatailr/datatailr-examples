@@ -13,9 +13,11 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
+from llm_service.admin_app.chat import ChatError, chat_request
 from llm_service.admin_app.client import ServiceClient, ServiceUnreachable
 from llm_service.admin_app.registry import BlobManualStore, Registry, platform_listing, valid_name
 from llm_service.admin_app.usage_merge import SUM_FIELDS, merge_rows, own_rows
@@ -27,6 +29,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 TIMEOUT_SECONDS = 30.0
 # A switch or a delete can wait for the weight cache lock while another model downloads.
 ACTION_TIMEOUT_SECONDS = 300.0
+# One limit for the whole chat answer, and the timeout of each step of the call.
+CHAT_TIMEOUT_SECONDS = 300.0
 MAX_VIEWER_LENGTH = 256
 ROLE_TIMEOUT_SECONDS = 3.0
 ROLE_CACHE_SECONDS = 30.0
@@ -331,6 +335,83 @@ def create_app(
         except ValueError:
             return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
         return await call(request, name, "POST", "/admin/model", action=True, json=body)
+
+    @app.post("/api/services/{name}/chat")
+    async def chat(name: str, request: Request):
+        """Send the prompt of the viewer to the service and pass the event stream back."""
+        viewer = viewer_or_error(request)
+        if isinstance(viewer, JSONResponse):
+            return viewer
+        refused = name_error(name)
+        if refused is not None:
+            return refused
+        # A form on another site cannot send this content type without a CORS preflight.
+        if not _is_json(request):
+            return _error(
+                415, "unsupported_media_type", "The request body must be application/json.", "invalid_request_error"
+            )
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
+        try:
+            built = chat_request(body)
+        except ChatError as error:
+            return _error(400, error.code, error.message, "invalid_request_error")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CHAT_TIMEOUT_SECONDS
+        stack = contextlib.AsyncExitStack()
+        try:
+            response = await stack.enter_async_context(
+                service.stream(name, "/v1/chat/completions", viewer, json=built, timeout=CHAT_TIMEOUT_SECONDS)
+            )
+            if response.status_code >= 400:
+                try:
+                    await response.aread()
+                    error_body = response.json()
+                except (httpx.HTTPError, ValueError):
+                    await stack.aclose()
+                    return _error(502, "service_unreachable", UNREACHABLE)
+                await stack.aclose()
+                return JSONResponse(error_body, status_code=response.status_code)
+        except ServiceUnreachable:
+            await stack.aclose()
+            return _error(502, "service_unreachable", UNREACHABLE)
+        except BaseException:
+            await stack.aclose()
+            raise
+
+        async def chunks():
+            chunk_iterator = response.aiter_raw().__aiter__()
+            try:
+                while True:
+                    left = deadline - loop.time()
+                    if left <= 0:
+                        log.warning("The chat answer of the service %s passed the time limit.", name)
+                        return
+                    try:
+                        chunk = await asyncio.wait_for(chunk_iterator.__anext__(), left)
+                    except StopAsyncIteration:
+                        return
+                    except asyncio.TimeoutError:
+                        log.warning("The chat answer of the service %s passed the time limit.", name)
+                        return
+                    except httpx.HTTPError:
+                        log.warning("The chat stream of the service %s broke.", name, exc_info=True)
+                        return
+                    yield chunk
+            finally:
+                # Also runs when the client is gone and the server cancels or closes the generator.
+                await chunk_iterator.aclose()
+                await stack.aclose()
+
+        # The background task closes the call when the response never starts to stream.
+        return StreamingResponse(
+            chunks(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+            background=BackgroundTask(stack.aclose),
+        )
 
     @app.delete("/api/services/{name}/models/{model_id:path}")
     async def delete_model(name: str, model_id: str, request: Request) -> JSONResponse:
