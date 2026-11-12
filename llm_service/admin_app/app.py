@@ -36,6 +36,8 @@ MAX_ERROR_BODY_BYTES = 64 * 1024
 MAX_VIEWER_LENGTH = 256
 ROLE_TIMEOUT_SECONDS = 3.0
 ROLE_CACHE_SECONDS = 30.0
+ROLE_ERROR_CACHE_SECONDS = 5.0
+NO_ANSWER = "The service did not answer."
 READY_WAIT_SECONDS = 10.0
 BAD_NAME = "The service name has 1 to 63 characters from a-z, 0-9 and -."
 UNREACHABLE = "The LLM service did not give a valid answer."
@@ -52,6 +54,15 @@ class NeedsAdmin(Exception):
 
 def _clock() -> float:
     return time.monotonic()
+
+
+class NoCacheStaticFiles(StaticFiles):
+    """Static files that the browser checks with the app before each use."""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 class UnusableViewer(Exception):
@@ -147,15 +158,18 @@ def create_app(
     async def roles(viewer: str, name: str) -> dict:
         """Return `{"access": bool, "admin": bool}` of `viewer` on the service `name`.
 
-        The answer is cached for 30 seconds for each viewer and service. A failed
-        call or a refused acting user means no access.
+        A refused acting user means no access. A failed call, a timeout or an
+        answer other than 200 gives `{"access": None, "admin": False, "error": text}`.
+        The cache keeps an answer for 30 seconds and an error for 5 seconds.
         """
         key = (viewer, name)
         now = _clock()
         hit = role_cache.get(key)
-        if hit is not None and now - hit[0] < ROLE_CACHE_SECONDS:
-            return dict(hit[1])
-        result = {"access": False, "admin": False}
+        if hit is not None:
+            limit = ROLE_ERROR_CACHE_SECONDS if hit[1]["access"] is None else ROLE_CACHE_SECONDS
+            if now - hit[0] < limit:
+                return dict(hit[1])
+        result = {"access": None, "admin": False, "error": NO_ANSWER}
         try:
             # The httpx timeout applies to each step. The total limit stops a service that sends slowly.
             status, body = await asyncio.wait_for(
@@ -164,11 +178,16 @@ def create_app(
             )
         except ServiceUnreachable:
             pass
+        except asyncio.TimeoutError:
+            log.warning("The role call to the service %s passed the time limit.", name)
         except Exception:  # one bad service must not fail the list. A cancel passes through.
             log.exception("The role call to the service %s failed.", name)
         else:
-            if status == 200 and isinstance(body, dict) and body.get("acting_user") != "refused":
-                result = {"access": True, "admin": body.get("admin") is True}
+            if status == 200 and isinstance(body, dict):
+                if body.get("acting_user") == "refused":
+                    result = {"access": False, "admin": False}
+                else:
+                    result = {"access": True, "admin": body.get("admin") is True}
         if len(role_cache) > 1000:
             for stale in [k for k, (at, _) in role_cache.items() if now - at >= ROLE_CACHE_SECONDS]:
                 del role_cache[stale]
@@ -249,7 +268,10 @@ def create_app(
             role = next(found) if entry.state == "ok" else {"access": False, "admin": False}
             row = entry.to_dict()
             del row["checked_at"]
-            services.append({**row, **role})
+            row.update(access=role["access"], admin=role["admin"])
+            if role["access"] is None:
+                row["role_error"] = role["error"]
+            services.append(row)
         return JSONResponse(
             {
                 "user": viewer,
@@ -529,7 +551,8 @@ def create_app(
         service fails with a message and the others still count. The answer is
         502 only when no service gives numbers. A named service that the
         registry shows with a state other than `ok` appears with `ok` false and
-        gets no call.
+        gets no call. A service whose role call fails also appears with `ok`
+        false. A service without access for the viewer stays out.
         """
         viewer = viewer_or_error(request)
         if isinstance(viewer, JSONResponse):
@@ -555,6 +578,10 @@ def create_app(
             entries = [e for e in registry.entries() if e.state == "ok"]
         found = await asyncio.gather(*(roles(viewer, e.name) for e in entries))
         chosen = [(e.name, role["admin"]) for e, role in zip(entries, found) if role["access"]]
+        # A service whose role call failed shows with its error. Only a service without access stays out.
+        for entry, role in zip(entries, found):
+            if role["access"] is None:
+                skipped[entry.name] = role["error"]
         per_service = {}
         params = {name: request.query_params.get(name) or None for name in ("since", "until", "user", "model")}
         results = await asyncio.gather(*(one_usage(viewer, n, admin, group_by, params) for n, admin in chosen))
@@ -575,9 +602,10 @@ def create_app(
 
     @app.get("/")
     async def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    # The browser checks the page and its files on each load, so a new version shows at once.
+    app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
     return app
 
 

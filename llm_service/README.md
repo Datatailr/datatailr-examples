@@ -323,7 +323,7 @@ curl "$BASE/admin/audit?user=bob&limit=20" -H "Cookie: __datatailr_user_cookie__
 
 The filters are `user`, `model`, `since`, `until`, `limit` and `offset`. The values of `since` and `until` are a day like `2026-11-10` or an ISO 8601 time. The default `limit` is 100 and the largest is 1000. The newest records come first.
 
-A request that has an acting user has the extra field `via` with the name of the caller. A request without an acting user has no `via` field.
+A request that has an acting user has the extra field `via` with the name of the caller. A request without an acting user has no `via` field. When the acting user is the caller, the record has no `via` field either.
 
 A model load or delete record has the field `event` (`model_switch`, `engine_reload` or `model_delete`) and the field `detail` with the revision or the error. A request record has `event` and `detail` set to `null`.
 
@@ -380,7 +380,7 @@ The page has a bar at the top with a service picker and a reload button. The pic
 
 ### How the app finds services
 
-The app collects service names from three sources. Each minute it asks each name for `GET /v1/service`, and a name that answers as an LLM service shows in the picker.
+The app collects service names from three sources. Each minute it asks each name that is not paused for `GET /v1/service`, and a name that answers as an LLM service shows in the picker. A name from the listing that does not answer, or does not answer as an LLM service, pauses for 10 minutes.
 
 - The platform listing. The app runs `dt job ls` and keeps the services that are ready in its own environment. If the command fails, the app uses the other two sources and the page shows that the listing failed.
 - `LLM_SERVICES`. A list of service names with commas. `deploy.py` sets it to the service that it deploys.
@@ -388,13 +388,14 @@ The app collects service names from three sources. Each minute it asks each name
 
 A service name has 1 to 63 characters from `a-z`, `0-9` and `-`. The app builds the URL `http://<name>` from it, so a name cannot point the app at another host. A service found in the listing that is not an LLM service does not show. A name from `LLM_SERVICES` or the manual list always shows, with its state.
 
-A service from an older version of this example has no `GET /v1/service`. It does not show in the app. Deploy that service again.
+A service from an older version of this example has no `GET /v1/service`. When the listing found it, it does not show in the app. When it is in `LLM_SERVICES` or in the manual list, it shows with the state `not_llm`. Deploy that service again.
 
 ### Service states
 
 - `ok`: the service answers and the owner of the app is an admin of it.
 - `no_access`: the service answers, but it refuses the app. The owner of the app is not an admin of the service.
 - `unreachable`: the app gets no answer from the service.
+- `not_llm`: the job answers, but not as an LLM service.
 
 ### The owner of the app must be an admin
 
@@ -402,7 +403,7 @@ The platform signs each call of the app as the user who deployed the app. The se
 
 ### Who sees what
 
-Each viewer needs access to a service to see anything from it. The service checks this for the viewer, with `LLM_ACCESS_GROUP`.
+Each viewer needs access to a service to see anything from it. The service checks this for the viewer, with `LLM_ACCESS_GROUP`. If the service does not answer this check, the page shows "The service did not answer." for it. The Usage tab then names that service as a service without numbers.
 
 - Each user with access sees the Usage tab with their own numbers, and the Connect tab.
 - An admin of a service also sees the numbers of all users of that service, the Audit tab and the Models tab. An admin switches the model and deletes cached weights there.
@@ -418,7 +419,7 @@ The Connect tab shows how to call the picked service. It has two parts.
 - Addresses and examples. The tab shows the internal base URL `http://<name>/v1` and the outside base URL, with the served model. It has examples for curl, for the `openai` package from a job, for the `openai` package from outside the platform, and for `chat.py`. Each example has a copy button. No example holds a token. The outside example reads it from the variable `LLM_TOKEN`.
 - The testing area. A viewer types a system prompt and a prompt, sets the model, the temperature and the maximum tokens, and presses Send. The answer streams into the page. After it, the area shows the token counts and the time to the first token. The area keeps the conversation, and Clear starts again.
 
-A request from the testing area counts for the viewer. It shows in the usage numbers and in the audit log under the name of the viewer. The `via` field of the record names the owner of the app.
+A request from the testing area counts for the viewer. It shows in the usage numbers and in the audit log under the name of the viewer. The `via` field of the record names the owner of the app. When the viewer is the owner of the app, the record has no `via` field.
 
 If you deploy the app alone with `python deploy.py app`, set the same `LLM_SERVICE_NAME` as for the service. The app then lists that service in `LLM_SERVICES`.
 

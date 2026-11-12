@@ -51,7 +51,8 @@ llm_service/
 ├── docs/
 │   ├── design.md          # this document
 │   ├── audit-storage-design.md
-│   └── admin-app-design.md
+│   ├── admin-app-design.md
+│   └── multi-service-app-design.md
 ├── admin_app/             # the admin app: FastAPI backend and one page
 ├── gateway/
 │   ├── app.py             # FastAPI routes and main(port)

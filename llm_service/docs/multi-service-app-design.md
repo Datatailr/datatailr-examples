@@ -78,7 +78,7 @@ A new dependency `effective_user` replaces `current_user` on these endpoints:
 
 There is one exception for rule 3 and rule 4. `GET /v1/service` never fails because of the header. If a rule fails there, the effective user is the caller and the body gets `"acting_user": "refused"`. The app needs the descriptor to explain the problem to the viewer.
 
-Usage numbers and audit records use the effective user. An audit record of a request with an acting user gets a new field `via` with the caller name. Records without an acting user have no `via` field.
+Usage numbers and audit records use the effective user. An audit record of a request with an acting user gets a new field `via` with the caller name. Records without an acting user have no `via` field. When the acting user is the caller, the record has no `via` field either.
 
 `require_admin` on `/admin/*` does not change.
 
@@ -164,6 +164,8 @@ The answer of `GET /api/services`:
 
 The per-viewer calls run in parallel with a timeout of 3 seconds. The app caches `access` and `admin` for each viewer and service for 30 seconds.
 
+A refused acting user gives `access` false. A transport error, a timeout or an answer other than 200 gives `access` null and the field `role_error` with the text "The service did not answer." The app caches this outcome for 5 seconds only. The page shows that text for the service in the picker and in the message without access.
+
 The routes of one service move under the service name. Each one calls the same service endpoint as before:
 
 | Old route | New route |
@@ -215,7 +217,7 @@ The answer:
 }
 ```
 
-`scope` is `all` for an admin and `own` for another user. A failed service does not fail the request. The answer is 200 with `ok` false for that service. If each service fails, the answer is 502 `service_unreachable`.
+`scope` is `all` for an admin and `own` for another user. A service whose role call failed appears with `scope` `own`, `ok` false and the error text. A service without access for the viewer stays out of the list. A failed service does not fail the request. The answer is 200 with `ok` false for that service. If each service fails, the answer is 502 `service_unreachable`.
 
 ### Testing area
 
@@ -274,7 +276,7 @@ Testing area:
 
 - `deploy.py` sets `LLM_SERVICES` for the app and `LLM_ACCESS_GROUP` for the service. No new argument.
 - The README gets a part for the app with many services. It explains how the app finds services, the manual list and the Connect tab. It states the rule that the owner of the app must be an admin of each service.
-- An older service without `GET /v1/service` does not show in the app. Deploy the service again first.
+- An older service without `GET /v1/service` does not show in the app when the listing found it. When it is configured or manual, it shows with the state `not_llm`. Deploy the service again first.
 
 ## Testing
 

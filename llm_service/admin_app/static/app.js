@@ -234,12 +234,16 @@ async function loadServices() {
 }
 
 const stateText = value => String(value).replace(/_/g, ' ');
-const roleText = entry => (entry.admin ? 'admin' : entry.access ? 'user' : 'no access');
+const NO_ANSWER = 'The service did not answer.';
+/** The role of the viewer on an `ok` entry. A null access means that the role call failed. */
+const roleText = entry => (entry.access === null ? 'no answer'
+  : entry.admin ? 'admin' : entry.access ? 'user' : 'no access');
 
 function showPicker() {
   const options = [el('option', {value: '', text: 'All services'})];
   for (const entry of state.services.services) {
-    const text = entry.state === 'ok' ? `${entry.name} (ok, ${roleText(entry)})` : `${entry.name} (${stateText(entry.state)})`;
+    let text = entry.state === 'ok' ? `${entry.name} (ok, ${roleText(entry)})` : `${entry.name} (${stateText(entry.state)})`;
+    if (entry.state === 'ok' && entry.access === null) text = `${entry.name}: ${NO_ANSWER}`;
     options.push(el('option', {value: entry.name, text, disabled: entry.access ? null : ''}));
   }
   $('service-picker').replaceChildren(...options);
@@ -274,8 +278,8 @@ function serviceEntryRow(entry) {
 }
 
 /** The reason why the viewer cannot use a service. */
-const noAccessReason = entry => entry.detail
-  || (entry.state === 'ok' ? 'The service gives you no access.' : `The service has the state ${stateText(entry.state)}.`);
+const noAccessReason = entry => (entry.state === 'ok' && entry.access === null ? NO_ANSWER : entry.detail
+  || (entry.state === 'ok' ? 'The service gives you no access.' : `The service has the state ${stateText(entry.state)}.`));
 
 /** Show the tabs if the viewer has access to a service, else one message. Return true for access. */
 function showAccess() {

@@ -233,12 +233,71 @@ def test_roles_are_cached_for_30_seconds(client, fakes, monkeypatch):
     assert len(fakes.calls("/v1/service")) == 6
 
 
-def test_a_role_call_has_a_short_timeout_and_a_failure_means_no_access(client, fakes):
+def test_a_role_call_has_a_short_timeout_and_a_failure_names_the_service(client, fakes):
     fakes.hosts["svc"].error = httpx.ConnectError("refused")
     body = client.get("/api/services", headers=ALICE).json()
-    assert (body["services"][0]["access"], body["services"][0]["admin"]) == (False, False)
+    first = body["services"][0]
+    assert (first["access"], first["admin"], first["role_error"]) == (None, False, "The service did not answer.")
     assert body["services"][1]["access"] is True
+    assert "role_error" not in body["services"][1]
     assert fakes.calls()[0].extensions["timeout"]["read"] == 3.0
+
+
+def test_a_role_call_that_times_out_names_the_service_in_the_list_and_the_usage(client, fakes):
+    fakes.hosts["svc"].error = httpx.ReadTimeout("slow")
+    body = client.get("/api/services", headers=ALICE).json()
+    first = body["services"][0]
+    assert (first["access"], first["admin"], first["role_error"]) == (None, False, "The service did not answer.")
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    usage = client.get("/api/usage", headers=ALICE)
+    assert usage.status_code == 200
+    assert usage.json()["services"] == [
+        {"name": "svc", "scope": "own", "ok": False, "error": "The service did not answer."},
+        {"name": "svc-two", "scope": "own", "ok": True},
+    ]
+
+
+def test_a_role_answer_that_is_not_200_is_an_error_and_not_no_access(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/v1/service")] = (500, {})
+    first = client.get("/api/services", headers=ALICE).json()["services"][0]
+    assert (first["access"], first["role_error"]) == (None, "The service did not answer.")
+
+
+def test_a_refused_acting_user_stays_no_access(client, fakes):
+    first = client.get("/api/services", headers=CAROL).json()["services"][0]
+    assert (first["access"], first["admin"]) == (False, False)
+    assert "role_error" not in first
+
+
+def test_a_failed_role_call_is_cached_for_5_seconds_only(client, fakes, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(app_module, "_clock", lambda: now[0])
+    fakes.hosts["svc"].error = httpx.ConnectError("refused")
+    client.get("/api/services", headers=ALICE)
+    assert len([r for r in fakes.calls("/v1/service") if r.url.host == "svc"]) == 1
+    now[0] += 4
+    client.get("/api/services", headers=ALICE)
+    assert len([r for r in fakes.calls("/v1/service") if r.url.host == "svc"]) == 1
+    now[0] += 2
+    fakes.hosts["svc"].error = None
+    first = client.get("/api/services", headers=ALICE).json()["services"][0]
+    assert len([r for r in fakes.calls("/v1/service") if r.url.host == "svc"]) == 2
+    assert first["access"] is True and "role_error" not in first
+
+
+def test_a_role_timeout_logs_one_warning_without_a_traceback(client, fakes, monkeypatch, caplog):
+    async def slow(request):
+        await asyncio.sleep(5)
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(app_module, "ROLE_TIMEOUT_SECONDS", 0.05)
+    fakes.hosts["svc"] = slow
+    with caplog.at_level(logging.WARNING, logger="llm_service.admin_app.app"):
+        client.get("/api/services", headers=ALICE)
+    records = [r for r in caplog.records if r.name == "llm_service.admin_app.app"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING and records[0].exc_info is None
+    assert "svc" in records[0].getMessage()
 
 
 def test_post_is_for_the_owner_only(make_client, fakes, store):
@@ -462,6 +521,21 @@ def test_index_and_static_are_served(client):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert client.get("/static/index.html").status_code == 200
+
+
+def test_the_page_is_not_cached_without_a_check(client):
+    assert client.get("/").headers["cache-control"] == "no-cache"
+
+
+def test_the_static_files_are_not_cached_without_a_check(client):
+    for path in ("/static/app.js", "/static/app.css", "/static/index.html"):
+        assert client.get(path).headers["cache-control"] == "no-cache", path
+
+
+def test_page_says_that_a_service_did_not_answer():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "The service did not answer." in text
+    assert "entry.access === null" in text
 
 
 def test_import_does_not_load_the_gateway_app():
@@ -862,17 +936,20 @@ def test_a_slow_service_does_not_hold_the_list(client, fakes, monkeypatch):
     started = time.monotonic()
     body = client.get("/api/services", headers=ALICE).json()
     assert time.monotonic() - started < 2
-    assert (body["services"][0]["access"], body["services"][0]["admin"]) == (False, False)
+    assert (body["services"][0]["access"], body["services"][0]["admin"]) == (None, False)
     assert body["services"][1]["access"] is True
 
 
-def test_an_unexpected_error_in_one_role_call_is_no_access(client, fakes):
+def test_an_unexpected_error_in_one_role_call_names_the_service(client, fakes, caplog):
     fakes.hosts["svc"].error = RuntimeError("boom")
-    response = client.get("/api/services", headers=ALICE)
+    with caplog.at_level(logging.ERROR, logger="llm_service.admin_app.app"):
+        response = client.get("/api/services", headers=ALICE)
     assert response.status_code == 200
     body = response.json()
-    assert (body["services"][0]["access"], body["services"][0]["admin"]) == (False, False)
+    assert (body["services"][0]["access"], body["services"][0]["admin"]) == (None, False)
+    assert body["services"][0]["role_error"] == "The service did not answer."
     assert body["services"][1]["access"] is True
+    assert any(r.exc_info for r in caplog.records if r.name == "llm_service.admin_app.app")
 
 
 def test_a_failed_store_is_logged(client, store, caplog):
