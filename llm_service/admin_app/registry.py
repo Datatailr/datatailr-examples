@@ -62,12 +62,23 @@ class BlobManualStore:
     """Manual names in a JSON list in blob storage."""
 
     def load(self) -> list[str]:
-        """Return the saved names. A missing or broken file gives an empty list."""
-        try:
-            from datatailr import Blob
+        """Return the saved names.
 
-            names = json.loads(Blob().get(MANUAL_BLOB_PATH))
+        A missing file and content that is not a JSON list give an empty list.
+        Any other error propagates, so a failed read never looks like an empty list.
+        """
+        from datatailr import Blob
+
+        blob = Blob()
+        try:
+            data = blob.get(MANUAL_BLOB_PATH)
         except Exception:
+            if not blob.exists(MANUAL_BLOB_PATH):
+                return []
+            raise
+        try:
+            names = json.loads(data)
+        except ValueError:
             return []
         if not isinstance(names, list):
             return []
@@ -127,10 +138,15 @@ class Registry:
         self._manual: list[str] = []
         self._paused: dict[str, float] = {}  # found names that failed, with the time of the probe
         self._ready = asyncio.Event()
+        self._lock = asyncio.Lock()  # one of refresh, add_manual and remove_manual at a time
         self.listing_state = "ok"
 
     async def refresh(self) -> None:
         """Build the candidate names, probe them and replace the entries."""
+        async with self._lock:
+            await self._refresh()
+
+    async def _refresh(self) -> None:
         manual = await self._load_manual()
         found = await self._find()
         sources: dict[str, str] = {}
@@ -138,7 +154,7 @@ class Registry:
             for name in names:
                 sources[name] = source  # a later source has the higher priority
         now = self._clock()
-        self._paused = {n: t for n, t in self._paused.items() if n in sources and now - t < self._retry_after}
+        self._paused = {n: t for n, t in self._paused.items() if sources.get(n) == "found" and now - t < self._retry_after}
         candidates = [n for n in sorted(sources) if n not in self._paused]
         gate = asyncio.Semaphore(self._concurrency)
 
@@ -188,29 +204,31 @@ class Registry:
         """Save a manual name and probe it at once. Raise `ValueError` for a bad name."""
         if not valid_name(name):
             raise ValueError("The service name has 1 to 63 characters from a-z, 0-9 and -.")
-        names = await asyncio.to_thread(self._manual_store.load)
-        if name not in names:
-            names = [*names, name]
-            await asyncio.to_thread(self._manual_store.save, names)
-        self._manual = names
-        entry = await self._probe(name, "configured" if name in self._configured else "manual")
-        self._entries = {**self._entries, name: entry}
-        self._paused.pop(name, None)
-        return entry
+        async with self._lock:
+            names = await asyncio.to_thread(self._manual_store.load)
+            if name not in names:
+                names = [*names, name]
+                await asyncio.to_thread(self._manual_store.save, names)
+            self._manual = names
+            entry = await self._probe(name, "configured" if name in self._configured else "manual")
+            self._entries = {**self._entries, name: entry}
+            self._paused.pop(name, None)
+            return entry
 
     async def remove_manual(self, name: str) -> bool:
         """Remove a manual name. Return False if it was not in the list."""
-        names = await asyncio.to_thread(self._manual_store.load)
-        if name not in names:
+        async with self._lock:
+            names = await asyncio.to_thread(self._manual_store.load)
+            if name not in names:
+                self._manual = names
+                return False
+            names = [n for n in names if n != name]
+            await asyncio.to_thread(self._manual_store.save, names)
             self._manual = names
-            return False
-        names = [n for n in names if n != name]
-        await asyncio.to_thread(self._manual_store.save, names)
-        self._manual = names
-        entry = self._entries.get(name)
-        if entry is not None and entry.source == "manual":
-            self._entries = {n: e for n, e in self._entries.items() if n != name}
-        return True
+            entry = self._entries.get(name)
+            if entry is not None and entry.source == "manual":
+                self._entries = {n: e for n, e in self._entries.items() if n != name}
+            return True
 
     async def _load_manual(self) -> list[str]:
         try:
@@ -247,7 +265,7 @@ class Registry:
                 ),
                 self._probe_timeout,
             )
-        except (httpx.HTTPError, asyncio.TimeoutError) as error:
+        except Exception as error:  # one bad service must not stop the others
             return "unreachable", f"The service did not answer ({type(error).__name__}).", None, None
         if response.status_code in (401, 403):
             return "no_access", f"The service refused the owner of the app (status {response.status_code}).", None, None

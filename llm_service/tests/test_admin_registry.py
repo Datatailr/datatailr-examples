@@ -468,6 +468,9 @@ class FakeBlob:
             raise FileNotFoundError(path)
         return self.files[path]
 
+    def exists(self, path):
+        return path in self.files
+
     def put(self, path, data):
         self.files[path] = data.encode() if isinstance(data, str) else data
 
@@ -496,9 +499,80 @@ def test_blob_store_broken_file(blob, content):
     assert BlobManualStore().load() == (["ok"] if b"ok" in content else [])
 
 
-def test_blob_store_read_error_is_empty(blob):
+def test_blob_store_read_error_propagates(blob):
+    blob.files["llm-service-admin/services.json"] = b'["a"]'
     blob.fail = True
-    assert BlobManualStore().load() == []
+    with pytest.raises(FileNotFoundError):
+        BlobManualStore().load()
+
+
+class FailingLoadStore(FakeStore):
+    def load(self):
+        raise OSError("blob down")
+
+
+def test_failed_load_blocks_add_and_remove_without_save(services, clock):
+    services.answers["new"] = (200, descriptor())
+    reg = make(services, clock)
+    reg._manual_store = store = FailingLoadStore(["keep"])
+    with pytest.raises(OSError):
+        asyncio.run(reg.add_manual("new"))
+    with pytest.raises(OSError):
+        asyncio.run(reg.remove_manual("keep"))
+    assert store.saved == []
+    assert services.requests == []
+
+
+def test_failed_load_in_refresh_keeps_last_manual_list(services, clock):
+    services.answers["man"] = (200, descriptor())
+    reg = make(services, clock, manual=["man"])
+    refresh(reg)
+    reg._manual_store = FailingLoadStore()
+    refresh(reg)
+    assert states(reg) == {"man": ("manual", "ok")}
+
+
+def test_paused_found_name_shows_when_it_becomes_manual(services, clock):
+    services.answers["svc"] = (404, {})
+    reg = make(services, clock, found=["svc"])
+    refresh(reg)
+    assert reg.entries() == []
+    reg.store.names = ["svc"]
+    refresh(reg)
+    assert states(reg) == {"svc": ("manual", "not_llm")}
+
+
+def test_add_manual_during_refresh_is_not_lost(services, clock):
+    gate = asyncio.Event()
+
+    async def slow(request):
+        await gate.wait()
+        return httpx.Response(200, json=descriptor())
+
+    services.answers["slow"] = slow
+    services.answers["new"] = (200, descriptor())
+    services.answers["new2"] = (200, descriptor())
+    reg = make(services, clock, configured=["slow"])
+
+    async def go():
+        refreshing = asyncio.create_task(reg.refresh())
+        await asyncio.sleep(0.01)
+        adds = [asyncio.create_task(reg.add_manual("new")), asyncio.create_task(reg.add_manual("new2"))]
+        await asyncio.sleep(0.01)
+        gate.set()
+        await asyncio.gather(refreshing, *adds)
+
+    asyncio.run(go())
+    assert set(states(reg)) == {"slow", "new", "new2"}
+    assert reg.store.names == ["new", "new2"]
+
+
+def test_unexpected_probe_error_is_unreachable_and_others_continue(services, clock):
+    services.answers["bad"] = ValueError("odd")
+    services.answers["good"] = (200, descriptor())
+    reg = make(services, clock, configured=["bad", "good"])
+    refresh(reg)
+    assert states(reg) == {"bad": ("configured", "unreachable"), "good": ("configured", "ok")}
 
 
 def test_module_does_not_import_datatailr_at_import():
