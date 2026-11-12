@@ -1,9 +1,10 @@
-"""A small client for the admin endpoints of the LLM service."""
+"""A small client for the LLM services that the admin app calls."""
 
 from __future__ import annotations
 
 import httpx
 
+from llm_service.admin_app.registry import service_url, valid_name
 from llm_service.gateway.identity import ACTING_USER_HEADER
 
 
@@ -20,35 +21,42 @@ class ServiceUnreachable(Exception):
 
 
 class ServiceClient:
-    """Call the service for a viewer and return the status and the JSON body."""
+    """Call a service by name for a viewer and return the status and the JSON body."""
 
-    def __init__(self, base_url: str, http: httpx.AsyncClient) -> None:
-        self._base_url = base_url.rstrip("/")
+    def __init__(self, http: httpx.AsyncClient) -> None:
         self._http = http
 
     async def request(
         self,
+        service: str,
         method: str,
         path: str,
-        viewer: str,
+        viewer: str | None,
         *,
         params: dict | None = None,
         json: object | None = None,
         timeout: float,
     ) -> tuple[int, object]:
-        """Send one request with the viewer name in the acting user header.
+        """Send one request to the service `service`.
 
-        Params with the value None are dropped. `timeout` is in seconds. Raise
+        `viewer` goes into the acting user header. With None, the request has no
+        acting user. Params with the value None are dropped. `timeout` is in
+        seconds. Raise `ValueError` for a bad service name. Raise
         `ServiceUnreachable` for a transport error and for a body that is not JSON.
         """
+        if not valid_name(service):
+            raise ValueError("The service name is not valid.")
         kept = {name: value for name, value in (params or {}).items() if value is not None}
+        # The auth proxy of the platform signs only the first request of a
+        # connection. A new connection for each request keeps every call signed.
+        headers = {"Connection": "close"}
+        if viewer is not None:
+            headers[ACTING_USER_HEADER] = viewer
         try:
             response = await self._http.request(
                 method,
-                self._base_url + path,
-                # The auth proxy of the platform signs only the first request of a
-                # connection. A new connection for each request keeps every call signed.
-                headers={ACTING_USER_HEADER: viewer, "Connection": "close"},
+                service_url(service) + path,
+                headers=headers,
                 params=kept,
                 json=json,
                 timeout=timeout,
