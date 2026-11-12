@@ -246,3 +246,53 @@ def test_use_does_not_create_memory_for_unknown_users(env):
     env.limiter.use("alice")
     env.limiter.release("alice")
     assert env.limiter._users == {}
+
+
+@pytest.mark.parametrize("name", ["requests_per_minute", "tokens_per_day", "parallel_requests"])
+@pytest.mark.parametrize("value", [0, -1])
+@pytest.mark.parametrize("busy", [False, True])
+def test_limit_below_one_refuses_each_request(env, name, value, busy):
+    if busy:
+        env.limiter.acquire("alice", NONE)
+    before = env.limiter.use("alice")
+    with pytest.raises(LimitExceeded) as info:
+        env.limiter.acquire("alice", limits(**{name: value}))
+    assert info.value.code == name
+    assert info.value.limit == value
+    assert info.value.retry_after >= 1
+    assert env.limiter.use("alice") == before
+
+
+def test_zero_requests_per_minute_retry_after_for_empty_window(env):
+    with pytest.raises(LimitExceeded) as info:
+        env.limiter.acquire("alice", limits(requests_per_minute=0))
+    assert info.value.retry_after == 60
+    env.limiter.acquire("alice", NONE)
+    env.limiter.release("alice")
+    env.now += 10
+    with pytest.raises(LimitExceeded) as info:
+        env.limiter.acquire("alice", limits(requests_per_minute=0))
+    assert info.value.retry_after == 50
+
+
+def test_acquire_sweeps_all_users_at_most_once_a_second(env):
+    env.limiter.acquire("alice", NONE)
+    env.limiter.release("alice")
+    env.now += 59.5
+    env.limiter.acquire("carol", NONE)
+    assert "alice" in env.limiter._users
+    env.now += 0.7
+    env.limiter.acquire("bob", NONE)
+    assert "alice" in env.limiter._users
+    env.now += 0.3
+    env.limiter.acquire("dave", NONE)
+    assert "alice" not in env.limiter._users
+
+
+def test_acquire_trims_the_calling_user_between_sweeps(env):
+    env.limiter.acquire("alice", NONE)
+    env.limiter.release("alice")
+    env.now += 59.9
+    env.limiter.acquire("bob", NONE)
+    env.now += 0.2
+    env.limiter.acquire("alice", limits(requests_per_minute=1))

@@ -9,10 +9,11 @@ from collections import deque
 from typing import Callable
 
 WINDOW_SECONDS = 60.0
+SWEEP_SECONDS = 1.0
 
 
 class LimitExceeded(Exception):
-    """A request passed a limit. The code is the name of the limit."""
+    """A request reached a limit. The code is the name of the limit."""
 
     def __init__(self, code: str, limit: int, retry_after: int, message: str) -> None:
         super().__init__(message)
@@ -43,6 +44,7 @@ class Limiter:
         self._seconds_to_midnight = seconds_to_midnight
         self._clock = clock
         self._users: dict[str, _UserState] = {}
+        self._last_sweep: float | None = None
 
     def _trim(self, user: str, now: float) -> _UserState | None:
         """Drop old entries of the window. Forget the user when nothing is left."""
@@ -58,13 +60,15 @@ class Limiter:
         return state
 
     def _sweep(self, now: float) -> None:
+        self._last_sweep = now
         for name in list(self._users):
             self._trim(name, now)
 
     def acquire(self, user: str, limits: dict) -> None:
         now = self._clock()
-        self._sweep(now)
-        state = self._users.get(user)
+        if self._last_sweep is None or now - self._last_sweep >= SWEEP_SECONDS:
+            self._sweep(now)
+        state = self._trim(user, now)
         in_flight = state.in_flight if state else 0
         recent = len(state.window) if state else 0
 
@@ -75,7 +79,10 @@ class Limiter:
             )
         limit = limits.get("requests_per_minute")
         if limit is not None and recent >= limit:
-            wait = _seconds_up(state.window[0] + WINDOW_SECONDS - now)
+            if state is not None and state.window:
+                wait = _seconds_up(state.window[0] + WINDOW_SECONDS - now)
+            else:
+                wait = int(WINDOW_SECONDS)
             raise LimitExceeded(
                 "requests_per_minute", limit, wait, f"You reached the limit of {limit} requests in one minute."
             )
