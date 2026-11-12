@@ -88,7 +88,7 @@ fakes.
 | `GET /v1/models` | The active model, the loading model and each model in the blob storage cache, in the OpenAI list format. See below. |
 | `GET /v1/models/{id}` | One entry of that list. The id contains `/`, for example `GET /v1/models/Qwen/Qwen2.5-1.5B-Instruct`. An unknown id gets 404 with code `model_not_found`. |
 | `GET /v1/usage/me` | The usage totals of the effective user. Not part of the OpenAI API. |
-| `GET /v1/limits/me` | The limits, the current use and the source of the limits of the effective user. Not part of the OpenAI API. |
+| `GET /v1/limits/me` | The limits, the current use and the source of the limits of the effective user, and `loaded`. Not part of the OpenAI API. |
 | `GET /v1/service` | The descriptor of the service: `api`, `api_version`, name, environment, engine state, model, effective user, `admin` and `caller_admin`. The admin app uses it to find services. |
 
 The model list has one entry for each model id. Each entry has the OpenAI
@@ -125,7 +125,7 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 | `GET /admin/audit/users` | The users in the log, with the first and last request time of each. |
 | `GET /admin/usage` | Usage totals. Filters: `since`, `until` (days in the form `YYYY-MM-DD`), `user`, `model`. `group_by` is `user` (default), `model` or `day`. |
 | `GET /admin/usage/{user}` | The totals of one user, by model and by day. |
-| `GET /admin/limits` | The default limits, the user entries, and the current use of each user who has an entry or use now. |
+| `GET /admin/limits` | The default limits, the user entries, and `loaded`. For each user who has an entry or use now: the current use, and the effective limits with their source. |
 | `PUT /admin/limits/default` | Replaces the default limits. The body has the three limit fields. |
 | `PUT /admin/limits/users/{name}` | Sets the entry of one user. The body has one to three limit fields. |
 | `DELETE /admin/limits/users/{name}` | Removes the entry of one user. The answer is 404 `limit_not_found` without an entry. |
@@ -450,6 +450,11 @@ OpenAI endpoints, after the body check and before the request goes to the
 engine. A request over a limit gets 429 `rate_limit_error` with a `Retry-After`
 header. The code of the error is the name of the limit. `limits.py` holds the
 limits file and the lookup. `limiter.py` holds the window and the counters.
+
+A storage error at the read of the limits file means no limits. The flusher then
+reads the file again after each flush, until a read works. Meanwhile,
+`GET /v1/limits/me` and `GET /admin/limits` answer `"loaded": false`, and the
+page shows a note.
 
 The design is in [limits-load-catalog-design.md](limits-load-catalog-design.md),
 Part 1. The README has the usage.

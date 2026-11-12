@@ -65,7 +65,8 @@ class LimitStore:
     def load(self) -> None:
         """Read the file. A missing or broken file means no limits.
 
-        Another read error also means no limits and an error log. The next write then reads again.
+        Another read error also means no limits and an error log. The next write or
+        `retry_load` then reads again.
         """
         with self._write_lock:
             self._load()
@@ -88,6 +89,21 @@ class LimitStore:
         with self._lock:
             self._default, self._users = default, users
             self._loaded = loaded
+
+    def loaded(self) -> bool:
+        """Return False after a read that failed for a reason other than the content."""
+        with self._lock:
+            return self._loaded
+
+    def retry_load(self) -> bool:
+        """Read the file again if the last read failed. Return `loaded()`. Never raises."""
+        try:
+            with self._write_lock:
+                if not self._loaded:
+                    self._load()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("the new read of %s failed: %s", self._path, exc)
+        return self.loaded()
 
     @staticmethod
     def _parse(raw: bytes) -> tuple[dict | None, dict[str, dict]]:

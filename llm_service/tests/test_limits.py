@@ -395,3 +395,36 @@ def test_needs_admin_only_for_a_user_without_an_entry_while_a_default_exists():
     assert store.gets == gets  # no storage call
     assert make({"users": {"bob": {"tokens_per_day": 1}}})[0].needs_admin("carol") is False
     assert make()[0].needs_admin("carol") is False
+
+
+def test_loaded_is_true_after_a_read_of_a_good_missing_or_broken_file():
+    assert make({"default": FULL})[0].loaded() is True
+    assert make()[0].loaded() is True
+    assert make("not json")[0].loaded() is True
+
+
+def test_retry_load_reads_again_only_after_a_failed_read():
+    limits, store = flaky(2)
+    limits.load()
+    assert limits.loaded() is False and limits.default() is None
+    assert limits.retry_load() is False  # the second read fails too
+    assert limits.loaded() is False
+    assert limits.retry_load() is True
+    assert limits.loaded() is True and limits.default() == FULL
+    store.failures = 5
+    assert limits.retry_load() is True  # no read while the last read was good
+    assert store.failures == 5
+
+
+def test_retry_load_never_raises(caplog):
+    class Broken(MemoryBlobStore):
+        def get(self, path):
+            raise RuntimeError("storage down")
+
+    limits = LimitStore(Broken(), ROOT)
+    with caplog.at_level(logging.ERROR):
+        limits.load()
+        assert limits.retry_load() is False
+    limits._load = lambda: 1 / 0  # an error that the read itself does not catch
+    assert limits.retry_load() is False
+    assert limits.loaded() is False

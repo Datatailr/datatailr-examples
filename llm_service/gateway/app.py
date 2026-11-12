@@ -156,16 +156,17 @@ def create_app(
     manager = ModelManager(weights, engine, store, config.blob_root, config.default_model, on_event)
 
     def on_flusher_tick() -> None:
-        """Run the usage steps after each flush, in the flusher thread.
+        """Run the usage steps and the new read of the limits after each flush, in the flusher thread.
 
-        Each step has its own guard, so one failure does not stop the other. The last cycle
-        at shutdown forces the checkpoint. The merge and the retention run in the
-        maintenance task, so a flush never waits for their deletes.
+        Each step has its own guard, so one failure does not stop the others. The last cycle
+        at shutdown forces the checkpoint. The limits file is read again only after a failed read.
+        The merge and the retention run in the maintenance task, so a flush never waits for their deletes.
         """
         last_cycle = stopping.is_set()
         steps = [
             ("close_days", usage.close_days),
             ("checkpoint", lambda: usage.checkpoint(force=last_cycle)),
+            ("limits", limits.retry_load),
         ]
         for name, step in steps:
             try:
@@ -502,7 +503,13 @@ def create_app(
     async def limits_me(user: str = Depends(effective_user)) -> dict:
         user_admin = await asyncio.to_thread(admin.is_admin, user)
         user_limits, source = limits.limits_for(user, user_admin)
-        return {"user": user, "limits": user_limits, "use": limiter.use(user), "source": source}
+        return {
+            "user": user,
+            "limits": user_limits,
+            "use": limiter.use(user),
+            "source": source,
+            "loaded": limits.loaded(),
+        }
 
     # Admin API
 
@@ -555,10 +562,21 @@ def create_app(
     async def get_limits(admin_user: str = Depends(require_admin)) -> dict:
         entries = limits.users()
         names = sorted(set(limiter.active_users()) | set(entries))
+
+        def effective() -> dict:
+            """The limits of each listed user and their source, with one admin lookup for each."""
+            found = {}
+            for name in names:
+                values, source = limits.limits_for(name, admin.is_admin(name))
+                found[name] = {"limits": values, "source": source}
+            return found
+
         return {
             "default": limits.default(),
             "users": entries,
             "use": {name: limiter.use(name) for name in names},
+            "effective": await asyncio.to_thread(effective),
+            "loaded": limits.loaded(),
         }
 
     @app.put("/admin/limits/default")

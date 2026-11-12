@@ -68,6 +68,8 @@ The service reads the file at the start and keeps it in memory. A change through
 
 A storage error at the read is different. The service does not know the content of the file then, so it also applies no limits. Each change through the API gets 502 `storage_unavailable` until a read works. The service reads the file again at each change, but only while the last read failed.
 
+The flusher of the audit log also reads the file again after each flush, but only while the last read failed. So the limits come back without a restart. While the read fails, `GET /v1/limits/me` and `GET /admin/limits` answer `"loaded": false`. The page then shows a note: "The service did not read the limits file. No limit applies now. The service tries again."
+
 ### Enforcement
 
 The check runs in the handler of the OpenAI endpoints, after the body check and before the request goes to the engine. The order is:
@@ -104,7 +106,7 @@ The window and the parallel counter are in the memory of the one container of th
 | Endpoint | For | Does |
 |---|---|---|
 | `GET /v1/limits/me` | Each user | The limits and the current use of the effective user. |
-| `GET /admin/limits` | Admin | The default, the user entries, and the current use of each user who has use now. |
+| `GET /admin/limits` | Admin | The default, the user entries, the current use and the effective limits of each listed user. |
 | `PUT /admin/limits/default` | Admin | Replaces the default. Body: the three fields. |
 | `PUT /admin/limits/users/{name}` | Admin | Sets the entry of one user. Body: one to three fields. |
 | `DELETE /admin/limits/users/{name}` | Admin | Removes the entry of one user. 404 `limit_not_found` without an entry. |
@@ -116,11 +118,27 @@ The answer of `GET /v1/limits/me`:
   "user": "bob",
   "limits": {"requests_per_minute": 60, "tokens_per_day": null, "parallel_requests": 4},
   "use": {"requests_last_minute": 3, "tokens_today": 15234, "parallel_requests": 1},
-  "source": "user"
+  "source": "user",
+  "loaded": true
 }
 ```
 
-`source` is `user`, `default`, `admin` or `none`.
+`source` is `user`, `default`, `admin` or `none`. `loaded` is false while the read of the limits file fails.
+
+The answer of `GET /admin/limits` lists each user with an entry or with use now:
+
+```json
+{
+  "default": {"requests_per_minute": 60, "tokens_per_day": 2000000, "parallel_requests": 4},
+  "users": {"bob": {"tokens_per_day": null}},
+  "use": {"bob": {"requests_last_minute": 3, "tokens_today": 15234, "parallel_requests": 1}},
+  "effective": {"bob": {"limits": {"requests_per_minute": 60, "tokens_per_day": null, "parallel_requests": 4},
+                        "source": "user"}},
+  "loaded": true
+}
+```
+
+`effective` holds the limits that apply to each listed user and their source, as `GET /v1/limits/me` gives them.
 
 A body that is not JSON, has an unknown field, a wrong type or a number outside the range gets 400 `invalid_limit`. So does a default body with a missing field and an empty body for a user. A change that fails because the service cannot read or write the file gets 502 `storage_unavailable`. A user name follows the rules of the acting user name: at most 256 characters, no control character. A bad name gets 400 `invalid_user`.
 
@@ -130,6 +148,7 @@ Each change writes an audit event `limits_change` with the admin name, the targe
 
 - New routes that pass through: `GET /api/services/{name}/limits`, `PUT /api/services/{name}/limits/default`, `PUT` and `DELETE /api/services/{name}/limits/users/{user}`, and `GET /api/services/{name}/limits/me`.
 - A Limits tab, for an admin of the picked service. It has a form for the default and a table of the user entries with the current use. The admin adds, changes and removes an entry there. An empty field means no limit.
+- The table shows the effective limits from the service. A limit from the default is muted. An admin without an entry shows "No limit".
 - The Connect tab shows the limits and the current use of the viewer.
 - The testing area shows the message of a 429 answer and the wait time.
 

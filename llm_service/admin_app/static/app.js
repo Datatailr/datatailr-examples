@@ -1162,6 +1162,7 @@ const LIMIT_SOURCES = {
   none: 'The service sets no limit for you.',
 };
 const NOT_OFFERED = 'This service does not offer limits.';
+const UNLOADED = 'The service did not read the limits file. No limit applies now. The service tries again.';
 
 /** The value of the own property `key` of `object`, or undefined. */
 const ownValue = (object, key) => (object && Object.hasOwn(object, key) ? object[key] : undefined);
@@ -1175,11 +1176,19 @@ const waitText = wait => (wait === null || wait === undefined ? ''
 /** True for the 404 of a service without the limit endpoints. The 404 of an unknown service is another error. */
 const limitsMissing = error => error instanceof ApiError && error.status === 404 && error.code !== 'unknown_service';
 
-/** The limit `name` of a user with the entry `entry` (or none), and whether it comes from the default `defaults`. */
-function effectiveLimit(entry, defaults, name) {
-  if (entry && Object.hasOwn(entry, name)) return {value: entry[name], inherited: false};
-  const value = ownValue(defaults, name);
-  return {value: value === undefined ? null : value, inherited: true};
+/** The cell of the limit `name` from the effective limits `effective` of the service and the entry `entry` (or
+ * none). The limit is muted when it comes from the default. The value is undefined without effective limits. */
+function limitCell(effective, entry, name) {
+  const source = ownValue(effective, 'source');
+  const muted = source === 'default' || (source === 'user' && !(entry && Object.hasOwn(entry, name)));
+  const title = muted ? 'From the default' : source === 'admin' ? 'Admin of the service' : null;
+  return {value: ownValue(ownValue(effective, 'limits'), name), muted, title};
+}
+
+/** The note of the card "Your limits" for the answer of `limits/me`. */
+function myLimitsNote({limits, loaded}) {
+  if (loaded === false) return UNLOADED;
+  return LIMITS.every(({name}) => noLimit(ownValue(limits, name))) ? 'You have no limit on this service.' : '';
 }
 
 /** The body of `PUT limits/default` from the text of each field. An empty field means no limit. */
@@ -1205,7 +1214,8 @@ function showMyLimitsNote(text) {
   $('my-limits-note').hidden = !text;
 }
 
-function showMyLimits({limits, use, source}) {
+function showMyLimits(answer) {
+  const {limits, use, source} = answer;
   for (const {name, use: key, when} of LIMITS) {
     const limit = ownValue(limits, name);
     const used = fmt(ownValue(use, key) ?? 0);
@@ -1213,8 +1223,7 @@ function showMyLimits({limits, use, source}) {
   }
   $('my-limits-source').textContent = ownValue(LIMIT_SOURCES, source) || String(source ?? '-');
   $('my-limits-list').hidden = false;
-  const none = LIMITS.every(({name}) => noLimit(ownValue(limits, name)));
-  showMyLimitsNote(none ? 'You have no limit on this service.' : '');
+  showMyLimitsNote(myLimitsNote(answer));
 }
 
 /** Read the limits and the use of the viewer on `service`. A failure shows a note in the card only. */
@@ -1264,21 +1273,27 @@ function showLimits(answer) {
   const defaults = answer.default || null;
   const users = answer.users || {};
   const use = answer.use || {};
+  const effective = answer.effective || {};
+  $('limits-unloaded').textContent = UNLOADED;
+  $('limits-unloaded').hidden = answer.loaded !== false;
   for (const {name} of LIMITS) {
     const value = ownValue(defaults, name);
     $(`limits-default-${name}`).value = noLimit(value) ? '' : String(value);
   }
   const names = [...new Set([...Object.keys(users), ...Object.keys(use)])].sort();
-  replaceRows($('limits-body'), names.map(user => limitRow(user, ownValue(users, user), defaults, ownValue(use, user))),
+  replaceRows($('limits-body'),
+              names.map(user => limitRow(user, ownValue(users, user), ownValue(effective, user), ownValue(use, user))),
               8, 'No user has an entry or a current use.');
 }
 
-/** A row of a user. A limit from the default is muted. A row with an entry has Edit and Remove. */
-function limitRow(user, entry, defaults, use) {
+/** A row of a user with the effective limits of the service. A limit from the default is muted. A row with an
+ * entry has Edit and Remove. */
+function limitRow(user, entry, effective, use) {
   const limits = LIMITS.map(({name}) => {
-    const {value, inherited} = effectiveLimit(entry, defaults, name);
-    return el('td', {className: inherited ? 'num muted' : 'num', title: inherited ? 'From the default' : null},
-              limitText(value), inherited ? el('span', {className: 'sr-only', text: ', from the default'}) : null);
+    const {value, muted, title} = limitCell(effective, entry, name);
+    return el('td', {className: muted ? 'num muted' : 'num', title},
+              value === undefined ? '-' : limitText(value),
+              title ? el('span', {className: 'sr-only', text: `, ${title.toLowerCase()}`}) : null);
   });
   const used = LIMITS.map(({use: key}) => el('td', {className: 'num', text: fmt(ownValue(use, key) ?? 0)}));
   const actions = entry ? el('div', {className: 'pair'},
@@ -1315,6 +1330,7 @@ function clearUserForm() {
 function clearLimits() {
   nextCall('limits');
   showLimitsMissing(false);
+  $('limits-unloaded').hidden = true;
   $('limits-default-form').reset();
   $('limits-body').replaceChildren();
   clearUserForm();

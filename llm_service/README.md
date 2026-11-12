@@ -396,7 +396,7 @@ The service looks up the limits of a user in this order:
 
 Without a limits file, no user has a limit, and the service works as before. The service keeps the limits in `limits.json` under `LLM_BLOB_ROOT`. It reads the file at the start. A broken file means no limits, and the service logs an error. The next PUT through the API replaces the broken file. A DELETE of an entry on a broken file gets 404 and writes nothing.
 
-If the read at the start fails because of a storage error, the service also applies no limits. Each change then gets 502 `storage_unavailable` until a read works. The service reads the file again at each change, but only while the last read failed.
+If the read at the start fails because of a storage error, the service also applies no limits. Each change then gets 502 `storage_unavailable` until a read works. The service reads the file again at each change, but only while the last read failed. The service also reads it again after each flush of the audit log, so the limits come back without a restart. Until then, the answers of `GET /v1/limits/me` and `GET /admin/limits` have `"loaded": false`.
 
 ### The 429 answer
 
@@ -428,14 +428,15 @@ curl http://llm-service/v1/limits/me
   "user": "bob",
   "limits": {"requests_per_minute": 60, "tokens_per_day": null, "parallel_requests": 4},
   "use": {"requests_last_minute": 3, "tokens_today": 15234, "parallel_requests": 1},
-  "source": "user"
+  "source": "user",
+  "loaded": true
 }
 ```
 
-The `source` is `user`, `default`, `admin` or `none`. The next calls are for admins.
+The `source` is `user`, `default`, `admin` or `none`. `loaded` is false while the service cannot read the limits file. The next calls are for admins.
 
 ```bash
-# Read the default, the user entries and the current use
+# Read the default, the user entries, the current use and the effective limits of each user
 curl http://llm-service/admin/limits
 
 # Replace the default. The body needs all three fields. Null means no limit.
@@ -469,7 +470,7 @@ Each change writes an audit event `limits_change` with the admin name, the targe
 
 ### The Limits tab
 
-The admin app has the Limits tab for an admin of the picked service. It has a card for the default limits and a table of the user entries with the current use. An admin adds, changes and removes an entry there. An empty field in the default card means no limit. Each viewer sees their own limits in the card "Your limits" on the Connect tab.
+The admin app has the Limits tab for an admin of the picked service. It has a card for the default limits and a table of the user entries with the current use. The table shows the limits that apply to each user, from `effective` in the answer of `GET /admin/limits`. A limit from the default is muted. An admin without an entry has "No limit". If the service did not read the limits file, the tab and the card "Your limits" show a note. An admin adds, changes and removes an entry there. An empty field in the default card means no limit. Each viewer sees their own limits in the card "Your limits" on the Connect tab.
 
 ## Admin app
 

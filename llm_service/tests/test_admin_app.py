@@ -762,7 +762,7 @@ def test_page_reads_split_events_and_builds_the_outside_url(tmp_path):
 
 
 LIMITS_IDS = (
-    "tab-limits", "panel-limits", "limits-pick", "limits-content", "limits-missing", "limits-cards",
+    "tab-limits", "panel-limits", "limits-pick", "limits-content", "limits-missing", "limits-cards", "limits-unloaded",
     "limits-default-form", "limits-default-requests_per_minute", "limits-default-tokens_per_day",
     "limits-default-parallel_requests", "limits-reload", "limits-body", "limits-user-form", "limits-user",
     "limits-user-requests_per_minute-mode", "limits-user-requests_per_minute",
@@ -807,6 +807,14 @@ def test_page_calls_the_five_limits_routes():
     assert "api(userPath, {method: 'DELETE'})" in text
 
 
+def test_page_shows_the_effective_limits_of_the_service():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("function showLimits("):text.index("function setChoice(")]
+    assert "ownValue(effective, user)" in body
+    assert "effectiveLimit" not in text  # the page no longer repeats the lookup order
+    assert "$('limits-unloaded').hidden = answer.loaded !== false;" in body
+
+
 def test_page_passes_retry_after_of_a_chat_error():
     text = (STATIC_DIR / "app.js").read_text()
     body = text[text.index("async function streamChat("):text.index("function chatTurn(")]
@@ -827,7 +835,7 @@ def test_page_limit_helpers(tmp_path):
         "  location: {pathname: '/', origin: 'https://example.test'}};\n"
         "vm.createContext(context);\n"
         "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {userLimitBody, defaultLimitBody,'\n"
-        "  + ' effectiveLimit, retryWait, waitText, limitsMissing, ApiError};', context);\n"
+        "  + ' limitCell, myLimitsNote, retryWait, waitText, limitsMissing, ApiError};', context);\n"
         "const h = context.h;\n"
         "const choice = (mode, value = '') => ({mode, value});\n"
         "const missing = (status, code) => h.limitsMissing(new h.ApiError('x', {status, code}));\n"
@@ -837,9 +845,17 @@ def test_page_limit_helpers(tmp_path):
         "  mixed: h.userLimitBody({requests_per_minute: choice('number', '60'), tokens_per_day: choice('none'),\n"
         "                          parallel_requests: choice('default', '9')}),\n"
         "  defaults: h.defaultLimitBody({requests_per_minute: '5', tokens_per_day: '', parallel_requests: ' 2 '}),\n"
-        "  own: h.effectiveLimit({tokens_per_day: null}, {tokens_per_day: 9}, 'tokens_per_day'),\n"
-        "  fromDefault: h.effectiveLimit({tokens_per_day: 3}, {requests_per_minute: 7}, 'requests_per_minute'),\n"
-        "  noEntry: h.effectiveLimit(undefined, null, 'parallel_requests'),\n"
+        "  own: h.limitCell({limits: {tokens_per_day: null}, source: 'user'}, {tokens_per_day: null}, 'tokens_per_day'),\n"
+        "  leftOut: h.limitCell({limits: {requests_per_minute: 7}, source: 'user'}, {tokens_per_day: 3},\n"
+        "                       'requests_per_minute'),\n"
+        "  fromDefault: h.limitCell({limits: {tokens_per_day: 9}, source: 'default'}, undefined, 'tokens_per_day'),\n"
+        "  admin: h.limitCell({limits: {parallel_requests: null}, source: 'admin'}, undefined, 'parallel_requests'),\n"
+        "  none: h.limitCell({limits: {parallel_requests: null}, source: 'none'}, undefined, 'parallel_requests'),\n"
+        "  unknown: h.limitCell(undefined, undefined, 'parallel_requests'),\n"
+        "  notes: [h.myLimitsNote({limits: {tokens_per_day: 5}, loaded: false}),\n"
+        "          h.myLimitsNote({limits: {tokens_per_day: null}, loaded: true}),\n"
+        "          h.myLimitsNote({limits: {tokens_per_day: 5}, loaded: true}),\n"
+        "          h.myLimitsNote({limits: {tokens_per_day: 5}})],\n"
         "  waits: ['17', '0', '', null, 'soon', '1.5', '123456'].map(h.retryWait),\n"
         "  texts: [h.waitText(1), h.waitText(17), h.waitText(null)],\n"
         "  missing: [missing(404, 'not_found'), missing(404, null), missing(404, 'unknown_service'),\n"
@@ -852,9 +868,14 @@ def test_page_limit_helpers(tmp_path):
     assert result["allDefault"] is None
     assert result["mixed"] == {"requests_per_minute": 60, "tokens_per_day": None}
     assert result["defaults"] == {"requests_per_minute": 5, "tokens_per_day": None, "parallel_requests": 2}
-    assert result["own"] == {"value": None, "inherited": False}
-    assert result["fromDefault"] == {"value": 7, "inherited": True}
-    assert result["noEntry"] == {"value": None, "inherited": True}
+    assert result["own"] == {"value": None, "muted": False, "title": None}
+    assert result["leftOut"] == {"value": 7, "muted": True, "title": "From the default"}
+    assert result["fromDefault"] == {"value": 9, "muted": True, "title": "From the default"}
+    assert result["admin"] == {"value": None, "muted": False, "title": "Admin of the service"}
+    assert result["none"] == {"value": None, "muted": False, "title": None}
+    assert result["unknown"] == {"muted": False, "title": None}  # no value: the row shows "-"
+    unloaded = "The service did not read the limits file. No limit applies now. The service tries again."
+    assert result["notes"] == [unloaded, "You have no limit on this service.", "", ""]
     assert result["waits"] == [17, 0, None, None, None, None, None]
     assert result["texts"] == ["Try again in 1 second.", "Try again in 17 seconds.", ""]
     assert result["missing"] == [True, True, False, False, False]

@@ -1741,6 +1741,7 @@ def test_limits_me_for_a_user_with_an_entry_and_the_use_after_a_request(tmp_path
             "limits": {"requests_per_minute": 10, "tokens_per_day": 100, "parallel_requests": None},
             "use": {"requests_last_minute": 1, "tokens_today": 5, "parallel_requests": 0},
             "source": "user",
+            "loaded": True,
         }
 
 
@@ -1807,11 +1808,49 @@ def test_get_limits_shows_default_entries_and_use(tmp_path):
         assert body["use"]["carol"] == {"requests_last_minute": 0, "tokens_today": 0, "parallel_requests": 0}
 
 
+def test_get_limits_shows_the_effective_limits_and_their_source(tmp_path, monkeypatch):
+    threads = []
+    real = AdminCheck.is_admin
+
+    def is_admin(check, user):
+        threads.append(threading.get_ident())
+        return real(check, user)
+
+    entries = {"bob": {"tokens_per_day": 9}, "carol": {"parallel_requests": None}}
+    c, _ = limited_client(tmp_path, {"default": FULL, "users": entries})
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200
+        c.app.state.limiter.acquire("dave", {})
+        c.app.state.limiter.release("dave")
+        monkeypatch.setattr(AdminCheck, "is_admin", is_admin)
+        body = c.get("/admin/limits", headers=ALICE).json()
+        assert body["effective"] == {
+            "alice": {"limits": ALL_NONE, "source": "admin"},
+            "bob": {"limits": {**FULL, "tokens_per_day": 9}, "source": "user"},
+            "carol": {"limits": {**FULL, "parallel_requests": None}, "source": "user"},
+            "dave": {"limits": FULL, "source": "default"},
+        }
+        lookups = threads[1:]  # the first lookup is the admin check of the caller
+        assert len(lookups) == 4 and len(set(lookups)) == 1  # one thread hop for all users
+
+
+def test_get_limits_effective_source_is_none_without_a_default(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=3))
+    with c:
+        wait_ready(c)
+        c.app.state.limiter.acquire("dave", {})
+        effective = c.get("/admin/limits", headers=ALICE).json()["effective"]
+        assert effective["dave"] == {"limits": ALL_NONE, "source": "none"}
+        assert effective["bob"] == {"limits": {**ALL_NONE, "requests_per_minute": 3}, "source": "user"}
+
+
 def test_get_limits_without_a_file(tmp_path):
     c, _ = limited_client(tmp_path, None)
     with c:
         wait_ready(c)
-        assert c.get("/admin/limits", headers=ALICE).json() == {"default": None, "users": {}, "use": {}}
+        body = c.get("/admin/limits", headers=ALICE).json()
+        assert body == {"default": None, "users": {}, "use": {}, "effective": {}, "loaded": True}
 
 
 def test_put_default_changes_the_answer_and_the_enforcement_at_once(tmp_path):
@@ -1975,6 +2014,38 @@ def test_a_limits_file_that_could_not_be_read_gives_502(tmp_path):
         wait_ready(c)
         r = c.put("/admin/limits/default", headers=ALICE, json=FULL)
         assert r.status_code == 502 and r.json()["error"]["code"] == "storage_unavailable"
+
+
+class SwitchedLimitsStore(MemoryBlobStore):
+    """A store whose reads of the limits file fail while `fail` is true."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = True
+
+    def get(self, path):
+        if self.fail and path == LIMITS_PATH:
+            raise OSError("the store is down")
+        return super().get(path)
+
+
+def test_a_failed_read_shows_loaded_false_and_the_flusher_reads_the_file_again(tmp_path):
+    store = SwitchedLimitsStore()
+    store.put(LIMITS_PATH, json.dumps(user_limits(requests_per_minute=1)))
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    with TestClient(make_app(tmp_path, store=store, http=http, flush_interval=0.05)) as c:
+        wait_ready(c)
+        assert c.get("/admin/limits", headers=ALICE).json()["loaded"] is False
+        assert c.get("/v1/limits/me", headers=BOB).json()["loaded"] is False
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200  # no limit applies now
+        store.fail = False
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not c.app.state.limits.loaded():
+            time.sleep(0.05)
+        assert c.get("/admin/limits", headers=ALICE).json()["loaded"] is True
+        assert c.get("/v1/limits/me", headers=BOB).json()["loaded"] is True
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 429
 
 
 def test_each_change_is_audited_with_old_and_new(tmp_path):
