@@ -15,6 +15,7 @@ def test_service_env_passes_overrides_and_optional_variables():
         "LLM_DEFAULT_MODEL": "org/model",
         "LLM_BLOB_ROOT": "/my-root/",
         "LLM_ADMIN_GROUP": "llm_admins",
+        "LLM_ACCESS_GROUP": "llm_users",
         "LLM_HF_TOKEN_KEY": "hf_token",
         "LLM_VLLM_ARGS": "--max-model-len 4096",
         "LLM_PROMPT_RETENTION_DAYS": "30",
@@ -23,6 +24,7 @@ def test_service_env_passes_overrides_and_optional_variables():
         "LLM_DEFAULT_MODEL": "org/model",
         "LLM_BLOB_ROOT": "my-root",
         "LLM_ADMIN_GROUP": "llm_admins",
+        "LLM_ACCESS_GROUP": "llm_users",
         "LLM_HF_TOKEN_KEY": "hf_token",
         "LLM_VLLM_ARGS": "--max-model-len 4096",
         "LLM_PROMPT_RETENTION_DAYS": "30",
@@ -30,12 +32,12 @@ def test_service_env_passes_overrides_and_optional_variables():
 
 
 def test_service_env_leaves_out_empty_optional_variables():
-    env = {"LLM_ADMIN_GROUP": "", "LLM_HF_TOKEN_KEY": "  ", "LLM_VLLM_ARGS": "", "LLM_PROMPT_RETENTION_DAYS": " "}
+    env = {"LLM_ADMIN_GROUP": "", "LLM_ACCESS_GROUP": " ", "LLM_HF_TOKEN_KEY": "  ", "LLM_VLLM_ARGS": "", "LLM_PROMPT_RETENTION_DAYS": " "}
     assert set(service_env(env)) == {"LLM_DEFAULT_MODEL", "LLM_BLOB_ROOT"}
 
 
 def test_service_env_ignores_variables_the_container_does_not_need():
-    env = {"LLM_VRAM": "40g", "LLM_ACCESS_GROUP": "team", "OTHER": "x"}
+    env = {"LLM_VRAM": "40g", "OTHER": "x"}
     assert set(service_env(env)) == {"LLM_DEFAULT_MODEL", "LLM_BLOB_ROOT"}
 
 

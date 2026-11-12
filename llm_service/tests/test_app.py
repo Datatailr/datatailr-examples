@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from llm_service.gateway.app import create_app, read_hf_token
 from llm_service.gateway.config import Config
-from llm_service.gateway.identity import AdminCheck
+from llm_service.gateway.identity import AccessCheck, AdminCheck
 from llm_service.gateway.storage import MemoryBlobStore
 from llm_service.tests.fakes import FakeEngine, fake_vllm_app
 
@@ -69,6 +69,7 @@ def make_app(
     download=plain_download,
     now=None,
     maintenance_interval=None,
+    with_access=True,
     **config_args,
 ):
     store = store or MemoryBlobStore()
@@ -81,7 +82,8 @@ def make_app(
         transport=httpx.ASGITransport(app=fake_vllm_app()), base_url="http://engine"
     )
     admin = AdminCheck("alice", "admins", lambda group: ["carol"])
-    extra = {}
+    access = AccessCheck(admin, "users", lambda group: ["bob"])
+    extra = {"access": access} if with_access else {}
     if now is not None:
         extra["now"] = now
     if maintenance_interval is not None:
@@ -681,11 +683,98 @@ def test_empty_acting_user_means_the_caller(client, headers):
     assert events[0]["user"] == "alice"
 
 
-def test_openai_endpoints_ignore_the_acting_user(client):
-    r = client.post(CHAT, headers=BOB | {ACTING: "alice"}, json=HI)
+def chat_records(client):
+    return [rec for rec in audit_records(client) if rec["endpoint"] == CHAT]
+
+
+def test_chat_without_header_is_the_caller_and_has_no_via(client):
+    assert client.post(CHAT, headers=BOB, json=HI).status_code == 200
+    (rec,) = chat_records(client)
+    assert rec["user"] == "bob" and "via" not in rec
+
+
+def test_chat_acts_for_a_user_with_access(client):
+    r = client.post(CHAT, headers=ALICE | {ACTING: "bob"}, json=HI)
     assert r.status_code == 200
-    users = [rec["user"] for rec in audit_records(client) if rec["endpoint"] == CHAT]
-    assert users == ["bob"]
+    (rec,) = chat_records(client)
+    assert rec["user"] == "bob" and rec["via"] == "alice"
+    assert client.app.state.audit.record(rec["ts"][:10], rec["request_id"])["via"] == "alice"
+    detail = client.get(
+        f"/admin/audit/records/{rec['request_id']}", headers=ALICE, params={"day": rec["ts"][:10]}
+    ).json()
+    assert detail["user"] == "bob" and detail["via"] == "alice"
+
+
+def test_acting_admin_has_access(client):
+    r = client.post(CHAT, headers=ALICE | {ACTING: "carol"}, json=HI)
+    assert r.status_code == 200
+    assert chat_records(client)[0]["user"] == "carol"
+
+
+@pytest.mark.parametrize("method, path", [("post", CHAT), ("get", "/v1/models"), ("get", "/v1/usage/me")])
+def test_non_admin_caller_with_acting_user_is_refused_on_v1(client, method, path):
+    kwargs = {"json": HI} if method == "post" else {}
+    r = getattr(client, method)(path, headers=BOB | {ACTING: "bob"}, **kwargs)
+    assert r.status_code == 403
+    assert r.json()["error"] == {
+        "message": r.json()["error"]["message"],
+        "type": "permission_error",
+        "code": "acting_user_not_allowed",
+    }
+
+
+@pytest.mark.parametrize("method, path", [("post", CHAT), ("get", "/v1/models"), ("get", "/v1/usage/me")])
+def test_acting_user_without_access_is_refused_on_v1(client, method, path):
+    kwargs = {"json": HI} if method == "post" else {}
+    r = getattr(client, method)(path, headers=ALICE | {ACTING: "dave"}, **kwargs)
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "access_denied"
+    assert r.json()["error"]["type"] == "permission_error"
+
+
+@pytest.mark.parametrize("method, path", [("post", CHAT), ("get", "/v1/models"), ("get", "/v1/usage/me")])
+@pytest.mark.parametrize("name", ["x" * 257, "a\tb"])
+def test_bad_acting_user_is_400_on_v1(client, method, path, name):
+    kwargs = {"json": HI} if method == "post" else {}
+    r = getattr(client, method)(path, headers=ALICE | {ACTING: name}, **kwargs)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_acting_user"
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_refused_acting_user_writes_no_chat_audit_record(client):
+    client.post(CHAT, headers=ALICE | {ACTING: "dave"}, json=HI)
+    assert chat_records(client) == []
+
+
+def test_empty_acting_user_on_v1_means_the_caller(client):
+    r = client.post(CHAT, headers=BOB | {ACTING: "  "}, json=HI)
+    assert r.status_code == 200
+    assert chat_records(client)[0]["user"] == "bob"
+
+
+def test_models_accept_an_acting_user_with_access(client):
+    assert client.get("/v1/models", headers=ALICE | {ACTING: "bob"}).status_code == 200
+    r = client.get("/v1/models/org/a", headers=ALICE | {ACTING: "bob"})
+    assert r.status_code == 200 and r.json()["id"] == "org/a"
+    assert client.get("/v1/models/org/a", headers=ALICE | {ACTING: "dave"}).status_code == 403
+
+
+def test_usage_me_returns_the_numbers_of_the_acting_user(client):
+    client.post(CHAT, headers=BOB, json=HI)
+    client.post(CHAT, headers=BOB, json=HI)
+    client.post(CHAT, headers=ALICE, json=HI)
+    bob = client.get("/v1/usage/me", headers=BOB).json()
+    via = client.get("/v1/usage/me", headers=ALICE | {ACTING: "bob"}).json()
+    assert via == bob
+    assert via != client.get("/v1/usage/me", headers=ALICE).json()
+
+
+def test_app_without_access_check_gives_access_to_admins_only(tmp_path):
+    with TestClient(make_app(tmp_path, with_access=False)) as c:
+        wait_ready(c)
+        assert c.get("/v1/models", headers=ALICE | {ACTING: "carol"}).status_code == 200
+        assert c.get("/v1/models", headers=ALICE | {ACTING: "bob"}).status_code == 403
 
 
 def switch_and_wait(client, model, revision="main"):

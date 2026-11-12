@@ -16,7 +16,7 @@ TARGETS = ("service", "app")
 USAGE = "usage: python deploy.py [service|app]"
 
 # Optional variables. The service gets each one only when it is set.
-OPTIONAL_VARIABLES = ("LLM_ADMIN_GROUP", "LLM_HF_TOKEN_KEY", "LLM_VLLM_ARGS", "LLM_PROMPT_RETENTION_DAYS")
+OPTIONAL_VARIABLES = ("LLM_ADMIN_GROUP", "LLM_ACCESS_GROUP", "LLM_HF_TOKEN_KEY", "LLM_VLLM_ARGS", "LLM_PROMPT_RETENTION_DAYS")
 
 
 def _value(env: Mapping[str, str], name: str, default: str = "") -> str:

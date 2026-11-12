@@ -94,6 +94,31 @@ class AdminCheck:
         return self._cached
 
 
+class AccessCheck:
+    """Decide whether a user has access to the service.
+
+    An admin has access. A member of `group` has access too. Without a group, only
+    admins have access. The group members are cached for `ttl` seconds. A failed
+    lookup means no access.
+    """
+
+    def __init__(
+        self,
+        admin: AdminCheck,
+        group: str | None,
+        members: Callable[[str], list[str]],
+        ttl: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._admin = admin
+        # An AdminCheck without an owner is a cached group lookup.
+        self._group = AdminCheck("", group, members, ttl, clock)
+
+    def has_access(self, user: str) -> bool:
+        """Return True when the user is an admin or a member of the access group."""
+        return self._admin.is_admin(user) or self._group.is_admin(user)
+
+
 def platform_group_members(group: str) -> list[str]:
     """Return the user names in a platform group.
 
