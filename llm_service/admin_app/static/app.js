@@ -650,7 +650,8 @@ async function loadConnect() {
   const entry = entryOf(service) || {};
   showConnect(service, entry.model, entry.engine);
   const answer = await current('connect', call, service, api(servicePath('models', service)));
-  showConnect(service, activeModel(answer) || entry.model, entry.engine);
+  // The fresh answer wins. Without an active model, the page shows none, not the model that the list still names.
+  showConnect(service, activeModel(answer), entry.engine);
 }
 
 function clearConnect() {

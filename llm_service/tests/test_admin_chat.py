@@ -410,3 +410,13 @@ def test_a_gone_client_closes_the_response_of_the_service(registry, backend, mon
         assert body.closed
 
     asyncio.run(drive())
+
+
+def test_the_limit_stops_a_slow_error_body(client, backend, monkeypatch):
+    monkeypatch.setattr(app_module, "CHAT_TIMEOUT_SECONDS", 0.2)
+    body = RecordedStream([b'{"error": '], then="hang")
+    backend.build = lambda request: httpx.Response(503, stream=body)
+    response = post(client)
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "service_unreachable"
+    assert body.closed

@@ -404,25 +404,31 @@ def create_app(
         deadline = loop.time() + CHAT_TIMEOUT_SECONDS
         stack = contextlib.AsyncExitStack()
         try:
-            response = await stack.enter_async_context(
-                service.stream(name, "/v1/chat/completions", viewer, json=built, timeout=CHAT_TIMEOUT_SECONDS)
-            )
-            if response.status_code != 200:
-                if response.status_code < 400:
+            # The time limit also covers slow response headers and a slow error body.
+            async with asyncio.timeout_at(deadline):
+                response = await stack.enter_async_context(
+                    service.stream(name, "/v1/chat/completions", viewer, json=built, timeout=CHAT_TIMEOUT_SECONDS)
+                )
+                if response.status_code != 200:
+                    if response.status_code < 400:
+                        await stack.aclose()
+                        return _error(502, "service_unreachable", UNREACHABLE)
+                    try:
+                        error_bytes = b""
+                        async for part in response.aiter_bytes():
+                            error_bytes += part
+                            if len(error_bytes) > MAX_ERROR_BODY_BYTES:
+                                raise ValueError("The error body is too large.")
+                        error_body = json.loads(error_bytes)
+                    except (httpx.HTTPError, ValueError):
+                        await stack.aclose()
+                        return _error(502, "service_unreachable", UNREACHABLE)
                     await stack.aclose()
-                    return _error(502, "service_unreachable", UNREACHABLE)
-                try:
-                    error_bytes = b""
-                    async for part in response.aiter_bytes():
-                        error_bytes += part
-                        if len(error_bytes) > MAX_ERROR_BODY_BYTES:
-                            raise ValueError("The error body is too large.")
-                    error_body = json.loads(error_bytes)
-                except (httpx.HTTPError, ValueError):
-                    await stack.aclose()
-                    return _error(502, "service_unreachable", UNREACHABLE)
-                await stack.aclose()
-                return JSONResponse(error_body, status_code=response.status_code)
+                    return JSONResponse(error_body, status_code=response.status_code)
+        except TimeoutError:
+            log.warning("The chat call to the service %s passed the time limit before the answer started.", name)
+            await stack.aclose()
+            return _error(502, "service_unreachable", UNREACHABLE)
         except ServiceUnreachable:
             await stack.aclose()
             return _error(502, "service_unreachable", UNREACHABLE)
@@ -603,7 +609,10 @@ def create_app(
             skipped = {e.name: f"The service has the state {e.state}." for e in entries if e.state != "ok"}
             entries = [e for e in entries if e.state == "ok"]
         else:
-            entries = [e for e in registry.entries() if e.state == "ok"]
+            # A shown service that is not usable is named, so its missing numbers are visible.
+            entries = registry.entries()
+            skipped = {e.name: f"The service has the state {e.state}." for e in entries if e.state != "ok"}
+            entries = [e for e in entries if e.state == "ok"]
         found = await asyncio.gather(*(roles(viewer, e.name) for e in entries))
         chosen = [(e.name, role["admin"]) for e, role in zip(entries, found) if role["access"]]
         # A service whose role call failed shows with its error. Only a service without access stays out.

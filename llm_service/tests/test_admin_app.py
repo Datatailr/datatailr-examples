@@ -1316,3 +1316,23 @@ def test_usage_an_unknown_valid_name_says_unknown(client):
     assert "unknown" in error["message"]
     bad = client.get("/api/usage?services=Bad", headers=ALICE).json()["error"]
     assert "a-z" in bad["message"]
+
+
+def test_usage_of_all_services_names_a_service_that_is_not_ok(client, fakes):
+    fakes.hosts["svc"].caller_admin = False
+    client.portal.call(client.app.state.registry.refresh)
+    fakes.requests.clear()
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    entry = client.app.state.registry.entries()[0]
+    assert entry.name == "svc" and entry.state != "ok"
+    body = client.get("/api/usage", headers=ALICE).json()
+    assert [s["name"] for s in body["services"]] == ["svc", "svc-two"]
+    first = body["services"][0]
+    assert first["ok"] is False and entry.state in first["error"]
+    assert {r.url.host for r in fakes.requests} == {"svc-two"}
+
+
+def test_page_shows_no_stale_model_after_a_fresh_answer():
+    script = (STATIC_DIR / "app.js").read_text()
+    assert "showConnect(service, activeModel(answer), entry.engine)" in script
+    assert "activeModel(answer) || entry.model" not in script
