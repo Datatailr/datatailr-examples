@@ -64,7 +64,9 @@ The limits are in one file, `<blob root>/limits.json`:
 }
 ```
 
-The service reads the file at the start and keeps it in memory. A change through the API writes the file first and then replaces the copy in memory. A broken file at the start means no limits, and the service logs an error.
+The service reads the file at the start and keeps it in memory. A change through the API writes the file first and then replaces the copy in memory. A broken file at the start means no limits, and the service logs an error. The next change through the API replaces the broken file.
+
+A storage error at the read is different. The service does not know the content of the file then, so it also applies no limits. Each change through the API gets 502 `storage_unavailable` until a read works. The service reads the file again at each change.
 
 ### Enforcement
 
@@ -120,7 +122,7 @@ The answer of `GET /v1/limits/me`:
 
 `source` is `user`, `default`, `admin` or `none`.
 
-A body with an unknown field, a wrong type or a number outside the range gets 400 `invalid_limit`. A user name follows the rules of the acting user name: at most 256 characters, no control character.
+A body with an unknown field, a wrong type or a number outside the range gets 400 `invalid_limit`. A change that fails because the service cannot read or write the file gets 502 `storage_unavailable`. A user name follows the rules of the acting user name: at most 256 characters, no control character.
 
 Each change writes an audit event `limits_change` with the admin name, the target (`default` or the user name) and the old and new values.
 

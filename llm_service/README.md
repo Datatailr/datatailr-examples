@@ -200,7 +200,7 @@ curl "$BASE/v1/service" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
 
 ## Acting user on the OpenAI endpoints
 
-The header `X-LLM-Acting-User` applies to `/admin/*` and to these endpoints: `/v1/service`, `/v1/models`, `/v1/models/{id}`, `/v1/usage/me`, `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. The admin app sends the name of the viewer in this header. The rules for a `/v1/*` endpoint are:
+The header `X-LLM-Acting-User` applies to `/admin/*` and to these endpoints: `/v1/service`, `/v1/models`, `/v1/models/{id}`, `/v1/usage/me`, `/v1/limits/me`, `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. The admin app sends the name of the viewer in this header. The rules for a `/v1/*` endpoint are:
 
 1. If the header is missing or empty, the effective user is the caller.
 2. A name that is longer than 256 characters or has a control character gets 400 `invalid_acting_user`.
@@ -372,6 +372,104 @@ Each row has the request count, the failed request count, the prompt, completion
 
 To read one user with the split by model and by day, call `/admin/usage/bob`. Each user can read their own usage at `/v1/usage/me`. This call is not part of the OpenAI API.
 
+## Limits for each user
+
+An admin protects the service from one heavy user with limits. A limit is a maximum for one user. The service has three limits.
+
+| Name | Meaning |
+|---|---|
+| `requests_per_minute` | The requests of the user in the last 60 seconds. |
+| `tokens_per_day` | The total tokens of the user in the current UTC day. |
+| `parallel_requests` | The requests of the user in flight now. |
+
+Each value is null or a whole number from 1 to 1,000,000,000. Null means no limit. The value 0 is not valid. To block a user, set `requests_per_minute` to 1, or remove the access of the user on the platform.
+
+The limits apply to `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. They apply to the effective user, so a request from the testing area of the app counts for the viewer.
+
+### Which limits a user gets
+
+The service looks up the limits of a user in this order:
+
+1. The entry of the user, if one exists. Each field of the entry is a number, null or absent. An absent field takes the default.
+2. For an admin without an entry: no limit.
+3. For each other user: the default.
+
+Without a limits file, no user has a limit, and the service works as before. The service keeps the limits in `limits.json` under `LLM_BLOB_ROOT`. It reads the file at the start. A broken file means no limits, and the service logs an error. The next change of the limits through the API replaces the broken file.
+
+If the read at the start fails because of a storage error, the service also applies no limits. Each change then gets 502 `storage_unavailable` until a read works. The service reads the file again at each change.
+
+### The 429 answer
+
+A request over a limit gets status 429. The service checks the limits in this order: `parallel_requests`, `requests_per_minute`, `tokens_per_day`. A refused request does not count in the window or in the parallel counter.
+
+```json
+{"error": {"message": "You reached the limit of 60 requests in one minute.",
+           "type": "rate_limit_error", "code": "requests_per_minute"}}
+```
+
+The `code` is the name of the limit. The header `Retry-After` has whole seconds:
+
+- `requests_per_minute`: the time until the oldest request leaves the window, at least 1.
+- `tokens_per_day`: the time until the next UTC midnight.
+- `parallel_requests`: 1.
+
+A refused request gets an audit record with status 429. It counts as a failed request in the usage numbers and adds no tokens.
+
+### Read and change the limits
+
+Each user reads their own limits and use:
+
+```bash
+curl http://llm-service/v1/limits/me
+```
+
+```json
+{
+  "user": "bob",
+  "limits": {"requests_per_minute": 60, "tokens_per_day": null, "parallel_requests": 4},
+  "use": {"requests_last_minute": 3, "tokens_today": 15234, "parallel_requests": 1},
+  "source": "user"
+}
+```
+
+The `source` is `user`, `default`, `admin` or `none`. The next calls are for admins.
+
+```bash
+# Read the default, the user entries and the current use
+curl http://llm-service/admin/limits
+
+# Replace the default. The body needs all three fields. Null means no limit.
+curl -X PUT http://llm-service/admin/limits/default \
+  -H "Content-Type: application/json" \
+  -d '{"requests_per_minute": 60, "tokens_per_day": 2000000, "parallel_requests": 4}'
+
+# Set the entry of carol. The body needs one to three fields.
+curl -X PUT http://llm-service/admin/limits/users/carol \
+  -H "Content-Type: application/json" \
+  -d '{"requests_per_minute": 10, "parallel_requests": 1}'
+
+# Let bob use any number of tokens in a day
+curl -X PUT http://llm-service/admin/limits/users/bob \
+  -H "Content-Type: application/json" \
+  -d '{"tokens_per_day": null}'
+
+# Remove the entry of alice
+curl -X DELETE http://llm-service/admin/limits/users/alice
+```
+
+The errors are:
+
+- 400 `invalid_limit`: the body has an unknown field, a wrong type or a number outside the range.
+- 403: the caller is not an admin.
+- 404 `limit_not_found`: the user has no entry. This applies to the delete.
+- 502 `storage_unavailable`: the service cannot read or write the limits file.
+
+Each change writes an audit event `limits_change` with the admin name, the target (`default` or the user name) and the old and new values.
+
+### The Limits tab
+
+The admin app has the Limits tab for an admin of the picked service. It has a card for the default limits and a table of the user entries with the current use. An admin adds, changes and removes an entry there. An empty field in the default card means no limit. Each viewer sees their own limits in the card "Your limits" on the Connect tab.
+
 ## Admin app
 
 The admin app is a web page for the users of your LLM services. It is the second job that `deploy.py` deploys. It works with each LLM service in its environment, not with one fixed service. It keeps no data, except a list of service names that the owner of the app edits.
@@ -405,10 +503,10 @@ The platform signs each call of the app as the user who deployed the app. The se
 
 Each viewer needs access to a service to see anything from it. The service checks this for the viewer, with `LLM_ACCESS_GROUP`. If the service does not answer this check, the page shows "The service did not answer." for it. The Usage tab then names that service as a service without numbers.
 
-- Each user with access sees the Usage tab with their own numbers, and the Connect tab.
-- An admin of a service also sees the numbers of all users of that service, the Audit tab and the Models tab. An admin switches the model and deletes cached weights there.
+- Each user with access sees the Usage tab with their own numbers, and the Connect tab. The Connect tab has the card "Your limits".
+- An admin of a service also sees the numbers of all users of that service, the Audit tab, the Models tab and the Limits tab. An admin switches the model and deletes cached weights in the Models tab. An admin sets limits in the Limits tab.
 - With "All services" picked, the Usage tab shows totals over all services, by user, by service and by day. A line names each service whose numbers are missing. Another line names each service where the viewer sees only their own numbers.
-- The Audit and Models tabs work with one service. With "All services" they ask the viewer to pick one.
+- The Audit, Models and Limits tabs work with one service. With "All services" they ask the viewer to pick one.
 
 The platform user names of the viewers must be ASCII. The app sends the name in an HTTP header. For a name that is not ASCII, the app answers 401 with the code `missing_user`.
 
@@ -417,7 +515,8 @@ The platform user names of the viewers must be ASCII. The app sends the name in 
 The Connect tab shows how to call the picked service. It has two parts.
 
 - Addresses and examples. The tab shows the internal base URL `http://<name>/v1` and the outside base URL, with the served model. It has examples for curl, for the `openai` package from a job, for the `openai` package from outside the platform, and for `chat.py`. Each example has a copy button. No example holds a token. The outside example reads it from the variable `LLM_TOKEN`.
-- The testing area. A viewer types a system prompt and a prompt, sets the model, the temperature and the maximum tokens, and presses Send. The answer streams into the page. After it, the area shows the token counts and the time to the first token. The area keeps the conversation, and Clear starts again.
+- The testing area. A viewer types a system prompt and a prompt, sets the model, the temperature and the maximum tokens, and presses Send. The answer streams into the page. After it, the area shows the token counts and the time to the first token. The area keeps the conversation, and Clear starts again. If the service answers 429, the area shows the message of the answer and the wait time.
+- The card "Your limits". The card shows the three limits of the viewer, the current use and the source of the limits. The source is the entry of the user, the default, admin (no limit) or none. A limit with no value shows as no limit.
 
 A request from the testing area counts for the viewer. It shows in the usage numbers and in the audit log under the name of the viewer. The `via` field of the record names the owner of the app. When the viewer is the owner of the app, the record has no `via` field.
 
@@ -440,6 +539,7 @@ All data is in blob storage, under the root directory in `LLM_BLOB_ROOT`:
 <root>/prompts/<day>/<time>-<id>.jsonl               # prompts of one flush
 <root>/usage/<day>.json                              # totals of one finished day
 <root>/usage/<day>.partial.json                      # checkpoint of the current day
+<root>/limits.json                                   # the limits of the users, if an admin set any
 ```
 
 The service writes `.complete` after the last weight file. The marker lists each file with its size. An upload that stops half way is not used. When the service downloads a model from blob storage, it downloads only the listed files and checks their sizes. If a file is missing or has the wrong size, the load fails with an error that names the file.
@@ -471,7 +571,9 @@ The first start after the upgrade reads every old layout file of the days withou
 - A stop ends the maintenance task first. It does not wait for a merge step that runs at that moment. The last flush waits at most for the write of one merged file. The process exits when the running merge step ends.
 - A late record for a day whose daily usage file exists counts in memory at once. The service writes it to the daily file at the next flusher cycle. A crash between the two loses it from the usage totals.
 - Token counts for a stream come from the last chunk. The service asks vLLM for that chunk. It removes the chunk again if the client did not ask for it.
-- There are no rate limits and no quotas for each user.
+- The token budget passes by the size of the requests in flight. The service checks `tokens_per_day` before a request, and the service knows the tokens of a request only at its end. So a user can pass the budget with parallel requests. The next request is refused.
+- A restart of the service clears the request window and the parallel counter. The token budget stays, because it comes from the usage totals.
+- The limits are for each service. Each service has its own limits file, and the app shows the limits of the picked service.
 - The platform does not start GPU nodes. You must start one.
 
 ## Run the tests

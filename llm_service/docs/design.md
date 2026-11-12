@@ -52,6 +52,7 @@ llm_service/
 │   ├── design.md          # this document
 │   ├── audit-storage-design.md
 │   ├── admin-app-design.md
+│   ├── limits-load-catalog-design.md
 │   └── multi-service-app-design.md
 ├── admin_app/             # the admin app: FastAPI backend and one page
 ├── gateway/
@@ -62,6 +63,8 @@ llm_service/
 │   ├── audit_layout.py    # file names, buckets and the split of a record
 │   ├── audit_merge.py     # merges of segments and parts, prompt retention
 │   ├── usage.py           # usage totals by user, model and day
+│   ├── limits.py          # the limits file and the lookup of the limits of one user
+│   ├── limiter.py         # request window, token budget and parallel counter
 │   ├── weights.py         # local disk and blob storage weight cache
 │   ├── engine.py          # start, stop and health of the vLLM process
 │   ├── models.py          # active model state and the switch state machine
@@ -85,6 +88,7 @@ fakes.
 | `GET /v1/models` | The active model, the loading model and each model in the blob storage cache, in the OpenAI list format. See below. |
 | `GET /v1/models/{id}` | One entry of that list. The id contains `/`, for example `GET /v1/models/Qwen/Qwen2.5-1.5B-Instruct`. An unknown id gets 404 with code `model_not_found`. |
 | `GET /v1/usage/me` | The usage totals of the effective user. Not part of the OpenAI API. |
+| `GET /v1/limits/me` | The limits, the current use and the source of the limits of the effective user. Not part of the OpenAI API. |
 | `GET /v1/service` | The descriptor of the service: `api`, `api_version`, name, environment, engine state, model, effective user, `admin` and `caller_admin`. The admin app uses it to find services. |
 
 The model list has one entry for each model id. Each entry has the OpenAI
@@ -108,6 +112,7 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 - If no model is loaded, the gateway returns 503 with code `no_model` and no
   `Retry-After` header. An admin must switch the model first.
 - If the request has no platform user, the gateway returns 401.
+- If the user is over a limit, the gateway returns 429 with a `Retry-After` header. See [Limits](#limits).
 
 ### Admin endpoints
 
@@ -120,6 +125,10 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 | `GET /admin/audit/users` | The users in the log, with the first and last request time of each. |
 | `GET /admin/usage` | Usage totals. Filters: `since`, `until` (days in the form `YYYY-MM-DD`), `user`, `model`. `group_by` is `user` (default), `model` or `day`. |
 | `GET /admin/usage/{user}` | The totals of one user, by model and by day. |
+| `GET /admin/limits` | The default limits, the user entries, and the current use of each user who has an entry or use now. |
+| `PUT /admin/limits/default` | Replaces the default limits. The body has the three limit fields. |
+| `PUT /admin/limits/users/{name}` | Sets the entry of one user. The body has one to three limit fields. |
+| `DELETE /admin/limits/users/{name}` | Removes the entry of one user. The answer is 404 `limit_not_found` without an entry. |
 | `DELETE /admin/models/{model}` | Removes the stored revisions of a model from blob storage, with or without a `.complete` marker. The query parameter `revision` limits it to one revision. Returns 200 with `{"deleted": [...]}`. The errors are 404 `model_not_found`, 409 `model_in_use`, 400 `invalid_model` and 500 `delete_failed`. One audit record has the event `model_delete`. |
 
 A caller who is not an admin gets 403.
@@ -433,6 +442,18 @@ them. For each streaming request, the gateway sets
 chunk. If the client did not ask for that chunk, the gateway removes it from
 the stream. The client then gets the same stream as from OpenAI.
 
+## Limits
+
+An admin sets limits for each user: requests in one minute, tokens in one UTC
+day and parallel requests. The gateway checks them in the handler of the three
+OpenAI endpoints, after the body check and before the request goes to the
+engine. A request over a limit gets 429 `rate_limit_error` with a `Retry-After`
+header. The code of the error is the name of the limit. `limits.py` holds the
+limits file and the lookup. `limiter.py` holds the window and the counters.
+
+The design is in [limits-load-catalog-design.md](limits-load-catalog-design.md),
+Part 1. The README has the usage.
+
 ## Concurrency
 
 The gateway is asynchronous and forwards requests with one shared `httpx`
@@ -493,6 +514,5 @@ the GPU, the fix is in the image build script, and the design stays the same.
 - More than one model in GPU memory at the same time.
 - A model switch triggered by the `model` field of a normal request.
 - Storage of model answers in the audit log.
-- Rate limits and quotas for each user.
 - Bearer token support at the platform edge.
 - A web interface for the admin endpoints.
