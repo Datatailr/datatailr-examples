@@ -560,13 +560,12 @@ function setRange(range) {
 const internalBaseUrl = name => `http://${name}/v1`;
 
 /** The base URL of the service `name` for a client outside the platform. The page runs under a
- * path such as `/job/dev/llm-service-admin/`, and the service runs beside it. Null for a page at
- * the root, for example a local run. */
+ * path such as `/job/dev/llm-service-admin/`, and the service runs beside it. Null for a page
+ * under any other path, for example a local run. */
 function outsideBaseUrl(name) {
-  const segments = location.pathname.split('/').filter(Boolean);
-  if (!segments.length) return null;
-  segments[segments.length - 1] = name;
-  return `${location.origin}/${segments.join('/')}/v1`;
+  const match = /^\/job\/([^/]+)\/[^/]+\/?$/.exec(location.pathname);
+  if (!match) return null;
+  return `${location.origin}/job/${match[1]}/${name}/v1`;
 }
 
 const EXAMPLE_PROMPT = 'Say hello in one sentence.';

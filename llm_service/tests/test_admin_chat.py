@@ -193,6 +193,17 @@ def test_the_service_gets_the_built_body_and_the_acting_user(client, backend):
     assert sent.url.host == "svc"
 
 
+def test_the_stream_call_asks_the_service_for_no_compression(client, backend):
+    assert post(client).status_code == 200
+    assert backend.chat_requests[0].headers["Accept-Encoding"] == "identity"
+
+
+def test_the_stream_answer_asks_the_edge_for_no_buffering(client):
+    response = post(client)
+    assert response.status_code == 200
+    assert response.headers["x-accel-buffering"] == "no"
+
+
 def test_the_sse_bytes_arrive_unchanged(client):
     response = post(client)
     assert response.status_code == 200

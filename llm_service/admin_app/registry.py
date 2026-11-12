@@ -91,7 +91,11 @@ class BlobManualStore:
 
 
 def platform_listing(environment: str, run=subprocess.run) -> list[str]:
-    """Return the names of the ready services in `environment`. Raise on failure."""
+    """Return the names of the ready services in `environment`. Raise on failure.
+
+    The field `name` of a listed job is already the host form, for example `llm-service`.
+    The field `display_name` holds the human name, so this function does not read it.
+    """
     result = run(
         ["dt", "job", "ls", "-j", "-f", "type = service"],
         capture_output=True,

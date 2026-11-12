@@ -737,7 +737,10 @@ def test_page_reads_split_events_and_builds_the_outside_url(tmp_path):
     assert platform["lines"] == ['data: {"a": 1}', "data: [DONE]"]
     assert platform["rest"] == ""
     assert platform["url"] == "https://example.test/job/dev/svc/v1"
-    assert run("/")["url"] is None
+    assert run("/job/dev/llm-service-admin")["url"] == "https://example.test/job/dev/svc/v1"
+    for other in ("/", "/job/dev/", "/job/dev/llm-service-admin/extra/", "/apps/dev/llm-service-admin/",
+                  "/x/job/dev/llm-service-admin/", "/job//llm-service-admin/"):
+        assert run(other)["url"] is None, other
 
 
 def _timeout(request: httpx.Request) -> float:

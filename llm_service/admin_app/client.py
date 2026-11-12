@@ -88,7 +88,8 @@ class ServiceClient:
         """
         if not valid_name(service):
             raise ValueError("The service name is not valid.")
-        headers = {"Connection": "close"}
+        # The app passes the raw bytes of the stream on, so the service must not compress them.
+        headers = {"Connection": "close", "Accept-Encoding": "identity"}
         if viewer is not None:
             headers[ACTING_USER_HEADER] = viewer
         async with contextlib.AsyncExitStack() as stack:

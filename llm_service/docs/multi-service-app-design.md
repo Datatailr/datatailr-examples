@@ -229,7 +229,7 @@ The body has `messages`, and optionally `model`, `temperature` and `max_tokens`.
 - `max_tokens` from 1 to 4096. The default is 512.
 - `temperature` from 0 to 2.
 
-The app passes the server-sent events of the service to the browser without a change, with the content type `text/event-stream`. If the service answers with an error before the stream starts, the app passes the status and the JSON body. A timeout of 300 seconds covers the whole answer. If the browser closes the connection, the app closes the call to the service.
+The app passes the server-sent events of the service to the browser without a change, with the content type `text/event-stream`. If the service answers with an error before the stream starts, the app passes the status and the JSON body. The app asks the service for a stream without compression. It sends the header `X-Accel-Buffering: no`, so a proxy at the platform edge passes each event at once. A timeout of 300 seconds covers the whole answer. If the browser closes the connection, the app closes the call to the service.
 
 ## The page
 
@@ -252,7 +252,7 @@ The tab has three parts for the picked service.
 Addresses:
 
 - The internal base URL: `http://<service name>/v1`.
-- The outside base URL: the origin of the page plus `/job/<environment>/<service name>/v1`.
+- The outside base URL: the origin of the page plus `/job/<environment>/<service name>/v1`. The page builds it only when its own path has the form `/job/<environment>/<app name>/`. Else the page shows a placeholder.
 - The served model and the engine state.
 
 Examples, each with a copy button:

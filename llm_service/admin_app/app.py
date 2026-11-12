@@ -440,7 +440,8 @@ def create_app(
         return StreamingResponse(
             chunks(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache"},
+            # X-Accel-Buffering asks a proxy at the platform edge to pass each event at once.
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             background=BackgroundTask(stack.aclose),
         )
 
