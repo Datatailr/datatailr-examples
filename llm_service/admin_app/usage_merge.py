@@ -25,13 +25,16 @@ def _fold(groups: dict[str, dict], key: str, name: str, row: dict) -> None:
     if target is None:
         groups[name] = {key: name, **{field: row.get(field) for field in SUM_FIELDS}}
         target = groups[name]
-        target["last_request"] = row.get("last_request")
+        last = row.get("last_request")
+        target["last_request"] = last if isinstance(last, str) else None
         return
     for field in SUM_FIELDS:
         target[field] = _add(target[field], row.get(field))
     last = row.get("last_request")
-    if last is not None and (target["last_request"] is None or last > target["last_request"]):
-        target["last_request"] = last
+    if isinstance(last, str):
+        held = target["last_request"]
+        if not isinstance(held, str) or last > held:
+            target["last_request"] = last
 
 
 def merge_rows(per_service: dict[str, list[dict]], group_by: str) -> list[dict]:
@@ -40,12 +43,13 @@ def merge_rows(per_service: dict[str, list[dict]], group_by: str) -> list[dict]:
     With `group_by` user, model or day, rows with the same key become one row
     with the sums of `SUM_FIELDS`. With `group_by` service, the rows of each
     service are day rows. The result has one row for each service, with the key
-    `service`. The sort order is the order of the services.
+    `service`. All sorts are by total tokens, largest first, then by key.
     """
     groups: dict[str, dict] = {}
     if group_by == "service":
         for name, rows in per_service.items():
-            groups[name] = {"service": name, **{field: 0 for field in SUM_FIELDS}, "last_request": None}
+            groups[name] = {"service": name, **{field: None for field in SUM_FIELDS}, "last_request": None}
+            groups[name]["requests"] = groups[name]["failed_requests"] = 0
             for row in rows:
                 _fold(groups, "service", name, row)
         return _sorted(list(groups.values()), "service")

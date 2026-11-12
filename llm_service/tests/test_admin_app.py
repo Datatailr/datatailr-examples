@@ -994,3 +994,69 @@ def test_usage_keeps_the_registry_order_in_services(client, fakes):
     fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
     body = client.get("/api/usage?services=svc-two,svc", headers=ALICE).json()
     assert [s["name"] for s in body["services"]] == ["svc", "svc-two"]
+
+
+def test_usage_a_malformed_last_request_fails_that_service_only(client, fakes):
+    bad = _usage_row("user", "alice")
+    bad["last_request"] = 12
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": [bad]})
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    response = client.get("/api/usage", headers=ALICE)
+    assert response.status_code == 200
+    assert [s["ok"] for s in response.json()["services"]] == [False, True]
+
+
+def test_usage_a_malformed_body_is_logged(client, fakes, caplog):
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": "x"})
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    with caplog.at_level(logging.WARNING):
+        client.get("/api/usage", headers=ALICE)
+    assert any(r.levelno == logging.WARNING and "svc" in r.getMessage() for r in caplog.records)
+
+
+def test_usage_model_filter_by_day_fails_a_service_of_a_viewer_who_is_not_admin(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/usage")] = (200, {"data": [_usage_row("day", "2026-01-01")]})
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    response = client.get("/api/usage?group_by=day&model=m1", headers=ALICE)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["services"][0] == {"name": "svc", "scope": "all", "ok": True}
+    assert body["services"][1] == {
+        "name": "svc-two",
+        "scope": "own",
+        "ok": False,
+        "error": "The model filter by day needs an admin of the service.",
+    }
+    assert len(body["data"]) == 1
+    only = client.get("/api/usage?group_by=day&model=m1&services=svc-two", headers=ALICE)
+    assert only.status_code == 502
+
+
+def test_usage_a_listed_service_that_is_not_ok_is_reported_and_not_called(client, fakes):
+    fakes.hosts["svc"].caller_admin = False
+    client.portal.call(client.app.state.registry.refresh)
+    fakes.requests.clear()
+    fakes.hosts["svc-two"].answers[("GET", "/v1/usage/me")] = (200, _me_detail("alice"))
+    entry = client.app.state.registry.entries()[0]
+    assert entry.name == "svc" and entry.state != "ok"
+    response = client.get("/api/usage?services=svc,svc-two", headers=ALICE)
+    assert response.status_code == 200
+    body = response.json()
+    assert [s["name"] for s in body["services"]] == ["svc", "svc-two"]
+    first = body["services"][0]
+    assert first["ok"] is False and first["scope"] == "own" and entry.state in first["error"]
+    assert {r.url.host for r in fakes.requests} == {"svc-two"}
+    alone = client.get("/api/usage?services=svc", headers=ALICE)
+    assert alone.status_code == 200
+    assert alone.json()["data"] == []
+    assert alone.json()["services"][0]["ok"] is False
+
+
+def test_usage_an_unknown_valid_name_says_unknown(client, fakes):
+    response = client.get("/api/usage?services=nope", headers=ALICE)
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "invalid_service"
+    assert "unknown" in error["message"]
+    bad = client.get("/api/usage?services=Bad", headers=ALICE).json()["error"]
+    assert "a-z" in bad["message"]

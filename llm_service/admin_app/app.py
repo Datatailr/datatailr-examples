@@ -34,8 +34,14 @@ READY_WAIT_SECONDS = 10.0
 BAD_NAME = "The service name has 1 to 63 characters from a-z, 0-9 and -."
 UNREACHABLE = "The LLM service did not give a valid answer."
 USAGE_GROUPS = ("user", "model", "day", "service")
+MODEL_BY_DAY = "The model filter by day needs an admin of the service."
+UNKNOWN_SERVICE = "This service is unknown."
 USAGE_TOO_SLOW = "The LLM service did not answer in time."
 TOO_SLOW = "The LLM service did not answer in time. The action may still finish. Use Reload to see the state."
+
+
+class NeedsAdmin(Exception):
+    """The request needs an admin of the service."""
 
 
 def _clock() -> float:
@@ -370,6 +376,8 @@ def create_app(
                 value = row.get(field)
                 if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
                     raise ValueError("bad count")
+            if row.get("last_request") is not None and not isinstance(row["last_request"], str):
+                raise ValueError("bad last_request")
         return rows
 
     def own_usage(detail: object, viewer: str, group_by: str, user: str | None, model: str | None) -> list[dict]:
@@ -381,7 +389,7 @@ def create_app(
         # The detail has no totals for a model by day, so a model filter by day cannot apply.
         # The other groups take the model rows and add them up.
         if model is not None and group_by == "day":
-            return []
+            raise NeedsAdmin
         if model is None:
             rows = own_rows(detail, viewer, "day" if group_by == "service" else group_by)
         else:
@@ -413,7 +421,10 @@ def create_app(
             return None, USAGE_TOO_SLOW
         except ServiceUnreachable:
             return None, UNREACHABLE
+        except NeedsAdmin:
+            return None, MODEL_BY_DAY
         except (ValueError, KeyError, TypeError, AttributeError):
+            log.warning("The service %s sent a usage answer with a bad shape.", name, exc_info=True)
             return None, UNREACHABLE
         except Exception:  # one bad service must not fail the others. A cancel passes through.
             log.exception("The usage call to the service %s failed.", name)
@@ -421,6 +432,15 @@ def create_app(
 
     @app.get("/api/usage")
     async def usage(request: Request) -> JSONResponse:
+        """Return the usage of the services, merged.
+
+        A viewer who is not an admin of a service gets the own numbers of that
+        service. With such a viewer, a model filter by day cannot apply. That
+        service fails with a message and the others still count. The answer is
+        502 only when no service gives numbers. A named service that the
+        registry shows with a state other than `ok` appears with `ok` false and
+        gets no call.
+        """
         viewer = viewer_or_error(request)
         if isinstance(viewer, JSONResponse):
             return viewer
@@ -430,26 +450,35 @@ def create_app(
                 400, "invalid_group_by", "group_by is user, model, day or service.", "invalid_request_error"
             )
         raw = request.query_params.get("services")
+        skipped: dict[str, str] = {}
         if raw:
             wanted = raw.split(",")
-            if not all(valid_name(n) and registry.get(n) is not None for n in wanted):
+            if not all(valid_name(n) for n in wanted):
                 return _error(400, "invalid_service", BAD_NAME, "invalid_request_error")
-            entries = [e for e in registry.entries() if e.name in set(wanted)]
+            shown = {e.name: e for e in registry.entries()}
+            if any(n not in shown for n in wanted):
+                return _error(400, "invalid_service", UNKNOWN_SERVICE, "invalid_request_error")
+            entries = [shown[n] for n in shown if n in set(wanted)]
+            skipped = {e.name: f"The service has the state {e.state}." for e in entries if e.state != "ok"}
+            entries = [e for e in entries if e.state == "ok"]
         else:
             entries = [e for e in registry.entries() if e.state == "ok"]
         found = await asyncio.gather(*(roles(viewer, e.name) for e in entries))
         chosen = [(e.name, role["admin"]) for e, role in zip(entries, found) if role["access"]]
+        per_service = {}
         params = {name: request.query_params.get(name) or None for name in ("since", "until", "user", "model")}
         results = await asyncio.gather(*(one_usage(viewer, n, admin, group_by, params) for n, admin in chosen))
-        services = []
-        per_service = {}
+        rows_of = {}
         for (name, admin), (rows, error) in zip(chosen, results):
             row = {"name": name, "scope": "all" if admin else "own", "ok": error is None}
             if error is not None:
                 row["error"] = error
             else:
                 per_service[name] = rows
-            services.append(row)
+            rows_of[name] = row
+        for name, text in skipped.items():
+            rows_of[name] = {"name": name, "scope": "own", "ok": False, "error": text}
+        services = [rows_of[e.name] for e in registry.entries() if e.name in rows_of]
         if chosen and not per_service:
             return _error(502, "service_unreachable", UNREACHABLE)
         return JSONResponse({"data": merge_rows(per_service, group_by), "services": services})

@@ -105,3 +105,28 @@ def test_own_rows_of_a_viewer_without_usage_has_no_user_row():
     }
     assert own_rows(empty, "carol", "user") == []
     assert own_rows(empty, "carol", "model") == []
+
+
+def test_merge_tolerates_a_last_request_that_is_not_a_string():
+    merged = merge_rows(
+        {"a": [row("user", "alice", last=5)], "b": [row("user", "alice", last="2026-01-01T00:00:00Z")]}, "user"
+    )
+    assert merged[0]["last_request"] == "2026-01-01T00:00:00Z"
+    merged = merge_rows({"a": [row("user", "alice", last="2026-01-01T00:00:00Z")], "b": [row("user", "alice", last=5)]}, "user")
+    assert merged[0]["last_request"] == "2026-01-01T00:00:00Z"
+
+
+def test_merge_by_service_keeps_null_tokens_null():
+    merged = merge_rows(
+        {
+            "llm-a": [row("day", "2026-01-01", prompt=None, completion=None, total=None)],
+            "llm-b": [row("day", "2026-01-01", prompt=None, completion=5, total=None)],
+        },
+        "service",
+    )
+    by_service = {r["service"]: r for r in merged}
+    assert by_service["llm-a"]["total_tokens"] is None
+    assert by_service["llm-a"]["prompt_tokens"] is None
+    assert by_service["llm-a"]["requests"] == 1
+    assert by_service["llm-b"]["completion_tokens"] == 5
+    assert by_service["llm-b"]["prompt_tokens"] is None
