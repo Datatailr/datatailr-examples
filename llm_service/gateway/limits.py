@@ -56,24 +56,38 @@ class LimitStore:
     def __init__(self, store: BlobStore, blob_root: str) -> None:
         self._store = store
         self._path = f"{blob_root.strip('/')}/limits.json"
-        self._lock = threading.Lock()  # guards `_default`, `_users` and the file
+        self._write_lock = threading.Lock()  # serializes `load` and the writers
+        self._lock = threading.Lock()  # guards `_default` and `_users`, never held for a blob call
         self._default: dict | None = None
         self._users: dict[str, dict] = {}
+        self._loaded = False  # False after a read that failed for a reason other than content
 
     def load(self) -> None:
-        """Read the file. A missing or broken file means no limits."""
+        """Read the file. A missing or broken file means no limits.
+
+        Another read error also means no limits and an error log. The next write then reads again.
+        """
+        with self._write_lock:
+            self._load()
+
+    def _load(self) -> None:
+        loaded = True
         try:
             raw = self._store.get(self._path)
         except KeyError:
             default, users = None, {}
+        except Exception as exc:  # noqa: BLE001
+            logger.error("cannot read %s, no limits apply: %s", self._path, exc)
+            default, users, loaded = None, {}, False
         else:
             try:
                 default, users = self._parse(raw)
-            except (ValueError, TypeError) as exc:
+            except (ValueError, TypeError, RecursionError) as exc:
                 logger.error("ignoring broken %s, no limits apply: %s", self._path, exc)
                 default, users = None, {}
         with self._lock:
             self._default, self._users = default, users
+            self._loaded = loaded
 
     @staticmethod
     def _parse(raw: bytes) -> tuple[dict | None, dict[str, dict]]:
@@ -106,32 +120,45 @@ class LimitStore:
             logger.error("cannot write %s: %s", self._path, exc)
             raise StorageUnavailable("The limits cannot be saved now.") from exc
 
+    def _prepare_write(self) -> None:
+        """Read the file again after a failed read. Call it with the write lock held."""
+        if not self._loaded:
+            self._load()
+        if not self._loaded:
+            raise StorageUnavailable("The limits cannot be read now.")
+
     def set_default(self, limits: dict) -> dict | None:
         """Replace the default. Return the old default."""
         new = copy.deepcopy(check_limits(limits, partial=False))
-        with self._lock:
+        with self._write_lock:
+            self._prepare_write()
             self._write(new, self._users)
-            old, self._default = self._default, new
+            with self._lock:
+                old, self._default = self._default, new
             return old
 
     def set_user(self, name: str, limits: dict) -> dict | None:
         """Set the entry of one user. Return the old entry."""
         new = copy.deepcopy(check_limits(limits, partial=True))
-        with self._lock:
+        with self._write_lock:
+            self._prepare_write()
             users = {**self._users, name: new}
             self._write(self._default, users)
-            old = self._users.get(name)
-            self._users = users
+            with self._lock:
+                old = self._users.get(name)
+                self._users = users
             return old
 
     def remove_user(self, name: str) -> dict:
         """Remove the entry of one user. Return it. Raise `KeyError` without one."""
-        with self._lock:
+        with self._write_lock:
+            self._prepare_write()
             if name not in self._users:
                 raise KeyError(name)
             users = {k: v for k, v in self._users.items() if k != name}
             self._write(self._default, users)
-            old, self._users = self._users[name], users
+            with self._lock:
+                old, self._users = self._users[name], users
             return old
 
     def limits_for(self, user: str, is_admin: bool) -> tuple[dict, str]:

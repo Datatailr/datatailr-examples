@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 
 import pytest
 
@@ -245,3 +246,131 @@ def test_admin_with_entry_uses_entry():
         {"requests_per_minute": 60, "tokens_per_day": 2000, "parallel_requests": 1},
         "user",
     )
+
+
+def test_limits_for_does_not_wait_for_a_slow_write():
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowPut(MemoryBlobStore):
+        def put(self, path, data):
+            entered.set()
+            assert release.wait(5)
+            super().put(path, data)
+
+    store = SlowPut()
+    MemoryBlobStore.put(store, PATH, json.dumps({"default": FULL, "users": {}}))
+    limits = LimitStore(store, ROOT)
+    limits.load()
+    writer = threading.Thread(target=limits.set_default, args=(dict(NONE),))
+    writer.start()
+    try:
+        assert entered.wait(5)
+        done = []
+        reader = threading.Thread(
+            target=lambda: done.append((limits.limits_for("alice", False), limits.default(), limits.users()))
+        )
+        reader.start()
+        reader.join(2)
+        assert not reader.is_alive()
+        assert done == [((FULL, "default"), FULL, {})]
+    finally:
+        release.set()
+        writer.join(5)
+    assert limits.default() == NONE
+
+
+class FlakyGet(MemoryBlobStore):
+    def __init__(self, failures):
+        super().__init__()
+        self.failures = failures
+
+    def get(self, path):
+        if self.failures:
+            self.failures -= 1
+            raise OSError("storage down")
+        return super().get(path)
+
+
+def flaky(failures):
+    store = FlakyGet(0)
+    MemoryBlobStore.put(store, PATH, json.dumps({"default": FULL, "users": {"bob": {"tokens_per_day": 1}}}))
+    store.failures = failures
+    limits = LimitStore(store, ROOT)
+    return limits, store
+
+
+BOB = {"bob": {"tokens_per_day": 1}}
+
+
+@pytest.mark.parametrize(
+    "write, expected",
+    [
+        (lambda s: s.set_default(dict(NONE)), {"default": NONE, "users": BOB}),
+        (
+            lambda s: s.set_user("carol", {"tokens_per_day": 2}),
+            {"default": FULL, "users": {**BOB, "carol": {"tokens_per_day": 2}}},
+        ),
+        (lambda s: s.remove_user("bob"), {"default": FULL, "users": {}}),
+    ],
+)
+def test_write_retries_a_failed_read(write, expected):
+    limits, store = flaky(1)
+    limits.load()
+    assert limits.default() is None
+    assert limits.users() == {}
+    write(limits)
+    assert json.loads(store.get(PATH)) == expected
+    assert limits.default() == expected["default"]
+    assert limits.users() == expected["users"]
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda s: s.set_default(dict(NONE)),
+        lambda s: s.set_user("carol", {"tokens_per_day": 2}),
+        lambda s: s.remove_user("bob"),
+    ],
+)
+def test_write_refused_while_read_keeps_failing(write, caplog):
+    limits, store = flaky(100)
+    with caplog.at_level(logging.ERROR):
+        limits.load()
+    assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1
+    with pytest.raises(StorageUnavailable):
+        write(limits)
+    assert limits.default() is None
+    assert limits.users() == {}
+    store.failures = 0
+    assert json.loads(store.get(PATH))["default"] == FULL
+
+
+def test_set_user_after_retry_keeps_stored_limits():
+    limits, store = flaky(1)
+    limits.load()
+    limits.set_user("carol", {"tokens_per_day": 2})
+    assert json.loads(store.get(PATH)) == {
+        "default": FULL,
+        "users": {"bob": {"tokens_per_day": 1}, "carol": {"tokens_per_day": 2}},
+    }
+    assert limits.default() == FULL
+
+
+def test_broken_file_counts_as_loaded_and_write_repairs_it():
+    limits, store = make("not json")
+    limits.set_default(FULL)
+    assert json.loads(store.get(PATH)) == {"default": FULL, "users": {}}
+
+
+def test_missing_file_counts_as_loaded():
+    limits, store = make()
+    limits.set_user("bob", {"tokens_per_day": 1})
+    assert json.loads(store.get(PATH))["users"] == {"bob": {"tokens_per_day": 1}}
+
+
+def test_deeply_nested_json_is_a_broken_file(caplog):
+    with caplog.at_level(logging.ERROR):
+        limits, _ = make("[" * 100000 + "]" * 100000)
+    assert limits.default() is None
+    assert limits.users() == {}
+    assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1
