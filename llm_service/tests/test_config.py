@@ -7,7 +7,7 @@ def test_defaults():
     c = Config.from_env({})
     assert c.default_model == "Qwen/Qwen2.5-1.5B-Instruct"
     assert c.blob_root == "llm-service"
-    assert c.admin_group is None and c.hf_token_key is None
+    assert c.admin_group is None and c.hf_token_key is None and c.access_group is None
     assert c.vllm_args == [] and c.engine_port == 8001
     assert c.owner == "" and str(c.local_dir) == "/tmp/llm-service"
     assert c.flush_interval == 5.0 and c.flush_size == 100
@@ -59,3 +59,13 @@ def test_prompt_retention_days_upper_bound():
     for value in ("36501", "9" * 5000):
         with pytest.raises(ValueError, match="LLM_PROMPT_RETENTION_DAYS"):
             Config.from_env({"LLM_PROMPT_RETENTION_DAYS": value})
+
+
+def test_access_group():
+    assert Config.from_env({"LLM_ACCESS_GROUP": "team"}).access_group == "team"
+    assert Config.from_env({"LLM_ACCESS_GROUP": ""}).access_group is None
+
+
+def test_job_name_and_environment():
+    c = Config.from_env({"DATATAILR_JOB_NAME": "llm-service", "DATATAILR_JOB_ENVIRONMENT": "dev"})
+    assert c.job_name == "llm-service" and c.environment == "dev"

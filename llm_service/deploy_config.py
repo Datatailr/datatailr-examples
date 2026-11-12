@@ -16,7 +16,7 @@ TARGETS = ("service", "app")
 USAGE = "usage: python deploy.py [service|app]"
 
 # Optional variables. The service gets each one only when it is set.
-OPTIONAL_VARIABLES = ("LLM_ADMIN_GROUP", "LLM_HF_TOKEN_KEY", "LLM_VLLM_ARGS", "LLM_PROMPT_RETENTION_DAYS")
+OPTIONAL_VARIABLES = ("LLM_ADMIN_GROUP", "LLM_ACCESS_GROUP", "LLM_HF_TOKEN_KEY", "LLM_VLLM_ARGS", "LLM_PROMPT_RETENTION_DAYS")
 
 
 def _value(env: Mapping[str, str], name: str, default: str = "") -> str:
@@ -46,15 +46,19 @@ def resources(env: Mapping[str, str]) -> dict:
     }
 
 
-def service_url(service_name: str) -> str:
-    """Return the internal URL of the service. `LLM Service` gives `http://llm-service`.
+def service_host(service_name: str) -> str:
+    """Return the internal host name of the service. `LLM Service` gives `llm-service`.
 
     The platform applies NFKC before the lower case step, so full-width
     letters give the same ASCII host name.
     """
     name = unicodedata.normalize("NFKC", service_name)
-    host = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    return f"http://{host}"
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def service_url(service_name: str) -> str:
+    """Return the internal URL of the service. `LLM Service` gives `http://llm-service`."""
+    return f"http://{service_host(service_name)}"
 
 
 def admin_app_name(env: Mapping[str, str]) -> str:

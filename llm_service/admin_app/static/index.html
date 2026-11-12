@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>LLM Service Admin</title>
 <!-- The platform serves the app under a path prefix that the backend cannot know. Without a
-     trailing slash in the address, the relative URLs below would leave that prefix, so this
+     trailing slash in the address, the relative URLs below leave that prefix, so this
      script adds the slash first. If a Content-Security-Policy forbids inline scripts, open the
      page with a trailing slash in the address. -->
 <script>
@@ -28,12 +28,17 @@ if (!location.pathname.endsWith('/')) {
     </svg>
     <span>LLM Service Admin</span>
   </div>
-  <div class="serving" id="serving" title="The model that the service serves now">
+  <div class="picker">
+    <label>Service <select id="service-picker"></select></label>
+    <button type="button" class="ghost" id="services-toggle" aria-expanded="false"
+            aria-controls="services-panel">Services</button>
+  </div>
+  <div class="serving" id="serving" title="The model that the picked service serves now" hidden>
     <span class="dot" id="serving-dot"></span><span id="serving-text">Reading the state</span>
   </div>
   <div class="who">
     <span class="caption">Signed in as</span> <b id="viewer"></b>
-    <button type="button" class="ghost" id="reload" title="Read the data of this tab again">Reload</button>
+    <button type="button" class="ghost" id="reload" title="Read the list of services and the data of this tab again">Reload</button>
   </div>
 </header>
 
@@ -42,13 +47,42 @@ if (!location.pathname.endsWith('/')) {
   <button type="button" class="ghost small" id="banner-close" aria-label="Close the message">Close</button>
 </div>
 
-<section class="denied" id="denied" hidden>
-  <p>You are not an admin of the LLM service.</p>
+<section class="card services-panel" id="services-panel" aria-labelledby="services-title" hidden>
+  <div class="card-head">
+    <h2 id="services-title">Services</h2>
+    <button type="button" class="ghost small" id="services-close">Close</button>
+  </div>
+  <p class="caption" id="services-listing" hidden>The platform listing of services failed. Only the configured and the added names show.</p>
+  <div class="scroll">
+    <table class="grid">
+      <thead><tr>
+        <th scope="col">Name</th><th scope="col">Source</th><th scope="col">State</th>
+        <th scope="col">Detail</th><th scope="col">Model</th><th scope="col">Your role</th>
+        <th scope="col" id="services-actions-head" hidden>Actions</th>
+      </tr></thead>
+      <tbody id="services-body"></tbody>
+    </table>
+  </div>
+  <form class="toolbar add" id="service-add" hidden>
+    <label>Add a service <input type="text" id="service-add-name" placeholder="service-name" required
+           maxlength="63" autocomplete="off"
+           title="1 to 63 characters from a-z, 0-9 and -"></label>
+    <button type="submit">Add</button>
+    <span class="caption">The app checks the name at once.</span>
+  </form>
+</section>
+
+<section class="denied" id="no-access" hidden>
+  <div class="message">
+    <p>You have access to no LLM service.</p>
+    <ul id="no-access-list"></ul>
+  </div>
 </section>
 
 <main id="main" hidden>
   <div class="tabs" role="tablist" aria-label="Sections">
     <button type="button" role="tab" id="tab-usage" aria-controls="panel-usage" data-tab="usage">Usage</button>
+    <button type="button" role="tab" id="tab-connect" aria-controls="panel-connect" data-tab="connect">Connect</button>
     <button type="button" role="tab" id="tab-audit" aria-controls="panel-audit" data-tab="audit">Audit</button>
     <button type="button" role="tab" id="tab-models" aria-controls="panel-models" data-tab="models">Models</button>
   </div>
@@ -68,6 +102,7 @@ if (!location.pathname.endsWith('/')) {
       </div>
       <span class="caption" id="range-text"></span>
     </div>
+    <p class="note" id="usage-note" role="status" hidden></p>
 
     <div class="tiles">
       <div class="tile"><div class="label">Requests</div><div class="value" id="tile-requests">-</div></div>
@@ -88,7 +123,7 @@ if (!location.pathname.endsWith('/')) {
     </div>
 
     <div class="card">
-      <h2>Users <span class="caption">Select a row to see the numbers of that user.</span></h2>
+      <h2>Users <span class="caption" id="users-hint">Select a row to see the numbers of that user.</span></h2>
       <div class="scroll">
         <table class="grid clickable">
           <thead><tr>
@@ -98,6 +133,21 @@ if (!location.pathname.endsWith('/')) {
             <th scope="col">Last request</th>
           </tr></thead>
           <tbody id="users-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Services</h2>
+      <div class="scroll">
+        <table class="grid">
+          <thead><tr>
+            <th scope="col">Service</th><th scope="col" class="num">Requests</th>
+            <th scope="col" class="num">Failed</th><th scope="col" class="num">Prompt tokens</th>
+            <th scope="col" class="num">Completion tokens</th><th scope="col" class="num">Total tokens</th>
+            <th scope="col">Last request</th>
+          </tr></thead>
+          <tbody id="services-usage-body"></tbody>
         </table>
       </div>
     </div>
@@ -128,8 +178,91 @@ if (!location.pathname.endsWith('/')) {
     </div>
   </section>
 
+  <!-- Connect -->
+  <section class="panel" role="tabpanel" id="panel-connect" aria-labelledby="tab-connect" hidden>
+    <p class="card pick" id="connect-pick" hidden>Pick one service in the bar to see how to connect to it and to test it.</p>
+    <div class="panel" id="connect-content">
+    <div class="card">
+      <h2>Addresses</h2>
+      <dl class="status">
+        <div class="wide"><dt>Base URL inside the platform</dt><dd class="mono" id="conn-internal">-</dd></div>
+        <div class="wide"><dt>Base URL outside the platform</dt><dd class="mono" id="conn-outside">-</dd></div>
+        <div><dt>Served model</dt><dd class="mono" id="conn-model">-</dd></div>
+        <div><dt>Engine state</dt><dd><span class="badge" id="conn-engine">-</span></dd></div>
+      </dl>
+      <p class="caption" id="conn-outside-note" hidden>The page knows the outside URL only on the platform. The outside example shows a placeholder.</p>
+    </div>
+
+    <div class="card">
+      <h2>Examples</h2>
+      <p class="caption intro">The platform adds your user name to each request. The service does not check the API key,
+        but the <span class="mono">openai</span> client needs a value. A client outside the platform sends an API token of
+        your user. You create the token in the Datatailr interface. Put it in the variable
+        <span class="mono">LLM_TOKEN</span> before you run the outside example.</p>
+      <span class="sr-only" id="copy-status" role="status"></span>
+      <div class="examples">
+        <div class="example">
+          <div class="card-head"><h3>curl, from a job on the platform</h3>
+            <button type="button" class="ghost small" data-copy="example-curl"
+                    aria-label="Copy the curl example">Copy</button></div>
+          <pre class="code"><code id="example-curl"></code></pre>
+        </div>
+        <div class="example">
+          <div class="card-head"><h3>Python, from a job on the platform</h3>
+            <button type="button" class="ghost small" data-copy="example-python"
+                    aria-label="Copy the Python example for the platform">Copy</button></div>
+          <pre class="code"><code id="example-python"></code></pre>
+        </div>
+        <div class="example">
+          <div class="card-head"><h3>Python, from outside the platform</h3>
+            <button type="button" class="ghost small" data-copy="example-outside"
+                    aria-label="Copy the Python example for outside the platform">Copy</button></div>
+          <pre class="code"><code id="example-outside"></code></pre>
+        </div>
+        <div class="example">
+          <div class="card-head"><h3>A conversation in the terminal with chat.py</h3>
+            <button type="button" class="ghost small" data-copy="example-chat"
+                    aria-label="Copy the chat.py example">Copy</button></div>
+          <pre class="code"><code id="example-chat"></code></pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Testing area</h2>
+      <p class="note">The requests of this area count as your requests. They show in the usage and in the audit records of the service.</p>
+      <div class="chat-log" id="chat-log" role="log" aria-label="Conversation" aria-busy="false"></div>
+      <form class="chat-form" id="chat-form">
+        <label class="field">System prompt
+          <textarea id="chat-system" rows="2" placeholder="You are a helpful assistant."></textarea></label>
+        <label class="field">Prompt
+          <textarea id="chat-prompt" rows="3" required placeholder="Say hello in one sentence."></textarea></label>
+        <div class="toolbar">
+          <label>Model <input type="text" id="chat-model" placeholder="The served model" autocomplete="off"></label>
+          <label>Temperature <input type="number" id="chat-temperature" min="0" max="2" step="any" value="0.7" required></label>
+          <label>Maximum tokens <input type="number" id="chat-max-tokens" min="1" max="4096" step="1" value="512" required></label>
+        </div>
+        <div class="toolbar">
+          <button type="submit" id="chat-send">Send</button>
+          <button type="button" class="ghost" id="chat-stop" disabled>Stop</button>
+          <button type="button" class="ghost" id="chat-clear">Clear</button>
+          <span class="caption" id="chat-status" role="status"></span>
+        </div>
+      </form>
+      <dl class="stats" id="chat-stats" hidden>
+        <div><dt>Prompt tokens</dt><dd id="chat-prompt-tokens">-</dd></div>
+        <div><dt>Completion tokens</dt><dd id="chat-completion-tokens">-</dd></div>
+        <div><dt>Time to the first token</dt><dd id="chat-first-time">-</dd></div>
+        <div><dt>Total time</dt><dd id="chat-total-time">-</dd></div>
+      </dl>
+    </div>
+    </div>
+  </section>
+
   <!-- Audit -->
   <section class="panel" role="tabpanel" id="panel-audit" aria-labelledby="tab-audit" hidden>
+    <p class="card pick" id="audit-pick" hidden>Pick one service in the bar to see its audit records.</p>
+    <div class="panel" id="audit-content">
     <form class="toolbar filters" id="audit-form">
       <label>User <input type="text" id="audit-user" list="audit-users" placeholder="All users" autocomplete="off"></label>
       <datalist id="audit-users"></datalist>
@@ -158,10 +291,13 @@ if (!location.pathname.endsWith('/')) {
         <button type="button" class="ghost" id="audit-older">Older</button>
       </div>
     </div>
+    </div>
   </section>
 
   <!-- Models -->
   <section class="panel" role="tabpanel" id="panel-models" aria-labelledby="tab-models" hidden>
+    <p class="card pick" id="models-pick" hidden>Pick one service in the bar to see its models.</p>
+    <div class="panel" id="models-content">
     <div class="card">
       <h2>Engine</h2>
       <dl class="status">
@@ -195,6 +331,7 @@ if (!location.pathname.endsWith('/')) {
         <button type="submit" id="serve-submit">Serve</button>
       </form>
       <p class="caption">The service downloads the model if it has no copy, then loads it.</p>
+    </div>
     </div>
   </section>
 </main>

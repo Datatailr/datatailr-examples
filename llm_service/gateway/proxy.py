@@ -186,7 +186,7 @@ class _UsageStream(StreamingResponse):
             raise
         finally:
             if status == 499:
-                usage = self._filter.usage  # the usage chunk may have come already
+                usage = self._filter.usage  # the usage chunk can be here already
             await self.finish(status, usage if status in (200, 499) else None)
 
     async def __call__(self, scope, receive, send) -> None:

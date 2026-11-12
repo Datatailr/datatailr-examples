@@ -23,7 +23,7 @@ from llm_service.gateway.audit import AuditLog, PromptUnreadable, iso, parse_tim
 from llm_service.gateway.audit_merge import MAINTENANCE_INTERVAL, AuditMerger, run_maintenance
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
-from llm_service.gateway.identity import AdminCheck, acting_user_from_headers, user_from_headers
+from llm_service.gateway.identity import AccessCheck, AdminCheck, acting_user_from_headers, user_from_headers
 from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.proxy import forward, prompt_of
 from llm_service.gateway.storage import BlobStore
@@ -36,6 +36,9 @@ SYSTEM_USER = "system"
 OPENAI_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings")
 MAX_AUDIT_LIMIT = 1000
 DAY_FORM = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+SERVICE_API = "datatailr-llm-service"
+SERVICE_API_VERSION = 1
 
 
 class ApiError(Exception):
@@ -85,12 +88,15 @@ def create_app(
     http: httpx.AsyncClient | None = None,
     now: Callable[[], datetime] = utc_now,
     maintenance_interval: float = MAINTENANCE_INTERVAL,
+    access: AccessCheck | None = None,
 ) -> FastAPI:
     """Build the gateway application from its parts.
 
     `now` is the clock of the audit log, the merger and the usage totals. Tests replace it.
     `maintenance_interval` is the sleep in seconds between two merge and retention steps.
+    `access` decides who has access to the service. Without it, only admins have access.
     """
+    access = access or AccessCheck(admin, None, lambda group: [])
     owns_http = http is None
     client = http or httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
     audit = AuditLog(store, config.blob_root, config.flush_size, now=now)
@@ -106,7 +112,7 @@ def create_app(
             record["ts"] = iso(now())
             audit.add(record)
         except Exception as error:
-            logger.warning("could not write an audit record: %s", error)
+            logger.warning("the write of an audit record failed: %s", error)
 
     def on_event(event: dict) -> None:
         failed = event["result"] != "ok"
@@ -244,16 +250,67 @@ def create_app(
             )
         return acting
 
+    async def resolve_effective(request: Request, caller: str) -> str:
+        """Return the effective user for the request. Raise `ApiError` if a rule fails."""
+        try:
+            acting = acting_user_from_headers(request.headers)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_acting_user", str(error)) from None
+        if acting is None:
+            return caller
+        if not await asyncio.to_thread(admin.is_admin, caller):
+            raise ApiError(
+                403,
+                "permission_error",
+                "acting_user_not_allowed",
+                "only an admin can send the header X-LLM-Acting-User",
+            )
+        if not await asyncio.to_thread(access.has_access, acting):
+            raise ApiError(403, "permission_error", "access_denied", "the acting user has no access to this service")
+        return acting
+
+    async def effective_user(request: Request, user: str = Depends(current_user)) -> str:
+        """Return the acting user if the header names one with access, else the caller."""
+        return await resolve_effective(request, user)
+
     # Platform
 
     @app.get("/health")
     async def health() -> PlainTextResponse:
         return PlainTextResponse("OK")
 
+    @app.get("/v1/service")
+    async def service_descriptor(request: Request, caller: str = Depends(current_user)) -> dict:
+        """Describe this service. A refused acting user never fails the call."""
+        refused = False
+        try:
+            user = await resolve_effective(request, caller)
+        except ApiError:
+            user, refused = caller, True
+        user_admin = await asyncio.to_thread(admin.is_admin, user)
+        caller_admin = user_admin if user == caller else await asyncio.to_thread(admin.is_admin, caller)
+        serving = manager.serving
+        body = {
+            "api": SERVICE_API,
+            "api_version": SERVICE_API_VERSION,
+            "name": config.job_name,
+            "environment": config.environment,
+            "state": manager.status()["state"],
+            "model": serving["model"] if serving else None,
+            "user": user,
+            "admin": user_admin,
+            "caller_admin": caller_admin,
+        }
+        if refused:
+            body["acting_user"] = "refused"
+        return body
+
     # OpenAI API
 
     def make_handler(path: str):
-        async def handler(request: Request, user: str = Depends(current_user)):
+        async def handler(
+            request: Request, caller: str = Depends(current_user), user: str = Depends(effective_user)
+        ):
             started = time.monotonic()
             request_id = uuid.uuid4().hex
             headers = {"x-request-id": request_id}
@@ -262,21 +319,22 @@ def create_app(
 
             def record(status: int, usage_counts: dict | None = None) -> None:
                 counts = usage_counts or {}
-                write_audit(
-                    {
-                        "request_id": request_id,
-                        "user": user,
-                        "endpoint": path,
-                        "model": model,
-                        "stream": bool(body.get("stream")) if body else False,
-                        "prompt": prompt_of(body) if body else {},
-                        "status": status,
-                        "prompt_tokens": counts.get("prompt_tokens"),
-                        "completion_tokens": counts.get("completion_tokens"),
-                        "total_tokens": counts.get("total_tokens"),
-                        "duration_ms": int((time.monotonic() - started) * 1000),
-                    }
-                )
+                entry = {
+                    "request_id": request_id,
+                    "user": user,
+                    "endpoint": path,
+                    "model": model,
+                    "stream": bool(body.get("stream")) if body else False,
+                    "prompt": prompt_of(body) if body else {},
+                    "status": status,
+                    "prompt_tokens": counts.get("prompt_tokens"),
+                    "completion_tokens": counts.get("completion_tokens"),
+                    "total_tokens": counts.get("total_tokens"),
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                }
+                if user != caller:
+                    entry["via"] = caller
+                write_audit(entry)
 
             def refuse(error: ApiError) -> JSONResponse:
                 record(error.status)
@@ -374,11 +432,11 @@ def create_app(
         return sorted(entries, key=lambda e: (rank[e["status"]], e["id"]))
 
     @app.get("/v1/models")
-    async def list_models(user: str = Depends(current_user)) -> dict:
+    async def list_models(user: str = Depends(effective_user)) -> dict:
         return {"object": "list", "data": await model_entries()}
 
     @app.get("/v1/models/{model_id:path}")
-    async def get_model_entry(model_id: str, user: str = Depends(current_user)) -> dict:
+    async def get_model_entry(model_id: str, user: str = Depends(effective_user)) -> dict:
         for entry in await model_entries():
             if entry["id"] == model_id:
                 return entry
@@ -386,7 +444,7 @@ def create_app(
 
     @app.get("/v1/usage/me")
     async def usage_me(
-        since: str | None = None, until: str | None = None, user: str = Depends(current_user)
+        since: str | None = None, until: str | None = None, user: str = Depends(effective_user)
     ) -> dict:
         _check_day("since", since)
         _check_day("until", until)
@@ -448,13 +506,13 @@ def create_app(
                 removed.append(name)
         except Exception as error:
             status = 500
-            logger.warning("could not delete %s: %s", model_id, error)
+            logger.warning("the delete of %s failed: %s", model_id, error)
             raise ApiError(
                 500, "server_error", "delete_failed",
-                f"could not delete the model {model_id!r} ({type(error).__name__})",
+                f"the delete of the model {model_id!r} failed ({type(error).__name__})",
             ) from None
         finally:
-            # A cancelled request frees the mark while the worker thread may still
+            # A cancelled request frees the mark while the worker thread can still
             # remove. This is safe: `WeightCache.ensure` and `remove` share one lock.
             manager.end_remove(model_id, found)
             write_audit(
@@ -558,7 +616,7 @@ def read_hf_token(key: str | None, environment: str, get_secret) -> str | None:
         return get_secret(key)
     except Exception as error:
         logger.error(
-            "could not read the Hugging Face token from the secret %r in the environment %r: %s. "
+            "the read of the Hugging Face token from the secret %r in the environment %r failed: %s. "
             "The service continues without a token, so only public models load.",
             key,
             environment,
@@ -581,11 +639,13 @@ def main(port) -> None:
     config = Config.from_env(os.environ)
     environment = os.environ.get("DATATAILR_JOB_ENVIRONMENT", "unknown")
     token = read_hf_token(config.hf_token_key, environment, lambda key: Secrets().get(key))
+    admin = AdminCheck(config.owner, config.admin_group, platform_group_members)
     app = create_app(
         config,
         DatatailrBlobStore(),
         VllmEngine(config.engine_port, config.vllm_args),
-        AdminCheck(config.owner, config.admin_group, platform_group_members),
+        admin,
         hf_downloader(token),
+        access=AccessCheck(admin, config.access_group, platform_group_members),
     )
     uvicorn.run(app, host="0.0.0.0", port=int(port))

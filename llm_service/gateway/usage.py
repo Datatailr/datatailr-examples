@@ -277,7 +277,7 @@ class UsageTotals:
                 _add(entry, row)
                 self._saved.discard(day)  # a late record makes the daily file stale
         except Exception as error:
-            logger.warning("could not count an audit record: %s", error)
+            logger.warning("the count of an audit record failed: %s", error)
 
     def flushed(self, day: str, seg: str, rows: list[dict]) -> None:
         """Add the rows of one written segment to the flushed totals of `day`.
@@ -300,7 +300,7 @@ class UsageTotals:
                     self._through[day] = seg
                 self._version[day] = self._version.get(day, 0) + 1
         except Exception as error:
-            logger.warning("could not count a flushed audit segment: %s", error)
+            logger.warning("the count of a flushed audit segment failed: %s", error)
 
     def checkpoint(self, force: bool = False) -> None:
         """Write the partial file of each day whose flushed totals changed. Never raises.
@@ -327,7 +327,7 @@ class UsageTotals:
                 self._store.put(self._partial_path(day), body)
             except Exception as error:
                 logger.warning(
-                    "could not write the partial usage file of %s, will retry: %s", day, error
+                    "the write of the partial usage file of %s failed, the next run retries: %s", day, error
                 )
                 continue
             with self._lock:
@@ -356,7 +356,7 @@ class UsageTotals:
             try:
                 self._store.put(self._path(day), body)
             except Exception as error:
-                logger.warning("could not write the usage file of %s, will retry: %s", day, error)
+                logger.warning("the write of the usage file of %s failed, the next run retries: %s", day, error)
                 continue
             with self._lock:
                 self._saved.add(day)
@@ -370,7 +370,7 @@ class UsageTotals:
                 self._store.delete(self._partial_path(day))
             except Exception as error:
                 logger.warning(
-                    "could not delete the partial usage file of %s, will retry: %s", day, error
+                    "the delete of the partial usage file of %s failed, the next run retries: %s", day, error
                 )
                 continue
             with self._lock:

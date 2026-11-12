@@ -201,14 +201,14 @@ class ModelManager:
                 self._store.put, self._active_path, json.dumps(self.active)
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("could not write %s: %s", self._active_path, exc)
+            log.warning("the write of %s failed: %s", self._active_path, exc)
 
     async def _prune(self) -> None:
         """Delete the local copies of the models that are not in use."""
         try:
             await asyncio.to_thread(self._weights.prune, self._in_use)
         except Exception as exc:  # noqa: BLE001
-            log.warning("could not delete old local weights: %s", exc)
+            log.warning("the delete of old local weights failed: %s", exc)
 
     async def _load(self, wanted: dict, previous: dict | None, trigger: str) -> None:
         model, revision = wanted["model"], wanted["revision"]

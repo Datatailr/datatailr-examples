@@ -31,6 +31,7 @@ class Config:
     default_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
     blob_root: str = "llm-service"
     admin_group: str | None = None
+    access_group: str | None = None
     hf_token_key: str | None = None
     vllm_args: list[str] = field(default_factory=list)
     owner: str = ""
@@ -39,6 +40,8 @@ class Config:
     flush_interval: float = 5.0
     flush_size: int = 100
     prompt_retention_days: int | None = None
+    job_name: str = "unknown"
+    environment: str = "unknown"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Config":
@@ -47,10 +50,13 @@ class Config:
             default_model=env.get("LLM_DEFAULT_MODEL") or cls.default_model,
             blob_root=(env.get("LLM_BLOB_ROOT") or cls.blob_root).strip("/"),
             admin_group=env.get("LLM_ADMIN_GROUP") or None,
+            access_group=env.get("LLM_ACCESS_GROUP") or None,
             hf_token_key=env.get("LLM_HF_TOKEN_KEY") or None,
             vllm_args=shlex.split(env.get("LLM_VLLM_ARGS", "")),
             owner=env.get("DATATAILR_USER", ""),
             local_dir=Path(env.get("LLM_LOCAL_DIR") or "/tmp/llm-service"),
             engine_port=int(env.get("LLM_ENGINE_PORT") or 8001),
             prompt_retention_days=_retention_days(env.get("LLM_PROMPT_RETENTION_DAYS")),
+            job_name=env.get("DATATAILR_JOB_NAME") or cls.job_name,
+            environment=env.get("DATATAILR_JOB_ENVIRONMENT") or cls.environment,
         )

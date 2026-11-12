@@ -51,7 +51,8 @@ llm_service/
 ├── docs/
 │   ├── design.md          # this document
 │   ├── audit-storage-design.md
-│   └── admin-app-design.md
+│   ├── admin-app-design.md
+│   └── multi-service-app-design.md
 ├── admin_app/             # the admin app: FastAPI backend and one page
 ├── gateway/
 │   ├── app.py             # FastAPI routes and main(port)
@@ -83,7 +84,8 @@ fakes.
 | `POST /v1/embeddings` | Forwarded to vLLM. Works only if the active model is an embedding model. |
 | `GET /v1/models` | The active model, the loading model and each model in the blob storage cache, in the OpenAI list format. See below. |
 | `GET /v1/models/{id}` | One entry of that list. The id contains `/`, for example `GET /v1/models/Qwen/Qwen2.5-1.5B-Instruct`. An unknown id gets 404 with code `model_not_found`. |
-| `GET /v1/usage/me` | The usage totals of the caller. Not part of the OpenAI API. |
+| `GET /v1/usage/me` | The usage totals of the effective user. Not part of the OpenAI API. |
+| `GET /v1/service` | The descriptor of the service: `api`, `api_version`, name, environment, engine state, model, effective user, `admin` and `caller_admin`. The admin app uses it to find services. |
 
 The model list has one entry for each model id. Each entry has the OpenAI
 fields `id`, `object`, `created` and `owned_by`, and four extra fields:
@@ -152,8 +154,24 @@ The `/admin/*` endpoints read the header `X-LLM-Acting-User`. The signed
 caller must be an admin. If the header names a user, that user must be an admin
 too, or the answer is 403 `admin_required`. The audit records of a model switch
 and a model delete name the acting user. A name that is too long or has a
-control character gets 400 `invalid_acting_user`. Other endpoints ignore the
-header.
+control character gets 400 `invalid_acting_user`.
+
+The `/v1/*` endpoints of the table above read the header too, through the
+dependency `effective_user`. The caller must be an admin, or the answer is 403
+`acting_user_not_allowed`. The acting user must pass the access check, or the
+answer is 403 `access_denied`. `GET /v1/service` never fails because of the
+header. Usage numbers and audit records use the acting user. An audit record
+with an acting user has the field `via` with the caller name. The rules are in
+[multi-service-app-design.md](multi-service-app-design.md).
+
+### Access check
+
+The platform checks the access of the caller at its edge. It cannot check the
+acting user, so the service does. An acting user has access if the user is an
+admin or a member of the group in `LLM_ACCESS_GROUP`. Without that variable,
+only admins have access. The gateway caches the group members for 60 seconds.
+A failed lookup means no access, and the gateway tries again after 10 seconds. `deploy.py` passes `LLM_ACCESS_GROUP` to the
+service container.
 
 ### Outside clients
 
@@ -434,7 +452,7 @@ they do not block request handling.
 | `LLM_MEMORY` | `24g` | Memory of the container. |
 | `LLM_CPU` | `4` | CPU count of the container. |
 | `LLM_ADMIN_GROUP` | not set | Platform group whose members are admins. |
-| `LLM_ACCESS_GROUP` | not set | Platform group that gets read and access permission. |
+| `LLM_ACCESS_GROUP` | not set | Platform group that gets read and access permission. The service container gets it too. |
 | `LLM_BLOB_ROOT` | `llm-service` | Root directory in blob storage. |
 | `LLM_HF_TOKEN_KEY` | not set | Secret store key of the Hugging Face token. |
 | `LLM_VLLM_ARGS` | not set | Extra arguments for `vllm serve`. |

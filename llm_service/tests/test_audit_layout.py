@@ -272,3 +272,12 @@ def test_the_prompt_marker_has_a_day_and_no_kind():
         "r/prompts/2026-11-11/prompts.marker",
     ):
         assert layout.marker_day("r", other) is None
+
+
+def test_split_record_keeps_via_in_the_row_and_out_of_the_prompt_line():
+    record = {"request_id": "r1", "user": "bob", "via": "alice", "prompt": {"messages": []}}
+    row, prompt_line = layout.split_record(record, "seg1", 0)
+    assert row["via"] == "alice" and row["user"] == "bob"
+    assert "via" not in prompt_line
+    assert layout.public_row(row)["via"] == "alice"
+    assert layout.join_record(row, prompt_line["prompt"])["via"] == "alice"

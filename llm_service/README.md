@@ -11,7 +11,7 @@ The service adds these parts to the model:
 - The service writes an audit log. The log records who sent each request and with what prompt. Only an admin can read it.
 - An admin can read the usage of each user, for example the tokens used.
 - An admin can remove the cached weights of a model.
-- An admin app is a web page for the usage, the audit log and the models.
+- An admin app is a web page for the usage, the audit log and the models. It works with many LLM services at once.
 - Many users can call the service at the same time.
 
 ## How it works
@@ -95,7 +95,7 @@ The script reads these variables at deploy time:
 | `LLM_MEMORY` | `24g` | Memory of the container. |
 | `LLM_CPU` | `4` | CPU count of the container. |
 | `LLM_ADMIN_GROUP` | not set | Platform group whose members are admins. |
-| `LLM_ACCESS_GROUP` | not set | Platform group that gets read and access permission. |
+| `LLM_ACCESS_GROUP` | not set | Platform group that gets read and access permission. The service container gets it too. |
 | `LLM_BLOB_ROOT` | `llm-service` | Root directory in blob storage. |
 | `LLM_HF_TOKEN_KEY` | not set | Secret store key of the Hugging Face token. |
 | `LLM_VLLM_ARGS` | not set | Extra arguments for `vllm serve`. |
@@ -104,6 +104,8 @@ The script reads these variables at deploy time:
 | `LLM_ADMIN_APP_NAME` | `LLM Service Admin` | Name of the admin app. |
 
 If `LLM_ACCESS_GROUP` is not set, only the user who deploys the service has access. If it is set, the owner and the group can read and use the service. Only the owner can change, operate or promote it.
+
+The service container gets `LLM_ACCESS_GROUP` as well. The platform checks the access of the caller at its edge. It cannot check a user that the admin app names in `X-LLM-Acting-User`. The service checks that user against the same group. Without the group, only admins can use the service through the app. See [Acting user on the OpenAI endpoints](#acting-user-on-the-openai-endpoints).
 
 The service name decides the host name. The default name `LLM Service` gives the host name `llm-service`.
 
@@ -168,6 +170,47 @@ client = OpenAI(
 The service page in the Datatailr interface shows the URL. Use that URL in place of `https://<your-domain>/<service path>`.
 
 A tool that accepts only a base URL and an API key does not work yet. The platform edge must first accept a Bearer token. That change belongs to the platform and is not part of this example.
+
+## Check that a job is an LLM service
+
+`GET /v1/service` describes the service. Each user with access can call it. The admin app uses it to find LLM services.
+
+```bash
+curl "$BASE/v1/service" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+```
+
+```json
+{
+  "api": "datatailr-llm-service",
+  "api_version": 1,
+  "name": "llm-service",
+  "environment": "dev",
+  "state": "ready",
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "user": "alice",
+  "admin": true,
+  "caller_admin": true
+}
+```
+
+- `api` and `api_version` are constants. A client checks them to know that the job is an LLM service.
+- `state` and `model` show the engine state and the served model. `model` is `null` when no model is served.
+- `user` is the effective user of the request, and `admin` says whether this user is an admin.
+- `caller_admin` says whether the signed caller is an admin. The admin app reads it to learn whether the service accepts the acting user.
+
+## Acting user on the OpenAI endpoints
+
+The header `X-LLM-Acting-User` applies to `/admin/*` and to these endpoints: `/v1/service`, `/v1/models`, `/v1/models/{id}`, `/v1/usage/me`, `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. The admin app sends the name of the viewer in this header. The rules for a `/v1/*` endpoint are:
+
+1. If the header is missing or empty, the effective user is the caller.
+2. A name that is longer than 256 characters or has a control character gets 400 `invalid_acting_user`.
+3. If the caller is not an admin, the answer is 403 `acting_user_not_allowed`.
+4. The acting user must be an admin or a member of `LLM_ACCESS_GROUP`. Otherwise the answer is 403 `access_denied`.
+5. If all checks pass, the effective user is the acting user.
+
+`GET /v1/service` never fails because of the header. If a rule fails there, the effective user is the caller and the body has `"acting_user": "refused"`.
+
+Usage numbers and audit records count the effective user. The service caches the members of `LLM_ACCESS_GROUP` for 60 seconds. A failed lookup means no access, and the service tries again after 10 seconds.
 
 ## Switch the model
 
@@ -280,6 +323,8 @@ curl "$BASE/admin/audit?user=bob&limit=20" -H "Cookie: __datatailr_user_cookie__
 
 The filters are `user`, `model`, `since`, `until`, `limit` and `offset`. The values of `since` and `until` are a day like `2026-11-10` or an ISO 8601 time. The default `limit` is 100 and the largest is 1000. The newest records come first.
 
+A request that has an acting user has the extra field `via` with the name of the caller. A request without an acting user has no `via` field. When the acting user is the caller, the record has no `via` field either.
+
 A model load or delete record has the field `event` (`model_switch`, `engine_reload` or `model_delete`) and the field `detail` with the revision or the error. A request record has `event` and `detail` set to `null`.
 
 To read the prompt, open one record. Give the request id from the list and the UTC day of the record time. The day must have the form `YYYY-MM-DD`:
@@ -329,21 +374,56 @@ To read one user with the split by model and by day, call `/admin/usage/bob`. Ea
 
 ## Admin app
 
-The admin app is a web page for the admins of the service. It is the second job that `deploy.py` deploys. It has three tabs:
+The admin app is a web page for the users of your LLM services. It is the second job that `deploy.py` deploys. It works with each LLM service in its environment, not with one fixed service. It keeps no data, except a list of service names that the owner of the app edits.
 
-- Usage: requests, failed requests and tokens, by user, by model and by day.
-- Audit: the audit log, with filters for user, model and time. A click on a row loads the full record with its prompt.
-- Models: the engine state and the cached models. An admin switches the model, follows the progress and deletes cached weights.
+The page has a bar at the top with a service picker and a reload button. The picker lists the services with their state. It also has the entry "All services" for the Usage tab. The page keeps the picked service in the address, after the `#`.
 
-The app keeps no data. It calls the service by its internal URL. The app takes this URL from the service name, so `LLM Service` gives `http://llm-service`. If you deploy the app alone with `python deploy.py app`, set the same `LLM_SERVICE_NAME` as for the deploy of the service. Otherwise the app calls a service that does not exist.
+### How the app finds services
 
-Only an admin of the service can use the app. The service decides this, not the app. A user who is not an admin sees the text "You are not an admin of the LLM service." If every viewer sees this text, the user who deployed the app is not an admin of the service.
+The app collects service names from three sources. Each minute it asks each name that is not paused for `GET /v1/service`, and a name that answers as an LLM service shows in the picker. A name from the listing that does not answer, or does not answer as an LLM service, pauses for 10 minutes.
+
+- The platform listing. The app runs `dt job ls` and keeps the services that are ready in its own environment. If the command fails, the app uses the other two sources and the page shows that the listing failed.
+- `LLM_SERVICES`. A list of service names with commas. `deploy.py` sets it to the service that it deploys.
+- The manual list. The owner of the app adds a name in the panel "Services". The app keeps the list in blob storage at `llm-service-admin/services.json`. The owner is the user who deployed the app.
+
+A service name has 1 to 63 characters from `a-z`, `0-9` and `-`. The app builds the URL `http://<name>` from it, so a name cannot point the app at another host. A service found in the listing that is not an LLM service does not show. A name from `LLM_SERVICES` or the manual list always shows, with its state.
+
+A service from an older version of this example has no `GET /v1/service`. When the listing found it, it does not show in the app. When it is in `LLM_SERVICES` or in the manual list, it shows with the state `not_llm`. Deploy that service again.
+
+### Service states
+
+- `ok`: the service answers and the owner of the app is an admin of it.
+- `no_access`: the service answers, but it refuses the app. The owner of the app is not an admin of the service.
+- `unreachable`: the app gets no answer from the service.
+- `not_llm`: the job answers, but not as an LLM service.
+
+### The owner of the app must be an admin
+
+The platform signs each call of the app as the user who deployed the app. The service accepts the acting user only from an admin caller. So the owner of the app must be an admin of each service that the app shows. Add the owner to `LLM_ADMIN_GROUP` of the service, or deploy the service and the app as the same user. A service where the owner is not an admin shows the state `no_access`.
+
+### Who sees what
+
+Each viewer needs access to a service to see anything from it. The service checks this for the viewer, with `LLM_ACCESS_GROUP`. If the service does not answer this check, the page shows "The service did not answer." for it. The Usage tab then names that service as a service without numbers.
+
+- Each user with access sees the Usage tab with their own numbers, and the Connect tab.
+- An admin of a service also sees the numbers of all users of that service, the Audit tab and the Models tab. An admin switches the model and deletes cached weights there.
+- With "All services" picked, the Usage tab shows totals over all services, by user, by service and by day. A line names each service whose numbers are missing. Another line names each service where the viewer sees only their own numbers.
+- The Audit and Models tabs work with one service. With "All services" they ask the viewer to pick one.
 
 The platform user names of the viewers must be ASCII. The app sends the name in an HTTP header. For a name that is not ASCII, the app answers 401 with the code `missing_user`.
 
-The platform signs the calls of the app as the user who deployed it. This user must be an admin of the service: the user who deployed the service, or a member of `LLM_ADMIN_GROUP`. The app also sends the name of the viewer in the header `X-LLM-Acting-User`. The service then requires that the viewer is an admin too, and the audit log names the viewer.
+### The Connect tab
 
-Open the app from the Datatailr interface. If the page does not load its data, open it with a trailing slash in the address. The design document [docs/admin-app-design.md](docs/admin-app-design.md) describes the app.
+The Connect tab shows how to call the picked service. It has two parts.
+
+- Addresses and examples. The tab shows the internal base URL `http://<name>/v1` and the outside base URL, with the served model. It has examples for curl, for the `openai` package from a job, for the `openai` package from outside the platform, and for `chat.py`. Each example has a copy button. No example holds a token. The outside example reads it from the variable `LLM_TOKEN`.
+- The testing area. A viewer types a system prompt and a prompt, sets the model, the temperature and the maximum tokens, and presses Send. The answer streams into the page. After it, the area shows the token counts and the time to the first token. The area keeps the conversation, and Clear starts again.
+
+A request from the testing area counts for the viewer. It shows in the usage numbers and in the audit log under the name of the viewer. The `via` field of the record names the owner of the app. When the viewer is the owner of the app, the record has no `via` field.
+
+If you deploy the app alone with `python deploy.py app`, set the same `LLM_SERVICE_NAME` as for the service. The app then lists that service in `LLM_SERVICES`.
+
+Open the app from the Datatailr interface. If the page does not load its data, open it with a trailing slash in the address. The design documents [docs/multi-service-app-design.md](docs/multi-service-app-design.md) and [docs/admin-app-design.md](docs/admin-app-design.md) describe the app.
 
 ## Where the data lives
 
@@ -381,7 +461,7 @@ The first start after the upgrade reads every old layout file of the days withou
 - If the engine fails in the middle of a stream, the stream ends without an error event. The audit record has the status 502.
 - At startup, the service reads the usage totals from blob storage. If that read fails, the service does not start, and the platform restarts it.
 - The service serves one model at a time. A switch stops the old model.
-- An admin who calls the service directly can name any admin in `X-LLM-Acting-User`.
+- An admin who calls the service directly can name any user with access in `X-LLM-Acting-User`. The `via` field of the audit record shows the caller.
 - The audit log stores each prompt in full. It does not store the answers. A prompt is not searchable. The filters work on metadata.
 - One service instance writes the audit log. Two instances on one `LLM_BLOB_ROOT` are not supported.
 - A day file is read in one piece. The design fits about 300,000 requests a day.
