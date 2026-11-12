@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -18,6 +19,8 @@ from fastapi.staticfiles import StaticFiles
 from llm_service.admin_app.client import ServiceClient, ServiceUnreachable
 from llm_service.admin_app.registry import BlobManualStore, Registry, platform_listing, valid_name
 from llm_service.gateway.identity import user_from_headers
+
+log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 TIMEOUT_SECONDS = 30.0
@@ -98,7 +101,8 @@ def create_app(
 
     `owner` is the platform user who owns the app. An empty `owner` matches no
     viewer. The lifespan runs the registry every `refresh_interval` seconds.
-    With None, the app never refreshes the registry.
+    With None, the app starts no refresh task and `GET /api/services` does not
+    wait for a first refresh. The caller then fills the registry itself.
     """
     owned = http is None
     # A redirect must not lead the app to another host, so follow_redirects stays False.
@@ -123,6 +127,7 @@ def create_app(
 
     app = FastAPI(title="LLM Service Admin", lifespan=lifespan)
     app.state.registry = registry
+    app.state.owner = owner
 
     async def roles(viewer: str, name: str) -> dict:
         """Return `{"access": bool, "admin": bool}` of `viewer` on the service `name`.
@@ -137,9 +142,15 @@ def create_app(
             return dict(hit[1])
         result = {"access": False, "admin": False}
         try:
-            status, body = await service.request(name, "GET", "/v1/service", viewer, timeout=ROLE_TIMEOUT_SECONDS)
+            # The httpx timeout applies to each step. The total limit stops a service that sends slowly.
+            status, body = await asyncio.wait_for(
+                service.request(name, "GET", "/v1/service", viewer, timeout=ROLE_TIMEOUT_SECONDS),
+                ROLE_TIMEOUT_SECONDS,
+            )
         except ServiceUnreachable:
             pass
+        except Exception:  # one bad service must not fail the list. A cancel passes through.
+            log.exception("The role call to the service %s failed.", name)
         else:
             if status == 200 and isinstance(body, dict) and body.get("acting_user") != "refused":
                 result = {"access": True, "admin": body.get("admin") is True}
@@ -213,7 +224,8 @@ def create_app(
         viewer = viewer_or_error(request)
         if isinstance(viewer, JSONResponse):
             return viewer
-        await registry.wait_ready(READY_WAIT_SECONDS)
+        if refresh_interval is not None:  # without a refresh task, nothing sets the ready event
+            await registry.wait_ready(READY_WAIT_SECONDS)
         entries = registry.entries()
         found = await asyncio.gather(*(roles(viewer, e.name) for e in entries if e.state == "ok"))
         found = iter(found)
@@ -257,6 +269,7 @@ def create_app(
         except ValueError:
             return _error(400, "invalid_service", BAD_NAME, "invalid_request_error")
         except Exception:
+            log.exception("The manual service list failed.")
             return _error(502, "store_unavailable", "The list of added services is not available.")
         row = entry.to_dict()
         del row["checked_at"]
@@ -275,6 +288,7 @@ def create_app(
         try:
             removed = await registry.remove_manual(name)
         except Exception:
+            log.exception("The manual service list failed.")
             return _error(502, "store_unavailable", "The list of added services is not available.")
         if not removed:
             return _error(404, "unknown_service", "The name is not in the list of added services.", "invalid_request_error")

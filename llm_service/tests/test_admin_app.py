@@ -1,7 +1,10 @@
+import asyncio
 import json
+import logging
 import re
 import subprocess
 import sys
+import time
 
 import httpx
 import pytest
@@ -704,10 +707,82 @@ def test_default_app_reads_the_environment():
 
 
 def test_default_app_without_variables_has_no_services():
+    # No lifespan here: it would start the real store and the real platform listing.
     built = default_app({})
     assert built.state.registry._configured == []
-    with TestClient(built) as test_client:
-        assert test_client.post("/api/services", json={"name": "svc"}, headers=ALICE).status_code == 403
+    assert built.state.owner == ""
+
+
+def test_importing_the_app_makes_no_blob_and_no_subprocess_call():
+    code = (
+        "import subprocess, sys, types\n"
+        "def boom(*a, **k): raise AssertionError('call at import')\n"
+        "subprocess.run = subprocess.Popen = boom\n"
+        "stub = types.ModuleType('datatailr')\n"
+        "stub.__getattr__ = boom\n"
+        "sys.modules['datatailr'] = stub\n"
+        "import llm_service.admin_app.app\n"
+    )
+    subprocess.run([sys.executable, "-W", "error", "-c", code], check=True)
+
+
+def test_a_slow_service_does_not_hold_the_list(client, fakes, monkeypatch):
+    async def slow(request):
+        await asyncio.sleep(5)
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(app_module, "ROLE_TIMEOUT_SECONDS", 0.05)
+    fakes.hosts["svc"] = slow
+    started = time.monotonic()
+    body = client.get("/api/services", headers=ALICE).json()
+    assert time.monotonic() - started < 2
+    assert (body["services"][0]["access"], body["services"][0]["admin"]) == (False, False)
+    assert body["services"][1]["access"] is True
+
+
+def test_an_unexpected_error_in_one_role_call_is_no_access(client, fakes):
+    fakes.hosts["svc"].error = RuntimeError("boom")
+    response = client.get("/api/services", headers=ALICE)
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["services"][0]["access"], body["services"][0]["admin"]) == (False, False)
+    assert body["services"][1]["access"] is True
+
+
+def test_a_failed_store_is_logged(client, store, caplog):
+    store.error = OSError("blob down")
+    with caplog.at_level(logging.ERROR, logger="llm_service.admin_app.app"):
+        client.post("/api/services", json={"name": "extra"}, headers=ALICE)
+        client.delete("/api/services/svc", headers=ALICE)
+    assert len([r for r in caplog.records if r.name == "llm_service.admin_app.app"]) >= 1
+
+
+def test_without_a_refresh_task_the_list_does_not_wait(fakes, registry):
+    http = httpx.AsyncClient(transport=httpx.MockTransport(fakes))
+    with TestClient(create_app(registry, "alice", http, refresh_interval=None)) as test_client:
+        started = time.monotonic()
+        response = test_client.get("/api/services", headers=ALICE)
+        assert response.status_code == 200 and response.json()["services"] == []
+        assert time.monotonic() - started < 2
+
+
+def test_the_refresh_task_is_cancelled_at_the_end(fakes, registry, monkeypatch):
+    seen = []
+
+    async def run(interval):
+        seen.append(("start", interval))
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            seen.append("cancelled")
+            raise
+
+    monkeypatch.setattr(registry, "run", run)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(fakes))
+    with TestClient(create_app(registry, "alice", http, refresh_interval=7.0)) as test_client:
+        test_client.get("/health")
+        assert seen == [("start", 7.0)]
+    assert seen == [("start", 7.0), "cancelled"]
 
 
 def test_the_lifespan_runs_and_stops_the_registry(fakes, registry):
