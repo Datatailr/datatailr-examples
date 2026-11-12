@@ -1424,15 +1424,29 @@ class HeldEngine:
         self.gate = threading.Event()
         self.entered = threading.Event()
         self.fail = False
+        self.crash = False
+        self.hold_stream = False  # a stream waits for `gate` after its first chunk
 
     def transport(self) -> httpx.MockTransport:
         async def handler(request: httpx.Request) -> httpx.Response:
             if self.fail:
                 raise httpx.ConnectError("engine is gone")
+            if self.crash:
+                raise RuntimeError("the transport broke")
             if self.hold:
                 self.entered.set()
                 await asyncio.to_thread(self.gate.wait, 10)
             body = json.loads(request.content)
+            if body.get("stream") and self.hold_stream:
+                gate = self.gate
+
+                class Held(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        yield b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+                        await asyncio.to_thread(gate.wait, 10)
+                        yield b"data: [DONE]\n\n"
+
+                return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Held())
             if body.get("stream"):
                 data = (
                     b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
@@ -1532,6 +1546,7 @@ def test_parallel_requests_limit_gives_429_while_a_request_is_held(tmp_path):
         assert parallel_of(c) == 1
         engine.gate.set()
         worker.join(10)
+        assert not worker.is_alive()
         assert first[0].status_code == 200
         assert parallel_of(c) == 0
         engine.hold = False
@@ -1557,10 +1572,21 @@ def test_parallel_counter_is_zero_after_an_engine_failure(tmp_path):
         assert parallel_of(c) == 0
 
 
-def test_parallel_counter_is_zero_after_a_client_leaves_a_stream(tmp_path):
-    c, _ = limited_client(tmp_path, user_limits(parallel_requests=1))
+def test_parallel_counter_is_zero_after_forward_raises(tmp_path):
+    c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
     with c:
         wait_ready(c)
+        engine.crash = True
+        with pytest.raises(RuntimeError):
+            c.post(CHAT, headers=BOB, json=HI)
+        assert parallel_of(c) == 0
+
+
+def test_parallel_counter_is_zero_after_a_client_leaves_a_stream(tmp_path):
+    c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        engine.hold_stream = True
         sent = []
 
         async def drop():
@@ -1598,9 +1624,10 @@ def test_parallel_counter_is_zero_after_a_client_leaves_a_stream(tmp_path):
             await c.app(scope, receive, send)
 
         c.portal.call(drop)
+        engine.gate.set()
         assert any(m.get("body") for m in sent)
         assert parallel_of(c) == 0
-        assert audit_records(c, user="bob")[0]["status"] in (200, 499)
+        assert audit_records(c, user="bob")[0]["status"] == 499
 
 
 def test_refused_model_never_takes_or_releases_a_slot(tmp_path):
@@ -1617,6 +1644,7 @@ def test_refused_model_never_takes_or_releases_a_slot(tmp_path):
         assert parallel_of(c) == 1  # the refused request did not release the slot of the held one
         engine.gate.set()
         worker.join(10)
+        assert not worker.is_alive()
         assert parallel_of(c) == 0
 
 
