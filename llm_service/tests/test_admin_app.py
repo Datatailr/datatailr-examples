@@ -655,7 +655,7 @@ def test_page_offers_the_names_of_the_next_task():
 def test_page_drops_late_answers_and_errors_of_a_load():
     text = (STATIC_DIR / "app.js").read_text()
     assert "if (error instanceof StaleAnswer) return false;" in text
-    for name in ("usage", "detail", "audit", "status"):
+    for name in ("usage", "detail", "audit", "status", "limits", "limitsMe"):
         assert f"current('{name}', call, service," in text, name
 
 
@@ -682,8 +682,8 @@ def test_page_has_the_elements_of_the_connect_tab(element_id):
 def test_connect_tab_comes_after_usage():
     page = (STATIC_DIR / "index.html").read_text()
     tabs = re.findall(r'role="tab" id="tab-(\w+)"', page)
-    assert tabs == ["usage", "connect", "audit", "models"]
-    assert "const TABS = ['usage', 'connect', 'audit', 'models'];" in (STATIC_DIR / "app.js").read_text()
+    assert tabs == ["usage", "connect", "audit", "models", "limits"]
+    assert "const TABS = ['usage', 'connect', 'audit', 'models', 'limits'];" in (STATIC_DIR / "app.js").read_text()
 
 
 @pytest.mark.parametrize(
@@ -719,7 +719,7 @@ def test_page_cancels_the_reader_and_reports_a_stop_before_an_error_body():
     body = text[text.index("async function streamChat("):text.index("function chatTurn(")]
     assert re.search(r"finally \{\s*(//[^\n]*\s*)?reader\.cancel\(\)", body)
     assert "if (signal.aborted)" in body
-    assert body.index("if (signal.aborted)") < body.index("data.error.message")
+    assert body.index("if (signal.aborted)") < body.index("throw answerError(response, data);")
     assert "The page knows this URL only on the platform." in text
     assert "Known only on the platform" not in text
 
@@ -759,6 +759,105 @@ def test_page_reads_split_events_and_builds_the_outside_url(tmp_path):
     for other in ("/", "/job/dev/", "/job/dev/llm-service-admin/extra/", "/apps/dev/llm-service-admin/",
                   "/x/job/dev/llm-service-admin/", "/job//llm-service-admin/"):
         assert run(other)["url"] is None, other
+
+
+LIMITS_IDS = (
+    "tab-limits", "panel-limits", "limits-pick", "limits-content", "limits-missing", "limits-cards",
+    "limits-default-form", "limits-default-requests_per_minute", "limits-default-tokens_per_day",
+    "limits-default-parallel_requests", "limits-reload", "limits-body", "limits-user-form", "limits-user",
+    "limits-user-requests_per_minute-mode", "limits-user-requests_per_minute",
+    "limits-user-tokens_per_day-mode", "limits-user-tokens_per_day",
+    "limits-user-parallel_requests-mode", "limits-user-parallel_requests", "limits-user-status",
+    "remove-dialog", "remove-text", "remove-confirm",
+    "my-limits", "my-limits-note", "my-limits-list", "my-requests_per_minute", "my-tokens_per_day",
+    "my-parallel_requests", "my-limits-source",
+)
+
+
+@pytest.mark.parametrize("element_id", LIMITS_IDS)
+def test_page_has_the_elements_of_the_limits(element_id):
+    assert f'id="{element_id}"' in (STATIC_DIR / "index.html").read_text()
+
+
+def test_limits_tab_is_for_an_admin_of_one_service():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "limits: {one: true, admin: true}" in text
+    assert "limits: loadLimits" in text
+    # The tab reads the limits only on a load or a click, never on a timer.
+    body = text[text.index("// ---- limits"):text.index("// ---- start")]
+    assert "setTimeout" not in body and "setInterval" not in body
+
+
+@pytest.mark.parametrize("number_id", [f"limits-{form}-{name}" for form in ("default", "user")
+                                       for name in ("requests_per_minute", "tokens_per_day", "parallel_requests")])
+def test_limit_fields_take_whole_numbers_of_the_range(number_id):
+    page = (STATIC_DIR / "index.html").read_text()
+    tag = re.search(rf'<input[^>]*id="{number_id}"[^>]*>', page).group(0)
+    for attribute in ('type="number"', 'min="1"', 'max="1000000000"', 'step="1"'):
+        assert attribute in tag, attribute
+
+
+def test_page_calls_the_five_limits_routes():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "servicePath('limits', service)" in text
+    assert "servicePath('limits/me', service)" in text
+    assert "servicePath('limits/default', service), {method: 'PUT'" in text
+    assert "const userPath = servicePath(`limits/users/${encodeURIComponent(user)}`, service);" in text
+    assert "api(userPath, {method: 'PUT'" in text
+    assert "api(userPath, {method: 'DELETE'})" in text
+
+
+def test_page_passes_retry_after_of_a_chat_error():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("async function streamChat("):text.index("function chatTurn(")]
+    assert "throw answerError(response, data);" in body
+    assert "response.headers.get('Retry-After')" in text
+    send = text[text.index("async function sendChat("):text.index("function stopChat(")]
+    assert "waitText(error.retryAfter)" in send
+    assert "loadMyLimits(service)" in send
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_page_limit_helpers(tmp_path):
+    harness = tmp_path / "harness.js"
+    harness.write_text(
+        "const vm = require('vm');\n"
+        "const fs = require('fs');\n"
+        "const context = {URL, console, Intl, document: {addEventListener() {}},\n"
+        "  location: {pathname: '/', origin: 'https://example.test'}};\n"
+        "vm.createContext(context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {userLimitBody, defaultLimitBody,'\n"
+        "  + ' effectiveLimit, retryWait, waitText, limitsMissing, ApiError};', context);\n"
+        "const h = context.h;\n"
+        "const choice = (mode, value = '') => ({mode, value});\n"
+        "const missing = (status, code) => h.limitsMissing(new h.ApiError('x', {status, code}));\n"
+        "console.log(JSON.stringify({\n"
+        "  allDefault: h.userLimitBody({requests_per_minute: choice('default'), tokens_per_day: choice('default'),\n"
+        "                               parallel_requests: choice('default')}),\n"
+        "  mixed: h.userLimitBody({requests_per_minute: choice('number', '60'), tokens_per_day: choice('none'),\n"
+        "                          parallel_requests: choice('default', '9')}),\n"
+        "  defaults: h.defaultLimitBody({requests_per_minute: '5', tokens_per_day: '', parallel_requests: ' 2 '}),\n"
+        "  own: h.effectiveLimit({tokens_per_day: null}, {tokens_per_day: 9}, 'tokens_per_day'),\n"
+        "  fromDefault: h.effectiveLimit({tokens_per_day: 3}, {requests_per_minute: 7}, 'requests_per_minute'),\n"
+        "  noEntry: h.effectiveLimit(undefined, null, 'parallel_requests'),\n"
+        "  waits: ['17', '0', '', null, 'soon', '1.5', '123456'].map(h.retryWait),\n"
+        "  texts: [h.waitText(1), h.waitText(17), h.waitText(null)],\n"
+        "  missing: [missing(404, 'not_found'), missing(404, null), missing(404, 'unknown_service'),\n"
+        "            missing(502, 'service_unreachable'), h.limitsMissing(new Error('x'))],\n"
+        "}));\n"
+    )
+    out = subprocess.run(["node", str(harness), str(STATIC_DIR / "app.js")],
+                         check=True, capture_output=True, text=True).stdout
+    result = json.loads(out)
+    assert result["allDefault"] is None
+    assert result["mixed"] == {"requests_per_minute": 60, "tokens_per_day": None}
+    assert result["defaults"] == {"requests_per_minute": 5, "tokens_per_day": None, "parallel_requests": 2}
+    assert result["own"] == {"value": None, "inherited": False}
+    assert result["fromDefault"] == {"value": 7, "inherited": True}
+    assert result["noEntry"] == {"value": None, "inherited": True}
+    assert result["waits"] == [17, 0, None, None, None, None, None]
+    assert result["texts"] == ["Try again in 1 second.", "Try again in 17 seconds.", ""]
+    assert result["missing"] == [True, True, False, False, False]
 
 
 def _timeout(request: httpx.Request) -> float:
