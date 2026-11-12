@@ -1,5 +1,5 @@
-/* LLM Service Admin: the page. A service picker and three tabs (usage, audit, models) over the
- * JSON API of the app.
+/* LLM Service Admin: the page. A service picker and four tabs (usage, connect, audit, models)
+ * over the JSON API of the app.
  *
  * The platform serves the app under a path prefix, so every URL is relative to BASE, the
  * location of the page. Text from the service goes into the page with textContent or as an
@@ -12,6 +12,10 @@ const BASE = new URL(location.pathname.endsWith('/') ? location.pathname : locat
 const PAGE_SIZE = 50;
 const POLL_MS = 3000;
 const MAX_POLL_FAILURES = 5;
+// The limits of the chat route of the app.
+const CHAT_MAX_MESSAGES = 50;
+const CHAT_MAX_CHARACTERS = 100000;
+const COPIED_MS = 1500;
 const COLORS = {bar: '#4c8dff', bar2: '#36c2b4', grid: 'rgba(56, 66, 82, .55)', text: '#9aa7b8'};
 
 const $ = id => document.getElementById(id);
@@ -21,7 +25,8 @@ const number = new Intl.NumberFormat();
 const state = {tab: null, service: null, services: null, range: '30', loaded: {}, offset: 0,
                polling: false, pollTimer: null, pollFailures: 0, pollService: null,
                detailUser: null, chartsOff: false,
-               charts: {}, pendingDelete: null, auditUsersRead: false, calls: {}};
+               charts: {}, pendingDelete: null, auditUsersRead: false, calls: {},
+               chat: {messages: [], controller: null, defaultModel: ''}};
 
 /** A number for a new call of `name`. A call that is no longer the newest drops its answer. */
 const nextCall = name => (state.calls[name] = (state.calls[name] || 0) + 1);
@@ -151,11 +156,12 @@ async function guarded(work) {
 
 // ---- tabs
 
-const TABS = ['usage', 'audit', 'models'];
-const LOADERS = {usage: loadUsage, audit: loadAudit, models: loadStatus};
+const TABS = ['usage', 'connect', 'audit', 'models'];
+const LOADERS = {usage: loadUsage, connect: loadConnect, audit: loadAudit, models: loadStatus};
 /** `one`: the tab works on one service. With "All services", the elements `<tab>-pick` (a note)
  * and `<tab>-content` swap. `admin`: the tab shows only for an admin of the picked service. */
-const TAB_RULES = {usage: {}, audit: {one: true, admin: true}, models: {one: true, admin: true}};
+const TAB_RULES = {usage: {}, connect: {one: true}, audit: {one: true, admin: true},
+                   models: {one: true, admin: true}};
 
 /** An admin tab shows for an admin of the picked service. With "All services", it shows for an
  * admin of at least one service. */
@@ -330,6 +336,8 @@ function clearServiceData() {
   $('st-state').className = 'badge';
   $('st-error').classList.remove('bad');
   $('st-rollback-row').hidden = true;
+  clearChat();
+  clearConnect();
 }
 
 /** Read the list of services again and show what depends on it. */
@@ -541,6 +549,313 @@ function setRange(range) {
     $('range-since').value = day(new Date(Date.now() - 29 * 86400000));
   }
   guarded(loadUsage);
+}
+
+// ---- connect
+
+const internalBaseUrl = name => `http://${name}/v1`;
+
+/** The base URL of the service `name` for a client outside the platform. The page runs under a
+ * path such as `/job/dev/llm-service-admin/`, and the service runs beside it. Null for a page at
+ * the root, for example a local run. */
+function outsideBaseUrl(name) {
+  const segments = location.pathname.split('/').filter(Boolean);
+  if (!segments.length) return null;
+  segments[segments.length - 1] = name;
+  return `${location.origin}/${segments.join('/')}/v1`;
+}
+
+const EXAMPLE_PROMPT = 'Say hello in one sentence.';
+const EXAMPLE_IDS = ['example-curl', 'example-python', 'example-outside', 'example-chat'];
+
+/** The text of each example for the service `name` and the model `model`, by element id. The
+ * outside example reads the token from LLM_TOKEN, so no example has a token value. */
+function examples(name, model) {
+  const internal = internalBaseUrl(name);
+  const outside = outsideBaseUrl(name) || `https://<your-domain>/job/<environment>/${name}/v1`;
+  const shown = model || '<model>';
+  const body = JSON.stringify({model: shown, messages: [{role: 'user', content: EXAMPLE_PROMPT}]});
+  const ask = [
+    'reply = client.chat.completions.create(',
+    `    model=${JSON.stringify(shown)},`,
+    `    messages=[{"role": "user", "content": ${JSON.stringify(EXAMPLE_PROMPT)}}],`,
+    ')',
+    'print(reply.choices[0].message.content)',
+  ];
+  const chosen = model ? ` LLM_MODEL="${model}"` : '';
+  return {
+    'example-curl': [
+      `curl ${internal}/chat/completions \\`,
+      '  -H "Content-Type: application/json" \\',
+      `  -d '${body}'`,
+    ].join('\n'),
+    'example-python': [
+      'from openai import OpenAI',
+      '',
+      `client = OpenAI(base_url="${internal}", api_key="unused")`,
+      ...ask,
+    ].join('\n'),
+    'example-outside': [
+      'import os',
+      '',
+      'from openai import OpenAI',
+      '',
+      'client = OpenAI(',
+      `    base_url="${outside}",`,
+      '    api_key="unused",',
+      '    default_headers={"Cookie": "__datatailr_user_cookie__=" + os.environ["LLM_TOKEN"]},',
+      ')',
+      ...ask,
+    ].join('\n'),
+    'example-chat': [
+      'pip install openai',
+      '# On the platform:',
+      `LLM_BASE_URL="${internal}"${chosen} python chat.py`,
+      '# Outside the platform, with your token in the variable LLM_TOKEN:',
+      `LLM_BASE_URL="${outside}"${chosen} python chat.py`,
+    ].join('\n'),
+  };
+}
+
+/** Show the addresses and the examples of the service `name`. */
+function showConnect(name, model, engine) {
+  const outside = outsideBaseUrl(name);
+  $('conn-internal').textContent = internalBaseUrl(name);
+  $('conn-outside').textContent = outside || 'Known only on the platform';
+  $('conn-outside-note').hidden = Boolean(outside);
+  $('conn-model').textContent = model || 'The service serves no model.';
+  $('conn-engine').textContent = engine ? stateText(engine) : 'unknown';
+  $('conn-engine').className = `badge ${engine || ''}`;
+  for (const [id, text] of Object.entries(examples(name, model))) $(id).textContent = text;
+  // The model field follows the served model until the viewer types another one.
+  const field = $('chat-model');
+  if (!field.value.trim() || field.value.trim() === state.chat.defaultModel) field.value = model || '';
+  state.chat.defaultModel = model || '';
+}
+
+/** The id of the active model in an answer of `GET /v1/models`, or null. */
+function activeModel(answer) {
+  const data = answer && Array.isArray(answer.data) ? answer.data : [];
+  const entry = data.find(item => item && item.status === 'active' && typeof item.id === 'string');
+  return entry ? entry.id : null;
+}
+
+async function loadConnect() {
+  const service = state.service;
+  if (!service) return;
+  const call = nextCall('connect');
+  const entry = entryOf(service) || {};
+  showConnect(service, entry.model, entry.engine);
+  const answer = await current('connect', call, service, api(servicePath('models', service)));
+  showConnect(service, activeModel(answer) || entry.model, entry.engine);
+}
+
+function clearConnect() {
+  for (const id of ['conn-internal', 'conn-outside', 'conn-model', 'conn-engine']) $(id).textContent = '-';
+  $('conn-engine').className = 'badge';
+  $('conn-outside-note').hidden = true;
+  for (const id of EXAMPLE_IDS) $(id).textContent = '';
+  $('chat-model').value = '';
+  state.chat.defaultModel = '';
+}
+
+async function copyExample(button) {
+  try {
+    await navigator.clipboard.writeText($(button.dataset.copy).textContent);
+  } catch {
+    showBanner('The browser did not copy the example. Select the text of the example and copy it by hand.');
+    return;
+  }
+  button.textContent = 'Copied';
+  $('copy-status').textContent = 'The page copied the example.';
+  clearTimeout(Number(button.dataset.timer));
+  button.dataset.timer = setTimeout(() => {
+    button.textContent = 'Copy';
+    $('copy-status').textContent = '';
+  }, COPIED_MS);
+}
+
+// ---- testing area
+
+/** The messages of the next request: the system prompt, the kept messages and `prompt`. */
+function chatMessages(prompt) {
+  const system = $('chat-system').value.trim();
+  return [...(system ? [{role: 'system', content: system}] : []), ...state.chat.messages,
+          {role: 'user', content: prompt}];
+}
+
+/** A text that names the limit of the app that `messages` passes, or null. */
+function chatLimit(messages) {
+  if (messages.length > CHAT_MAX_MESSAGES) {
+    return `The conversation reached the limit of ${CHAT_MAX_MESSAGES} messages. Use Clear to start again.`;
+  }
+  const characters = messages.reduce((total, message) => total + message.content.length, 0);
+  if (characters > CHAT_MAX_CHARACTERS) {
+    return `The conversation passed the limit of ${number.format(CHAT_MAX_CHARACTERS)} characters. ` +
+           'Use Clear to start again.';
+  }
+  return null;
+}
+
+/** Split `text` into whole lines and the rest after the last line break. A network chunk can end
+ * in the middle of a line, so the caller keeps the rest for the next chunk. */
+function splitLines(text) {
+  const lines = text.split('\n');
+  const rest = lines.pop();
+  return {lines: lines.map(line => line.replace(/\r$/, '')), rest};
+}
+
+/** Post the chat request and call `onText` with each piece of the answer. Return the usage of the
+ * last chunk. Throw an ApiError when the answer fails or ends without `[DONE]`. A stop throws the
+ * AbortError of the browser. */
+async function streamChat(service, body, signal, onText) {
+  let response;
+  try {
+    response = await fetch(new URL(servicePath('chat', service), BASE),
+                           {method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify(body), signal});
+  } catch (error) {
+    if (error.name === 'AbortError') throw error;
+    throw new ApiError('The admin app does not answer.');
+  }
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    const message = data && data.error && data.error.message;
+    throw new ApiError(typeof message === 'string' ? message : `The admin app answered ${response.status}.`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let rest = '';
+  let usage = null;
+  for (;;) {
+    let part;
+    try {
+      part = await reader.read();
+    } catch (error) {
+      if (error.name === 'AbortError') throw error;
+      throw new ApiError('The stream of the answer broke.');
+    }
+    rest += part.done ? decoder.decode() : decoder.decode(part.value, {stream: true});
+    const split = splitLines(part.done ? `${rest}\n` : rest);
+    rest = split.rest;
+    for (const line of split.lines) {
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (data === '[DONE]') return usage;
+      let chunk;
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      if (chunk && chunk.error) {
+        const message = chunk.error.message;
+        throw new ApiError(typeof message === 'string' ? message : 'The service reported an error.');
+      }
+      if (chunk && chunk.usage) usage = chunk.usage;
+      const content = chunk?.choices?.[0]?.delta?.content;
+      if (typeof content === 'string' && content) onText(content);
+    }
+    if (part.done) throw new ApiError('The stream ended before the service finished the answer.');
+  }
+}
+
+/** Add a turn to the conversation. The text goes in with textContent only. */
+function chatTurn(role, text) {
+  const body = el('div', {className: 'turn-text', text});
+  const turn = el('div', {className: `turn ${role}`},
+                  el('div', {className: 'label', text: role === 'user' ? 'You' : 'Model'}), body);
+  $('chat-log').append(turn);
+  return {turn, body};
+}
+
+function setChatBusy(running) {
+  $('chat-send').disabled = running;
+  $('chat-stop').disabled = !running;
+  $('chat-log').setAttribute('aria-busy', String(running));
+}
+
+const seconds = ms => `${(ms / 1000).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})} s`;
+
+function showChatStats(usage, firstMs, totalMs) {
+  $('chat-prompt-tokens').textContent = fmt(usage && usage.prompt_tokens);
+  $('chat-completion-tokens').textContent = fmt(usage && usage.completion_tokens);
+  $('chat-first-time').textContent = firstMs === null ? '-' : seconds(firstMs);
+  $('chat-total-time').textContent = seconds(totalMs);
+  $('chat-stats').hidden = false;
+}
+
+/** Send the prompt with the kept messages, and show the answer while it streams. A stopped or
+ * failed answer removes its prompt from the kept messages. */
+async function sendChat(event) {
+  event.preventDefault();
+  const service = state.service;
+  const prompt = $('chat-prompt').value.trim();
+  if (state.chat.controller || !service || !prompt) return;
+  const messages = chatMessages(prompt);
+  const limit = chatLimit(messages);
+  if (limit) {
+    $('chat-status').textContent = limit;
+    return;
+  }
+  const body = {messages, temperature: Number($('chat-temperature').value),
+                max_tokens: Number($('chat-max-tokens').value)};
+  const model = $('chat-model').value.trim();
+  if (model) body.model = model;
+  const asked = messages[messages.length - 1];
+  state.chat.messages.push(asked);
+  $('chat-prompt').value = '';
+  const question = chatTurn('user', prompt);
+  const answer = chatTurn('assistant', '');
+  const controller = new AbortController();
+  state.chat.controller = controller;
+  setChatBusy(true);
+  $('chat-stats').hidden = true;
+  $('chat-status').textContent = 'The model answers.';
+  const started = performance.now();
+  let firstMs = null;
+  try {
+    const usage = await streamChat(service, body, controller.signal, piece => {
+      if (controller !== state.chat.controller) return;
+      if (firstMs === null) firstMs = performance.now() - started;
+      answer.body.textContent += piece;
+    });
+    if (controller !== state.chat.controller) return;
+    state.chat.messages.push({role: 'assistant', content: answer.body.textContent});
+    showChatStats(usage, firstMs, performance.now() - started);
+    $('chat-status').textContent = chatLimit(chatMessages('')) || 'The answer is complete.';
+  } catch (error) {
+    // Clear or another service made this answer stale. They also removed its turns.
+    if (controller !== state.chat.controller) return;
+    state.chat.messages = state.chat.messages.filter(message => message !== asked);
+    question.turn.classList.add('dropped');
+    answer.turn.classList.add('dropped');
+    if (!$('chat-prompt').value) $('chat-prompt').value = prompt;
+    const reason = error.name === 'AbortError' ? 'You stopped the answer.'
+      : `The answer failed: ${error instanceof ApiError ? error.message : String(error)}`;
+    $('chat-status').textContent = `${reason} The conversation does not keep this prompt.`;
+  } finally {
+    if (controller === state.chat.controller) {
+      state.chat.controller = null;
+      setChatBusy(false);
+    }
+  }
+}
+
+function stopChat() {
+  if (state.chat.controller) state.chat.controller.abort();
+}
+
+/** Stop a running answer and forget the conversation. */
+function clearChat() {
+  const controller = state.chat.controller;
+  state.chat.controller = null;
+  if (controller) controller.abort();
+  setChatBusy(false);
+  state.chat.messages = [];
+  $('chat-log').replaceChildren();
+  $('chat-stats').hidden = true;
+  $('chat-status').textContent = '';
 }
 
 // ---- audit
@@ -831,6 +1146,12 @@ function wire() {
     serve($('serve-model').value.trim(), $('serve-revision').value.trim() || 'main');
   });
   $('confirm-delete').addEventListener('click', confirmDelete);
+  for (const button of document.querySelectorAll('[data-copy]')) {
+    button.addEventListener('click', () => copyExample(button));
+  }
+  $('chat-form').addEventListener('submit', sendChat);
+  $('chat-stop').addEventListener('click', stopChat);
+  $('chat-clear').addEventListener('click', clearChat);
   for (const button of document.querySelectorAll('dialog [data-close]')) {
     button.addEventListener('click', () => button.closest('dialog').close());
   }

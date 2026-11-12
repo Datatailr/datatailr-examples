@@ -584,6 +584,88 @@ def test_page_prose_follows_the_rules(name):
     assert "n't" not in text and "—" not in text
 
 
+CONNECT_IDS = (
+    "tab-connect", "panel-connect", "connect-pick", "connect-content", "conn-internal", "conn-outside",
+    "conn-outside-note", "conn-model", "conn-engine", "example-curl", "example-python", "example-outside",
+    "example-chat", "chat-form", "chat-system", "chat-prompt", "chat-model", "chat-temperature",
+    "chat-max-tokens", "chat-send", "chat-stop", "chat-clear", "chat-log", "chat-status", "chat-stats",
+)
+
+
+@pytest.mark.parametrize("element_id", CONNECT_IDS)
+def test_page_has_the_elements_of_the_connect_tab(element_id):
+    assert f'id="{element_id}"' in (STATIC_DIR / "index.html").read_text()
+
+
+def test_connect_tab_comes_after_usage():
+    page = (STATIC_DIR / "index.html").read_text()
+    tabs = re.findall(r'role="tab" id="tab-(\w+)"', page)
+    assert tabs == ["usage", "connect", "audit", "models"]
+    assert "const TABS = ['usage', 'connect', 'audit', 'models'];" in (STATIC_DIR / "app.js").read_text()
+
+
+@pytest.mark.parametrize(
+    "element_id, attributes",
+    [("chat-temperature", ('min="0"', 'max="2"', 'step="0.1"', 'value="0.7"')),
+     ("chat-max-tokens", ('min="1"', 'max="4096"', 'step="1"', 'value="512"'))],
+)
+def test_chat_fields_have_the_limits_of_the_app(element_id, attributes):
+    page = (STATIC_DIR / "index.html").read_text()
+    tag = re.search(rf'<input[^>]*id="{element_id}"[^>]*>', page).group(0)
+    for attribute in attributes:
+        assert attribute in tag, attribute
+
+
+def test_page_examples_have_no_token_value():
+    text = (STATIC_DIR / "app.js").read_text() + (STATIC_DIR / "index.html").read_text()
+    assert 'os.environ["LLM_TOKEN"]' in text
+    assert 'api_key="unused"' in text
+    # The cookie name is always followed by the end of a string, never by a value.
+    after = re.findall(r"__datatailr_user_cookie__=(.?)", text)
+    assert after and all(char in "\"'" for char in after)
+    assert not re.search(r"LLM_TOKEN=\S", text)
+
+
+def test_page_streams_the_answer_with_stop():
+    text = (STATIC_DIR / "app.js").read_text()
+    for name in ("new AbortController()", ".abort()", "getReader()", "'[DONE]'", "delta"):
+        assert name in text, name
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_page_reads_split_events_and_builds_the_outside_url(tmp_path):
+    # Load app.js with stubs for the browser, then call its pure helpers.
+    harness = tmp_path / "harness.js"
+    harness.write_text(
+        "const vm = require('vm');\n"
+        "const fs = require('fs');\n"
+        "const context = {URL, TextDecoder, console, document: {addEventListener() {}},\n"
+        "  location: {pathname: process.argv[3], origin: 'https://example.test'}};\n"
+        "vm.createContext(context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') +\n"
+        "  '\\nthis.splitLines = splitLines; this.outsideBaseUrl = outsideBaseUrl;', context);\n"
+        "let rest = '';\n"
+        "const lines = [];\n"
+        "for (const part of ['data: {\"a\"', ': 1}\\r\\ndata: [DO', 'NE]\\n']) {\n"
+        "  const split = context.splitLines(rest + part);\n"
+        "  rest = split.rest;\n"
+        "  lines.push(...split.lines);\n"
+        "}\n"
+        "console.log(JSON.stringify({lines, rest, url: context.outsideBaseUrl('svc')}));\n"
+    )
+
+    def run(pathname):
+        out = subprocess.run(["node", str(harness), str(STATIC_DIR / "app.js"), pathname],
+                             check=True, capture_output=True, text=True).stdout
+        return json.loads(out)
+
+    platform = run("/job/dev/llm-service-admin/")
+    assert platform["lines"] == ['data: {"a": 1}', "data: [DONE]"]
+    assert platform["rest"] == ""
+    assert platform["url"] == "https://example.test/job/dev/svc/v1"
+    assert run("/")["url"] is None
+
+
 def _timeout(request: httpx.Request) -> float:
     return request.extensions["timeout"]["read"]
 
