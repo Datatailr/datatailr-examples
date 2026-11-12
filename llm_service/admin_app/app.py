@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import time
@@ -31,6 +32,7 @@ TIMEOUT_SECONDS = 30.0
 ACTION_TIMEOUT_SECONDS = 300.0
 # One limit for the whole chat answer, and the timeout of each step of the call.
 CHAT_TIMEOUT_SECONDS = 300.0
+MAX_ERROR_BODY_BYTES = 64 * 1024
 MAX_VIEWER_LENGTH = 256
 ROLE_TIMEOUT_SECONDS = 3.0
 ROLE_CACHE_SECONDS = 30.0
@@ -365,10 +367,17 @@ def create_app(
             response = await stack.enter_async_context(
                 service.stream(name, "/v1/chat/completions", viewer, json=built, timeout=CHAT_TIMEOUT_SECONDS)
             )
-            if response.status_code >= 400:
+            if response.status_code != 200:
+                if response.status_code < 400:
+                    await stack.aclose()
+                    return _error(502, "service_unreachable", UNREACHABLE)
                 try:
-                    await response.aread()
-                    error_body = response.json()
+                    error_bytes = b""
+                    async for part in response.aiter_bytes():
+                        error_bytes += part
+                        if len(error_bytes) > MAX_ERROR_BODY_BYTES:
+                            raise ValueError("The error body is too large.")
+                    error_body = json.loads(error_bytes)
                 except (httpx.HTTPError, ValueError):
                     await stack.aclose()
                     return _error(502, "service_unreachable", UNREACHABLE)

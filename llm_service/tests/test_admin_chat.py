@@ -217,6 +217,30 @@ def test_a_403_of_the_service_passes_through(client, backend):
     assert response.json() == error
 
 
+def test_a_status_below_400_that_is_not_200_is_502(client, backend):
+    for status in (201, 204, 302):
+        backend.build = lambda request, status=status: httpx.Response(status, content=b"data: x\n\n")
+        response = post(client)
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "service_unreachable"
+
+
+def test_an_error_body_over_64_kib_is_502(client, backend):
+    big = json.dumps({"error": {"message": "x" * 70_000}}).encode()
+    backend.build = lambda request: httpx.Response(500, content=big)
+    response = post(client)
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "service_unreachable"
+
+
+def test_an_error_body_under_the_limit_passes(client, backend):
+    error = {"error": {"message": "x" * 60_000, "type": "server_error", "code": "boom"}}
+    backend.build = lambda request: httpx.Response(500, json=error)
+    response = post(client)
+    assert response.status_code == 500
+    assert response.json() == error
+
+
 def test_an_error_body_that_is_not_json_is_502(client, backend):
     backend.build = lambda request: httpx.Response(500, content=b"<html>oops</html>")
     response = post(client)
@@ -242,10 +266,11 @@ def test_an_unknown_service_is_404(client, backend):
     assert backend.chat_requests == []
 
 
-def test_a_bad_name_is_400(client):
+def test_a_bad_name_is_400(client, backend):
     response = post(client, name="Bad_Name")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_service"
+    assert backend.chat_requests == []
 
 
 def test_a_body_without_json_content_type_is_415(client, backend):
@@ -312,7 +337,18 @@ def test_the_limit_stops_a_slow_stream(client, backend, monkeypatch):
     assert body.closed
 
 
-def test_a_gone_client_closes_the_response_of_the_service(registry, backend):
+def test_a_gone_client_closes_the_response_of_the_service(registry, backend, monkeypatch):
+    held = []
+
+    class Holding(app_module.ServiceClient):
+        """Keep each call alive, so garbage collection cannot close its generators."""
+
+        def stream(self, *args, **kwargs):
+            call = super().stream(*args, **kwargs)
+            held.append(call)
+            return call
+
+    monkeypatch.setattr(app_module, "ServiceClient", Holding)
     body = RecordedStream([b"data: one\n\n"], then="hang")
     backend.build = lambda request: httpx.Response(200, stream=body)
     http = httpx.AsyncClient(transport=httpx.MockTransport(backend))
@@ -351,6 +387,7 @@ def test_a_gone_client_closes_the_response_of_the_service(registry, backend):
                 first_chunk.set()
 
         await asyncio.wait_for(app(scope, receive, send), 10)
+        assert held
         # Check before asyncio.run closes the open generators, which would close the body too.
         assert body.closed
 

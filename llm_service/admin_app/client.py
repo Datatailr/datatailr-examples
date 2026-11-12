@@ -80,7 +80,7 @@ class ServiceClient:
         json: object | None = None,
         timeout: float,
     ) -> AsyncIterator[httpx.Response]:
-        """Send a POST to the service `service` and give the response before its body is read.
+        """Send a POST to the service `service` and give the response before the app reads its body.
 
         The response closes when the block ends, whatever the cause. `viewer`
         and `timeout` work as in `request`. Raise `ValueError` for a bad service
