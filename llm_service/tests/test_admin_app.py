@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -682,8 +683,9 @@ def test_page_has_the_elements_of_the_connect_tab(element_id):
 def test_connect_tab_comes_after_usage():
     page = (STATIC_DIR / "index.html").read_text()
     tabs = re.findall(r'role="tab" id="tab-(\w+)"', page)
-    assert tabs == ["usage", "connect", "audit", "models", "limits"]
-    assert "const TABS = ['usage', 'connect', 'audit', 'models', 'limits'];" in (STATIC_DIR / "app.js").read_text()
+    assert tabs == ["usage", "load", "connect", "audit", "models", "limits"]
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "const TABS = ['usage', 'load', 'connect', 'audit', 'models', 'limits'];" in text
 
 
 @pytest.mark.parametrize(
@@ -893,6 +895,147 @@ def test_page_limit_helpers(tmp_path):
     assert result["waits"] == [17, 0, None, None, None, None, None]
     assert result["texts"] == ["Try again in 1 second.", "Try again in 17 seconds.", "", ""]
     assert result["missing"] == [True, True, False, False, False]
+
+
+LOAD_IDS = (
+    "tab-load", "panel-load", "load-missing", "load-note", "load-note-text", "load-retry", "load-one", "load-all",
+    "load-dates", "load-since", "load-until", "load-dates-status", "load-now-text", "load-minute-text",
+    "load-in-flight", "load-waiting", "load-completion-rate", "load-prompt-rate", "load-gpu",
+    "load-requests", "load-failed", "load-ttft-p50", "load-ttft-p95", "load-duration-p50", "load-duration-p95",
+    "load-range-text", "load-days-note", "load-charts", "chart-load-requests", "chart-load-tokens",
+    "chart-load-ttft", "chart-load-duration", "chart-load-queue", "chart-load-gpu", "load-all-text", "load-all-body",
+)
+
+
+@pytest.mark.parametrize("element_id", LOAD_IDS)
+def test_page_has_the_elements_of_the_load_tab(element_id):
+    assert f'id="{element_id}"' in (STATIC_DIR / "index.html").read_text()
+
+
+def test_page_offers_the_ranges_of_the_load_tab():
+    page = (STATIC_DIR / "index.html").read_text()
+    assert re.findall(r'data-load-range="(\w+)"', page) == ["hour", "6h", "24h", "7d", "custom"]
+    for field in ("load-since", "load-until"):
+        tag = re.search(rf'<input[^>]*id="{field}"[^>]*>', page).group(0)
+        assert 'type="datetime-local"' in tag
+    assert "Times in your local time." in (STATIC_DIR / "app.js").read_text()
+
+
+def test_load_tab_is_for_an_admin_and_shows_the_table_for_all_services():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "load: {admin: true}" in text
+    assert "load: loadLoad" in text
+    rules = text[text.index("const TAB_RULES = "):text.index("function tabShown(")]
+    for rule in ("connect: {one: true}", "audit: {one: true, admin: true}", "models: {one: true, admin: true}",
+                 "limits: {one: true, admin: true}", "usage: {}"):
+        assert rule in rules, rule
+
+
+def test_page_calls_the_three_load_routes_and_drops_late_answers():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "current('loadLive', call, service, api(servicePath('metrics/live', service)))" in text
+    assert "current('loadAll', call, null, api('api/load'))" in text
+    assert "current('loadHistory', call, service," in text
+    assert "servicePath('metrics/history', service)" in text
+
+
+def test_load_tab_reads_on_a_timer_only_while_it_is_open_and_visible():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "const LOAD_MS = 5000;" in text and "const LOAD_MAX_FAILURES = 5;" in text
+    assert "addEventListener('visibilitychange'" in text
+    assert "document.visibilityState !== 'visible'" in text
+    body = text[text.index("function selectTab("):text.index("function tabKeys(")]
+    assert "stopLoadTimer()" in body
+    clear = text[text.index("function clearServiceData("):text.index("async function refreshServices(")]
+    assert "clearLoad();" in clear
+    tick = text[text.index("async function loadTick("):text.index("function startLoadTimer(")]
+    assert "if (stale() || state.loadBusy) return;" in tick
+
+
+def test_load_charts_are_lines_on_a_linear_time_axis_updated_in_place():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("// ---- load"):text.index("// ---- connect")]
+    assert "type: 'line'" in body and "type: 'linear'" in body
+    assert "spanGaps: false" in body
+    assert ".destroy(" not in body and "type: 'time'" not in body
+    assert "chart.update(" in body
+    page = (STATIC_DIR / "index.html").read_text()
+    assert page.count("vendor/") == 1  # no new library
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_page_load_helpers(tmp_path):
+    harness = tmp_path / "harness.js"
+    harness.write_text(
+        "const vm = require('vm');\n"
+        "const fs = require('fs');\n"
+        "const context = {URL, console, document: {addEventListener() {}},\n"
+        "  location: {pathname: '/', origin: 'https://example.test'}};\n"
+        "vm.createContext(context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {loadSeries, loadRange, stepText,'\n"
+        "  + ' msText, rateText, gpuText, tickStep, localInputValue, loadMissing, ApiError};', context);\n"
+        "const h = context.h;\n"
+        "const point = (ts, extra = {}) => ({ts, requests: 2, failed_requests: 0, ttft_ms_p50: 300, ...extra});\n"
+        "const now = Date.parse('2026-11-12T12:00:00Z');\n"
+        "const pick = (series, name) => series[name].map(p => [new Date(p.x).toISOString().slice(11, 16), p.y]);\n"
+        "const live = h.loadSeries([point('2026-11-12T10:00:00Z'), point('2026-11-12T10:01:00Z', {ttft_ms_p50: null}),\n"
+        "                           point('2026-11-12T10:07:00Z'), {ts: 'bad'}, null, {requests: 4}], 60);\n"
+        "const merged = h.loadSeries([point('2026-11-12T10:05:00Z'), point('2026-11-12T10:00:00Z'),\n"
+        "                             point('2026-11-12T10:15:00Z')], 300);\n"
+        "const missing = (status, code) => h.loadMissing(new h.ApiError('x', {status, code}));\n"
+        "console.log(JSON.stringify({\n"
+        "  requests: pick(live, 'requests'), ttft: pick(live, 'ttft_ms_p50'), prompt: pick(live, 'prompt_tokens'),\n"
+        "  merged: pick(merged, 'requests'), empty: h.loadSeries(undefined, 60).requests,\n"
+        "  ranges: ['hour', '6h', '24h', '7d'].map(r => h.loadRange(r, now, '', '')),\n"
+        "  custom: h.loadRange('custom', now, '2026-11-01T10:00', '2026-11-02T10:30'),\n"
+        "  longest: h.loadRange('custom', now, '2026-11-01T00:00', '2026-12-02T00:00'),\n"
+        "  errors: [h.loadRange('custom', now, '', '2026-11-02T10:30'), h.loadRange('custom', now, 'x', 'y'),\n"
+        "           h.loadRange('custom', now, '2026-11-02T10:30', '2026-11-02T10:30'),\n"
+        "           h.loadRange('custom', now, '2026-11-01T00:00', '2026-12-02T00:01')],\n"
+        "  ms: [h.msText(310), h.msText(2100), h.msText(0), h.msText(null), h.msText(undefined)],\n"
+        "  rates: [h.rateText(96.54), h.rateText(0), h.rateText(null), h.rateText('7')],\n"
+        "  gpu: [h.gpuText(14200, 15360), h.gpuText(14200, null), h.gpuText(null, 15360)],\n"
+        "  steps: [60, 300, 3600, 7200, 5400, null].map(h.stepText),\n"
+        "  ticks: [3600000, 6 * 3600000, 24 * 3600000, 7 * 86400000, 31 * 86400000].map(h.tickStep),\n"
+        "  input: h.localInputValue(new Date('2026-11-12T09:05:00Z')),\n"
+        "  missing: [missing(404, 'not_found'), missing(404, 'unknown_service'), missing(502, null)],\n"
+        "}));\n"
+    )
+    env = {**os.environ, "TZ": "Europe/Berlin", "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
+    out = subprocess.run(["node", str(harness), str(STATIC_DIR / "app.js")],
+                         check=True, capture_output=True, text=True, env=env).stdout
+    result = json.loads(out)
+    # A missing minute is a gap (null), not zero. A point without a time is skipped.
+    assert result["requests"] == [["10:00", 2], ["10:01", 2], ["10:02", None], ["10:07", 2]]
+    assert result["ttft"] == [["10:00", 300], ["10:01", None], ["10:02", None], ["10:07", 300]]
+    assert result["prompt"] == [["10:00", None], ["10:01", None], ["10:02", None], ["10:07", None]]
+    # Merged points: a gap needs more than 1.5 steps. The points come in time order.
+    assert result["merged"] == [["10:00", 2], ["10:05", 2], ["10:10", None], ["10:15", 2]]
+    assert result["empty"] == []
+    assert result["ranges"] == [
+        None,
+        {"since": "2026-11-12T06:00:00.000Z", "until": "2026-11-12T12:00:00.000Z"},
+        {"since": "2026-11-11T12:00:00.000Z", "until": "2026-11-12T12:00:00.000Z"},
+        {"since": "2026-11-05T12:00:00.000Z", "until": "2026-11-12T12:00:00.000Z"},
+    ]
+    # The fields are local time (Berlin, UTC+1 in November). The route gets UTC.
+    assert result["custom"] == {"since": "2026-11-01T09:00:00.000Z", "until": "2026-11-02T09:30:00.000Z"}
+    assert result["longest"] == {"since": "2026-10-31T23:00:00.000Z", "until": "2026-12-01T23:00:00.000Z"}
+    assert result["errors"] == [
+        {"error": "Fill in both times of the range."},
+        {"error": "The page cannot read a time of the range."},
+        {"error": "The end of the range must come after its start."},
+        {"error": "The range is longer than 31 days. Pick a shorter range."},
+    ]
+    assert result["ms"] == ["310 ms", "2.10 s", "0 ms", "-", "-"]
+    assert result["rates"] == ["96.5", "0", "-", "-"]
+    assert result["gpu"] == ["13.9 of 15 GiB", "13.9 GiB", "-"]
+    assert result["steps"] == ["One point for each minute.", "One point for each 5 minutes.",
+                               "One point for each hour.", "One point for each 2 hours.",
+                               "One point for each 90 minutes.", ""]
+    assert result["ticks"] == [600000, 3600000, 10800000, 86400000, 604800000]
+    assert result["input"] == "2026-11-12T10:05"
+    assert result["missing"] == [True, False, False]
 
 
 def _timeout(request: httpx.Request) -> float:

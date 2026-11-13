@@ -1,4 +1,4 @@
-/* LLM Service Admin: the page. A service picker and five tabs (usage, connect, audit, models,
+/* LLM Service Admin: the page. A service picker and six tabs (usage, load, connect, audit, models,
  * limits) over the JSON API of the app.
  *
  * The platform serves the app under a path prefix, so every URL is relative to BASE, the
@@ -16,7 +16,8 @@ const MAX_POLL_FAILURES = 5;
 const CHAT_MAX_MESSAGES = 50;
 const CHAT_MAX_CHARACTERS = 100000;
 const COPIED_MS = 1500;
-const COLORS = {bar: '#4c8dff', bar2: '#36c2b4', grid: 'rgba(56, 66, 82, .55)', text: '#9aa7b8'};
+const COLORS = {bar: '#4c8dff', bar2: '#36c2b4', red: '#f26d6d', yellow: '#e2b444', grid: 'rgba(56, 66, 82, .55)',
+                text: '#9aa7b8'};
 
 const $ = id => document.getElementById(id);
 const number = new Intl.NumberFormat();
@@ -25,6 +26,7 @@ const number = new Intl.NumberFormat();
 const state = {tab: null, service: null, services: null, range: '30', loaded: {}, offset: 0,
                polling: false, pollTimer: null, pollFailures: 0, pollService: null,
                detailUser: null, chartsOff: false,
+               loadRange: 'hour', loadTimer: null, loadFailures: 0, loadBusy: null, loadCharts: {},
                charts: {}, pendingDelete: null, pendingRemove: null, auditUsersRead: false, calls: {},
                chat: {messages: [], controller: null, defaultModel: ''}};
 
@@ -171,11 +173,13 @@ async function guarded(work) {
 
 // ---- tabs
 
-const TABS = ['usage', 'connect', 'audit', 'models', 'limits'];
-const LOADERS = {usage: loadUsage, connect: loadConnect, audit: loadAudit, models: loadStatus, limits: loadLimits};
+const TABS = ['usage', 'load', 'connect', 'audit', 'models', 'limits'];
+const LOADERS = {usage: loadUsage, load: loadLoad, connect: loadConnect, audit: loadAudit, models: loadStatus,
+                 limits: loadLimits};
 /** `one`: the tab works on one service. With "All services", the elements `<tab>-pick` (a note)
- * and `<tab>-content` swap. `admin`: the tab shows only for an admin of the picked service. */
-const TAB_RULES = {usage: {}, connect: {one: true}, audit: {one: true, admin: true},
+ * and `<tab>-content` swap. `admin`: the tab shows only for an admin of the picked service. An
+ * admin tab without `one` also works with "All services", as the Load tab with its table does. */
+const TAB_RULES = {usage: {}, load: {admin: true}, connect: {one: true}, audit: {one: true, admin: true},
                    models: {one: true, admin: true}, limits: {one: true, admin: true}};
 
 /** An admin tab shows for an admin of the picked service. With "All services", it shows for an
@@ -219,6 +223,9 @@ function selectTab(name, focus = false) {
     $(`${name}-content`).hidden = pick;
   }
   writeHash();
+  // The Load tab reads on a timer only while it is open.
+  if (name !== 'load') stopLoadTimer();
+  else if (state.loaded.load) startLoadTimer();
   if (!pick && !state.loaded[name]) {
     state.loaded[name] = true;
     guarded(LOADERS[name]);
@@ -360,6 +367,7 @@ function clearServiceData() {
   clearConnect();
   clearMyLimits();
   clearLimits();
+  clearLoad();
 }
 
 /** Read the list of services again and show what depends on it. */
@@ -454,7 +462,7 @@ function barChart(id, color, horizontal, shortLabel) {
 /** Turn the charts off after a failure. The tiles and the tables still work. */
 function chartsFailed() {
   state.chartsOff = true;
-  document.querySelector('.charts').hidden = true;
+  for (const charts of document.querySelectorAll('.charts')) charts.hidden = true;
   showBanner('The charts did not load. The numbers and tables still work.');
 }
 
@@ -571,6 +579,393 @@ function setRange(range) {
     $('range-since').value = day(new Date(Date.now() - 29 * 86400000));
   }
   guarded(loadUsage);
+}
+
+// ---- load
+
+const LOAD_MS = 5000;
+const LOAD_MAX_FAILURES = 5;
+const HOUR_MS = 3600000;
+const MAX_RANGE_DAYS = 31;
+/** The ranges that end now, by their name in `data-load-range`. "hour" reads the live points. */
+const LOAD_SPANS = {'6h': 6 * HOUR_MS, '24h': 24 * HOUR_MS, '7d': 7 * 24 * HOUR_MS};
+const POINT_FIELDS = ['requests', 'failed_requests', 'prompt_tokens', 'completion_tokens', 'ttft_ms_p50', 'ttft_ms_p95',
+                      'duration_ms_p50', 'duration_ms_p95', 'in_flight_max', 'waiting_max', 'gpu_memory_used_max',
+                      'gpu_memory_total'];
+const LOAD_TILES = ['load-in-flight', 'load-waiting', 'load-completion-rate', 'load-prompt-rate', 'load-gpu',
+                    'load-requests', 'load-failed', 'load-ttft-p50', 'load-ttft-p95', 'load-duration-p50',
+                    'load-duration-p95'];
+// The steps of the time axis in minutes, from 1 minute to 1 week.
+const TICK_STEPS = [1, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 2880, 10080].map(minutes => minutes * 60000);
+const oneDecimal = new Intl.NumberFormat(undefined, {maximumFractionDigits: 1});
+
+/** The number `value`, or null for null, a missing value and each value that is not a finite number. */
+const numeric = value => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+
+/** The series of each point field as `{x, y}` pairs, with `x` in milliseconds. A missing point, or a
+ * missing value, is a null `y`. A step of more than 1.5 times `stepSeconds` between two points adds a
+ * null pair, so the chart shows a gap. A point without a valid `ts` stays out. */
+function loadSeries(points, stepSeconds) {
+  const step = (numeric(stepSeconds) || 60) * 1000;
+  const timed = (Array.isArray(points) ? points : [])
+    .map(point => ({point, x: point ? Date.parse(point.ts) : NaN}))
+    .filter(({x}) => Number.isFinite(x))
+    .sort((a, b) => a.x - b.x);
+  const series = Object.fromEntries(POINT_FIELDS.map(name => [name, []]));
+  let last = null;
+  for (const {point, x} of timed) {
+    if (last !== null && x - last > 1.5 * step) {
+      for (const name of POINT_FIELDS) series[name].push({x: last + step, y: null});
+    }
+    for (const name of POINT_FIELDS) series[name].push({x, y: numeric(point[name])});
+    last = x;
+  }
+  return series;
+}
+
+/** The `since` and `until` of the range `range` as ISO times in UTC, null for the last hour, or
+ * `{error}`. A custom range takes the values of two datetime-local fields, in local time. */
+function loadRange(range, now, sinceText, untilText) {
+  if (range === 'hour') return null;
+  if (Object.hasOwn(LOAD_SPANS, range)) {
+    return {since: new Date(now - LOAD_SPANS[range]).toISOString(), until: new Date(now).toISOString()};
+  }
+  if (!sinceText || !untilText) return {error: 'Fill in both times of the range.'};
+  const since = new Date(sinceText);
+  const until = new Date(untilText);
+  if (Number.isNaN(since.getTime()) || Number.isNaN(until.getTime())) {
+    return {error: 'The page cannot read a time of the range.'};
+  }
+  if (until <= since) return {error: 'The end of the range must come after its start.'};
+  if (until - since > MAX_RANGE_DAYS * 24 * HOUR_MS) {
+    return {error: `The range is longer than ${MAX_RANGE_DAYS} days. Pick a shorter range.`};
+  }
+  return {since: since.toISOString(), until: until.toISOString()};
+}
+
+/** The text of the step of the points, or an empty text for a step that is not a number. */
+function stepText(seconds) {
+  const minutes = numeric(seconds) === null ? 0 : Math.round(seconds / 60);
+  if (minutes < 1) return '';
+  if (minutes === 1) return 'One point for each minute.';
+  if (minutes % 60 === 0) return minutes === 60 ? 'One point for each hour.' : `One point for each ${fmt(minutes / 60)} hours.`;
+  return `One point for each ${fmt(minutes)} minutes.`;
+}
+
+/** A time in milliseconds: "310 ms" below one second, else "2.10 s". */
+const msText = ms => (numeric(ms) === null ? '-' : ms < 1000 ? `${fmt(Math.round(ms))} ms` : seconds(ms));
+/** Tokens per second with at most one decimal. */
+const rateText = value => (numeric(value) === null ? '-' : oneDecimal.format(value));
+/** GPU memory from MiB as GiB: "13.9 of 15 GiB", or only the used part without a total. */
+function gpuText(used, total) {
+  if (numeric(used) === null) return '-';
+  const gib = value => oneDecimal.format(value / 1024);
+  return numeric(total) === null ? `${gib(used)} GiB` : `${gib(used)} of ${gib(total)} GiB`;
+}
+
+/** The step of the time axis for a span in milliseconds: at most 8 steps. */
+const tickStep = span => TICK_STEPS.find(step => span / step <= 8) || TICK_STEPS[TICK_STEPS.length - 1];
+
+/** A label of the time axis in local time. A span of more than a day adds the date. */
+function timeTick(ms, span) {
+  const date = new Date(ms);
+  const time = {hour: '2-digit', minute: '2-digit'};
+  return span <= 24 * HOUR_MS ? date.toLocaleTimeString([], time)
+    : date.toLocaleString([], {month: 'short', day: 'numeric', ...time});
+}
+
+const pad = value => String(value).padStart(2, '0');
+/** A date as the value of a datetime-local field, in local time. */
+const localInputValue = date => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+  `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+
+/** A time of the service in local time, or "-". `withDate` adds the date. */
+function localText(iso, withDate = false) {
+  const date = new Date(iso);
+  if (!iso || Number.isNaN(date.getTime())) return '-';
+  return withDate ? date.toLocaleString() : date.toLocaleTimeString();
+}
+
+/** True for the 404 of a service without the load endpoints. The rule is the same as for the limits. */
+const loadMissing = error => limitsMissing(error);
+
+/** Each line chart: its canvas, the format of its values and its series as [field, label, color, dashed].
+ * `axis` formats the values on the axis when it differs from `format`. `whole` keeps the axis on whole numbers. */
+const LOAD_CHARTS = [
+  {id: 'chart-load-requests', format: fmt, whole: true,
+   series: [['requests', 'Requests', COLORS.bar], ['failed_requests', 'Failed requests', COLORS.red]]},
+  {id: 'chart-load-tokens', format: fmt, axis: value => compact.format(value), whole: true,
+   series: [['prompt_tokens', 'Prompt tokens', COLORS.bar], ['completion_tokens', 'Completion tokens', COLORS.bar2]]},
+  {id: 'chart-load-ttft', format: msText,
+   series: [['ttft_ms_p50', 'p50', COLORS.bar], ['ttft_ms_p95', 'p95', COLORS.yellow]]},
+  {id: 'chart-load-duration', format: msText,
+   series: [['duration_ms_p50', 'p50', COLORS.bar], ['duration_ms_p95', 'p95', COLORS.yellow]]},
+  {id: 'chart-load-queue', format: fmt, whole: true,
+   series: [['in_flight_max', 'In flight', COLORS.bar], ['waiting_max', 'Waiting', COLORS.yellow]]},
+  {id: 'chart-load-gpu', format: value => `${oneDecimal.format(value)} GiB`, gib: true,
+   series: [['gpu_memory_used_max', 'Used', COLORS.bar2], ['gpu_memory_total', 'Total', COLORS.text, true]]},
+];
+
+/** A line chart over a linear time axis. The build of Chart.js has no date adapter, so the axis
+ * holds milliseconds and its labels come from `timeTick`. A null value is a gap in the line. */
+function lineChart({id, format, axis, whole, series}) {
+  return new Chart($(id), {
+    type: 'line',
+    data: {datasets: series.map(([, label, color, dashed]) => ({
+      label, data: [], borderColor: color, backgroundColor: color, borderWidth: 2, borderDash: dashed ? [5, 4] : [],
+      pointRadius: 0, pointHoverRadius: 3, pointHitRadius: 6, tension: 0, spanGaps: false}))},
+    options: {
+      interaction: {mode: 'index', intersect: false},
+      scales: {
+        x: {type: 'linear', grid: {display: false},
+            ticks: {maxRotation: 0, includeBounds: false, callback(value) { return timeTick(value, this.max - this.min); }}},
+        y: {beginAtZero: true, ticks: {...(whole ? {precision: 0} : {}), callback: value => (axis || format)(value)}},
+      },
+      plugins: {
+        legend: {display: true, labels: {boxWidth: 12, boxHeight: 2}},
+        tooltip: {callbacks: {title: items => (items.length ? new Date(items[0].parsed.x).toLocaleString() : ''),
+                              label: item => `${item.dataset.label}: ${format(item.parsed.y)}`}},
+      },
+    },
+  });
+}
+
+/** Show `series` from `min` to `max` (milliseconds). Each chart keeps its object and takes the new data. */
+function setLoadCharts(series, min, max) {
+  if (state.chartsOff) return;
+  try {
+    for (const spec of LOAD_CHARTS) {
+      const chart = (state.loadCharts[spec.id] ||= lineChart(spec));
+      spec.series.forEach(([name], index) => {
+        chart.data.datasets[index].data = spec.gib
+          ? series[name].map(({x, y}) => ({x, y: y === null ? null : y / 1024})) : series[name];
+      });
+      Object.assign(chart.options.scales.x, {min, max});
+      chart.options.scales.x.ticks.stepSize = tickStep(max - min);
+      chart.update('none');
+    }
+  } catch {
+    chartsFailed();  // only once: the charts stay off after this
+  }
+}
+
+function showLoadNote(text, stopped = false) {
+  $('load-note-text').textContent = text;
+  $('load-retry').hidden = !stopped;
+  $('load-note').hidden = !text;
+}
+
+/** One service shows tiles and charts, "All services" shows the table. `missing`: the service has
+ * no load endpoints, so only that note shows. */
+function showLoadView(missing = false) {
+  $('load-missing').hidden = !missing;
+  $('load-one').hidden = !state.service || missing;
+  $('load-all').hidden = Boolean(state.service);
+}
+
+function showLoadRange() {
+  for (const button of document.querySelectorAll('[data-load-range]')) {
+    button.setAttribute('aria-pressed', String(button.dataset.loadRange === state.loadRange));
+  }
+  $('load-dates').hidden = state.loadRange !== 'custom';
+}
+
+/** True when the tab shows numbers of this moment: the tab is open with "All services", or with
+ * one service that offers the endpoints and the range "Last hour". */
+const loadLive = () => state.tab === 'load' && !$('main').hidden && $('load-missing').hidden
+  && (!state.service || state.loadRange === 'hour');
+
+/** The tiles and the charts of the last hour from the answer of the live route. */
+function showLive({now, points}) {
+  const at = now || {};
+  $('load-in-flight').textContent = fmt(numeric(at.in_flight));
+  $('load-waiting').textContent = fmt(numeric(at.waiting));
+  $('load-completion-rate').textContent = rateText(at.completion_tokens_per_s);
+  $('load-prompt-rate').textContent = rateText(at.prompt_tokens_per_s);
+  $('load-gpu').textContent = gpuText(at.gpu_memory_used, at.gpu_memory_total);
+  $('load-now-text').textContent = at.ts ? `Read at ${localText(at.ts)}` : 'The service has no sample yet.';
+  const list = Array.isArray(points) ? points : [];
+  const last = list.length ? list[list.length - 1] || {} : {};
+  $('load-requests').textContent = fmt(numeric(last.requests));
+  $('load-failed').textContent = fmt(numeric(last.failed_requests));
+  $('load-ttft-p50').textContent = msText(last.ttft_ms_p50);
+  $('load-ttft-p95').textContent = msText(last.ttft_ms_p95);
+  $('load-duration-p50').textContent = msText(last.duration_ms_p50);
+  $('load-duration-p95').textContent = msText(last.duration_ms_p95);
+  $('load-minute-text').textContent = last.ts ? `The minute from ${localText(last.ts)}` : 'The service has no point yet.';
+  const series = loadSeries(list, 60);
+  const xs = series.requests.map(({x}) => x);
+  // The clock of the browser can differ from the clock of the service, so the axis holds each point.
+  const end = Math.max(Date.now(), ...xs.slice(-1).map(x => x + 60000));
+  setLoadCharts(series, Math.min(end - HOUR_MS, ...xs.slice(0, 1)), end);
+  $('load-range-text').textContent =
+    `Last hour. ${stepText(60)} Times in your local time. The page reads the numbers every 5 seconds.`;
+  $('load-days-note').hidden = true;
+}
+
+/** A row of the table of "All services". A failed service shows its error. */
+function loadRow(entry) {
+  const name = el('th', {scope: 'row', className: 'mono', text: entry.name});
+  if (!entry.ok) return el('tr', {}, name, el('td', {colspan: 5, className: 'bad', text: entry.error || NO_ANSWER}));
+  const now = entry.now || {};
+  return el('tr', {}, name,
+    el('td', {className: 'num', text: fmt(numeric(now.in_flight))}),
+    el('td', {className: 'num', text: fmt(numeric(now.waiting))}),
+    el('td', {className: 'num', text: rateText(now.completion_tokens_per_s)}),
+    el('td', {className: 'num', text: rateText(now.prompt_tokens_per_s)}),
+    el('td', {className: 'num', text: gpuText(now.gpu_memory_used, now.gpu_memory_total)}));
+}
+
+function showAll(answer) {
+  const services = answer && Array.isArray(answer.services) ? answer.services : [];
+  replaceRows($('load-all-body'), services.map(loadRow), 6, 'No service shows its load numbers to you.');
+  $('load-all-text').textContent =
+    `Read at ${new Date().toLocaleTimeString()}, your local time. The page reads the numbers every 5 seconds.`;
+}
+
+/** One read of the timer `run`: the live route of the picked service, or `api/load` for "All
+ * services". A tick while a read runs does nothing. A stopped timer drops the answer. */
+async function loadTick(run) {
+  const stale = () => run !== state.calls.loadTimer;
+  if (stale() || state.loadBusy) return;
+  const service = state.service;
+  state.loadBusy = run;
+  try {
+    if (service) {
+      const call = nextCall('loadLive');
+      const answer = await current('loadLive', call, service, api(servicePath('metrics/live', service)));
+      if (stale()) return;
+      showLive(answer);
+    } else {
+      const call = nextCall('loadAll');
+      const answer = await current('loadAll', call, null, api('api/load'));
+      if (stale()) return;
+      showAll(answer);
+    }
+    state.loadFailures = 0;
+    showLoadNote('');
+  } catch (error) {
+    if (stale() || error instanceof StaleAnswer) return;
+    if (service && loadMissing(error)) {
+      stopLoadTimer();
+      showLoadView(true);
+      return;
+    }
+    state.loadFailures += 1;
+    const message = error instanceof ApiError ? error.message : String(error);
+    if (state.loadFailures < LOAD_MAX_FAILURES) {
+      showLoadNote(`The page did not get the load numbers: ${message} The page tries again in 5 seconds.`);
+    } else {
+      stopLoadTimer();
+      showLoadNote(`The page did not get the load numbers ${LOAD_MAX_FAILURES} times in a row: ${message} ` +
+                   'The page stopped. Use Reload to read the numbers again.', true);
+    }
+  } finally {
+    if (state.loadBusy === run) state.loadBusy = null;
+  }
+}
+
+/** Read now and then every 5 seconds, while the tab shows numbers of this moment and the page is
+ * visible. A start drops the timer before it. */
+function startLoadTimer() {
+  stopLoadTimer();
+  if (!loadLive() || document.visibilityState !== 'visible') return;
+  state.loadFailures = 0;
+  const run = nextCall('loadTimer');
+  state.loadTimer = setInterval(() => loadTick(run), LOAD_MS);
+  loadTick(run);
+}
+
+/** Stop the timer. A read of the timer that still runs drops its answer. */
+function stopLoadTimer() {
+  clearInterval(state.loadTimer);
+  state.loadTimer = null;
+  state.loadBusy = null;
+  nextCall('loadTimer');
+}
+
+function onVisibility() {
+  if (document.visibilityState !== 'visible') stopLoadTimer();
+  else if (state.loaded.load && state.loadFailures < LOAD_MAX_FAILURES) startLoadTimer();
+}
+
+/** Read the history of the picked service for the picked range. The timer stops. */
+async function readHistory() {
+  const service = state.service;
+  if (!service) return;
+  stopLoadTimer();
+  const range = loadRange(state.loadRange, Date.now(), $('load-since').value, $('load-until').value);
+  if (!range) return;
+  const call = nextCall('loadHistory');
+  $('load-dates-status').textContent = range.error || '';
+  if (range.error) return;
+  showLoadNote('');
+  let answer;
+  try {
+    answer = await current('loadHistory', call, service,
+      api(`${servicePath('metrics/history', service)}${query(range)}`));
+  } catch (error) {
+    if (error instanceof StaleAnswer) return;
+    if (loadMissing(error)) {
+      showLoadView(true);
+      return;
+    }
+    showLoadNote(`The page did not get the history: ${error instanceof ApiError ? error.message : String(error)}`);
+    return;
+  }
+  setLoadCharts(loadSeries(answer.points, answer.step_seconds), Date.parse(range.since), Date.parse(range.until));
+  $('load-range-text').textContent = `${localText(range.since, true)} to ${localText(range.until, true)}. ` +
+    `${stepText(answer.step_seconds)} Times in your local time.`;
+  const days = Array.isArray(answer.missing_days) ? answer.missing_days : [];
+  $('load-days-note').textContent = days.length
+    ? `The service did not read the history of these UTC days, so their points are missing: ${days.join(', ')}.` : '';
+  $('load-days-note').hidden = !days.length;
+}
+
+function setLoadRange(range) {
+  state.loadRange = range;
+  showLoadRange();
+  if (range === 'custom' && !$('load-since').value) {
+    const now = new Date();
+    $('load-until').value = localInputValue(now);
+    $('load-since').value = localInputValue(new Date(now.getTime() - 24 * HOUR_MS));
+  }
+  if (range === 'hour') {
+    nextCall('loadHistory');  // a history read that still runs drops its answer
+    $('load-dates-status').textContent = '';
+    startLoadTimer();
+  } else {
+    guarded(readHistory);
+  }
+}
+
+async function loadLoad() {
+  showLoadView(false);
+  showLoadRange();
+  showLoadNote('');
+  if (state.service && state.loadRange !== 'hour') await readHistory();
+  else startLoadTimer();
+}
+
+/** Remove the numbers of the last service. The range goes back to the last hour. */
+function clearLoad() {
+  stopLoadTimer();
+  for (const name of ['loadLive', 'loadAll', 'loadHistory']) nextCall(name);
+  state.loadRange = 'hour';
+  state.loadFailures = 0;
+  showLoadRange();
+  showLoadNote('');
+  $('load-missing').hidden = true;
+  $('load-days-note').hidden = true;
+  for (const id of LOAD_TILES) $(id).textContent = '-';
+  for (const id of ['load-now-text', 'load-minute-text', 'load-range-text', 'load-dates-status', 'load-all-text']) {
+    $(id).textContent = '';
+  }
+  $('load-all-body').replaceChildren();
+  for (const chart of Object.values(state.loadCharts)) {
+    for (const dataset of chart.data.datasets) dataset.data = [];
+    chart.update('none');
+  }
 }
 
 // ---- connect
@@ -1436,6 +1831,12 @@ function wire() {
   $('limits-user-clear').addEventListener('click', clearUserForm);
   $('limits-reload').addEventListener('click', () => guarded(loadLimits));
   $('remove-confirm').addEventListener('click', confirmRemove);
+  for (const button of document.querySelectorAll('[data-load-range]')) {
+    button.addEventListener('click', () => setLoadRange(button.dataset.loadRange));
+  }
+  $('load-dates').addEventListener('submit', event => { event.preventDefault(); guarded(readHistory); });
+  $('load-retry').addEventListener('click', startLoadTimer);
+  document.addEventListener('visibilitychange', onVisibility);
   for (const {name} of LIMITS) {
     $(`limits-user-${name}-mode`).addEventListener('change', event => {
       setChoice(name, event.target.value, $(`limits-user-${name}`).value);
@@ -1482,6 +1883,7 @@ async function start() {
   for (const button of document.querySelectorAll('[data-range]')) {
     button.setAttribute('aria-pressed', String(button.dataset.range === state.range));
   }
+  showLoadRange();
   if (!showAccess()) return;
   selectService(wanted.service);
   selectTab(wanted.tab);

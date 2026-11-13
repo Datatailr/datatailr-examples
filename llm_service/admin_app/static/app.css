@@ -239,6 +239,18 @@ fieldset.choice legend { float: left; margin-right: 8px; color: var(--muted); fo
 /* The column titles of the users table wrap, so the table fits a wide window without a scroll. */
 #limits-cards .grid thead th { white-space: normal; vertical-align: bottom; }
 
+/* ---- load */
+
+h2.group {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin-bottom: -6px;
+  font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .7px;
+}
+h2.group .caption { text-transform: none; letter-spacing: 0; }
+.load-tiles .value { font-size: 22px; }
+.load-charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.note.with-action { display: flex; align-items: center; gap: 12px; }
+.note.with-action span { flex: 1; }
+
 /* ---- dialogs */
 
 dialog {
