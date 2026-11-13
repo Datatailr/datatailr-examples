@@ -386,12 +386,14 @@ def test_retrieve_one_model(client):
 
 ADMIN_ROUTES = [
     ("POST", "/admin/model", {"json": {"model": "org/b"}}),
+    ("POST", "/admin/models/download", {"json": {"model": "org/b"}}),
     ("GET", "/admin/model", {}),
     ("GET", "/admin/audit", {}),
     ("GET", "/admin/audit/users", {}),
     ("GET", "/admin/audit/records/abc?day=2026-11-10", {}),
     ("GET", "/admin/usage", {}),
     ("GET", "/admin/usage/bob", {}),
+    ("GET", "/admin/models/fit?model=org/a", {}),
 ]
 
 
@@ -2573,3 +2575,705 @@ def test_the_sampler_stops_before_the_engine_stops(tmp_path):
         wait_until(lambda: load.live()["now"]["ts"] is not None)
     assert engine.stopped == 1
     assert reads_during_stop == []
+
+
+DOWNLOAD = "/admin/models/download"
+
+
+def download_events(client):
+    return [r for r in audit_records(client) if r["event"] == "model_download"]
+
+
+def wait_download(client, state):
+    return wait_for(client, lambda s: (s["download"] or {}).get("state") == state)
+
+
+def test_download_202_then_done_and_audited_under_the_admin(tmp_path):
+    store = MemoryBlobStore()
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        r = c.post(DOWNLOAD, headers=ALICE | {ACTING: "carol"}, json={"model": "org/b"})
+        assert r.status_code == 202
+        assert r.json()["download"]["model"] == "org/b"
+        assert r.json()["download"]["revision"] == "main"
+        status = wait_download(c, "done")
+        assert status["download"]["error"] is None
+        assert status["active"] == {"model": "org/a", "revision": "main"}
+        assert store.exists("llm-service/models/org--b/main/.complete")
+        events = download_events(c)
+        assert len(events) == 1
+        event = events[0]
+        assert event["user"] == "carol" and event["status"] == 200
+        assert event["endpoint"] == DOWNLOAD and event["model"] == "org/b"
+        assert event["detail"] == {"revision": "main", "error": None}
+        prompt = full_record(c, event)["prompt"]
+        assert prompt == {"event": "model_download", "revision": "main", "error": None}
+        # A download does not change the admin of a later switch event.
+        assert c.app.state.last_admin == "system"
+
+
+def test_download_of_a_cached_pair_answers_200_and_starts_nothing(client):
+    r = client.post(DOWNLOAD, headers=ALICE, json={"model": "org/a", "revision": "main"})
+    assert r.status_code == 200
+    assert r.json() == {"state": "cached", "model": "org/a", "revision": "main"}
+    assert client.get("/admin/model", headers=ALICE).json()["download"] is None
+    assert download_events(client) == []
+
+
+def test_failed_download_is_audited_with_status_500_and_leaves_no_marker(tmp_path):
+    store = MemoryBlobStore()
+
+    def download(model: str, revision: str, target: Path) -> None:
+        if model == "org/b":
+            raise OSError("no network")
+        plain_download(model, revision, target)
+
+    with TestClient(make_app(tmp_path, store=store, download=download)) as c:
+        wait_ready(c)
+        assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+        status = wait_download(c, "failed")
+        assert status["download"]["error"] == "OSError: no network"
+        assert not store.exists("llm-service/models/org--b/main/.complete")
+        event = download_events(c)[0]
+        assert event["status"] == 500 and event["user"] == "alice"
+        assert event["detail"] == {"revision": "main", "error": "OSError: no network"}
+
+
+def test_download_bad_body_or_name_is_400(client):
+    for body in ({"model": "nonsense"}, {"model": "org/b", "revision": "a/b"},
+                 {"model": 5}, {"model": "org/b", "revision": 5}, {}, [1]):
+        r = client.post(DOWNLOAD, headers=ALICE, json=body)
+        assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_model"
+    r = client.post(DOWNLOAD, headers=ALICE, content=b"nope")
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_model"
+    assert client.get("/admin/model", headers=ALICE).json()["download"] is None
+
+
+def test_download_conflicts_and_delete_during_a_download_are_409(tmp_path):
+    download = GatedDownload("org/b")
+    store = MemoryBlobStore()
+    try:
+        with TestClient(make_app(tmp_path, store=store, download=download)) as c:
+            wait_ready(c)
+            assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+            assert download.fetching.wait(10)
+            r = c.post(DOWNLOAD, headers=ALICE, json={"model": "org/c"})
+            assert r.status_code == 409 and r.json()["error"]["code"] == "download_in_progress"
+            assert r.json()["error"]["type"] == "invalid_request_error"
+            # Blob storage has no file of the pair during the Hugging Face phase.
+            assert store.ls("llm-service/models/org--b/") == []
+            for path in ("/admin/models/org/b", "/admin/models/org/b?revision=main"):
+                r = c.delete(path, headers=ALICE)
+                assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            r = c.delete("/admin/models/org/b?revision=v2", headers=ALICE)
+            assert r.status_code == 404 and r.json()["error"]["code"] == "model_not_found"
+            assert delete_events(c) == []
+            download.gate.set()
+            wait_download(c, "done")
+    finally:
+        download.gate.set()
+
+
+def test_delete_of_another_model_during_a_download_is_409_download_in_progress(tmp_path):
+    download = GatedDownload("org/b")
+    store = MemoryBlobStore()
+    try:
+        with TestClient(make_app(tmp_path, store=store, download=download)) as c:
+            wait_ready(c)
+            switch_and_wait(c, "org/other")
+            switch_and_wait(c, "org/a")
+            assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+            assert download.fetching.wait(10)
+            for path in ("/admin/models/org/other", "/admin/models/org/other?revision=main"):
+                r = c.delete(path, headers=ALICE)
+                assert r.status_code == 409
+                assert r.json()["error"] == {
+                    "message": "A model download runs now. Delete after it ends.",
+                    "type": "invalid_request_error",
+                    "code": "download_in_progress",
+                }
+            # The pair of the download keeps its own answer.
+            r = c.delete("/admin/models/org/b", headers=ALICE)
+            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            assert c.app.state.manager.removing == set()
+            assert store.exists("llm-service/models/org--other/main/.complete")
+            assert delete_events(c) == []
+            download.gate.set()
+            wait_download(c, "done")
+            assert c.delete("/admin/models/org/other", headers=ALICE).status_code == 200
+    finally:
+        download.gate.set()
+
+
+def test_download_of_a_pair_under_removal_is_409(tmp_path):
+    store = SlowDeleteStore()
+    try:
+        with TestClient(make_app(tmp_path, store=store)) as c:
+            wait_ready(c)
+            switch_and_wait(c, "org/other")
+            switch_and_wait(c, "org/a")
+            store.armed = True
+            result = {}
+            worker = threading.Thread(
+                target=lambda: result.update(r=c.delete("/admin/models/org/other", headers=ALICE))
+            )
+            worker.start()
+            assert store.deleting.wait(10)
+            r = c.post(DOWNLOAD, headers=ALICE, json={"model": "org/other"})
+            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            store.gate.set()
+            worker.join(10)
+            assert result["r"].status_code == 200
+    finally:
+        store.gate.set()
+
+
+def test_download_during_a_delete_of_another_model_is_409(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        switch_and_wait(c, "org/other")
+        switch_and_wait(c, "org/a")
+        manager = c.app.state.manager
+        manager.begin_remove("org/x", ["main"])
+        for model in ("org/b", "org/other"):  # a new pair and a cached pair
+            r = c.post(DOWNLOAD, headers=ALICE, json={"model": model})
+            assert r.status_code == 409
+            assert r.json()["error"] == {
+                "message": "A delete runs now. Download after it ends.",
+                "type": "invalid_request_error",
+                "code": "model_in_use",
+            }
+        assert manager.download is None
+        manager.end_remove("org/x", ["main"])
+        assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+        wait_download(c, "done")
+
+
+class MarkingExistsStore(MemoryBlobStore):
+    """A store whose check of the org/other marker starts a delete mark of that pair while `manager` is set."""
+
+    manager = None
+
+    def exists(self, path: str) -> bool:
+        if self.manager is not None and path.endswith("org--other/main/.complete"):
+            self.manager.begin_remove("org/other", ["main"])
+        return super().exists(path)
+
+
+def test_download_rechecks_a_delete_that_starts_during_the_cache_check(tmp_path):
+    store = MarkingExistsStore()
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        switch_and_wait(c, "org/other")
+        switch_and_wait(c, "org/a")
+        store.manager = c.app.state.manager
+        r = c.post(DOWNLOAD, headers=ALICE, json={"model": "org/other"})
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "model_in_use"
+        assert c.app.state.manager.download is None
+
+
+def test_shutdown_cancels_a_running_download(tmp_path):
+    download = GatedDownload("org/b")
+    try:
+        with TestClient(make_app(tmp_path, download=download)) as c:
+            wait_ready(c)
+            assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+            assert download.fetching.wait(10)
+            task = c.app.state.download_task
+        assert task.cancelled()
+        download_state = c.app.state.manager.download
+        assert download_state["state"] == "failed" and download_state["error"] == "cancelled"
+    finally:
+        download.gate.set()
+
+
+class FailingExistsStore(MemoryBlobStore):
+    """A memory store whose `exists` of a model marker raises."""
+
+    def exists(self, path: str) -> bool:
+        if "/models/" in path:
+            raise OSError("store down")
+        return super().exists(path)
+
+
+def test_download_cache_check_error_is_500_with_the_error_body(tmp_path):
+    with TestClient(make_app(tmp_path, store=FailingExistsStore())) as c:
+        wait_ready(c)
+        r = c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"})
+        assert r.status_code == 500
+        error = r.json()["error"]
+        assert error["code"] == "cache_check_failed" and error["type"] == "server_error"
+        assert set(error) == {"message", "type", "code"}
+        assert c.get("/admin/model", headers=ALICE).json()["download"] is None
+
+
+FIT = "/admin/models/fit"
+
+
+def put_catalog(store, *entries):
+    models = [{"note": "", "gpu_memory_mib": None, **entry} for entry in entries]
+    store.put("llm-service/catalog.json", json.dumps({"models": models}))
+
+
+def big_download(model: str, revision: str, target: Path) -> None:
+    (target / "weights.bin").write_bytes(b"x" * (10 * 2**20))
+
+
+def fit_answer(client, **params):
+    r = client.get(FIT, headers=ALICE, params=params)
+    assert r.status_code == 200
+    return r.json()
+
+
+def test_fit_uses_the_catalog_entry_and_the_container_memory(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert fit_answer(c, model="org/b") == {
+            "fits": "yes",
+            "needed_mib": 6000,
+            "available_mib": 15360,
+            "basis": "catalog",
+            "available_source": "container",
+        }
+
+
+def test_fit_no_when_the_catalog_needs_more(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, {"model": "org/b", "revision": "dev", "gpu_memory_mib": 20000})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert fit_answer(c, model="org/b", revision="dev")["fits"] == "no"
+
+
+def test_fit_uses_the_cached_size_with_the_margin(tmp_path):
+    with TestClient(make_app(tmp_path, download=big_download, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+        wait_download(c, "done")
+        answer = fit_answer(c, model="org/b")
+        assert answer["basis"] == "weights" and answer["needed_mib"] == 12
+        assert answer["fits"] == "yes"
+
+
+def test_fit_is_unknown_for_a_pair_in_neither_place(tmp_path):
+    with TestClient(make_app(tmp_path, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert fit_answer(c, model="org/zzz") == {
+            "fits": "unknown",
+            "needed_mib": None,
+            "available_mib": 15360,
+            "basis": "unknown",
+            "available_source": "container",
+        }
+
+
+def test_fit_takes_nvidia_smi_before_the_container_value(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
+    app = make_app(
+        tmp_path, store=store, gpu=FakeGpu((1000, 4000)), sample_interval=0.02, gpu_memory_mib=15360
+    )
+    with TestClient(app) as c:
+        wait_ready(c)
+        wait_until(lambda: c.app.state.load.live()["now"]["gpu_memory_total"] == 4000)
+        answer = fit_answer(c, model="org/b")
+        assert answer["available_mib"] == 4000 and answer["available_source"] == "nvidia-smi"
+        assert answer["fits"] == "no"
+
+
+def test_fit_has_null_available_with_neither_number(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        answer = fit_answer(c, model="org/a")
+        assert answer["available_mib"] is None and answer["available_source"] is None
+        assert answer["fits"] == "unknown"
+
+
+def test_fit_bad_name_is_400(client):
+    for params in ({"model": "../x"}, {"model": "org/a", "revision": "a b"}, {}):
+        r = client.get(FIT, headers=ALICE, params=params)
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "invalid_model"
+
+
+class FailingMarkerStore(MemoryBlobStore):
+    """A memory store whose read of a model marker raises while `broken` is true."""
+
+    broken = False
+
+    def get(self, path: str) -> bytes:
+        if self.broken and "/models/" in path and path.endswith("/.complete"):
+            raise OSError("store down")
+        return super().get(path)
+
+
+def test_fit_survives_a_store_error_of_the_marker_read(tmp_path):
+    store = FailingMarkerStore()
+    put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        store.broken = True
+        assert fit_answer(c, model="org/b")["basis"] == "catalog"
+        answer = fit_answer(c, model="org/a")
+        assert answer["basis"] == "unknown" and answer["fits"] == "unknown"
+        # A failed read is not kept: the next request reads the marker again.
+        store.broken = False
+        assert fit_answer(c, model="org/a")["basis"] == "weights"
+
+
+def test_fit_of_takes_a_list_of_cached_entries(tmp_path):
+    with TestClient(make_app(tmp_path, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        cached = [{"model": "org/q", "revision": "main", "size_bytes": 10 * 2**20}]
+        answer = c.portal.call(c.app.state.fit_of, "org/q", "main", cached)
+        assert answer["basis"] == "weights" and answer["needed_mib"] == 12
+
+
+class MarkerCountingStore(MemoryBlobStore):
+    """A store that counts the listings of the models folder and the reads of markers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.listings = 0
+        self.marker_reads: list[str] = []
+
+    def ls(self, prefix):
+        if prefix.endswith("/models/"):
+            self.listings += 1
+        return super().ls(prefix)
+
+    def get(self, path):
+        if path.endswith("/.complete"):
+            self.marker_reads.append(path)
+        return super().get(path)
+
+
+def test_one_fit_request_reads_one_marker_and_no_listing(tmp_path):
+    store = MarkerCountingStore()
+    with TestClient(make_app(tmp_path, store=store, download=big_download, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+        wait_download(c, "done")
+        store.listings, store.marker_reads = 0, []
+        answer = fit_answer(c, model="org/b")
+        assert answer["basis"] == "weights" and answer["needed_mib"] == 12
+        assert store.listings == 0
+        assert store.marker_reads == ["llm-service/models/org--b/main/.complete"]
+
+
+def test_get_catalog_reads_the_live_numbers_once(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, ENTRY_B, ENTRY_C, {"model": "org/d", "revision": "main"})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        load = c.app.state.load
+        real, reads = load.live, []
+        load.live = lambda: reads.append(1) or real()
+        models = c.get(CATALOG, headers=ALICE).json()["models"]
+        assert len(models) == 3
+        assert all(m["fit"]["available_mib"] == 15360 for m in models)
+        assert len(reads) == 1
+
+
+def test_catalog_is_loaded_at_start_and_read_again_by_the_flusher(tmp_path):
+    class FlakyStore(MemoryBlobStore):
+        broken = True
+
+        def get(self, path: str) -> bytes:
+            if self.broken and path.endswith("catalog.json"):
+                raise OSError("store down")
+            return super().get(path)
+
+    store = FlakyStore()
+    put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert not c.app.state.catalog.loaded()
+        store.broken = False
+        wait_until(lambda: c.app.state.catalog.loaded())
+        assert fit_answer(c, model="org/b")["basis"] == "catalog"
+
+
+# Catalog endpoints
+
+CATALOG = "/admin/catalog"
+CATALOG_PATH = "llm-service/catalog.json"
+ENTRY_B = {"model": "org/b", "revision": "main", "note": "small", "gpu_memory_mib": 6000}
+ENTRY_C = {"model": "org/c", "revision": "dev", "note": "", "gpu_memory_mib": None}
+
+
+def catalog_events(client):
+    return [r for r in audit_records(client, limit=1000) if r["event"] == "catalog_change"]
+
+
+CATALOG_ROUTES = [
+    ("GET", CATALOG, {}),
+    ("PUT", CATALOG, {"json": ENTRY_B}),
+    ("DELETE", CATALOG, {"params": {"model": "org/b"}}),
+]
+
+
+@pytest.mark.parametrize("method,path,kwargs", CATALOG_ROUTES)
+def test_catalog_endpoints_need_an_admin(tmp_path, method, path, kwargs):
+    store = MemoryBlobStore()
+    put_catalog(store, ENTRY_B)
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        r = c.request(method, path, headers=BOB, **kwargs)
+        assert r.status_code == 403 and r.json()["error"]["code"] == "admin_required"
+        assert c.request(method, path, **kwargs).status_code == 401
+        assert c.app.state.catalog.entries() == [ENTRY_B]
+
+
+def test_get_catalog_lists_entries_with_cached_and_fit(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, ENTRY_B, ENTRY_C)
+    with TestClient(make_app(tmp_path, store=store, download=big_download, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert c.get(CATALOG, headers=ALICE).json()["models"][0]["cached"] is False
+        assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+        wait_download(c, "done")
+        body = c.get(CATALOG, headers=ALICE).json()
+        assert body["loaded"] is True
+        assert [m["model"] for m in body["models"]] == ["org/b", "org/c"]
+        first, second = body["models"]
+        assert first["cached"] is True and first["fit"]["fits"] == "yes" and first["fit"]["basis"] == "catalog"
+        assert first["note"] == "small" and first["gpu_memory_mib"] == 6000
+        assert second["cached"] is False and second["fit"]["fits"] == "unknown"
+
+
+class ListingStore(MemoryBlobStore):
+    """A store that counts the listings of the models folder and fails them while `fail` is true."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.listings = 0
+        self.fail = False
+
+    def ls(self, prefix):
+        if prefix.endswith("/models/"):
+            self.listings += 1
+            if self.fail:
+                raise OSError("store down")
+        return super().ls(prefix)
+
+
+def test_get_catalog_reads_the_blob_listing_once(tmp_path):
+    store = ListingStore()
+    put_catalog(store, ENTRY_B, ENTRY_C, {"model": "org/d", "revision": "main"})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        store.listings = 0
+        assert len(c.get(CATALOG, headers=ALICE).json()["models"]) == 3
+        assert store.listings == 1
+
+
+def test_get_catalog_survives_a_failed_listing(tmp_path):
+    store = ListingStore()
+    put_catalog(store, ENTRY_B, ENTRY_C)
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        store.fail = True
+        r = c.get(CATALOG, headers=ALICE)
+        assert r.status_code == 200
+        models = r.json()["models"]
+        assert [m["cached"] for m in models] == [False, False]
+        assert models[0]["fit"]["basis"] == "catalog" and models[1]["fit"]["fits"] == "unknown"
+
+
+def test_get_catalog_of_an_empty_catalog(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        assert c.get(CATALOG, headers=ALICE).json() == {"models": [], "loaded": True}
+
+
+def test_put_catalog_adds_and_replaces_and_the_change_shows_at_once(tmp_path):
+    with TestClient(make_app(tmp_path, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, json={"model": "org/b", "revision": "main"})
+        assert r.status_code == 200
+        assert r.json() == {"model": "org/b", "revision": "main", "note": "", "gpu_memory_mib": None}
+        assert [m["gpu_memory_mib"] for m in c.get(CATALOG, headers=ALICE).json()["models"]] == [None]
+        r = c.put(CATALOG, headers=ALICE, json=ENTRY_B)
+        assert r.status_code == 200 and r.json() == ENTRY_B
+        models = c.get(CATALOG, headers=ALICE).json()["models"]
+        assert len(models) == 1 and models[0]["gpu_memory_mib"] == 6000
+        assert fit_answer(c, model="org/b")["basis"] == "catalog"
+        assert json.loads(c.app.state.catalog._store.get(CATALOG_PATH))["models"] == [ENTRY_B]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"model": "org/b"},
+        {**ENTRY_B, "extra": 1},
+        {**ENTRY_B, "model": "../x"},
+        {**ENTRY_B, "note": "x" * 501},
+        {**ENTRY_B, "gpu_memory_mib": True},
+        {**ENTRY_B, "gpu_memory_mib": 0},
+    ],
+)
+def test_put_catalog_with_a_bad_entry_is_400(tmp_path, body):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, json=body)
+        assert r.status_code == 400
+        error = r.json()["error"]
+        assert error["code"] == "invalid_catalog_entry" and error["type"] == "invalid_request_error"
+        assert error["message"] and len(error["message"]) <= 300
+        assert c.app.state.catalog.entries() == [] and catalog_events(c) == []
+
+
+@pytest.mark.parametrize("content", [b"hello", b"[1]", b"", b"5", b"[" * 100000])
+def test_put_catalog_with_a_body_that_is_not_an_object_is_400(tmp_path, content):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, content=content)
+        assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_catalog_entry"
+
+
+def test_a_400_message_is_cut_to_300_characters(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, json={**ENTRY_B, "k" * 1000: 1})
+        assert r.status_code == 400
+        assert 0 < len(r.json()["error"]["message"]) <= 300
+
+
+def test_put_catalog_over_the_limit_is_409_catalog_full(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, *({"model": f"org/m{i}", "revision": "main"} for i in range(200)))
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, json={"model": "org/new", "revision": "main"})
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "catalog_full"
+        assert set(r.json()["error"]) == {"message", "type", "code"}
+        assert len(c.app.state.catalog.entries()) == 200 and catalog_events(c) == []
+        assert c.put(CATALOG, headers=ALICE, json={"model": "org/m1", "revision": "main", "note": "n"}).status_code == 200
+
+
+class FailingCatalogStore(MemoryBlobStore):
+    """A store that refuses each write of the catalog file while `fail` is true."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+
+    def put(self, path, data):
+        if self.fail and path == CATALOG_PATH:
+            raise OSError("the store is down")
+        super().put(path, data)
+
+
+@pytest.mark.parametrize(
+    "method,kwargs",
+    [
+        ("PUT", {"json": {**ENTRY_B, "note": "changed"}}),
+        ("PUT", {"json": ENTRY_C}),
+        ("DELETE", {"params": {"model": "org/b"}}),
+    ],
+)
+def test_a_failed_catalog_write_is_502_and_changes_nothing(tmp_path, method, kwargs):
+    store = FailingCatalogStore()
+    put_catalog(store, ENTRY_B)
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        store.fail = True
+        r = c.request(method, CATALOG, headers=ALICE, **kwargs)
+        assert r.status_code == 502
+        error = r.json()["error"]
+        assert error["code"] == "storage_unavailable" and error["type"] == "server_error"
+        assert c.app.state.catalog.entries() == [ENTRY_B]
+        assert catalog_events(c) == []
+
+
+def test_a_catalog_file_that_could_not_be_read_gives_502(tmp_path):
+    class UnreadableStore(MemoryBlobStore):
+        def get(self, path):
+            if path == CATALOG_PATH:
+                raise OSError("the store is down")
+            return super().get(path)
+
+    with TestClient(make_app(tmp_path, store=UnreadableStore())) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, json=ENTRY_B)
+        assert r.status_code == 502 and r.json()["error"]["code"] == "storage_unavailable"
+        assert c.get(CATALOG, headers=ALICE).json() == {"models": [], "loaded": False}
+
+
+def test_delete_catalog_removes_the_entry(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, ENTRY_B, {"model": "org/b", "revision": "dev"})
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        r = c.delete(CATALOG, headers=ALICE, params={"model": "org/b", "revision": "dev"})
+        assert r.status_code == 200 and r.json() == {"removed": {"model": "org/b", "revision": "dev"}}
+        assert [m["revision"] for m in c.get(CATALOG, headers=ALICE).json()["models"]] == ["main"]
+        r = c.delete(CATALOG, headers=ALICE, params={"model": "org/b"})
+        assert r.status_code == 200 and r.json() == {"removed": {"model": "org/b", "revision": "main"}}
+        assert c.get(CATALOG, headers=ALICE).json()["models"] == []
+        assert json.loads(c.app.state.catalog._store.get(CATALOG_PATH))["models"] == []
+
+
+def test_delete_of_a_missing_entry_is_404(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        r = c.delete(CATALOG, headers=ALICE, params={"model": "org/b"})
+        assert r.status_code == 404
+        error = r.json()["error"]
+        assert error["code"] == "catalog_entry_not_found" and error["type"] == "invalid_request_error"
+        assert catalog_events(c) == []
+
+
+@pytest.mark.parametrize(
+    "params", [{}, {"model": ""}, {"model": "../x"}, {"model": "org/b", "revision": "a b"}, {"model": "org/b", "revision": ""}]
+)
+def test_delete_with_a_bad_name_is_400(tmp_path, params):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        r = c.delete(CATALOG, headers=ALICE, params=params)
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "invalid_catalog_entry"
+        assert len(r.json()["error"]["message"]) <= 300
+        assert catalog_events(c) == []
+
+
+def test_each_catalog_change_is_audited_with_old_and_new(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        changed = {**ENTRY_B, "note": "bigger"}
+        c.put(CATALOG, headers=ALICE, json=ENTRY_B)
+        c.put(CATALOG, headers={**ALICE, ACTING: "carol"}, json=changed)
+        c.delete(CATALOG, headers=ALICE, params={"model": "org/b"})
+        events = sorted(catalog_events(c), key=lambda e: e["ts"])
+        assert len(events) == 3
+        assert all(e["endpoint"] == "/admin/catalog" and e["status"] == 200 for e in events)
+        details = [(e["user"], e["detail"]) for e in events]
+        assert sorted(details, key=json.dumps) == sorted(
+            [
+                ("alice", {"target": "org/b@main", "old": None, "new": ENTRY_B}),
+                ("carol", {"target": "org/b@main", "old": ENTRY_B, "new": changed}),
+                ("alice", {"target": "org/b@main", "old": changed, "new": None}),
+            ],
+            key=json.dumps,
+        )
+        prompt = full_record(c, events[0])["prompt"]
+        assert prompt["event"] == "catalog_change" and set(prompt) == {"event", "target", "old", "new"}
+
+
+def test_a_fit_with_a_catalog_value_reads_no_marker(tmp_path):
+    store = MarkerCountingStore()
+    put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        store.listings, store.marker_reads = 0, []
+        answer = fit_answer(c, model="org/b")
+        assert answer["basis"] == "catalog" and answer["needed_mib"] == 6000
+        assert store.marker_reads == [] and store.listings == 0
+        # Without a catalog value the fit still reads the one marker of the pair.
+        assert fit_answer(c, model="org/c")["basis"] == "unknown"
+        assert store.marker_reads == ["llm-service/models/org--c/main/.complete"]

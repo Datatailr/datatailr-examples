@@ -64,6 +64,8 @@ llm_service/
 │   ├── audit_merge.py     # merges of segments and parts, prompt retention
 │   ├── usage.py           # usage totals by user, model and day
 │   ├── limits.py          # the limits file and the lookup of the limits of one user
+│   ├── catalog.py         # the catalog file and the checks of its entries
+│   ├── fit.py             # the GPU memory check: memory sizes and the rules of the answer
 │   ├── limiter.py         # request window, token budget and parallel counter
 │   ├── engine_metrics.py  # readers of the vLLM metrics endpoint and of nvidia-smi
 │   ├── load.py            # live load: samples each 5 seconds, one point each minute
@@ -122,7 +124,7 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 | Endpoint | Behavior |
 |---|---|
 | `POST /admin/model` | Body `{"model": "org/name", "revision": "main"}`. Starts a switch and returns 202. `revision` is optional. |
-| `GET /admin/model` | The active model, the served model, the switch state and the last switch error. `rolling_back` is the model that a rollback loads now, or null. |
+| `GET /admin/model` | The active model, the served model, the switch state and the last switch error. `rolling_back` is the model that a rollback loads now, or null. `download` is the last download without a switch, or null. |
 | `GET /admin/audit` | Audit entries, newest first, without the prompt. Filters: `user`, `model`, `since`, `until`, `limit`, `offset`. |
 | `GET /admin/audit/records/{request_id}?day=YYYY-MM-DD` | One full record with its prompt. `day` is the UTC day of the record time. The errors are 400 `invalid_time`, 404 `record_not_found` and 502 `prompt_unreadable`. |
 | `GET /admin/audit/users` | The users in the log, with the first and last request time of each. |
@@ -132,9 +134,14 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 | `PUT /admin/limits/default` | Replaces the default limits. The body has the three limit fields. |
 | `PUT /admin/limits/users/{name}` | Sets the entry of one user. The body has one to three limit fields. |
 | `DELETE /admin/limits/users/{name}` | Removes the entry of one user. The answer is 404 `limit_not_found` without an entry. |
+| `GET /admin/catalog` | The catalog entries and `loaded`. Each entry has `cached` and the `fit` answer. |
+| `PUT /admin/catalog` | Adds or replaces one entry. The body is the entry. The errors are 400 `invalid_catalog_entry`, 409 `catalog_full` and 502 `storage_unavailable`. One audit record has the event `catalog_change`. |
+| `DELETE /admin/catalog` | Removes one entry. Query: `model` and `revision`. The errors are 400 `invalid_catalog_entry`, 404 `catalog_entry_not_found` and 502 `storage_unavailable`. One audit record has the event `catalog_change`. |
+| `POST /admin/models/download` | Body `{"model": "org/name", "revision": "main"}`. Downloads the weights to the cache without a switch. Returns 202, or 200 with `"state": "cached"` for a pair in the cache. The errors are 400 `invalid_model`, 409 `download_in_progress`, 409 `model_in_use` and 500 `cache_check_failed`. One audit record has the event `model_download`. |
+| `GET /admin/models/fit` | The GPU memory check of one model. Query: `model` and `revision`. The answer has `fits`, `needed_mib`, `available_mib`, `basis` and `available_source`. The error is 400 `invalid_model`. |
 | `GET /admin/metrics/live` | The last sample of the load (`now`) and the last 60 points, from memory. |
 | `GET /admin/metrics/history` | The points of a time range from the history files. Query: `since`, `until` (ISO times, at most 31 days apart). The answer has `step_seconds`, `points` and `missing_days`. The error is 400 `invalid_time`. |
-| `DELETE /admin/models/{model}` | Removes the stored revisions of a model from blob storage, with or without a `.complete` marker. The query parameter `revision` limits it to one revision. Returns 200 with `{"deleted": [...]}`. The errors are 404 `model_not_found`, 409 `model_in_use`, 400 `invalid_model` and 500 `delete_failed`. One audit record has the event `model_delete`. |
+| `DELETE /admin/models/{model}` | Removes the stored revisions of a model from blob storage, with or without a `.complete` marker. The query parameter `revision` limits it to one revision. Returns 200 with `{"deleted": [...]}`. The errors are 404 `model_not_found`, 409 `model_in_use` (also for the model that downloads), 409 `download_in_progress` (a download of another model runs now), 400 `invalid_model` and 500 `delete_failed`. One audit record has the event `model_delete`. |
 
 A caller who is not an admin gets 403.
 
@@ -215,6 +222,8 @@ Blob storage layout, under a root set by `LLM_BLOB_ROOT` (default `llm-service`)
 <root>/prompts/<day>/<time>-<id>.jsonl               # prompts of one flush
 <root>/usage/<day>.json                              # totals of one finished day
 <root>/usage/<day>.partial.json                      # checkpoint of the current day
+<root>/limits.json                                   # the limits of the users, if an admin set any
+<root>/catalog.json                                  # the model catalog, if an admin added an entry
 <root>/metrics/<day>/<writer>.jsonl                  # load points of one process on one UTC day
 ```
 
@@ -300,7 +309,9 @@ The gateway checks the vLLM process at each request to
 exited while `serving` is set, the gateway clears `serving`. If the state is
 `ready`, the gateway also starts one automatic reload of the active model. The
 reload uses the startup load path and runs as a background task. The state is
-`loading` during the reload. The audit log gets an `engine_reload` event with
+`loading` during the reload. The reload reads a complete local copy of the
+active model without the lock of the weight cache, so a running download does
+not hold it up. A rollback after a failed switch does the same. The audit log gets an `engine_reload` event with
 the user `system`.
 
 If the process exits during the fetch phase of a switch, the gateway starts no
@@ -478,6 +489,23 @@ the reads or for blob storage.
 The design is in [limits-load-catalog-design.md](limits-load-catalog-design.md),
 Part 2. The README has the usage.
 
+## Model catalog
+
+An admin keeps a list of recommended models, downloads a model without a
+switch and checks the GPU memory before a switch. `catalog.py` holds the
+catalog file, `<root>/catalog.json`, and the checks of its entries. `fit.py`
+holds the parse of memory sizes and the rules of the answer. The download runs
+in `models.py` as a background task that calls `WeightCache.ensure`. The
+download holds the lock of the weight cache for its whole fetch. An admin
+switch waits for that lock, also a switch to another model. A delete gets 409
+`download_in_progress`, or 409 `model_in_use` for the pair of the download.
+An automatic reload and a rollback do not wait: they read the complete local
+copy of their model without the lock. No request of a user waits for the catalog, a download or blob
+storage.
+
+The design is in [limits-load-catalog-design.md](limits-load-catalog-design.md),
+Part 3. The README has the usage.
+
 ## Concurrency
 
 The gateway is asynchronous and forwards requests with one shared `httpx`
@@ -493,7 +521,7 @@ they do not block request handling.
 |---|---|---|
 | `LLM_SERVICE_NAME` | `LLM Service` | Service name. The internal host name comes from it. |
 | `LLM_DEFAULT_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` | Model loaded at the first start. |
-| `LLM_VRAM` | `16g` | GPU memory of the container. |
+| `LLM_VRAM` | `16g` | GPU memory of the container. The service also reads it for the GPU memory check. |
 | `LLM_MEMORY` | `24g` | Memory of the container. |
 | `LLM_CPU` | `4` | CPU count of the container. |
 | `LLM_ADMIN_GROUP` | not set | Platform group whose members are admins. |

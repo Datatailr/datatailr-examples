@@ -279,31 +279,40 @@ A model that is not in the catalog still works with the switch and the download,
 
 ### Download without a switch
 
-`POST /admin/models/download` with `{"model", "revision"}` starts a download and answers 202. The service runs `WeightCache.ensure` in the background. That step downloads the files and stores them in blob storage. After the step, the service removes the local copy if the engine does not use it.
+`POST /admin/models/download` with `{"model", "revision"}` starts a download and answers 202. The body of the 202 answer is the model status of `GET /admin/model`. Its `state` is the state of the engine, and its `download` field holds the new download. A client tells a new download from a cached pair by the HTTP status: 202 or 200. The service runs `WeightCache.ensure` in the background. That step downloads the files and stores them in blob storage. After the step, the service removes the local copy unless the service needs the model. It keeps the copy of the served, target and rollback model, and removes nothing while the service starts.
 
 - One download runs at a time. A second request gets 409 `download_in_progress`.
-- A download of a model that is in the cache already answers 200 with `"state": "cached"` and starts nothing.
-- A model switch during a download waits for the lock of the weight cache, as two switches do today.
-- A delete of the model that downloads gets 409 `model_in_use`.
+- A download of a model that is in the cache already answers 200 with `{"state": "cached", "model", "revision"}` and starts nothing.
+- A bad name or revision gets 400 `invalid_model`. A store error in the check of the cache gets 500 `cache_check_failed`.
+- An admin switch during a download waits for the lock of the weight cache, also a switch to another model.
+- An automatic reload after an engine exit and a rollback after a failed switch do not wait. They read the complete local copy of the model without the lock. No delete or prune removes that copy, because the model is active or the previous one.
+- A delete of the model that downloads gets 409 `model_in_use`. This holds also before the files reach blob storage, so the delete does not remove a half-written download.
+- A delete of another model gets 409 `download_in_progress` with the message "A model download runs now. Delete after it ends." The delete needs the lock of the weight cache, and the download holds it for the whole fetch.
+- A download of a pair that a delete removes now gets 409 `model_in_use`. While a delete of another model runs, a download also gets 409 `model_in_use` with the message "A delete runs now. Download after it ends."
 
-`GET /admin/model` gets the new field `download`: null, or `{"model", "revision", "state", "error", "started_at"}`. `state` is `running`, `done` or `failed`. The last result stays until the next download starts.
+`GET /admin/model` gets the new field `download`: null, or `{"model", "revision", "state", "error", "started_at"}`. `state` is `running`, `done` or `failed`. The last result stays until the next download starts. A download that the service cancels at shutdown ends as `failed` with the error `cancelled`. The field `error` has at most 300 characters.
 
-The service writes an audit event `model_download` at the end, with the admin name and the result.
+The service writes an audit event `model_download` at the end, with the admin name and the result. The record has the status 200 for a good end and 500 for an error.
 
 ### GPU memory check
 
-`GET /admin/models/fit?model=<name>&revision=<revision>` answers:
+`GET /admin/models/fit?model=<name>&revision=<revision>` answers. The revision is `main` when absent. A bad name gives 400 `invalid_model`.
 
 ```json
-{"fits": "yes", "needed_mib": 6000, "available_mib": 15360, "basis": "catalog"}
+{"fits": "yes", "needed_mib": 6000, "available_mib": 15360, "basis": "catalog", "available_source": "container"}
 ```
 
-- `available_mib` is the total GPU memory from `nvidia-smi`. It is null without that number.
+- `available_mib` and `available_source`:
+  - `nvidia-smi`: the total GPU memory from `nvidia-smi` in the last load sample, when the service has it.
+  - `container`: the GPU memory of the container from the deploy value `LLM_VRAM`. The service uses it when `nvidia-smi` gives no number. On a cluster without `nvidia-smi` in the container, this is the usual case. The deploy script always passes `LLM_VRAM` to the service, with the default `16g`.
+  - null for both: `nvidia-smi` gives no number and `LLM_VRAM` is bad.
 - `needed_mib` and `basis`:
   - `catalog`: the `gpu_memory_mib` of the catalog entry.
-  - `weights`: the size of the cached weights, times 1.2. The margin covers the working memory of the engine for a short context.
-  - `unknown`: the model is not in the catalog and not in the cache. `needed_mib` is null.
+  - `weights`: the size of the cached weights, times 1.2, rounded up to a whole MiB. The margin covers the working memory of the engine for a short context.
+  - `unknown`: the entry has no `gpu_memory_mib` and the pair is not in the cache, or blob storage is not readable now. `needed_mib` is null.
 - `fits` is `yes` when the needed memory is at most the available memory, `no` when it is more, and `unknown` when a number is missing.
+
+A read error of blob storage never fails the endpoint. The answer then uses the catalog only. One fit request reads only the `.complete` marker of its pair. `GET /admin/catalog` lists the cache once and reads the available memory once for all entries.
 
 The check is an estimate. A model that fits can still fail with a long context. The switch does not use the check: an admin can start a switch with each result.
 
@@ -313,25 +322,26 @@ All are for admins.
 
 | Endpoint | Does |
 |---|---|
-| `GET /admin/catalog` | The entries. Each one gets `cached` (true or false) and the `fit` answer. |
-| `PUT /admin/catalog` | Adds or replaces one entry. Body: the entry. 400 `invalid_catalog_entry`, 409 `catalog_full`. |
-| `DELETE /admin/catalog?model=<name>&revision=<revision>` | Removes one entry. 404 `catalog_entry_not_found`. |
+| `GET /admin/catalog` | `{"models": [...], "loaded": true}`. Each entry gets `cached` (true or false) and the `fit` answer. `loaded` is false when the last read of `catalog.json` failed for a reason other than its content. The list is then empty. |
+| `PUT /admin/catalog` | Adds or replaces one entry. Body: the entry. The answer is the stored entry. 400 `invalid_catalog_entry`, 409 `catalog_full`, 502 `storage_unavailable`. |
+| `DELETE /admin/catalog?model=<name>&revision=<revision>` | Removes one entry. The answer is `{"removed": {"model", "revision"}}`. 400 `invalid_catalog_entry` for a bad name, 404 `catalog_entry_not_found`, 502 `storage_unavailable`. |
 | `POST /admin/models/download` | See above. |
 | `GET /admin/models/fit` | See above. |
 
-A change of the catalog writes an audit event `catalog_change`.
+A change of the catalog writes an audit event `catalog_change` with the target (`model@revision`) and the old and new entries.
 
 ### The app
 
 - New routes that pass through for each endpoint, under `/api/services/{name}/`.
-- The Models tab gets a Catalog card: a table with model, revision, note, needed memory, a fit badge and a cached badge. Each row has the buttons Serve, Download and Remove from the list. A form adds an entry.
+- The Models tab gets a Catalog card: a table with model, revision, note, needed memory, a fit badge and a cached badge. Each row has the buttons Serve and Remove from the list. A row that is not cached also has Download. A form adds an entry.
 - The "Serve a model" form shows the fit result for the typed model before the switch, as a note. A `no` result shows as a warning and does not block the button.
-- During a download, the Models tab shows its state and reads it again each 3 seconds.
+- A running download shows in the engine card of the Models tab. The tab reads the state again each 3 seconds.
 
 ## Errors
 
 - A failure to read the metrics endpoint or `nvidia-smi` gives null numbers. The service logs the first failure and the recovery, not each try.
 - A failure to write `limits.json` or `catalog.json` answers 502 `storage_unavailable`, and the copy in memory does not change.
+- A failure to read `catalog.json` for a reason other than its content gives an empty catalog and `loaded` false. The flusher and the next write read the file again.
 - The app passes the status and the body of the service through, as its other routes do.
 
 ## Testing
@@ -349,6 +359,9 @@ A change of the catalog writes an audit event `catalog_change`.
 - The limits are for each service. A user with access to two services has two budgets.
 - The percentiles of a merged history point are the maximum of the merged minutes, not a true percentile of the longer time.
 - The fit check does not know the context length or the engine arguments.
+- A restart of the service forgets a running download. The next download of the pair starts again.
+- A stop of the service during a download lasts until the fetch thread ends or the platform ends the process. The audit event then says `cancelled`, although the files can be complete.
+- The `nvidia-smi` total is the sum over all GPUs of the node. On a node with several GPUs, the check can say `fits` for a model that needs one GPU.
 
 ## Out of scope
 

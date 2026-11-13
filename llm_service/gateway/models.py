@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Callable
 
+from .audit import iso, utc_now
 from .engine import Engine
 from .storage import BlobStore
 from .weights import WeightCache, validate_model_name, validate_revision
@@ -22,6 +24,14 @@ class ModelInUse(Exception):
     """A model revision is in use or is being removed."""
 
 
+class DownloadInProgress(Exception):
+    """A download without a switch is already running."""
+
+
+# The longest error text that `download` keeps.
+DOWNLOAD_ERROR_CHARS = 300
+
+
 class ModelManager:
     """Hold the state of the served model: empty, loading, ready or failed.
 
@@ -33,6 +43,9 @@ class ModelManager:
     `removing` holds the (model, revision) pairs that a delete removes now.
     `starting` is True while `startup` reads the saved model, before `target`
     names it.
+    `download` is the last download without a switch, or None. It holds
+    `model`, `revision`, `state` (`running`, `done` or `failed`), `error` and
+    `started_at`.
     """
 
     def __init__(
@@ -51,6 +64,8 @@ class ModelManager:
         self._default_model = default_model
         self._on_event = on_event
         self._task: asyncio.Task | None = None
+        # The prune after a reload. Nothing waits for it. `_prune` logs its errors.
+        self._prune_task: asyncio.Task | None = None
         self.state = "empty"
         self.active: dict | None = None
         self.target: dict | None = None
@@ -58,6 +73,7 @@ class ModelManager:
         self.serving: dict | None = None
         self.rolling_back: dict | None = None
         self.removing: set[tuple[str, str]] = set()
+        self.download: dict | None = None
         # `startup` sets the flag. A manager that never starts accepts deletes.
         self.starting = False
 
@@ -74,6 +90,7 @@ class ModelManager:
             "error": self.error,
             "serving": self.serving,
             "rolling_back": self.rolling_back,
+            "download": dict(self.download) if self.download else None,
         }
 
     async def startup(self) -> None:
@@ -121,7 +138,7 @@ class ModelManager:
         validate_model_name(model)
         validate_revision(revision)
         if (model, revision) in self.removing:
-            raise ModelInUse(f"{model} {revision} is being removed")
+            raise ModelInUse(f"a delete removes {model} {revision} now")
         if self.state == "loading":
             raise SwitchInProgress("a model switch is already running")
         if self.rolling_back is not None:
@@ -133,11 +150,84 @@ class ModelManager:
         )
         return self._task
 
+    def request_download(self, model: str, revision: str, admin: str) -> asyncio.Task:
+        """Start a download of the weights without a switch. Call it inside a running loop.
+
+        Raise `ValueError` for a bad name, `ModelInUse` while a delete runs, and
+        `DownloadInProgress` while a download runs. The check and
+        the mark run without an `await`, so no delete can start between them.
+        """
+        validate_model_name(model)
+        validate_revision(revision)
+        if (model, revision) in self.removing:
+            raise ModelInUse(f"a delete removes {model} {revision} now")
+        if self.removing:
+            # A delete takes the cache lock once for each revision. A download
+            # between two of them makes the rest of the delete wait.
+            raise ModelInUse("A delete runs now. Download after it ends.")
+        if self.running_download() is not None:
+            raise DownloadInProgress("a model download is already running")
+        self.download = {
+            "model": model,
+            "revision": revision,
+            "state": "running",
+            "error": None,
+            "started_at": iso(utc_now()),
+        }
+        return asyncio.create_task(self._download(model, revision, admin))
+
+    def running_download(self) -> dict | None:
+        """Return the pair of the running download as `model` and `revision`, or None."""
+        if self.download is None or self.download["state"] != "running":
+            return None
+        return {"model": self.download["model"], "revision": self.download["revision"]}
+
+    async def _download(self, model: str, revision: str, admin: str) -> None:
+        # `ensure` holds the cache lock for the whole fetch. A switch to the
+        # same pair waits for it and then finds the files.
+        error = None
+        try:
+            try:
+                await asyncio.to_thread(self._weights.ensure, model, revision)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}: {exc}"[:DOWNLOAD_ERROR_CHARS]
+                log.warning("the download of %s %s failed: %s", model, revision, error)
+            else:
+                # The local copy goes unless the engine uses the pair. During
+                # the start, `startup` has not named the saved model yet.
+                if not self.starting:
+                    await self._prune()
+        except asyncio.CancelledError:
+            self._end_download(model, revision, admin, "cancelled")
+            raise
+        self._end_download(model, revision, admin, error)
+
+    def _end_download(self, model: str, revision: str, admin: str, error: str | None) -> None:
+        """Set the end state of the download and report it."""
+        state = "done" if error is None else "failed"
+        self.download = {**self.download, "state": state, "error": error}
+        try:
+            self._on_event(
+                {
+                    "event": "model_download",
+                    "model": model,
+                    "revision": revision,
+                    "result": "ok" if error is None else "error",
+                    "error": error,
+                    "admin": admin,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("event handler failed")
+
     def begin_remove(self, model: str, revisions: list[str]) -> None:
         """Mark revisions of a model as being removed.
 
         Raise `ModelInUse` while the service starts, or if one of them is the
-        active, serving, target or rollback model, or is already being removed.
+        active, serving, target, rollback or downloading model, or is already
+        being removed.
         Nothing is marked in that case.
         Call `end_remove` when the removal ends. The check and the mark run
         without an `await`, so no switch can start between them.
@@ -150,6 +240,9 @@ class ModelManager:
             for entry in (self.active, self.serving, self.target, self.rolling_back)
             if entry
         }
+        downloading = self.running_download()
+        if downloading is not None:
+            busy.add((downloading["model"], downloading["revision"]))
         if pairs & busy:
             name, revision = sorted(pairs & busy)[0]
             raise ModelInUse(f"{name} {revision} is in use")
@@ -185,14 +278,24 @@ class ModelManager:
         return self._task
 
     async def _reload(self, wanted: dict) -> None:
-        await self._load(wanted, previous=None, trigger="reload")
-        if self.state != "ready":
+        loaded = await self._load(wanted, previous=None, trigger="reload")
+        # The decision uses the result of this load. No `await` runs between
+        # the end of `_load` and this line, so the state is still its own.
+        if not loaded:
             self.state = "failed"
             self.active = None
 
     def _in_use(self) -> list[dict]:
-        """Return the active model and the model that loads, if any."""
-        return [entry for entry in (self.active, self.target) if entry]
+        """Return the active, loading, serving and rollback models, if any.
+
+        During a rollback, only `rolling_back` names the model that the engine
+        starts. A prune keeps the local copies of all of them.
+        """
+        return [
+            entry
+            for entry in (self.active, self.target, self.serving, self.rolling_back)
+            if entry
+        ]
 
     async def _save_active(self) -> None:
         """Write `active.json` in a worker thread. A failure only logs a warning."""
@@ -210,16 +313,35 @@ class ModelManager:
         except Exception as exc:  # noqa: BLE001
             log.warning("the delete of old local weights failed: %s", exc)
 
-    async def _load(self, wanted: dict, previous: dict | None, trigger: str) -> None:
+    async def _served_copy(self, model: str, revision: str) -> Path:
+        """Return the local copy of a model that the engine served last.
+
+        A complete local copy is used without the cache lock, so a download
+        does not hold up a reload or a rollback. That is safe: the pair is the
+        active or previous model, so no delete or prune removes it. Without a
+        local copy, `ensure` fetches the files.
+        """
+        local = await asyncio.to_thread(self._weights.local_copy, model, revision)
+        if local is not None:
+            return local
+        return await asyncio.to_thread(self._weights.ensure, model, revision)
+
+    async def _load(self, wanted: dict, previous: dict | None, trigger: str) -> bool:
+        """Load `wanted` and return True if the engine serves it at the end."""
         model, revision = wanted["model"], wanted["revision"]
         try:
             try:
-                model_dir = await asyncio.to_thread(
-                    self._weights.ensure, model, revision
-                )
+                if trigger == "reload":
+                    model_dir = await self._served_copy(model, revision)
+                else:
+                    # An admin switch takes the cache lock: a prune at the
+                    # same time can delete the local copy of a new target.
+                    model_dir = await asyncio.to_thread(
+                        self._weights.ensure, model, revision
+                    )
             except Exception as exc:  # noqa: BLE001
                 self._fail_before_stop(wanted, previous, f"{model}: {exc}", trigger)
-                return
+                return False
             if previous is not None:
                 self.serving = None
                 await self._engine.stop()
@@ -227,7 +349,7 @@ class ModelManager:
                 await self._engine.start(model_dir, model)
             except Exception as exc:  # noqa: BLE001
                 await self._fail_after_stop(wanted, previous, f"{model}: {exc}", trigger)
-                return
+                return False
             self.active = dict(wanted)
             self.serving = dict(wanted)
             self.target = None
@@ -242,8 +364,14 @@ class ModelManager:
             self.state = "failed"
             self.error = f"{model}: {exc}"
             self._emit(wanted, "failed", self.error, trigger)
-            return
-        await self._prune()
+            return False
+        if trigger == "reload":
+            # A download can hold the cache lock for a long time. The reload
+            # task ends now, and the prune runs on its own.
+            self._prune_task = asyncio.create_task(self._prune())
+        else:
+            await self._prune()
+        return True
 
     def _fail_before_stop(
         self, wanted: dict, previous: dict | None, error: str, trigger: str
@@ -271,8 +399,8 @@ class ModelManager:
             self.rolling_back = dict(previous)
             try:
                 try:
-                    model_dir = await asyncio.to_thread(
-                        self._weights.ensure, previous["model"], previous["revision"]
+                    model_dir = await self._served_copy(
+                        previous["model"], previous["revision"]
                     )
                     await self._engine.start(model_dir, previous["model"])
                 except Exception as exc:  # noqa: BLE001

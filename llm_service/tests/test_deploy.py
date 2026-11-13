@@ -3,10 +3,11 @@ import pytest
 from llm_service.deploy_config import admin_app_name, deploy_targets, resources, service_env, service_host, service_url
 
 
-def test_service_env_defaults_hold_only_the_two_required_variables():
+def test_service_env_defaults_hold_the_model_the_root_and_the_vram():
     assert service_env({}) == {
         "LLM_DEFAULT_MODEL": "Qwen/Qwen2.5-1.5B-Instruct",
         "LLM_BLOB_ROOT": "llm-service",
+        "LLM_VRAM": "16g",
     }
 
 
@@ -14,6 +15,7 @@ def test_service_env_passes_overrides_and_optional_variables():
     env = {
         "LLM_DEFAULT_MODEL": "org/model",
         "LLM_BLOB_ROOT": "/my-root/",
+        "LLM_VRAM": "40g",
         "LLM_ADMIN_GROUP": "llm_admins",
         "LLM_ACCESS_GROUP": "llm_users",
         "LLM_HF_TOKEN_KEY": "hf_token",
@@ -24,6 +26,7 @@ def test_service_env_passes_overrides_and_optional_variables():
     assert service_env(env) == {
         "LLM_DEFAULT_MODEL": "org/model",
         "LLM_BLOB_ROOT": "my-root",
+        "LLM_VRAM": "40g",
         "LLM_ADMIN_GROUP": "llm_admins",
         "LLM_ACCESS_GROUP": "llm_users",
         "LLM_HF_TOKEN_KEY": "hf_token",
@@ -42,12 +45,17 @@ def test_service_env_leaves_out_empty_optional_variables():
         "LLM_PROMPT_RETENTION_DAYS": " ",
         "LLM_METRICS_RETENTION_DAYS": " ",
     }
-    assert set(service_env(env)) == {"LLM_DEFAULT_MODEL", "LLM_BLOB_ROOT"}
+    assert set(service_env(env)) == {"LLM_DEFAULT_MODEL", "LLM_BLOB_ROOT", "LLM_VRAM"}
 
 
 def test_service_env_ignores_variables_the_container_does_not_need():
-    env = {"LLM_VRAM": "40g", "OTHER": "x"}
-    assert set(service_env(env)) == {"LLM_DEFAULT_MODEL", "LLM_BLOB_ROOT"}
+    env = {"LLM_MEMORY": "64g", "OTHER": "x"}
+    assert set(service_env(env)) == {"LLM_DEFAULT_MODEL", "LLM_BLOB_ROOT", "LLM_VRAM"}
+
+
+def test_service_env_vram_is_the_value_of_resources():
+    for env in ({}, {"LLM_VRAM": ""}, {"LLM_VRAM": " "}, {"LLM_VRAM": " 40g "}):
+        assert service_env(env)["LLM_VRAM"] == resources(env)["vram"]
 
 
 def test_resources_defaults():

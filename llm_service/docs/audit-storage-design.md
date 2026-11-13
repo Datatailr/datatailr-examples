@@ -56,8 +56,8 @@ A metadata row is the audit record of today without the prompt, plus four fields
 | Field | Value |
 |---|---|
 | `seg` | The segment name that first held the row. A merge keeps it. |
-| `event` | `model_switch`, `engine_reload`, `model_delete`, or null for a request. |
-| `detail` | For an event: the small event data (`revision`, `revisions`, `error`). Null for a request. |
+| `event` | `model_switch`, `engine_reload`, `model_delete`, `model_download`, `catalog_change`, or null for a request. |
+| `detail` | For an event: the small event data (`revision`, `revisions`, `error`, `target`, `old`, `new`). Null for a request. |
 | `prompt_ref` | For a request: `{"file": <segment name>, "line": <index>}`. Null for an event. |
 
 The other fields stay: `ts`, `request_id`, `user`, `endpoint`, `model`, `stream`, `status`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `duration_ms`, `ttft_ms`. A row of a request from before the load numbers has no `ttft_ms` field.

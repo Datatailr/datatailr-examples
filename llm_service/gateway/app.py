@@ -32,10 +32,12 @@ from llm_service.gateway.identity import (
     user_from_headers,
 )
 from llm_service.gateway.limiter import LimitExceeded, Limiter
+from llm_service.gateway.catalog import CatalogFull, CatalogStore, InvalidEntry, check_entry
+from llm_service.gateway.fit import fit, needed_from
 from llm_service.gateway.limits import InvalidLimit, LimitStore, StorageUnavailable
 from llm_service.gateway.load import LoadMonitor
 from llm_service.gateway.metrics_store import MAX_DAYS, MetricsStore
-from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
+from llm_service.gateway.models import DownloadInProgress, ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.proxy import forward, prompt_of
 from llm_service.gateway.storage import BlobStore
 from llm_service.gateway.usage import UsageTotals
@@ -140,6 +142,7 @@ def create_app(
     audit = AuditLog(store, config.blob_root, config.flush_size, now=now)
     usage = UsageTotals(store, config.blob_root, audit, lambda: iso(now())[:10], now=now)
     limits = LimitStore(store, config.blob_root)
+    catalog = CatalogStore(store, config.blob_root)
 
     def seconds_to_midnight() -> float:
         current = now()
@@ -168,6 +171,27 @@ def create_app(
 
     def on_event(event: dict) -> None:
         failed = event["result"] != "ok"
+        if event["event"] == "model_download":
+            # A download names its own admin. It does not change `last_admin`.
+            write_audit(
+                {
+                    "user": event["admin"],
+                    "endpoint": "/admin/models/download",
+                    "model": event["model"],
+                    "stream": False,
+                    "prompt": {
+                        "event": "model_download",
+                        "revision": event["revision"],
+                        "error": event["error"],
+                    },
+                    "status": 500 if failed else 200,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
+                    "duration_ms": None,
+                }
+            )
+            return
         trigger = event.get("trigger")
         write_audit(
             {
@@ -196,7 +220,7 @@ def create_app(
 
         The steps run in the flusher thread. Each step has its own guard, so one failure does not
         stop the others. The last cycle at shutdown forces the checkpoint and the metrics write.
-        The limits file is read again only after a failed read. The merge and the retention run
+        The limits file and the catalog file are read again only after a failed read. The merge and the retention run
         in the maintenance task, so a flush never waits for their deletes.
         """
         last_cycle = stopping.is_set()
@@ -204,6 +228,7 @@ def create_app(
             ("close_days", usage.close_days),
             ("checkpoint", lambda: usage.checkpoint(force=last_cycle)),
             ("limits", limits.retry_load),
+            ("catalog", catalog.retry_load),
             ("metrics", lambda: metrics.write(force=last_cycle)),
         ]
         for name, step in steps:
@@ -247,6 +272,7 @@ def create_app(
         # in between, so that no record is counted twice and no flush runs against
         # a half-loaded day.
         await asyncio.to_thread(limits.load)
+        await asyncio.to_thread(catalog.load)
         started = time.monotonic()
         days = await asyncio.to_thread(usage.load)
         logger.info("usage totals loaded in %.1f s for %d days", time.monotonic() - started, days)
@@ -264,7 +290,12 @@ def create_app(
         try:
             yield
         finally:
-            tasks = (app.state.startup_task, app.state.switch_task, app.state.reload_task)
+            tasks = (
+                app.state.startup_task,
+                app.state.switch_task,
+                app.state.reload_task,
+                app.state.download_task,
+            )
             for task in tasks:
                 if task is not None and not task.done():
                     task.cancel()
@@ -300,11 +331,13 @@ def create_app(
     app.state.switch_task = None
     app.state.startup_task = None
     app.state.reload_task = None
+    app.state.download_task = None
     app.state.maintenance_task = None
     app.state.manager = manager
     app.state.audit = audit
     app.state.usage = usage
     app.state.limits = limits
+    app.state.catalog = catalog
     app.state.limiter = limiter
     app.state.load = load
     app.state.metrics = metrics
@@ -730,6 +763,196 @@ def create_app(
         app.state.last_admin = admin_user
         return manager.status()
 
+    def available_memory() -> tuple[int | None, str | None]:
+        """Return the available GPU memory in MiB and its source.
+
+        The source is the total of `nvidia-smi` in the last load sample, else the memory of the
+        container, else None.
+        """
+        available = load.live()["now"]["gpu_memory_total"]
+        if available is not None:
+            return available, "nvidia-smi"
+        if config.gpu_memory_mib is not None:
+            return config.gpu_memory_mib, "container"
+        return None, None
+
+    async def fit_of(
+        model: str,
+        revision: str,
+        cached: list[dict] | None = None,
+        memory: tuple[int | None, str | None] | None = None,
+    ) -> dict:
+        """Return the GPU memory check of one pair.
+
+        The needed memory comes from the catalog entry, else from the size of the cached pair.
+        `cached` is an already read list of `weights.cached()`. Without it, the function reads
+        the one marker of the pair in a thread. A store error then leaves the size unknown.
+        `memory` is an already read answer of `available_memory()`. Without it, the function
+        reads it.
+        """
+        entry = catalog.get(model, revision)
+        size_bytes = None
+        if entry is not None and entry.get("gpu_memory_mib") is not None:
+            pass  # the catalog value wins, so the size of the weights is not needed
+        elif cached is None:
+            try:
+                size_bytes = await asyncio.to_thread(weights.size_of, model, revision)
+            except Exception as error:
+                logger.warning("the size read for the fit of %s %s failed: %s", model, revision, error)
+        else:
+            for item in cached:
+                if item["model"] == model and item["revision"] == revision:
+                    size_bytes = item["size_bytes"]
+        needed, basis = needed_from(entry, size_bytes)
+        available, source = memory if memory is not None else available_memory()
+        return fit(needed, basis, available, source)
+
+    app.state.fit_of = fit_of
+
+    @app.get("/admin/models/fit")
+    async def get_model_fit(model: str = "", revision: str = "main", admin_user: str = Depends(require_admin)) -> dict:
+        try:
+            validate_model_name(model)
+            validate_revision(revision)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
+        return await fit_of(model, revision)
+
+    @app.get("/admin/catalog")
+    async def get_catalog(admin_user: str = Depends(require_admin)) -> dict:
+        try:
+            cached = await asyncio.to_thread(weights.cached)
+        except Exception as error:
+            logger.warning("the cache list for the catalog failed: %s", error)
+            cached = None
+        have = {(item["model"], item["revision"]) for item in cached or []}
+        memory = available_memory()
+        models = []
+        for entry in catalog.entries():
+            models.append(
+                {
+                    **entry,
+                    "cached": (entry["model"], entry["revision"]) in have,
+                    "fit": await fit_of(
+                        entry["model"], entry["revision"], cached if cached is not None else [], memory
+                    ),
+                }
+            )
+        return {"models": models, "loaded": catalog.loaded()}
+
+    async def change_catalog(
+        target: str, admin_user: str, change: Callable[[], tuple[dict | None, dict | None]]
+    ) -> None:
+        """Run a catalog change in a thread and audit it. The change returns the old and the new entry."""
+        try:
+            old, new = await asyncio.to_thread(change)
+        except InvalidEntry as error:
+            raise ApiError(400, "invalid_request_error", "invalid_catalog_entry", str(error)[:300]) from None
+        except CatalogFull as error:
+            raise ApiError(409, "invalid_request_error", "catalog_full", str(error)) from None
+        except StorageUnavailable as error:
+            raise ApiError(502, "server_error", "storage_unavailable", str(error)) from None
+        write_audit(
+            {
+                "user": admin_user,
+                "endpoint": "/admin/catalog",
+                "model": None,
+                "stream": False,
+                "prompt": {"event": "catalog_change", "target": target, "old": old, "new": new},
+                "status": 200,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "duration_ms": None,
+            }
+        )
+
+    @app.put("/admin/catalog")
+    async def put_catalog(request: Request, admin_user: str = Depends(require_admin)) -> dict:
+        try:
+            body = json.loads(await request.body())
+        except (ValueError, RecursionError):
+            body = None
+        try:
+            new = check_entry(body)
+        except InvalidEntry as error:
+            raise ApiError(400, "invalid_request_error", "invalid_catalog_entry", str(error)[:300]) from None
+
+        def change():
+            return catalog.put(new), new
+
+        await change_catalog(f"{new['model']}@{new['revision']}", admin_user, change)
+        return new
+
+    @app.delete("/admin/catalog")
+    async def delete_catalog(
+        model: str = "", revision: str = "main", admin_user: str = Depends(require_admin)
+    ) -> dict:
+        try:
+            validate_model_name(model)
+            validate_revision(revision)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_catalog_entry", str(error)[:300]) from None
+
+        def change():
+            try:
+                return catalog.remove(model, revision), None
+            except KeyError:
+                raise ApiError(
+                    404, "invalid_request_error", "catalog_entry_not_found", f"the catalog has no entry {model}@{revision}"
+                ) from None
+
+        await change_catalog(f"{model}@{revision}", admin_user, change)
+        return {"removed": {"model": model, "revision": revision}}
+
+    @app.post("/admin/models/download", status_code=202)
+    async def download_model(request: Request, admin_user: str = Depends(require_admin)):
+        try:
+            body = json.loads(await request.body())
+        except (ValueError, RecursionError):
+            body = None
+        if not isinstance(body, dict) or not isinstance(body.get("model"), str):
+            raise ApiError(400, "invalid_request_error", "invalid_model", "the body needs a string 'model'")
+        model, revision = body["model"], body.get("revision", "main")
+        if not isinstance(revision, str):
+            raise ApiError(400, "invalid_request_error", "invalid_model", "'revision' must be a string")
+        try:
+            validate_model_name(model)
+            validate_revision(revision)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
+        def check_removing() -> None:
+            # A delete removes the marker first. Until then the pair looks cached.
+            if (model, revision) in manager.removing:
+                raise ApiError(
+                    409, "invalid_request_error", "model_in_use", f"a delete removes {model} {revision} now"
+                )
+            if manager.removing:
+                raise ApiError(
+                    409, "invalid_request_error", "model_in_use", "A delete runs now. Download after it ends."
+                )
+
+        check_removing()
+        try:
+            cached = await asyncio.to_thread(weights.is_cached, model, revision)
+        except Exception as error:
+            logger.warning("the cache check of %s %s failed: %s", model, revision, error)
+            raise ApiError(
+                500, "server_error", "cache_check_failed",
+                f"the cache check of the model {model!r} failed ({type(error).__name__})",
+            ) from None
+        # A delete can start during the cache check.
+        check_removing()
+        if cached:
+            return JSONResponse({"state": "cached", "model": model, "revision": revision})
+        try:
+            app.state.download_task = manager.request_download(model, revision, admin_user)
+        except DownloadInProgress as error:
+            raise ApiError(409, "invalid_request_error", "download_in_progress", str(error)) from None
+        except ModelInUse as error:
+            raise ApiError(409, "invalid_request_error", "model_in_use", str(error)) from None
+        return manager.status()
+
     @app.delete("/admin/models/{model_id:path}")
     async def delete_model(
         model_id: str, revision: str | None = None, admin_user: str = Depends(require_admin)
@@ -744,8 +967,28 @@ def create_app(
         # So a second delete also removes what a failed delete left.
         stored = await asyncio.to_thread(weights.stored, model_id)
         found = [name for name in stored if revision in (None, name)]
+        # During the Hugging Face phase, blob storage has no file of the
+        # download yet. `begin_remove` refuses its pair with 409.
+        downloading = manager.running_download()
+        if (
+            downloading is not None
+            and downloading["model"] == model_id
+            and revision in (None, downloading["revision"])
+            and downloading["revision"] not in found
+        ):
+            found.append(downloading["revision"])
         if not found:
             raise ApiError(404, "invalid_request_error", "model_not_found", f"no stored copy of {model_id!r} matches")
+        # A download holds the cache lock for its whole fetch, and `remove`
+        # needs that lock. A delete of the pair of the download gets
+        # `model_in_use` from `begin_remove`. Each other delete gets this answer.
+        if downloading is not None and not (
+            downloading["model"] == model_id and downloading["revision"] in found
+        ):
+            raise ApiError(
+                409, "invalid_request_error", "download_in_progress",
+                "A model download runs now. Delete after it ends.",
+            )
         try:
             manager.begin_remove(model_id, found)
         except ModelInUse as error:

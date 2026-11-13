@@ -116,6 +116,17 @@ class WeightCache:
             (target / COMPLETE).write_text("")
         return target
 
+    def local_copy(self, model: str, revision: str) -> Path | None:
+        """Return the local directory of the pair if its `.complete` file exists, else None.
+
+        It takes no lock, so it does not wait for a fetch. Use it only for a
+        pair that no delete or prune removes now: the active or previous model.
+        """
+        validate_model_name(model)
+        validate_revision(revision)
+        target = self._local_dir / model.replace("/", "--") / revision
+        return target if (target / COMPLETE).exists() else None
+
     def _read_manifest(self, marker: str) -> list[dict] | None:
         """Return the file list of the blob marker, or None if it is not usable.
 
@@ -257,6 +268,15 @@ class WeightCache:
                 revisions.add(parts[0])
         return sorted(revisions)
 
+    def is_cached(self, model: str, revision: str) -> bool:
+        """Return True when blob storage has the `.complete` marker of the pair.
+
+        The local copy does not count. A store error goes to the caller.
+        """
+        validate_model_name(model)
+        validate_revision(revision)
+        return self._store.exists(f"{self._blob_dir(model, revision)}/{COMPLETE}")
+
     def _size(self, marker: str) -> int | None:
         """Return the total size of the files in a marker, or None if it is not known.
 
@@ -278,6 +298,16 @@ class WeightCache:
             if generation == self._sizes_generation:
                 self._sizes[marker] = size
         return size
+
+    def size_of(self, model: str, revision: str) -> int | None:
+        """Return the total size of the files of one pair in blob storage, or None.
+
+        It reads the one marker of the pair through the size memo and lists
+        nothing. None means no usable marker, or a store error with a warning.
+        """
+        validate_model_name(model)
+        validate_revision(revision)
+        return self._size(f"{self._blob_dir(model, revision)}/{COMPLETE}")
 
     def cached(self) -> list[dict]:
         """List the models in blob storage that have a `.complete` marker.

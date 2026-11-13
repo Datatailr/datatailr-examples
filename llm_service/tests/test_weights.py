@@ -492,3 +492,72 @@ def test_remove_after_a_failed_remove_deletes_the_rest(tmp_path):
     fx.cache.remove("org/m", "main")
     assert fx.cache.stored("org/m") == []
     assert fx.store.ls("root/models/org--m") == []
+
+
+def test_is_cached_is_true_only_with_the_blob_marker(fx):
+    assert fx.cache.is_cached("org/m", "main") is False
+    fx.store.put("root/models/org--m/main/config.json", "{}")
+    assert fx.cache.is_cached("org/m", "main") is False
+    fx.cache.ensure("org/m", "main")
+    assert fx.cache.is_cached("org/m", "main") is True
+    assert fx.cache.is_cached("org/m", "v2") is False
+
+
+def test_is_cached_ignores_the_local_copy(fx):
+    fx.cache.ensure("org/m", "main")
+    fx.store.delete(MARKER)
+    assert (fx.local / "org--m" / "main" / ".complete").exists()
+    assert fx.cache.is_cached("org/m", "main") is False
+
+
+@pytest.mark.parametrize("model,revision", [("nonsense", "main"), ("org/m", "a/b"), ("org/m", "..")])
+def test_is_cached_validates_the_names(fx, model, revision):
+    with pytest.raises(ValueError):
+        fx.cache.is_cached(model, revision)
+
+
+def test_local_copy_gives_the_directory_of_a_complete_local_copy(fx):
+    assert fx.cache.local_copy("org/m", "main") is None
+    path = fx.cache.ensure("org/m", "main")
+    assert fx.cache.local_copy("org/m", "main") == path
+    (path / ".complete").unlink()  # a partial copy does not count
+    assert fx.cache.local_copy("org/m", "main") is None
+
+
+def test_local_copy_does_not_take_the_cache_lock(fx):
+    path = fx.cache.ensure("org/m", "main")
+    with fx.cache._lock:
+        assert fx.cache.local_copy("org/m", "main") == path
+
+
+@pytest.mark.parametrize("model,revision", [("nonsense", "main"), ("org/m", "a/b"), ("org/m", "..")])
+def test_local_copy_validates_the_names(fx, model, revision):
+    with pytest.raises(ValueError):
+        fx.cache.local_copy(model, revision)
+
+
+def test_size_of_reads_one_marker_once_and_lists_nothing(tmp_path):
+    fx = Fixture(tmp_path, GetCountingStore())
+    fx.cache.ensure("org/m", "main")
+    fx.store.gets.clear()
+    assert fx.cache.size_of("org/m", "main") == 3
+    assert fx.cache.size_of("org/m", "main") == 3
+    assert fx.store.gets == [MARKER]
+    assert fx.cache.size_of("org/m", "v2") is None
+    # `cached` uses the same memo.
+    fx.store.gets.clear()
+    assert fx.cache.cached()[0]["size_bytes"] == 3
+    assert fx.store.gets == []
+
+
+def test_size_of_lists_nothing(fx):
+    fx.cache.ensure("org/m", "main")
+    fx.store.listings = 0
+    assert fx.cache.size_of("org/m", "main") == 3
+    assert fx.store.listings == 0
+
+
+@pytest.mark.parametrize("model,revision", [("nonsense", "main"), ("org/m", "a/b")])
+def test_size_of_validates_the_names(fx, model, revision):
+    with pytest.raises(ValueError):
+        fx.cache.size_of(model, revision)

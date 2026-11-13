@@ -2325,3 +2325,339 @@ def test_history_axis_starts_at_the_minute_of_since(tmp_path):
     text = (STATIC_DIR / "app.js").read_text()
     body = text[text.index("async function readHistory("):text.index("function setLoadRange(")]
     assert "minuteStart(Date.parse(range.since))" in body
+
+
+CATALOG_BODY = {"entries": [{"model": "org/a", "revision": "main", "note": "", "gpu_memory_mib": 9000}]}
+DOWNLOAD_ERROR = {"error": {"message": "busy", "type": "conflict", "code": "download_in_progress"}}
+
+CATALOG_ROUTES = [
+    ("GET", "/api/services/svc-two/catalog", None, "GET", "/admin/catalog", {}),
+    ("PUT", "/api/services/svc-two/catalog", CATALOG_BODY, "PUT", "/admin/catalog", {}),
+    (
+        "DELETE",
+        "/api/services/svc-two/catalog?model=org/a&revision=main",
+        None,
+        "DELETE",
+        "/admin/catalog",
+        {"model": "org/a", "revision": "main"},
+    ),
+    (
+        "POST",
+        "/api/services/svc-two/models/download",
+        {"model": "org/a", "revision": "main"},
+        "POST",
+        "/admin/models/download",
+        {},
+    ),
+    (
+        "GET",
+        "/api/services/svc-two/models/fit?model=org/a&revision=main",
+        None,
+        "GET",
+        "/admin/models/fit",
+        {"model": "org/a", "revision": "main"},
+    ),
+]
+CATALOG_WRITE_ROUTES = ["catalog", "models/download"]
+
+
+@pytest.mark.parametrize("method,route,body,service_method,service_path,params", CATALOG_ROUTES)
+def test_each_catalog_route_reaches_its_service_endpoint(
+    client, fakes, method, route, body, service_method, service_path, params
+):
+    fakes.hosts["svc-two"].answers[(service_method, service_path)] = (200, {"ok": True})
+    response = client.request(method, route, json=body, headers=ALICE)
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    sent = fakes.calls()
+    assert len(sent) == 1
+    assert (sent[0].url.host, sent[0].method, sent[0].url.path) == ("svc-two", service_method, service_path)
+    assert dict(sent[0].url.params) == params
+    assert sent[0].headers["X-LLM-Acting-User"] == "alice"
+    assert sent[0].headers["Connection"] == "close"
+    if body is not None:
+        assert json.loads(sent[0].content) == body
+
+
+def test_the_catalog_routes_pass_only_model_and_revision_as_query(client, fakes):
+    client.delete("/api/services/svc/catalog?model=org/a&revision=main&x=1", headers=ALICE)
+    client.get("/api/services/svc/models/fit?model=org/a&other=2", headers=ALICE)
+    delete, fit = fakes.calls()
+    assert dict(delete.url.params) == {"model": "org/a", "revision": "main"}
+    assert dict(fit.url.params) == {"model": "org/a"}
+
+
+def test_only_the_download_route_waits_the_long_action_time(client, fakes):
+    for method, route, body, *_ in CATALOG_ROUTES:
+        client.request(method, route, json=body, headers=ALICE)
+    timeouts = {(r.method, r.url.path): _timeout(r) for r in fakes.calls()}
+    assert timeouts[("POST", "/admin/models/download")] == 300
+    assert [t for key, t in timeouts.items() if key[1] != "/admin/models/download"] == [30] * 4
+
+
+@pytest.mark.parametrize("route", CATALOG_WRITE_ROUTES)
+def test_the_catalog_write_routes_need_json(client, fakes, route):
+    method = "PUT" if route == "catalog" else "POST"
+    response = client.request(
+        method, f"/api/services/svc/{route}", content=b"{}", headers={**ALICE, "Content-Type": "text/plain"}
+    )
+    assert response.status_code == 415
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize("route", CATALOG_WRITE_ROUTES)
+@pytest.mark.parametrize("content", [b"{oops", b"[" * 100_000])
+def test_the_catalog_write_routes_need_valid_json(client, fakes, route, content):
+    method = "PUT" if route == "catalog" else "POST"
+    response = client.request(
+        method, f"/api/services/svc/{route}", content=content, headers={**ALICE, "Content-Type": "application/json"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_json"
+    assert fakes.calls() == []
+
+
+def test_the_catalog_routes_of_an_unknown_service_are_404(client, fakes):
+    for method, route, body, *_ in CATALOG_ROUTES:
+        response = client.request(method, route.replace("svc-two", "nope"), json=body, headers=ALICE)
+        assert response.status_code == 404
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize(
+    "status,body", [(202, {"state": "downloading"}), (200, {"state": "cached"}), (400, ERROR_403), (409, DOWNLOAD_ERROR), (500, ERROR_403)]
+)
+def test_the_download_answers_of_the_service_pass_through(client, fakes, status, body):
+    fakes.hosts["svc"].answers[("POST", "/admin/models/download")] = (status, body)
+    response = client.post("/api/services/svc/models/download", json={"model": "org/a"}, headers=ALICE)
+    assert response.status_code == status
+    assert response.json() == body
+
+
+def test_a_catalog_409_and_a_dead_service_pass_through(client, fakes):
+    fakes.hosts["svc"].answers[("PUT", "/admin/catalog")] = (409, DOWNLOAD_ERROR)
+    response = client.put("/api/services/svc/catalog", json=CATALOG_BODY, headers=ALICE)
+    assert (response.status_code, response.json()) == (409, DOWNLOAD_ERROR)
+    fakes.hosts["svc"].error = httpx.ConnectError("refused")
+    response = client.get("/api/services/svc/models/fit?model=org/a", headers=ALICE)
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "service_unreachable"
+
+
+def test_a_catalog_retry_after_passes_through_when_valid(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/catalog")] = (429, ERROR_429)
+    fakes.hosts["svc"].answer_headers[("GET", "/admin/catalog")] = {"Retry-After": "9"}
+    assert client.get("/api/services/svc/catalog", headers=ALICE).headers["retry-after"] == "9"
+    fakes.hosts["svc"].answer_headers[("GET", "/admin/catalog")] = {"Retry-After": "soon"}
+    assert "retry-after" not in client.get("/api/services/svc/catalog", headers=ALICE).headers
+
+
+# ---- the page: catalog card, memory check and download state
+
+CATALOG_IDS = (
+    "catalog-card", "catalog-missing", "catalog-content", "catalog-note", "catalog-reload", "catalog-body",
+    "catalog-form", "catalog-model", "catalog-revision", "catalog-note-text", "catalog-memory", "catalog-save",
+    "catalog-status", "catalog-dialog", "catalog-remove-text", "catalog-remove-confirm", "serve-fit",
+    "st-download-row", "st-download-state", "st-download-model", "st-download-time", "st-download-error",
+)
+
+
+@pytest.mark.parametrize("element_id", CATALOG_IDS)
+def test_page_has_the_elements_of_the_catalog(element_id):
+    assert f'id="{element_id}"' in (STATIC_DIR / "index.html").read_text()
+
+
+def test_the_catalog_card_comes_before_the_cached_models():
+    page = (STATIC_DIR / "index.html").read_text()
+    panel = page[page.index('id="panel-models"'):page.index('id="panel-limits"')]
+    assert panel.index('id="catalog-card"') < panel.index('id="models-body"') < panel.index('id="serve-form"')
+    assert panel.index('id="serve-form"') < panel.index('id="serve-fit"')
+
+
+def test_the_catalog_form_fields_have_the_limits_of_an_entry():
+    page = (STATIC_DIR / "index.html").read_text()
+    memory = re.search(r'<input[^>]*id="catalog-memory"[^>]*>', page).group(0)
+    for attribute in ('type="number"', 'min="1"', 'max="10000000"', 'step="1"'):
+        assert attribute in memory, attribute
+    assert 'value="main"' in re.search(r'<input[^>]*id="catalog-revision"[^>]*>', page).group(0)
+    assert 'maxlength="500"' in re.search(r'<input[^>]*id="catalog-note-text"[^>]*>', page).group(0)
+
+
+def test_page_calls_the_five_catalog_routes():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "api(servicePath('catalog', service))" in text
+    assert "api(servicePath('catalog', service), {method: 'PUT'" in text
+    assert "api(`${servicePath('catalog', service)}${query({model, revision})}`, {method: 'DELETE'})" in text
+    assert "api(servicePath('models/download', service), {method: 'POST'" in text
+    assert "api(`${servicePath('models/fit', service)}${query({model, revision})}`)" in text
+
+
+def test_page_drops_late_answers_of_the_catalog_and_the_memory_check():
+    text = (STATIC_DIR / "app.js").read_text()
+    for name in ("catalog", "fit"):
+        assert f"current('{name}', call, service," in text, name
+    assert "const FIT_WAIT_MS = 500;" in text
+    # Each change of a field of the serve form makes an older memory check stale at once.
+    schedule = text[text.index("function scheduleFit("):text.index("async function checkFit(")]
+    assert "nextCall('fit')" in schedule and "setTimeout(checkFit, FIT_WAIT_MS)" in schedule
+
+
+def test_the_models_tab_loads_the_catalog_and_polls_for_a_download():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "models: loadModels" in text
+    status = text[text.index("async function loadStatus("):text.index("function startPoll(")]
+    assert "if (pollNeeded(status.engine))" in status
+    poll = text[text.index("async function poll("):text.index("function switchReport(")]
+    assert "if (pollNeeded(status.engine))" in poll
+    # A finished download and the end of a switch change the cached badges of the catalog.
+    assert "const reloads = pollEndReloads(follows, status.engine);" in poll
+    assert "if (reloads.catalog) loadCatalog(service);" in poll
+    assert "if (reloads.fit) recheckFit();" in poll
+
+
+def test_the_catalog_save_is_off_while_its_put_runs():
+    text = (STATIC_DIR / "app.js").read_text()
+    save = text[text.index("async function saveCatalogEntry("):text.index("function askRemoveEntry(")]
+    assert "if ($('catalog-save').disabled) return;" in save
+    assert save.index("$('catalog-save').disabled = true;") < save.index("{method: 'PUT'")
+    assert "} finally {\n    $('catalog-save').disabled = false;\n  }" in save
+    # A saved entry changes the memory check of the serve form.
+    assert "recheckFit();" in save
+
+
+def test_the_memory_check_runs_again_only_for_a_valid_pair():
+    text = (STATIC_DIR / "app.js").read_text()
+    recheck = text[text.index("function recheckFit("):text.index("async function checkFit(")]
+    assert "if (servePair()) checkFit();" in recheck
+    check = text[text.index("async function checkFit("):text.index("function clearCatalog(")]
+    assert "const pair = servePair();" in check
+
+
+def test_the_remove_of_a_catalog_entry_says_that_the_weights_stay():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("function askRemoveEntry("):text.index("async function confirmRemoveEntry(")]
+    assert "The cached weights of the model stay." in body
+    assert "$('catalog-dialog').showModal();" in body
+    clear = text[text.index("function clearServiceData("):text.index("async function refreshServices(")]
+    assert "'catalog-dialog'" in clear and "clearCatalog();" in clear
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_page_catalog_helpers(tmp_path):
+    from llm_service.gateway.weights import validate_model_name, validate_revision
+
+    names = ["org/a", "Qwen/Qwen2.5-1.5B-Instruct", "org", "org/a/b", "/a", "org/", "org/-a", "org/a-", "org/a--b",
+             "org/.a", "org/..", "org/a b", "org/a\n", "o_r.g/n-a_m.e", "org/ä", ""]
+    revisions = ["main", "v1.0", "a_b-c", "", ".", "..", "-x", "a/b", "a b", "abc\n", "ä"]
+    harness = tmp_path / "harness.js"
+    harness.write_text(
+        "const vm = require('vm');\n"
+        "const fs = require('fs');\n"
+        "const context = {URL, console, Intl, document: {addEventListener() {}},\n"
+        "  location: {pathname: '/', origin: 'https://example.test'}};\n"
+        "vm.createContext(context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {validModelName, validRevision,'\n"
+        "  + ' catalogEntry, fitText, fitBadge, needText, mibText, pollNeeded, downloadReport, pollEndReloads,'\n"
+        "  + ' validPair};', context);\n"
+        "const h = context.h;\n"
+        "const input = JSON.parse(process.argv[3]);\n"
+        "const fit = (fits, needed, available, basis, source) => h.fitText({fits, needed_mib: needed,\n"
+        "  available_mib: available, basis, available_source: source});\n"
+        "const entry = (model, revision, note, memory) => h.catalogEntry({model, revision, note, memory});\n"
+        "console.log(JSON.stringify({\n"
+        "  names: input.names.map(h.validModelName), revisions: input.revisions.map(h.validRevision),\n"
+        "  entries: [entry(' org/a ', ' ', ' Small. ', ''), entry('org/a', 'v1', '', '6000'),\n"
+        "            entry('org', 'main', '', ''), entry('org/a', 'a/b', '', ''), entry('org/a', 'main', 'x'.repeat(501), ''),\n"
+        "            entry('org/a', 'main', '\\u00e4'.repeat(500), ''), entry('org/a', 'main', '', '0'),\n"
+        "            entry('org/a', 'main', '', '10000001'), entry('org/a', 'main', '', '1.5'),\n"
+        "            entry('org/a', 'main', '', '10000000')],\n"
+        "  fits: [fit('yes', 6000, 15360, 'catalog', 'container'), fit('no', 20480, 15360, 'weights', 'nvidia-smi'),\n"
+        "         fit('unknown', null, 15360, 'unknown', 'container'), fit('unknown', 6000, null, 'catalog', null),\n"
+        "         fit('unknown', null, null, 'unknown', null)],\n"
+        "  badges: ['yes', 'no', 'unknown', undefined].map(fits => h.fitBadge({fits})),\n"
+        "  needs: [h.needText({needed_mib: 6000, basis: 'catalog'}), h.needText({needed_mib: null, basis: 'unknown'}),\n"
+        "          h.needText(undefined)],\n"
+        "  mib: [h.mibText(15360), h.mibText(6000), h.mibText(1), h.mibText(40), h.mibText(1023), h.mibText(1024),\n"
+        "        h.mibText(null)],\n"
+        "  reloads: [h.pollEndReloads({switching: true, downloading: false}, {download: null}),\n"
+        "            h.pollEndReloads({switching: false, downloading: true}, {download: {state: 'done'}}),\n"
+        "            h.pollEndReloads({switching: false, downloading: true}, {download: {state: 'failed'}}),\n"
+        "            h.pollEndReloads({switching: true, downloading: true}, {download: {state: 'done'}}),\n"
+        "            h.pollEndReloads({switching: false, downloading: false}, {download: {state: 'done'}})],\n"
+        "  pairs: [h.validPair(' org/a ', ''), h.validPair('org/a', ' v1 '), h.validPair('org', 'main'),\n"
+        "          h.validPair('org/a', 'a/b')],\n"
+        "  polls: [h.pollNeeded({state: 'loading'}), h.pollNeeded({state: 'ready', rolling_back: {model: 'org/a'}}),\n"
+        "          h.pollNeeded({state: 'ready', download: {state: 'running'}}),\n"
+        "          h.pollNeeded({state: 'ready', download: {state: 'done'}}),\n"
+        "          h.pollNeeded({state: 'ready', download: null}), h.pollNeeded({state: 'ready'})],\n"
+        "  reports: [h.downloadReport({model: 'org/a', revision: 'main', state: 'done', error: null}),\n"
+        "            h.downloadReport({model: 'org/a', revision: 'main', state: 'failed', error: 'no space.'})],\n"
+        "}));\n"
+    )
+    argument = json.dumps({"names": names, "revisions": revisions})
+    out = subprocess.run(["node", str(harness), str(STATIC_DIR / "app.js"), argument],
+                         check=True, capture_output=True, text=True).stdout
+    result = json.loads(out)
+
+    def accepted(check, value):
+        try:
+            check(value)
+        except ValueError:
+            return False
+        return True
+
+    # The page uses the rule of the service.
+    assert result["names"] == [accepted(validate_model_name, name) for name in names]
+    assert result["revisions"] == [accepted(validate_revision, revision) for revision in revisions]
+    assert result["entries"][:2] == [
+        {"entry": {"model": "org/a", "revision": "main", "note": "Small.", "gpu_memory_mib": None}},
+        {"entry": {"model": "org/a", "revision": "v1", "note": "", "gpu_memory_mib": 6000}},
+    ]
+    name_error = "The model name needs the form org/name, with letters, digits, \".\", \"_\" and \"-\"."
+    revision_error = "The revision has letters, digits, \".\", \"_\" and \"-\" only."
+    note_error = "The note has at most 500 characters."
+    memory_error = "The needed GPU memory is a whole number of MiB from 1 to 10,000,000. Leave it empty if unknown."
+    assert result["entries"][2:] == [
+        {"error": name_error}, {"error": revision_error}, {"error": note_error},
+        {"entry": {"model": "org/a", "revision": "main", "note": "ä" * 500, "gpu_memory_mib": None}},
+        {"error": memory_error}, {"error": memory_error}, {"error": memory_error},
+        {"entry": {"model": "org/a", "revision": "main", "note": "", "gpu_memory_mib": 10000000}},
+    ]
+    assert result["fits"] == [
+        {"kind": "yes", "text": "The model fits. It needs 5.9 GiB, from the catalog. "
+                                "The GPU memory of the container is 15.0 GiB."},
+        {"kind": "no", "text": "The model does not fit. It needs 20.0 GiB, from the size of the cached weights, "
+                               "plus 20 percent. The GPU memory that nvidia-smi reports is 15.0 GiB. "
+                               "A switch can still start, but the load can fail."},
+        {"kind": "unknown", "text": "The memory check has no result. The service does not know the GPU memory "
+                                    "that the model needs. Add the model to the catalog with its memory, "
+                                    "or download it first."},
+        {"kind": "unknown", "text": "The memory check has no result. "
+                                    "The service does not know the GPU memory of the container."},
+        {"kind": "unknown", "text": "The memory check has no result. The service does not know the GPU memory "
+                                    "that the model needs. Add the model to the catalog with its memory, "
+                                    "or download it first. The service does not know the GPU memory of the container."},
+    ]
+    assert result["badges"] == [{"label": "fits", "kind": "yes"}, {"label": "does not fit", "kind": "no"},
+                                {"label": "unknown", "kind": "unknown"}, {"label": "unknown", "kind": "unknown"}]
+    assert result["needs"] == [{"value": "5.9 GiB", "basis": "from the catalog"},
+                               {"value": "unknown", "basis": ""}, {"value": "unknown", "basis": ""}]
+    assert result["mib"] == ["15.0 GiB", "5.9 GiB", "1 MiB", "40 MiB", "1023 MiB", "1.0 GiB", "-"]
+    assert result["reloads"] == [{"catalog": True, "fit": False}, {"catalog": True, "fit": True},
+                                 {"catalog": False, "fit": False}, {"catalog": True, "fit": True},
+                                 {"catalog": False, "fit": False}]
+    assert result["pairs"] == [{"model": "org/a", "revision": "main"}, {"model": "org/a", "revision": "v1"},
+                               None, None]
+    assert result["polls"] == [True, True, True, False, False, False]
+    assert result["reports"] == [
+        {"text": "The download of org/a @ main is complete. The model is in the cache now.", "ok": True},
+        {"text": "The download of org/a @ main failed: no space.", "ok": False},
+    ]
+
+
+def test_a_delete_and_a_removed_entry_check_the_serve_fit_again():
+    text = (STATIC_DIR / "app.js").read_text()
+    delete = text[text.index("async function confirmDelete("):text.index("// The catalog card and the memory check")]
+    assert "recheckFit();" in delete
+    remove = text[text.index("async function confirmRemoveEntry("):text.index("function showFit(")]
+    assert "recheckFit();" in remove

@@ -82,3 +82,9 @@ def test_metrics_retention_days():
 def test_metrics_retention_days_rejects_anything_else(value):
     with pytest.raises(ValueError, match="LLM_METRICS_RETENTION_DAYS"):
         Config.from_env({"LLM_METRICS_RETENTION_DAYS": value})
+
+
+def test_gpu_memory_mib_from_llm_vram():
+    assert Config.from_env({}).gpu_memory_mib is None
+    assert Config.from_env({"LLM_VRAM": "16g"}).gpu_memory_mib == 16384
+    assert Config.from_env({"LLM_VRAM": "lots"}).gpu_memory_mib is None

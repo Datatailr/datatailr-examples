@@ -91,7 +91,7 @@ The script reads these variables at deploy time:
 |---|---|---|
 | `LLM_SERVICE_NAME` | `LLM Service` | Service name. The internal host name comes from it. |
 | `LLM_DEFAULT_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` | Model loaded at the first start. |
-| `LLM_VRAM` | `16g` | GPU memory of the container. |
+| `LLM_VRAM` | `16g` | GPU memory of the container. The service also reads it for the GPU memory check. |
 | `LLM_MEMORY` | `24g` | Memory of the container. |
 | `LLM_CPU` | `4` | CPU count of the container. |
 | `LLM_ADMIN_GROUP` | not set | Platform group whose members are admins. |
@@ -334,6 +334,7 @@ The service does not remove a model that it needs. The call returns status 409 w
 - the target of a running switch
 - the model of a running rollback
 - a model that another delete removes now
+- the model of a running download, also before its files reach blob storage
 
 The call also returns 409 `model_in_use` while the service starts. A switch to a model that the service removes gets the same error.
 
@@ -341,6 +342,7 @@ The other errors:
 
 - 400 `invalid_model`: the model name or the revision is not valid.
 - 404 `model_not_found`: no stored revision matches.
+- 409 `download_in_progress`: a download of another model runs now. Delete after it ends.
 - 500 `delete_failed`: a removal failed. The revisions removed before the error stay removed.
 
 After a failed delete, send the same delete again. The second delete removes the files that the failed delete left. Each delete makes one audit record.
@@ -361,7 +363,7 @@ A request that has an acting user has the extra field `via` with the name of the
 
 The field `ttft_ms` is the time in milliseconds from the start of the request to the first content of a stream. It is `null` for a request without a stream and for a request without content. A record from before the load numbers has no `ttft_ms` field.
 
-A model load or delete record has the field `event` (`model_switch`, `engine_reload` or `model_delete`) and the field `detail` with the revision or the error. A request record has `event` and `detail` set to `null`.
+A record of a model event has the field `event`. Its value is `model_switch`, `engine_reload`, `model_delete`, `model_download` or `catalog_change`. The field `detail` holds the revision, the error or the catalog change. A request record has `event` and `detail` set to `null`.
 
 To read the prompt, open one record. Give the request id from the list and the UTC day of the record time. The day must have the form `YYYY-MM-DD`:
 
@@ -407,6 +409,145 @@ The filters are `since`, `until`, `user` and `model`. The values of `since` and 
 Each row has the request count, the failed request count, the prompt, completion and total tokens, and the time of the last request.
 
 To read one user with the split by model and by day, call `/admin/usage/bob`. Each user can read their own usage at `/v1/usage/me`. This call is not part of the OpenAI API.
+
+## Model catalog
+
+An admin keeps a list of recommended models, downloads a model before a switch, and checks whether a model fits in the GPU memory. All three work without a switch. A model that is not in the catalog still works with the switch and the download.
+
+In the commands of this part, `BASE` is `http://llm-service` and `COOKIE` is the login cookie, as in the parts above.
+
+### The catalog
+
+The service keeps the catalog in `catalog.json` under `LLM_BLOB_ROOT`. It reads the file at the start. A missing or broken file means an empty catalog, and the service logs an error for a broken file. An entry has these fields:
+
+| Field | Meaning |
+|---|---|
+| `model` | The Hugging Face repository, with the same checks as the model switch. |
+| `revision` | The revision, with the same checks as the model switch. |
+| `note` | A text of at most 500 characters. The default is an empty text. |
+| `gpu_memory_mib` | The GPU memory that the model needs, in MiB, if you know it. Null or a whole number from 1 to 10,000,000. The default is null. |
+
+The pair `model` and `revision` is the key of an entry. An entry has no other field. The catalog has at most 200 entries.
+
+### Download without a switch
+
+A download puts the weights of a model in the cache and does not touch the served model:
+
+```bash
+curl -X POST "$BASE/admin/models/download" \
+  -H "Cookie: $COOKIE" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen2.5-0.5B-Instruct", "revision": "main"}'
+```
+
+The field `revision` is optional. The call returns status 202 and the download runs in the background. The body of the 202 answer is the model status of `GET /admin/model`. Its field `state` is the state of the engine, not of the download. The field `download` holds the new download. A client tells a new download from a cached model by the HTTP status: 202 or 200. The service downloads the files from Hugging Face and stores them in blob storage. Then it removes the local copy, unless the service needs the model.
+
+Read the state in the field `download` of `GET /admin/model`. The field is null before the first download. It has these keys:
+
+- `model` and `revision`: the pair.
+- `state`: `running`, `done` or `failed`.
+- `error`: null, or the error text, cut to 300 characters. A download that the service stops at shutdown ends as `failed` with the error `cancelled`.
+- `started_at`: the start time in UTC.
+
+The last result stays until the next download starts. The service writes the audit event `model_download` when a download ends.
+
+The rules of the download:
+
+- One download runs at a time. A second call gets 409 `download_in_progress`.
+- A model that is in the cache already gets status 200 and the body `{"state": "cached", "model": ..., "revision": ...}`. The service starts nothing.
+- An admin switch during a download waits for the lock of the weight cache, also a switch to another model. A switch to the same model then finds the files.
+- An automatic reload after an engine exit and a rollback after a failed switch do not wait for a download. They use the complete local copy of the model when it exists.
+- A delete of the model that downloads gets 409 `model_in_use`. This holds also before the first file reaches blob storage.
+- A delete of another model during a download gets 409 `download_in_progress` with the message "A model download runs now. Delete after it ends."
+- A pair that a delete removes now gets 409 `model_in_use`. While a delete of another model runs, a download also gets 409 `model_in_use` with the message "A delete runs now. Download after it ends."
+- A bad name or revision gets 400 `invalid_model`.
+- A store error in the check of the cache gets 500 `cache_check_failed`.
+
+### The GPU memory check
+
+The check tells an admin whether a model fits before a switch. The revision is `main` when absent:
+
+```bash
+curl "$BASE/admin/models/fit?model=Qwen/Qwen2.5-1.5B-Instruct&revision=main" \
+  -H "Cookie: $COOKIE"
+```
+
+```json
+{"fits": "yes", "needed_mib": 6000, "available_mib": 15360, "basis": "catalog", "available_source": "container"}
+```
+
+The service takes the needed memory from the first source that has a number:
+
+| `basis` | Source |
+|---|---|
+| `catalog` | The `gpu_memory_mib` of the catalog entry. |
+| `weights` | The size of the cached weights times 1.2, rounded up to a whole MiB. The margin of 1.2 covers the working memory of the engine for a short context. |
+| `unknown` | The entry has no `gpu_memory_mib` and the model is not in the cache. `needed_mib` is null. |
+
+The available memory has two sources:
+
+| `available_source` | Source |
+|---|---|
+| `nvidia-smi` | The total GPU memory from `nvidia-smi` in the last load sample. |
+| `container` | The deploy value `LLM_VRAM`. The service uses it when `nvidia-smi` gives no number. Without `nvidia-smi` in the container, this is the usual case. |
+| null | `nvidia-smi` gives no number and `LLM_VRAM` is bad. `available_mib` is null. |
+
+The deploy script always passes `LLM_VRAM` to the service. The default is `16g`. The service reads the units `m`, `g` and `t` as binary units, so `16g` is 16,384 MiB.
+
+The field `fits` is `yes` when the needed memory is at most the available memory. It is `no` when the needed memory is larger. It is `unknown` when a number is missing. If the service cannot read blob storage, the answer uses the catalog only, and the call does not fail. A bad name gets 400 `invalid_model`.
+
+### The catalog endpoints
+
+All five endpoints are for admins. A user without admin rights gets 403.
+
+```bash
+# Read the entries. Each entry has `cached`, `fit` and the flag `loaded` for the whole list
+curl "$BASE/admin/catalog" -H "Cookie: $COOKIE"
+
+# Add an entry, or replace the entry with the same pair
+curl -X PUT "$BASE/admin/catalog" \
+  -H "Cookie: $COOKIE" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen2.5-1.5B-Instruct", "revision": "main", "note": "Small and fast. Good for tests.", "gpu_memory_mib": 6000}'
+
+# Remove an entry. The cached files stay in blob storage
+curl -X DELETE "$BASE/admin/catalog?model=Qwen/Qwen2.5-1.5B-Instruct&revision=main" \
+  -H "Cookie: $COOKIE"
+
+# Download a model, and check the fit
+curl -X POST "$BASE/admin/models/download" -H "Cookie: $COOKIE" \
+  -H "Content-Type: application/json" -d '{"model": "Qwen/Qwen2.5-0.5B-Instruct"}'
+curl "$BASE/admin/models/fit?model=Qwen/Qwen2.5-0.5B-Instruct" -H "Cookie: $COOKIE"
+```
+
+| Endpoint | Answer |
+|---|---|
+| `GET /admin/catalog` | Status 200 and `{"models": [...], "loaded": true}`. `cached` is true when the pair is in the cache. `fit` is the answer of the check. `loaded` is false when the service cannot read `catalog.json` now. The list is then empty. |
+| `PUT /admin/catalog` | Status 200 and the stored entry. The errors are 400 `invalid_catalog_entry`, 409 `catalog_full` and 502 `storage_unavailable`. |
+| `DELETE /admin/catalog` | Status 200 and `{"removed": {"model": ..., "revision": ...}}`. The revision is `main` when absent. The errors are 400 `invalid_catalog_entry`, 404 `catalog_entry_not_found` and 502 `storage_unavailable`. |
+| `POST /admin/models/download` | See above. |
+| `GET /admin/models/fit` | See above. |
+
+When the service cannot write `catalog.json`, it answers 502 and keeps the old catalog. After a failed read, the next write or the next flush tries to read the file again. Each change of the catalog writes the audit event `catalog_change` with the admin name, the target (`model@revision`) and the old and new entries.
+
+The admin app has a route for each endpoint under `/api/services/{name}/`: `catalog` (GET, PUT and DELETE), `models/download` and `models/fit`. Each route passes the status and the body of the service through.
+
+### The Catalog card
+
+The Models tab of the admin app has the card "Catalog". It has one row for each entry, with the model, the revision, the note, the needed memory, a fit badge and a cached badge. The badges read `fits`, `does not fit` or `unknown`, and `cached` or `not cached`. Each row has the buttons Serve and Remove from the list. A row that is not cached also has the button Download. Serve fills the serve form and starts the switch. Remove asks for a confirmation and keeps the cached weights. A form under the table adds an entry or replaces the entry with the same pair. A Reload button reads the catalog again. A service without the catalog endpoints shows a note instead of the table.
+
+Under the form "Serve a model", a note shows the fit result for the typed model. A result `does not fit` is a warning. The note says that a switch can still start. It does not block the Serve button. The page runs the check again when a download ends or an entry of the catalog is saved. The end of a switch or a download reads the catalog again.
+
+A running download shows in the engine card with its state, its model and its start time. The tab reads the state of the service each 3 seconds while a switch or a download runs.
+
+### Limits of the model catalog
+
+- The check is an estimate. It does not know the context length or the arguments of the engine. A model that fits can still fail with a long context.
+- The switch does not use the check. An admin can start a switch with each result.
+- A restart of the service forgets a running download. The partial files do not count as a cached copy, so the next download of the pair starts again.
+- One download runs at a time, and the service has no queue.
+- A stop of the service during a download lasts until the fetch thread ends or the platform ends the process. The audit event then says `cancelled`, although the files can be complete.
+- The `nvidia-smi` total is the sum over all GPUs of the node. On a node with several GPUs, the check can say `fits` for a model that needs one GPU.
 
 ## Limits for each user
 
@@ -646,7 +787,7 @@ The platform signs each call of the app as the user who deployed the app. The se
 Each viewer needs access to a service to see anything from it. The service checks this for the viewer, with `LLM_ACCESS_GROUP`. If the service does not answer this check, the page shows "The service did not answer." for it. The Usage tab then names that service as a service without numbers.
 
 - Each user with access sees the Usage tab with their own numbers, and the Connect tab. The Connect tab has the card "Your limits".
-- An admin of a service also sees the numbers of all users of that service. An admin also sees the Audit, Models, Limits and Load tabs. An admin switches the model and deletes cached weights in the Models tab. An admin sets limits in the Limits tab.
+- An admin of a service also sees the numbers of all users of that service. An admin also sees the Audit, Models, Limits and Load tabs. An admin switches the model, deletes cached weights and keeps the model catalog in the Models tab. An admin sets limits in the Limits tab.
 - With "All services" picked, the Usage tab shows totals over all services, by user, by service and by day. A line names each service whose numbers are missing. Another line names each service where the viewer sees only their own numbers.
 - The Audit, Models and Limits tabs work with one service. With "All services" they ask the viewer to pick one. The Load tab shows a table of the services where the viewer is an admin instead.
 
@@ -683,6 +824,7 @@ All data is in blob storage, under the root directory in `LLM_BLOB_ROOT`:
 <root>/usage/<day>.json                              # totals of one finished day
 <root>/usage/<day>.partial.json                      # checkpoint of the current day
 <root>/limits.json                                   # the limits of the users, if an admin set any
+<root>/catalog.json                                  # the model catalog, if an admin added an entry
 <root>/metrics/<day>/<writer>.jsonl                  # load points of one process on one UTC day
 ```
 
@@ -722,6 +864,7 @@ The first start after the upgrade reads every old layout file of the days withou
 - The service has no load numbers for the minutes when it did not run.
 - A history read makes one listing of `<root>/metrics/` and one read for each file of the range. Each process that ran on a day has its own file. A day with many restarts has many small files, and its read takes longer.
 - A point of a merged history range holds the maximum of the merged percentiles. It is not the true percentile of the longer time.
+- The model catalog and the GPU memory check have their own limits. See [Limits of the model catalog](#limits-of-the-model-catalog).
 - The platform does not start GPU nodes. You must start one.
 
 ## Run the tests

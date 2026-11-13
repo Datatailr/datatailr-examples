@@ -260,7 +260,7 @@ def create_app(
 
         The answer is the status, the body and the headers to pass on.
 
-        `action` marks a switch or a delete. It waits longer. Its timeout message
+        `action` marks a switch, a delete or a download. It waits longer. Its timeout message
         says that the action can still finish.
         """
         viewer = viewer_or_error(request)
@@ -532,6 +532,46 @@ def create_app(
         if path is None:
             return _error(400, "invalid_model", "The model id is not valid.", "invalid_request_error")
         return await call(request, name, "DELETE", path, action=True, params=_query(request, ("revision",)))
+
+    async def json_body(request: Request) -> object | JSONResponse:
+        """Return the JSON body of a write request, or the error response to send."""
+        # A form on another site cannot send this content type without a CORS preflight.
+        if not _is_json(request):
+            return _error(
+                415, "unsupported_media_type", "The request body must be application/json.", "invalid_request_error"
+            )
+        try:
+            return await request.json()
+        except (ValueError, RecursionError):  # deeply nested JSON raises RecursionError
+            return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
+
+    @app.get("/api/services/{name}/catalog")
+    async def get_catalog(name: str, request: Request) -> JSONResponse:
+        return await call(request, name, "GET", "/admin/catalog")
+
+    @app.put("/api/services/{name}/catalog")
+    async def put_catalog(name: str, request: Request) -> JSONResponse:
+        body = await json_body(request)
+        if isinstance(body, JSONResponse):
+            return body
+        return await call(request, name, "PUT", "/admin/catalog", json=body)
+
+    @app.delete("/api/services/{name}/catalog")
+    async def delete_catalog_entry(name: str, request: Request) -> JSONResponse:
+        params = _query(request, ("model", "revision"))
+        return await call(request, name, "DELETE", "/admin/catalog", params=params)
+
+    @app.post("/api/services/{name}/models/download")
+    async def download_model(name: str, request: Request) -> JSONResponse:
+        body = await json_body(request)
+        if isinstance(body, JSONResponse):
+            return body
+        return await call(request, name, "POST", "/admin/models/download", action=True, json=body)
+
+    @app.get("/api/services/{name}/models/fit")
+    async def model_fit(name: str, request: Request) -> JSONResponse:
+        params = _query(request, ("model", "revision"))
+        return await call(request, name, "GET", "/admin/models/fit", params=params)
 
     @app.get("/api/services/{name}/usage/{user}")
     async def usage_of_user(name: str, user: str, request: Request) -> JSONResponse:
