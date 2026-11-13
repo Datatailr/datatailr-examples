@@ -10,8 +10,8 @@ from typing import Mapping
 MAX_RETENTION_DAYS = 36500  # 100 years
 
 
-def _retention_days(value: str | None) -> int | None:
-    """Return the days to keep prompts, or None for no limit. Raise `ValueError` for a bad value."""
+def _retention_days(value: str | None, name: str = "LLM_PROMPT_RETENTION_DAYS") -> int | None:
+    """Return the days to keep data, or None for no limit. Raise `ValueError` for a bad value."""
     text = (value or "").strip()
     if not text:
         return None
@@ -19,7 +19,7 @@ def _retention_days(value: str | None) -> int | None:
     if 1 <= days <= MAX_RETENTION_DAYS:
         return days
     raise ValueError(
-        f"LLM_PROMPT_RETENTION_DAYS must be a whole number from 1 to {MAX_RETENTION_DAYS}, "
+        f"{name} must be a whole number from 1 to {MAX_RETENTION_DAYS}, "
         f"not {text[:40]!r}"
     )
 
@@ -40,6 +40,7 @@ class Config:
     flush_interval: float = 5.0
     flush_size: int = 100
     prompt_retention_days: int | None = None
+    metrics_retention_days: int = 30
     job_name: str = "unknown"
     environment: str = "unknown"
 
@@ -57,6 +58,10 @@ class Config:
             local_dir=Path(env.get("LLM_LOCAL_DIR") or "/tmp/llm-service"),
             engine_port=int(env.get("LLM_ENGINE_PORT") or 8001),
             prompt_retention_days=_retention_days(env.get("LLM_PROMPT_RETENTION_DAYS")),
+            metrics_retention_days=(
+                _retention_days(env.get("LLM_METRICS_RETENTION_DAYS"), "LLM_METRICS_RETENTION_DAYS")
+                or cls.metrics_retention_days
+            ),
             job_name=env.get("DATATAILR_JOB_NAME") or cls.job_name,
             environment=env.get("DATATAILR_JOB_ENVIRONMENT") or cls.environment,
         )
