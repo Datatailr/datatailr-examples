@@ -2074,3 +2074,26 @@ def test_each_change_is_audited_with_old_and_new(tmp_path):
         )
         prompt = full_record(c, events[0])["prompt"]
         assert prompt["event"] == "limits_change" and set(prompt) == {"event", "target", "old", "new"}
+
+
+def test_get_limits_keeps_a_user_with_tokens_today_after_the_window_ends(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": FULL})
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        # The request window of bob ends, as it does after 60 seconds and after a restart.
+        c.app.state.limiter._users.clear()
+        body = c.get("/admin/limits", headers=ALICE).json()
+        assert body["use"]["bob"] == {"requests_last_minute": 0, "tokens_today": 5, "parallel_requests": 0}
+        assert body["effective"]["bob"]["source"] == "default"
+
+
+def test_an_admin_whose_entry_goes_away_gets_no_limit_from_the_default(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": FULL, "users": {"alice": {"requests_per_minute": 1}}})
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200
+        assert c.post(CHAT, headers=ALICE, json=HI).status_code == 429
+        assert c.delete("/admin/limits/users/alice", headers=ALICE).status_code == 200
+        for _ in range(FULL["requests_per_minute"] + 2):
+            assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200

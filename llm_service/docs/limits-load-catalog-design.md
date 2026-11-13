@@ -125,7 +125,7 @@ The answer of `GET /v1/limits/me`:
 
 `source` is `user`, `default`, `admin` or `none`. `loaded` is false while the read of the limits file fails.
 
-The answer of `GET /admin/limits` lists each user with an entry or with use now:
+The answer of `GET /admin/limits` lists each user with an entry, with use now or with tokens today:
 
 ```json
 {

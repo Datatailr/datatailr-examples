@@ -872,3 +872,11 @@ def test_tokens_today_matches_the_totals_with_two_file_rows_of_one_user_and_mode
     usage.tokens_today("alice")  # the running total of the day exists before the load
     usage.load()
     assert usage.tokens_today("alice") == _scan(usage, "alice") == 7
+
+
+def test_users_today_lists_the_users_with_tokens_in_the_current_day():
+    _, audit, usage, state = make(today=D2)
+    seed(audit)
+    assert usage.users_today() == ["alice"]  # bob has use on the day before only
+    state["today"] = D1
+    assert "bob" in usage.users_today()

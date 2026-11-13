@@ -125,7 +125,7 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 | `GET /admin/audit/users` | The users in the log, with the first and last request time of each. |
 | `GET /admin/usage` | Usage totals. Filters: `since`, `until` (days in the form `YYYY-MM-DD`), `user`, `model`. `group_by` is `user` (default), `model` or `day`. |
 | `GET /admin/usage/{user}` | The totals of one user, by model and by day. |
-| `GET /admin/limits` | The default limits, the user entries, and `loaded`. For each user who has an entry or use now: the current use, and the effective limits with their source. |
+| `GET /admin/limits` | The default limits, the user entries, and `loaded`. For each user who has an entry, use now or tokens today: the current use, and the effective limits with their source. |
 | `PUT /admin/limits/default` | Replaces the default limits. The body has the three limit fields. |
 | `PUT /admin/limits/users/{name}` | Sets the entry of one user. The body has one to three limit fields. |
 | `DELETE /admin/limits/users/{name}` | Removes the entry of one user. The answer is 404 `limit_not_found` without an entry. |
