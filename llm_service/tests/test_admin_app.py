@@ -1773,6 +1773,37 @@ def test_load_a_hanging_service_times_out_and_the_others_answer(client, fakes, m
     assert body["services"][1]["ok"] is True
 
 
+def test_load_lists_a_service_that_is_not_ok_and_does_not_call_it(client, fakes):
+    fakes.hosts["svc"].caller_admin = False
+    client.portal.call(client.app.state.registry.refresh)
+    fakes.requests.clear()
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc-two"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    entry = client.app.state.registry.entries()[0]
+    assert entry.name == "svc" and entry.state != "ok"
+    response = client.get("/api/load", headers=ALICE)
+    assert response.status_code == 200
+    services = response.json()["services"]
+    assert services[0] == {"name": "svc", "ok": False, "error": f"The service has the state {entry.state}."}
+    assert services[1]["name"] == "svc-two" and services[1]["ok"] is True
+    assert {r.url.host for r in fakes.requests} == {"svc-two"}
+
+
+def test_metrics_history_without_times_sends_no_time_parameters(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/history")] = (200, {"step_seconds": 60, "points": []})
+    assert client.get("/api/services/svc/metrics/history", headers=ALICE).status_code == 200
+    (sent,) = fakes.calls("/admin/metrics")
+    assert "since" not in sent.url.params and "until" not in sent.url.params
+
+
+@pytest.mark.parametrize("route", ["live", "history"])
+def test_metrics_routes_refuse_a_bad_service_name_without_a_call(client, fakes, route):
+    response = client.get(f"/api/services/Bad_Name/metrics/{route}", headers=ALICE)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_service"
+    assert fakes.calls() == []
+
+
 def test_load_needs_a_user(client, fakes):
     assert client.get("/api/load").status_code == 401
     assert fakes.requests == []

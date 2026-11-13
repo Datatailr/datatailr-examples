@@ -708,8 +708,8 @@ def create_app(
         """
         try:
             limit = LOAD_TIMEOUT_SECONDS
-            call = service.request(name, "GET", "/admin/metrics/live", viewer, timeout=limit)
-            status, body = await asyncio.wait_for(call, limit)
+            pending = service.request(name, "GET", "/admin/metrics/live", viewer, timeout=limit)
+            status, body = await asyncio.wait_for(pending, limit)
             if status == 403:
                 return None, None, False
             if status == 404:
@@ -733,15 +733,21 @@ def create_app(
         """Return the numbers of this moment of each service where the viewer is an admin.
 
         The answer is 200 also when each service fails. A service whose role
-        call fails appears with `ok` false. A service where the viewer is not an
-        admin stays out. So does a service with a state other than `ok`.
+        call fails appears with `ok` false. So does a service with a state other
+        than `ok`, and it gets no call. A service where the viewer is not an
+        admin stays out.
         """
         viewer = viewer_or_error(request)
         if isinstance(viewer, JSONResponse):
             return viewer
-        entries = [e for e in registry.entries() if e.state == "ok"]
+        all_entries = registry.entries()
+        entries = [e for e in all_entries if e.state == "ok"]
         found = await asyncio.gather(*(roles(viewer, e.name) for e in entries))
-        rows: dict[str, dict] = {}
+        rows: dict[str, dict] = {
+            e.name: {"name": e.name, "ok": False, "error": f"The service has the state {e.state}."}
+            for e in all_entries
+            if e.state != "ok"
+        }
         chosen = []
         for entry, role in zip(entries, found):
             if role["access"] is None:
@@ -755,7 +761,7 @@ def create_app(
             rows[name] = {"name": name, "ok": True, "now": now} if error is None else {
                 "name": name, "ok": False, "error": error
             }
-        return JSONResponse({"services": [rows[e.name] for e in entries if e.name in rows]})
+        return JSONResponse({"services": [rows[e.name] for e in all_entries if e.name in rows]})
 
     @app.get("/")
     async def index() -> FileResponse:
