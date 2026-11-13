@@ -900,16 +900,31 @@ def test_page_limit_helpers(tmp_path):
 LOAD_IDS = (
     "tab-load", "panel-load", "load-missing", "load-note", "load-note-text", "load-retry", "load-one", "load-all",
     "load-dates", "load-since", "load-until", "load-dates-status", "load-now-text", "load-minute-text",
-    "load-in-flight", "load-waiting", "load-completion-rate", "load-prompt-rate", "load-gpu",
+    "load-in-flight", "load-waiting", "load-completion-rate", "load-prompt-rate", "load-kv-cache", "load-gpu",
     "load-requests", "load-failed", "load-ttft-p50", "load-ttft-p95", "load-duration-p50", "load-duration-p95",
     "load-range-text", "load-days-note", "load-charts", "chart-load-requests", "chart-load-tokens",
-    "chart-load-ttft", "chart-load-duration", "chart-load-queue", "chart-load-gpu", "load-all-text", "load-all-body",
+    "chart-load-ttft", "chart-load-duration", "chart-load-queue", "chart-load-engine", "load-all-text", "load-all-body",
 )
 
 
 @pytest.mark.parametrize("element_id", LOAD_IDS)
 def test_page_has_the_elements_of_the_load_tab(element_id):
     assert f'id="{element_id}"' in (STATIC_DIR / "index.html").read_text()
+
+
+def test_load_tab_shows_the_kv_cache_use():
+    page = (STATIC_DIR / "index.html").read_text()
+    assert 'id="chart-load-gpu"' not in page
+    assert page.index('id="load-kv-cache"') < page.index('id="load-gpu"')
+    assert '<div class="label">KV cache use</div>' in page
+    assert '<h2>Engine memory <span class="caption">Maximum</span></h2>' in page
+    head = page[page.index('id="load-all"'):page.index('id="load-all-body"')]
+    assert head.index(">KV cache use</th>") < head.index(">GPU memory used</th>")
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "$('load-kv-cache').textContent = percentText(at.kv_cache_use);" in text
+    assert "el('td', {className: 'num', text: percentText(now.kv_cache_use)})" in text
+    assert "colspan: 6," in text and "services.map(loadRow), 7," in text
+    assert "'load-kv-cache'" in text[text.index("const LOAD_TILES"):text.index("// The steps of the time axis")]
 
 
 def test_page_offers_the_ranges_of_the_load_tab():
@@ -977,7 +992,8 @@ def test_page_load_helpers(tmp_path):
         "  location: {pathname: '/', origin: 'https://example.test'}};\n"
         "vm.createContext(context);\n"
         "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {loadSeries, loadRange, stepText,'\n"
-        "  + ' msText, rateText, gpuText, localInputValue, loadMissing, ApiError, LOAD_CHARTS};', context);\n"
+        "  + ' msText, rateText, gpuText, percentText, loadChartData, localInputValue, loadMissing, ApiError,'\n"
+        "  + ' LOAD_CHARTS};', context);\n"
         "const h = context.h;\n"
         "const point = (ts, extra = {}) => ({ts, requests: 2, failed_requests: 0, ttft_ms_p50: 300, ...extra});\n"
         "const now = Date.parse('2026-11-12T12:00:00Z');\n"
@@ -987,6 +1003,12 @@ def test_page_load_helpers(tmp_path):
         "const merged = h.loadSeries([point('2026-11-12T10:05:00Z'), point('2026-11-12T10:00:00Z'),\n"
         "                             point('2026-11-12T10:15:00Z')], 300);\n"
         "const missing = (status, code) => h.loadMissing(new h.ApiError('x', {status, code}));\n"
+        "const engine = h.LOAD_CHARTS.find(c => c.id === 'chart-load-engine');\n"
+        "const kvSeries = h.loadSeries([point('2026-11-12T10:00:00Z', {kv_cache_use_max: 0.4}),\n"
+        "  point('2026-11-12T10:01:00Z', {kv_cache_use_max: null}), point('2026-11-12T10:02:00Z'),\n"
+        "  point('2026-11-12T10:03:00Z', {kv_cache_use_max: 0.9})], 60);\n"
+        "const gpuSeries = h.loadSeries([point('2026-11-12T10:00:00Z', {kv_cache_use_max: 0.1, gpu_memory_used_max: 2048}),\n"
+        "  point('2026-11-12T10:01:00Z', {gpu_memory_used_max: null})], 60);\n"
         "console.log(JSON.stringify({\n"
         "  requests: pick(live, 'requests'), ttft: pick(live, 'ttft_ms_p50'), prompt: pick(live, 'prompt_tokens'),\n"
         "  merged: pick(merged, 'requests'), empty: h.loadSeries(undefined, 60).requests,\n"
@@ -1000,7 +1022,12 @@ def test_page_load_helpers(tmp_path):
         "  rates: [h.rateText(96.54), h.rateText(0), h.rateText(null), h.rateText('7')],\n"
         "  gpu: [h.gpuText(14200, 15360), h.gpuText(14200, null), h.gpuText(null, 15360)],\n"
         "  steps: [60, 300, 3600, 7200, 5400, null].map(h.stepText),\n"
-        "  gpuFormat: [null, 13.5].map(h.LOAD_CHARTS.find(c => c.id === 'chart-load-gpu').format),\n"
+        "  percent: [0.37, 0.375, 0, 1, 0.004, null, undefined, '0.5'].map(h.percentText),\n"
+        "  engine: engine.series.map(([name, label, , , gib]) => [name, label, Boolean(gib)]),\n"
+        "  engineFormats: [engine.format(0.5), engine.format(null)],\n"
+        "  kv: pick(kvSeries, 'kv_cache_use_max'),\n"
+        "  kvData: h.loadChartData(engine, kvSeries).map(d => [d.data.map(p => p.y), d.shown]),\n"
+        "  gpuData: h.loadChartData(engine, gpuSeries).map(d => [d.data.map(p => p.y), d.shown]),\n"
         "  input: h.localInputValue(new Date('2026-11-12T09:05:00Z')),\n"
         "  missing: [missing(404, 'not_found'), missing(404, 'unknown_service'), missing(502, null)],\n"
         "}));\n"
@@ -1037,7 +1064,16 @@ def test_page_load_helpers(tmp_path):
     assert result["steps"] == ["One point for each minute.", "One point for each 5 minutes.",
                                "One point for each hour.", "One point for each 2 hours.",
                                "One point for each 90 minutes.", ""]
-    assert result["gpuFormat"] == ["-", "13.5 GiB"]
+    assert result["percent"] == ["37%", "38%", "0%", "100%", "0%", "-", "-", "-"]
+    # The engine chart: the KV cache use as a fraction on the first axis, the GPU memory on a second axis.
+    assert result["engine"] == [["kv_cache_use_max", "KV cache use", False],
+                                ["gpu_memory_used_max", "GPU memory used", True]]
+    assert result["engineFormats"] == ["50%", "-"]
+    # A null value, and a point without the field, are gaps.
+    assert result["kv"] == [["10:00", 0.4], ["10:01", None], ["10:02", None], ["10:03", 0.9]]
+    # The GPU memory line shows only when a point has a value. Its values are GiB.
+    assert result["kvData"] == [[[0.4, None, None, 0.9], True], [[None, None, None, None], False]]
+    assert result["gpuData"] == [[[0.1, None], True], [[2, None], True]]
     assert result["input"] == "2026-11-12T10:05"
     assert result["missing"] == [True, False, False]
 
@@ -1740,6 +1776,7 @@ LIVE_NOW = {
     "in_flight": 3,
     "running": 3,
     "waiting": 0,
+    "kv_cache_use": 0.37,
     "prompt_tokens_per_s": 210.0,
     "completion_tokens_per_s": None,
     "gpu_memory_used": 14200,

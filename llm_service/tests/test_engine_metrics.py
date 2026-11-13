@@ -8,6 +8,7 @@ import subprocess
 import time
 
 import httpx
+import pytest
 
 from llm_service.gateway.engine_metrics import (
     EngineReader,
@@ -25,19 +26,22 @@ vllm:num_requests_running{model_name="org/m"} 3.0
 vllm:num_requests_waiting{model_name="org/m"} 2.0
 vllm:prompt_tokens_total{model_name="org/m"} 9100.0
 vllm:generation_tokens_total{model_name="org/m"} 5200.0
+vllm:kv_cache_usage_perc{model_name="org/m"} 0.25
 """
 
 
-def test_parse_metrics_all_four_names():
+def test_parse_metrics_all_five_names():
     numbers, names = parse_metrics(FULL_TEXT)
     assert numbers == {
         "running": 3.0,
         "waiting": 2.0,
         "prompt_tokens_total": 9100.0,
         "completion_tokens_total": 5200.0,
+        "kv_cache_use": 0.25,
     }
     assert names == [
         "vllm:generation_tokens_total",
+        "vllm:kv_cache_usage_perc",
         "vllm:num_requests_running",
         "vllm:num_requests_waiting",
         "vllm:prompt_tokens_total",
@@ -64,6 +68,50 @@ def test_parse_metrics_missing_name_is_none():
     assert numbers["waiting"] == 0.0
     assert numbers["prompt_tokens_total"] is None
     assert numbers["completion_tokens_total"] is None
+
+
+def test_parse_metrics_kv_cache_use_newer_name():
+    numbers, _ = parse_metrics('vllm:kv_cache_usage_perc{engine="0"} 0.37\n')
+    assert numbers["kv_cache_use"] == pytest.approx(0.37)
+
+
+def test_parse_metrics_kv_cache_use_older_name():
+    numbers, _ = parse_metrics('vllm:gpu_cache_usage_perc{engine="0"} 0.5\n')
+    assert numbers["kv_cache_use"] == pytest.approx(0.5)
+
+
+def test_parse_metrics_kv_cache_use_newer_name_wins():
+    text = "vllm:gpu_cache_usage_perc 0.9\nvllm:kv_cache_usage_perc 0.1\n"
+    numbers, _ = parse_metrics(text)
+    assert numbers["kv_cache_use"] == pytest.approx(0.1)
+
+
+def test_parse_metrics_kv_cache_use_is_the_maximum_of_label_sets():
+    text = (
+        'vllm:kv_cache_usage_perc{engine="0"} 0.4\n'
+        'vllm:kv_cache_usage_perc{engine="1"} 0.7\n'
+    )
+    numbers, _ = parse_metrics(text)
+    assert numbers["kv_cache_use"] == pytest.approx(0.7)
+
+
+def test_parse_metrics_kv_cache_use_percent_is_a_fraction():
+    numbers, _ = parse_metrics("vllm:kv_cache_usage_perc 37.5\n")
+    assert numbers["kv_cache_use"] == pytest.approx(0.375)
+
+
+def test_parse_metrics_kv_cache_use_is_clamped():
+    numbers, _ = parse_metrics("vllm:kv_cache_usage_perc 1.02\n")
+    assert numbers["kv_cache_use"] == 1.0
+    numbers, _ = parse_metrics("vllm:kv_cache_usage_perc -0.01\n")
+    assert numbers["kv_cache_use"] == 0.0
+    numbers, _ = parse_metrics("vllm:kv_cache_usage_perc 101\n")
+    assert numbers["kv_cache_use"] == 1.0
+
+
+def test_parse_metrics_kv_cache_use_missing_is_none():
+    numbers, _ = parse_metrics("vllm:num_requests_running 1\n")
+    assert numbers["kv_cache_use"] is None
 
 
 def test_parse_metrics_sums_label_sets():
@@ -134,6 +182,7 @@ def test_parse_metrics_empty_text():
         "waiting": None,
         "prompt_tokens_total": None,
         "completion_tokens_total": None,
+        "kv_cache_use": None,
     }
     assert names == []
 
@@ -209,6 +258,7 @@ def test_engine_reader_good_answer():
         "waiting": 2.0,
         "prompt_tokens_total": 9100.0,
         "completion_tokens_total": 5200.0,
+        "kv_cache_use": 0.25,
     }
 
 
@@ -232,6 +282,7 @@ ALL_NONE = {
     "waiting": None,
     "prompt_tokens_total": None,
     "completion_tokens_total": None,
+    "kv_cache_use": None,
 }
 
 
@@ -278,6 +329,15 @@ def test_engine_reader_logs_missing_numbers_once_and_again_on_change(caplog):
     assert "prompt_tokens_total" in warnings[0]
     assert "waiting" in warnings[0]
     assert "waiting" not in warnings[1].split("saw")[0]
+
+
+def test_engine_reader_warns_for_a_missing_kv_cache_use(caplog):
+    caplog.set_level(logging.DEBUG, logger=LOGGER_NAME)
+    text = FULL_TEXT.replace('vllm:kv_cache_usage_perc{model_name="org/m"} 0.25\n', "")
+    (numbers,) = _run_reads(lambda request: httpx.Response(200, text=text))
+    assert numbers["kv_cache_use"] is None
+    (warning,) = _messages(caplog, logging.WARNING)
+    assert "No known metric name for: kv_cache_use." in warning
 
 
 def test_engine_reader_missing_warning_repeats_after_the_set_clears(caplog):

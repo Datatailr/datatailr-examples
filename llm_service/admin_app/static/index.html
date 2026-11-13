@@ -212,6 +212,7 @@ if (!location.pathname.endsWith('/')) {
         <div class="tile"><div class="label">Requests that wait</div><div class="value" id="load-waiting">-</div></div>
         <div class="tile"><div class="label">Completion tokens per second</div><div class="value" id="load-completion-rate">-</div></div>
         <div class="tile"><div class="label">Prompt tokens per second</div><div class="value" id="load-prompt-rate">-</div></div>
+        <div class="tile"><div class="label">KV cache use</div><div class="value" id="load-kv-cache">-</div></div>
         <div class="tile"><div class="label">GPU memory used</div><div class="value" id="load-gpu">-</div></div>
       </div>
 
@@ -249,8 +250,8 @@ if (!location.pathname.endsWith('/')) {
           <div class="chart"><canvas id="chart-load-queue" aria-label="Line chart of the maximum of the requests in flight and of the requests that wait" role="img"></canvas></div>
         </div>
         <div class="card">
-          <h2>GPU memory</h2>
-          <div class="chart"><canvas id="chart-load-gpu" aria-label="Line chart of the GPU memory used and the total GPU memory" role="img"></canvas></div>
+          <h2>Engine memory <span class="caption">Maximum</span></h2>
+          <div class="chart"><canvas id="chart-load-engine" aria-label="Line chart of the KV cache use in percent and of the GPU memory used" role="img"></canvas></div>
         </div>
       </div>
     </div>
@@ -262,7 +263,8 @@ if (!location.pathname.endsWith('/')) {
           <thead><tr>
             <th scope="col">Service</th><th scope="col" class="num">Requests in flight</th>
             <th scope="col" class="num">Requests that wait</th><th scope="col" class="num">Completion tokens per second</th>
-            <th scope="col" class="num">Prompt tokens per second</th><th scope="col" class="num">GPU memory used</th>
+            <th scope="col" class="num">Prompt tokens per second</th><th scope="col" class="num">KV cache use</th>
+            <th scope="col" class="num">GPU memory used</th>
           </tr></thead>
           <tbody id="load-all-body"></tbody>
         </table>

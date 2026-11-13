@@ -47,6 +47,7 @@ def point(ts, **over):
         "failed_requests": 0,
         "in_flight_max": 1,
         "waiting_max": 0,
+        "kv_cache_use_max": 0.3,
         "prompt_tokens": 10,
         "completion_tokens": 5,
         "ttft_ms_p50": 100,
@@ -191,12 +192,12 @@ def test_merge_buckets_start_at_the_minute_of_since():
 def test_merge_field_rules():
     a = point(
         "2026-11-12T10:00:00Z", requests=2, failed_requests=1, prompt_tokens=10, completion_tokens=4,
-        in_flight_max=3, waiting_max=1, ttft_ms_p50=100, ttft_ms_p95=300, duration_ms_p50=900,
+        in_flight_max=3, waiting_max=1, kv_cache_use_max=0.55, ttft_ms_p50=100, ttft_ms_p95=300, duration_ms_p50=900,
         duration_ms_p95=1500, gpu_memory_used_max=400, gpu_memory_total=1000,
     )
     b = point(
         "2026-11-12T10:01:00Z", requests=5, failed_requests=2, prompt_tokens=20, completion_tokens=6,
-        in_flight_max=2, waiting_max=4, ttft_ms_p50=250, ttft_ms_p95=200, duration_ms_p50=800,
+        in_flight_max=2, waiting_max=4, kv_cache_use_max=0.2, ttft_ms_p50=250, ttft_ms_p95=200, duration_ms_p50=800,
         duration_ms_p95=2500, gpu_memory_used_max=600, gpu_memory_total=2000,
     )
     ten = S + timedelta(hours=10)
@@ -205,7 +206,7 @@ def test_merge_field_rules():
     assert out == [
         {
             "ts": "2026-11-12T10:00:00Z", "requests": 7, "failed_requests": 3,
-            "in_flight_max": 3, "waiting_max": 4, "prompt_tokens": 30, "completion_tokens": 10,
+            "in_flight_max": 3, "waiting_max": 4, "kv_cache_use_max": 0.55, "prompt_tokens": 30, "completion_tokens": 10,
             "ttft_ms_p50": 250, "ttft_ms_p95": 300, "duration_ms_p50": 900, "duration_ms_p95": 2500,
             "gpu_memory_used_max": 600, "gpu_memory_total": 2000,
         }
@@ -214,7 +215,7 @@ def test_merge_field_rules():
 
 def test_merge_null_handling():
     nulls = dict.fromkeys(
-        ("in_flight_max", "waiting_max", "ttft_ms_p50", "ttft_ms_p95", "duration_ms_p50",
+        ("in_flight_max", "waiting_max", "kv_cache_use_max", "ttft_ms_p50", "ttft_ms_p95", "duration_ms_p50",
          "duration_ms_p95", "gpu_memory_used_max", "gpu_memory_total")
     )
     a = point("2026-11-12T10:00:00Z", **nulls)
@@ -229,6 +230,23 @@ def test_merge_null_handling():
     assert out[0]["ttft_ms_p50"] == 100
     assert out[0]["gpu_memory_total"] == 1500
     assert out[0]["in_flight_max"] == 1
+    assert out[0]["kv_cache_use_max"] == 0.3
+
+
+def test_merge_point_without_kv_cache_use_reads_as_null():
+    old = point("2026-11-12T10:00:00Z")
+    del old["kv_cache_use_max"]
+    ten = S + timedelta(hours=10)
+    out, step = merge_points([old], ten, ten)
+    assert step == 60
+    assert out[0]["kv_cache_use_max"] is None
+    assert "kv_cache_use_max" not in old
+    out, step = merge_points([old], ten, ten + timedelta(minutes=1), limit=1)
+    assert step == 120
+    assert out[0]["kv_cache_use_max"] is None
+    new = point("2026-11-12T10:01:00Z", kv_cache_use_max=0.8)
+    out, _ = merge_points([old, new], ten, ten + timedelta(minutes=1), limit=1)
+    assert out[0]["kv_cache_use_max"] == 0.8
 
 
 def test_merge_empty():

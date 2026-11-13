@@ -156,7 +156,7 @@ Each change writes an audit event `limits_change` with the admin name, the targe
 
 ### Requirements
 
-1. An admin sees how busy a service is now: requests in flight, requests that wait, tokens per second, latency and GPU memory.
+1. An admin sees how busy a service is now: requests in flight, requests that wait, tokens per second, latency, KV cache use and GPU memory.
 2. An admin sees the same numbers for the last hour without a read from blob storage.
 3. The service writes the history to blob storage, so an admin can load older days.
 4. A failure of a number source does not stop the service. The number is null then.
@@ -168,6 +168,7 @@ Each change writes an audit event `limits_change` with the admin name, the targe
 | Requests in flight | A counter in the gateway. |
 | Requests that run and that wait in the engine | The metrics endpoint of vLLM, `GET /metrics` on the engine port. |
 | Generated tokens and prompt tokens | The token counters of the same endpoint. The rate is the change between two samples. |
+| KV cache use | The same endpoint: `vllm:kv_cache_usage_perc`, or `vllm:gpu_cache_usage_perc` of older versions. It is a fraction from 0 to 1. Over more than one label set it is the maximum, not the sum. A value above 1.5 is a percent and is divided by 100. Each value is limited to 0 to 1. |
 | GPU memory used and total | `nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits`. The task reads it at each third sample, so each 15 seconds. The samples between use the last value. |
 | Time to the first token, total time | The gateway measures each request. |
 
@@ -175,19 +176,21 @@ The names of the vLLM metrics changed between versions. The gateway reads each n
 
 With more than one GPU, the memory numbers are the sums.
 
+vLLM takes most of the GPU memory at its start, so the GPU memory used says little about the load. The KV cache use shows how full the engine is. A container without `nvidia-smi` has no GPU memory numbers.
+
 ### Time to the first token
 
 The proxy records the time from the start of the request to the first content chunk of a streamed answer. The audit row gets the new field `ttft_ms`. It is null for a request without a stream and for a request without content.
 
 ### Samples and points
 
-A background task takes one sample each 5 seconds. A sample has: time, in flight, running, waiting, prompt tokens per second, completion tokens per second, GPU memory used, GPU memory total.
+A background task takes one sample each 5 seconds. A sample has: time, in flight, running, waiting, KV cache use, prompt tokens per second, completion tokens per second, GPU memory used, GPU memory total.
 
 At the end of each minute the task makes one point:
 
 ```json
 {"ts": "2026-11-12T10:15:00Z", "requests": 42, "failed_requests": 1,
- "in_flight_max": 6, "waiting_max": 2,
+ "in_flight_max": 6, "waiting_max": 2, "kv_cache_use_max": 0.52,
  "prompt_tokens": 9100, "completion_tokens": 5200,
  "ttft_ms_p50": 310, "ttft_ms_p95": 900,
  "duration_ms_p50": 2100, "duration_ms_p95": 7400,
@@ -196,7 +199,8 @@ At the end of each minute the task makes one point:
 
 - `requests`, `failed_requests` and the token sums come from the requests that ended in that minute.
 - The percentiles come from the requests of that minute with a status below 400. A refused or failed request ends fast and stays out of them. They are null for a minute without such a request.
-- The maximum values come from the samples of that minute.
+- The maximum values come from the samples of that minute. `kv_cache_use_max` is a fraction from 0 to 1.
+- A point of a file from before `kv_cache_use_max` existed has no such field. Each reader takes it as null.
 - GPU memory is in MiB.
 
 The service keeps the last 60 points and the last 12 samples in memory.
@@ -220,7 +224,7 @@ Both are for admins.
 `GET /admin/metrics/live` answers from memory:
 
 ```json
-{"now": {"ts": "...", "in_flight": 3, "running": 3, "waiting": 0,
+{"now": {"ts": "...", "in_flight": 3, "running": 3, "waiting": 0, "kv_cache_use": 0.37,
          "prompt_tokens_per_s": 210.0, "completion_tokens_per_s": 96.5,
          "gpu_memory_used": 14200, "gpu_memory_total": 15360},
  "points": [ ... the last 60 points ... ]}
@@ -236,8 +240,8 @@ A bad time, a `since` after `until` or a range that is too long gets 400 `invali
 
 - New routes that pass through: `GET /api/services/{name}/metrics/live` and `GET /api/services/{name}/metrics/history`.
 - New route `GET /api/load`: the `now` part of each service where the viewer is an admin, in parallel, with the same failure rules as the combined usage.
-- A Load tab, for an admin. With one service: tiles for the numbers of this moment and charts of the last hour. The tab reads the live endpoint each 5 seconds while it is open and the page is visible. Each read of the tab has a time limit of 30 seconds. A read over the limit counts as a failed read. A range picker loads the history and stops the refresh.
-- With "All services": one table row for each service with the numbers of this moment.
+- A Load tab, for an admin. With one service: tiles for the numbers of this moment and charts of the last hour. A tile and the chart "Engine memory" show the KV cache use in percent. That chart shows the GPU memory used on a second axis when a point has it. The tab reads the live endpoint each 5 seconds while it is open and the page is visible. Each read of the tab has a time limit of 30 seconds. A read over the limit counts as a failed read. A range picker loads the history and stops the refresh.
+- With "All services": one table row for each service with the numbers of this moment, the KV cache use among them.
 
 ## Part 3: model catalog
 

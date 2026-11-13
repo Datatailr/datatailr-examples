@@ -8,7 +8,7 @@ from llm_service.gateway.load import POINTS_KEPT, SAMPLES_KEPT, LoadMonitor, per
 START = datetime(2026, 11, 12, 10, 15, 0, tzinfo=timezone.utc)
 
 POINT_FIELDS = {
-    "ts", "requests", "failed_requests", "in_flight_max", "waiting_max",
+    "ts", "requests", "failed_requests", "in_flight_max", "waiting_max", "kv_cache_use_max",
     "prompt_tokens", "completion_tokens", "ttft_ms_p50", "ttft_ms_p95",
     "duration_ms_p50", "duration_ms_p95", "gpu_memory_used_max", "gpu_memory_total",
 }
@@ -22,12 +22,13 @@ class Env:
     def advance(self, seconds):
         self.now = self.now + timedelta(seconds=seconds)
 
-    def sample(self, running=0.0, waiting=0.0, prompt=0.0, completion=0.0, gpu=None):
+    def sample(self, running=0.0, waiting=0.0, prompt=0.0, completion=0.0, gpu=None, kv=None):
         engine = {
             "running": running,
             "waiting": waiting,
             "prompt_tokens_total": prompt,
             "completion_tokens_total": completion,
+            "kv_cache_use": kv,
         }
         return self.monitor.add_sample(engine, gpu)
 
@@ -93,13 +94,14 @@ def test_end_at_zero_stays_zero(env):
 def test_sample_fields_and_ts(env):
     env.now = START + timedelta(seconds=7, microseconds=900000)
     env.monitor.begin()
-    env.sample(running=2.0, waiting=1.0, gpu=(100, 200))
+    env.sample(running=2.0, waiting=1.0, gpu=(100, 200), kv=0.37)
     now = env.monitor.live()["now"]
     assert now == {
         "ts": "2026-11-12T10:15:07Z",
         "in_flight": 1,
         "running": 2.0,
         "waiting": 1.0,
+        "kv_cache_use": 0.37,
         "prompt_tokens_per_s": None,
         "completion_tokens_per_s": None,
         "gpu_memory_used": 100,
@@ -160,20 +162,21 @@ def test_null_engine_values_and_gpu(env):
     now = env.monitor.live()["now"]
     assert now["running"] is None
     assert now["waiting"] is None
+    assert now["kv_cache_use"] is None
     assert now["gpu_memory_used"] is None
     assert now["gpu_memory_total"] is None
 
 
 def test_point_for_minute_with_records_and_samples(env):
     env.monitor.begin()
-    env.sample(running=1.0, waiting=2.0, gpu=(1000, 2000))
+    env.sample(running=1.0, waiting=2.0, gpu=(1000, 2000), kv=0.2)
     env.advance(5)
     env.monitor.begin()
     env.monitor.begin()
-    env.sample(running=3.0, waiting=5.0, gpu=(1500, 2000))
+    env.sample(running=3.0, waiting=5.0, gpu=(1500, 2000), kv=0.6)
     env.advance(5)
     env.monitor.end()
-    env.sample(running=2.0, waiting=0.0, gpu=(1200, None))
+    env.sample(running=2.0, waiting=0.0, gpu=(1200, None), kv=None)
     for ttft, dur in [(100, 1000), (200, 2000), (300, 3000), (400, 4000)]:
         env.record(ttft_ms=ttft, duration_ms=dur, prompt_tokens=10, completion_tokens=5)
     env.record(status=500, ttft_ms=None, duration_ms=5000, prompt_tokens=7, completion_tokens=None)
@@ -185,6 +188,7 @@ def test_point_for_minute_with_records_and_samples(env):
         "failed_requests": 1,
         "in_flight_max": 3,
         "waiting_max": 5.0,
+        "kv_cache_use_max": 0.6,
         "prompt_tokens": 47,
         "completion_tokens": 20,
         "ttft_ms_p50": 200,
@@ -195,6 +199,7 @@ def test_point_for_minute_with_records_and_samples(env):
         "gpu_memory_total": 2000,
     }]
     assert set(points[0]) == POINT_FIELDS
+    assert list(points[0])[5] == "kv_cache_use_max"
 
 
 def test_minute_with_one_request(env):
@@ -222,6 +227,7 @@ def test_minute_with_samples_and_no_request(env):
     assert point["duration_ms_p50"] is None
     assert point["duration_ms_p95"] is None
     assert point["waiting_max"] == 1.0
+    assert point["kv_cache_use_max"] is None
     assert point["in_flight_max"] == 0
     assert point["gpu_memory_used_max"] is None
     assert point["gpu_memory_total"] is None
@@ -234,6 +240,7 @@ def test_minute_with_records_and_no_sample_gives_point(env):
     assert point["requests"] == 1
     assert point["in_flight_max"] is None
     assert point["waiting_max"] is None
+    assert point["kv_cache_use_max"] is None
 
 
 def test_failed_request_threshold(env):
@@ -360,7 +367,7 @@ def test_live_before_first_sample(env):
     live = env.monitor.live()
     assert live["points"] == []
     assert live["now"] == {
-        "ts": None, "in_flight": None, "running": None, "waiting": None,
+        "ts": None, "in_flight": None, "running": None, "waiting": None, "kv_cache_use": None,
         "prompt_tokens_per_s": None, "completion_tokens_per_s": None,
         "gpu_memory_used": None, "gpu_memory_total": None,
     }
@@ -459,3 +466,25 @@ def test_samples_of_one_minute_are_bounded_after_a_backward_clock_step(env):
     (point,) = env.sample()
     assert point["ts"] == "2026-11-12T10:16:00Z"
     assert point["gpu_memory_used_max"] == 1  # the oldest sample, with 9000, is dropped
+
+
+def test_kv_cache_use_max_is_the_maximum_of_the_minute(env):
+    env.sample(kv=0.1)
+    env.advance(5)
+    env.sample(kv=None)
+    env.advance(5)
+    env.sample(kv=0.45)
+    env.advance(5)
+    env.sample(kv=0.3)
+    env.now = START + timedelta(seconds=60)
+    (point,) = env.sample(kv=0.9)
+    assert point["kv_cache_use_max"] == 0.45
+    assert env.monitor.live()["now"]["kv_cache_use"] == 0.9
+
+
+def test_kv_cache_use_missing_from_the_engine_numbers_is_null(env):
+    env.monitor.add_sample({"running": 1.0, "waiting": 0.0}, None)
+    assert env.monitor.live()["now"]["kv_cache_use"] is None
+    env.now = START + timedelta(seconds=60)
+    (point,) = env.sample()
+    assert point["kv_cache_use_max"] is None

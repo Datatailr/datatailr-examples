@@ -613,10 +613,10 @@ const MAX_RANGE_DAYS = 31;
 /** The ranges that end now, by their name in `data-load-range`. "hour" reads the live points. */
 const LOAD_SPANS = {'6h': 6 * HOUR_MS, '24h': 24 * HOUR_MS, '7d': 7 * 24 * HOUR_MS};
 const POINT_FIELDS = ['requests', 'failed_requests', 'prompt_tokens', 'completion_tokens', 'ttft_ms_p50', 'ttft_ms_p95',
-                      'duration_ms_p50', 'duration_ms_p95', 'in_flight_max', 'waiting_max', 'gpu_memory_used_max',
-                      'gpu_memory_total'];
-const LOAD_TILES = ['load-in-flight', 'load-waiting', 'load-completion-rate', 'load-prompt-rate', 'load-gpu',
-                    'load-requests', 'load-failed', 'load-ttft-p50', 'load-ttft-p95', 'load-duration-p50',
+                      'duration_ms_p50', 'duration_ms_p95', 'in_flight_max', 'waiting_max', 'kv_cache_use_max',
+                      'gpu_memory_used_max', 'gpu_memory_total'];
+const LOAD_TILES = ['load-in-flight', 'load-waiting', 'load-completion-rate', 'load-prompt-rate', 'load-kv-cache',
+                    'load-gpu', 'load-requests', 'load-failed', 'load-ttft-p50', 'load-ttft-p95', 'load-duration-p50',
                     'load-duration-p95'];
 // The steps of the time axis in minutes, from 1 minute to 1 week.
 const TICK_STEPS = [1, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 2880, 10080].map(minutes => minutes * 60000);
@@ -681,6 +681,10 @@ function stepText(seconds) {
 const msText = ms => (numeric(ms) === null ? '-' : ms < 1000 ? `${fmt(Math.round(ms))} ms` : seconds(ms));
 /** Tokens per second with at most one decimal. */
 const rateText = value => (numeric(value) === null ? '-' : oneDecimal.format(value));
+/** A fraction from 0 to 1 as a percent with no decimals: "37%". */
+const percentText = value => (numeric(value) === null ? '-' : `${Math.round(value * 100)}%`);
+/** A value in GiB with at most one decimal: "13.5 GiB". */
+const gibText = value => (numeric(value) === null ? '-' : `${oneDecimal.format(value)} GiB`);
 /** GPU memory from MiB as GiB: "13.9 of 15 GiB", or only the used part without a total. */
 function gpuText(used, total) {
   if (numeric(used) === null) return '-';
@@ -733,8 +737,10 @@ function localText(iso, withDate = false) {
 /** True for the 404 of a service without the load endpoints. The rule is the same as for the limits. */
 const loadMissing = error => limitsMissing(error);
 
-/** Each line chart: its canvas, the format of its values and its series as [field, label, color, dashed].
- * `axis` formats the values on the axis when it differs from `format`. `whole` keeps the axis on whole numbers. */
+/** Each line chart: its canvas, the format of its values and its series as [field, label, color, dashed, gib].
+ * `axis` formats the values on the axis when it differs from `format`. `whole` keeps the axis on whole numbers.
+ * `max` is the top of the axis. A `gib` series holds MiB. It shows in GiB on a second axis, and only when
+ * a point has a value for it. */
 const LOAD_CHARTS = [
   {id: 'chart-load-requests', format: fmt, whole: true,
    series: [['requests', 'Requests', COLORS.bar], ['failed_requests', 'Failed requests', COLORS.red]]},
@@ -746,18 +752,30 @@ const LOAD_CHARTS = [
    series: [['duration_ms_p50', 'p50', COLORS.bar], ['duration_ms_p95', 'p95', COLORS.yellow]]},
   {id: 'chart-load-queue', format: fmt, whole: true,
    series: [['in_flight_max', 'In flight', COLORS.bar], ['waiting_max', 'Waiting', COLORS.yellow]]},
-  {id: 'chart-load-gpu', format: value => (numeric(value) === null ? '-' : `${oneDecimal.format(value)} GiB`), gib: true,
-   series: [['gpu_memory_used_max', 'Used', COLORS.bar2], ['gpu_memory_total', 'Total', COLORS.text, true]]},
+  {id: 'chart-load-engine', format: percentText, max: 1,
+   series: [['kv_cache_use_max', 'KV cache use', COLORS.bar],
+            ['gpu_memory_used_max', 'GPU memory used', COLORS.bar2, false, true]]},
 ];
+
+/** The data of each series of the chart `spec` from `series`, and whether the series shows. A `gib` series
+ * changes from MiB to GiB and shows only with a value. Each other series shows always. */
+function loadChartData(spec, series) {
+  return spec.series.map(([name, , , , gib]) => {
+    const data = gib ? series[name].map(({x, y}) => ({x, y: y === null ? null : y / 1024})) : series[name];
+    return {data, shown: !gib || data.some(({y}) => y !== null)};
+  });
+}
 
 /** A line chart over a linear time axis. The build of Chart.js has no date adapter, so the axis
  * holds milliseconds and its labels come from `timeTick`. A null value is a gap in the line. */
-function lineChart({id, format, axis, whole, series}) {
+function lineChart({id, format, axis, whole, max, series}) {
+  const gib = series.some(([, , , , onGib]) => onGib);
   return new Chart($(id), {
     type: 'line',
-    data: {datasets: series.map(([, label, color, dashed]) => ({
+    data: {datasets: series.map(([, label, color, dashed, onGib]) => ({
       label, data: [], borderColor: color, backgroundColor: color, borderWidth: 2, borderDash: dashed ? [5, 4] : [],
-      pointRadius: 0, pointHoverRadius: 3, pointHitRadius: 6, tension: 0, spanGaps: false}))},
+      pointRadius: 0, pointHoverRadius: 3, pointHitRadius: 6, tension: 0, spanGaps: false,
+      ...(onGib ? {yAxisID: 'gib'} : {})}))},
     options: {
       interaction: {mode: 'index', intersect: false},
       scales: {
@@ -765,12 +783,17 @@ function lineChart({id, format, axis, whole, series}) {
         x: {type: 'linear', grid: {display: false},
             afterBuildTicks: scale => { scale.ticks = timeTicks(scale.min, scale.max).map(value => ({value})); },
             ticks: {maxRotation: 0, callback(value) { return timeTick(value, this.max - this.min); }}},
-        y: {beginAtZero: true, ticks: {...(whole ? {precision: 0} : {}), callback: value => (axis || format)(value)}},
+        y: {beginAtZero: true, ...(max === undefined ? {} : {max}),
+            ticks: {...(whole ? {precision: 0} : {}), callback: value => (axis || format)(value)}},
+        ...(gib ? {gib: {position: 'right', beginAtZero: true, display: false, grid: {drawOnChartArea: false},
+                         ticks: {callback: gibText}}} : {}),
       },
       plugins: {
-        legend: {display: true, labels: {boxWidth: 12, boxHeight: 2}},
+        legend: {display: true, labels: {boxWidth: 12, boxHeight: 2,
+                                          filter: (item, data) => !data.datasets[item.datasetIndex].hidden}},
         tooltip: {callbacks: {title: items => (items.length ? new Date(items[0].parsed.x).toLocaleString() : ''),
-                              label: item => `${item.dataset.label}: ${format(item.parsed.y)}`}},
+                              label: item => `${item.dataset.label}: ${
+                                (item.dataset.yAxisID === 'gib' ? gibText : format)(item.parsed.y)}`}},
       },
     },
   });
@@ -782,9 +805,10 @@ function setLoadCharts(series, min, max) {
   try {
     for (const spec of LOAD_CHARTS) {
       const chart = (state.loadCharts[spec.id] ||= lineChart(spec));
-      spec.series.forEach(([name], index) => {
-        chart.data.datasets[index].data = spec.gib
-          ? series[name].map(({x, y}) => ({x, y: y === null ? null : y / 1024})) : series[name];
+      loadChartData(spec, series).forEach(({data, shown}, index) => {
+        const dataset = chart.data.datasets[index];
+        Object.assign(dataset, {data, hidden: !shown});
+        if (dataset.yAxisID === 'gib') chart.options.scales.gib.display = shown;
       });
       Object.assign(chart.options.scales.x, {min, max});
       chart.update('none');
@@ -844,6 +868,7 @@ function showLive({now, points}) {
   $('load-waiting').textContent = fmt(numeric(at.waiting));
   $('load-completion-rate').textContent = rateText(at.completion_tokens_per_s);
   $('load-prompt-rate').textContent = rateText(at.prompt_tokens_per_s);
+  $('load-kv-cache').textContent = percentText(at.kv_cache_use);
   $('load-gpu').textContent = gpuText(at.gpu_memory_used, at.gpu_memory_total);
   state.loadNow = {ts: at.ts || null};
   showNowText();
@@ -869,19 +894,20 @@ function showLive({now, points}) {
 /** A row of the table of "All services". A failed service shows its error. */
 function loadRow(entry) {
   const name = el('th', {scope: 'row', className: 'mono', text: entry.name});
-  if (!entry.ok) return el('tr', {}, name, el('td', {colspan: 5, className: 'bad', text: entry.error || NO_ANSWER}));
+  if (!entry.ok) return el('tr', {}, name, el('td', {colspan: 6, className: 'bad', text: entry.error || NO_ANSWER}));
   const now = entry.now || {};
   return el('tr', {}, name,
     el('td', {className: 'num', text: fmt(numeric(now.in_flight))}),
     el('td', {className: 'num', text: fmt(numeric(now.waiting))}),
     el('td', {className: 'num', text: rateText(now.completion_tokens_per_s)}),
     el('td', {className: 'num', text: rateText(now.prompt_tokens_per_s)}),
+    el('td', {className: 'num', text: percentText(now.kv_cache_use)}),
     el('td', {className: 'num', text: gpuText(now.gpu_memory_used, now.gpu_memory_total)}));
 }
 
 function showAll(answer) {
   const services = answer && Array.isArray(answer.services) ? answer.services : [];
-  replaceRows($('load-all-body'), services.map(loadRow), 6, 'No service shows its load numbers to you.');
+  replaceRows($('load-all-body'), services.map(loadRow), 7, 'No service shows its load numbers to you.');
   $('load-all-text').textContent =
     `Read at ${new Date().toLocaleTimeString()}, your local time. The page reads the numbers every 5 seconds.`;
 }

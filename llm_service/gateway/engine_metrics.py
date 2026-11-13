@@ -24,7 +24,13 @@ METRIC_NAMES = {
     "waiting": ("vllm:num_requests_waiting",),
     "prompt_tokens_total": ("vllm:prompt_tokens_total", "vllm:prompt_tokens"),
     "completion_tokens_total": ("vllm:generation_tokens_total", "vllm:generation_tokens"),
+    "kv_cache_use": ("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"),
 }
+
+# A number of these keys is a share. It takes the maximum over the label sets, not the sum.
+SHARE_KEYS = frozenset({"kv_cache_use"})
+# A share above this value is a percent. Some vLLM versions report 0 to 100.
+PERCENT_ABOVE = 1.5
 
 ENGINE_PREFIX = "vllm:"
 
@@ -59,13 +65,14 @@ def _finite(token: str) -> float | None:
 
 
 def parse_metrics(text: str) -> tuple[dict[str, float | None], list[str]]:
-    """Return the four numbers and the sorted `vllm:` names of the text.
+    """Return the five numbers and the sorted `vllm:` names of the text.
 
-    A number is the sum of the samples of one name over its label sets. It is
-    None when no known name has a finite sample. Comment lines and bad lines
-    are ignored.
+    A number is the sum of the samples of one name over its label sets. A share
+    takes the maximum instead, as a fraction from 0 to 1. A number is None when
+    no known name has a finite sample. Comment lines and bad lines are ignored.
     """
     sums: dict[str, float] = {}
+    maxima: dict[str, float] = {}
     seen: set[str] = set()
     for raw in text.split("\n"):
         line = raw.strip()
@@ -80,11 +87,23 @@ def parse_metrics(text: str) -> tuple[dict[str, float | None], list[str]]:
         value = _finite(match.group("value"))
         if value is not None:
             sums[name] = sums.get(name, 0.0) + value
+            maxima[name] = max(maxima.get(name, value), value)
     numbers: dict[str, float | None] = {}
     for key, names in METRIC_NAMES.items():
+        if key in SHARE_KEYS:
+            share = next((maxima[n] for n in names if n in maxima), None)
+            numbers[key] = None if share is None else _fraction(share)
+            continue
         total = next((sums[n] for n in names if n in sums), None)
         numbers[key] = total if total is not None and math.isfinite(total) else None
     return numbers, sorted(seen)
+
+
+def _fraction(value: float) -> float:
+    """A share as a fraction from 0 to 1. A value above PERCENT_ABOVE is a percent."""
+    if value > PERCENT_ABOVE:
+        value = value / 100.0
+    return min(max(value, 0.0), 1.0)
 
 
 def answer_summary(text: str, limit: int = 10) -> tuple[int, list[str]]:
@@ -134,7 +153,7 @@ def metrics_client(timeout: float = 2.0) -> httpx.AsyncClient:
 
 
 class EngineReader:
-    """Read the four load numbers from the metrics endpoint of the engine.
+    """Read the five load numbers from the metrics endpoint of the engine.
 
     Give it a client of its own, not the client of the proxy. `metrics_client` builds one.
     """
@@ -147,7 +166,7 @@ class EngineReader:
         self._missing: frozenset[str] = frozenset()
 
     async def read(self) -> dict[str, float | None]:
-        """Return the four numbers. Each one is None on a failure."""
+        """Return the five numbers. Each one is None on a failure."""
         try:
             # The httpx timeout is a limit for each phase. The outer limit covers the total.
             response = await asyncio.wait_for(

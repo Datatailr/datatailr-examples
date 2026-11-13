@@ -2176,6 +2176,7 @@ METRICS_TEXT = (
     "vllm:num_requests_waiting 2\n"
     "vllm:prompt_tokens_total 100\n"
     "vllm:generation_tokens_total 50\n"
+    'vllm:kv_cache_usage_perc{engine="0"} 0.37\n'
 )
 METRICS_DIR = "llm-service/metrics"
 DAY = "2026-11-10"
@@ -2275,6 +2276,7 @@ def test_live_shows_the_gpu_and_the_engine_numbers_after_a_round(tmp_path):
         wait_until(lambda: c.app.state.load.live()["now"]["running"] == 3)
         body = c.get("/admin/metrics/live", headers=ALICE).json()
         assert body["now"]["running"] == 3 and body["now"]["waiting"] == 2
+        assert body["now"]["kv_cache_use"] == 0.37
         assert body["now"]["gpu_memory_used"] == 1000 and body["now"]["gpu_memory_total"] == 2000
         assert body["now"]["in_flight"] == 0
         assert body["points"] == []
@@ -2287,6 +2289,7 @@ def test_live_has_null_numbers_without_a_metrics_endpoint(tmp_path):
         wait_until(lambda: c.app.state.load.live()["now"]["ts"] is not None)
         now = c.get("/admin/metrics/live", headers=ALICE).json()["now"]
         assert now["running"] is None and now["waiting"] is None
+        assert now["kv_cache_use"] is None
         assert now["prompt_tokens_per_s"] is None
         assert now["gpu_memory_used"] is None and now["gpu_memory_total"] is None
         assert now["in_flight"] == 0

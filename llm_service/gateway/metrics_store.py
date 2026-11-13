@@ -23,7 +23,7 @@ READ_THREADS = 8
 
 _SUM_FIELDS = ("requests", "failed_requests", "prompt_tokens", "completion_tokens")
 _MAX_FIELDS = (
-    "in_flight_max", "waiting_max", "gpu_memory_used_max",
+    "in_flight_max", "waiting_max", "kv_cache_use_max", "gpu_memory_used_max",
     "ttft_ms_p50", "ttft_ms_p95", "duration_ms_p50", "duration_ms_p95",
 )
 
@@ -43,13 +43,14 @@ def merge_points(
     exist. A point goes to the bucket `floor((ts - start) / step)`. An empty bucket gives no point.
     The `ts` of a merged point is the start of its bucket. Counts and token numbers add up.
     Maximum values and percentiles take the maximum, or null if each value is null.
-    `gpu_memory_total` takes the last value that is not null.
+    `gpu_memory_total` takes the last value that is not null. A point without `kv_cache_use_max`
+    comes from a file of an older version. Its value reads as null.
     """
     start = since.astimezone(timezone.utc).replace(second=0, microsecond=0)
     minutes = int((until - start).total_seconds() // 60) + 1
     step = max(1, math.ceil(minutes / limit))
     if step == 1:
-        return [dict(p) for p in points], 60
+        return [_with_defaults(p) for p in points], 60
     buckets: dict[int, list[dict]] = {}
     for p in points:
         index = int((_parse_ts(p["ts"]) - start).total_seconds() // (60 * step))
@@ -66,6 +67,13 @@ def merge_points(
         out["gpu_memory_total"] = totals[-1] if totals else None
         merged.append(out)
     return merged, 60 * step
+
+
+def _with_defaults(point: dict) -> dict:
+    """A copy of a point with null for each field that an older version did not write."""
+    copy = dict(point)
+    copy.setdefault("kv_cache_use_max", None)
+    return copy
 
 
 def _iso(moment: datetime) -> str:

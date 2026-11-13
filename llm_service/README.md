@@ -477,7 +477,7 @@ The admin app has the Limits tab for an admin of the picked service. It has a ca
 
 ## Load and latency
 
-An admin sees how busy a service is now and how busy it was before. The numbers are requests in flight, requests that wait, tokens per second, latency and GPU memory.
+An admin sees how busy a service is now and how busy it was before. The numbers are requests in flight, requests that wait, tokens per second, latency, the KV cache use of the engine and GPU memory.
 
 ### Where the numbers come from
 
@@ -486,16 +486,21 @@ An admin sees how busy a service is now and how busy it was before. The numbers 
 | Requests in flight | A counter in the gateway. |
 | Requests that run and that wait in the engine | The vLLM metrics endpoint, `GET /metrics` on the engine port. |
 | Prompt and generated tokens per second | The token counters of the same endpoint. The rate is the change between two samples. |
+| KV cache use | The same endpoint, `vllm:kv_cache_usage_perc` or the older `vllm:gpu_cache_usage_perc`. A fraction from 0 to 1. With more than one engine, the largest value. |
 | GPU memory used and total | `nvidia-smi`. With more than one GPU, the numbers are sums. |
 | Time to the first token and total time | The gateway measures each request. |
 
 The service reads GPU memory at each third sample, so each 15 seconds. The samples between use the last value.
 
+vLLM takes most of the GPU memory at its start and keeps it. So the GPU memory used stays near the total and says little about the load. The KV cache use is the number to watch. The KV cache holds the tokens of the running requests. When it is full, new requests wait. On a node without `nvidia-smi` in the container, the GPU memory numbers are empty.
+
+Some vLLM versions report the KV cache use from 0 to 100. The service reads a value above 1.5 as a percent and divides it by 100. It limits each value to the range from 0 to 1.
+
 The names of the vLLM metrics differ between versions. The service reads each number from a short list of known names. If the installed vLLM version uses another name, that number shows as empty. The service log then has a warning that names the metric names the service saw. A failure to read the metrics endpoint or `nvidia-smi` also gives an empty number. The service logs the first failure and the recovery. It does not stop, and no request fails.
 
 ### The sample and the point
 
-A sample is a set of numbers that the service takes each 5 seconds. At the end of each minute, the service makes one point from the samples of that minute and the requests that ended in it. It keeps the last 60 points and the last 12 samples in memory.
+A sample is a set of numbers that the service takes each 5 seconds. Its fields are `ts`, `in_flight`, `running`, `waiting`, `kv_cache_use`, `prompt_tokens_per_s`, `completion_tokens_per_s`, `gpu_memory_used` and `gpu_memory_total`. At the end of each minute, the service makes one point from the samples of that minute and the requests that ended in it. It keeps the last 60 points and the last 12 samples in memory.
 
 A point has these fields:
 
@@ -504,12 +509,13 @@ A point has these fields:
 | `ts` | The start of the minute, an ISO time in UTC with `Z`. |
 | `requests`, `failed_requests` | The requests that ended in the minute, and those with status 400 or higher. |
 | `in_flight_max`, `waiting_max` | The largest values of the samples of the minute. |
+| `kv_cache_use_max` | The largest KV cache use of the samples of the minute, a fraction from 0 to 1. |
 | `prompt_tokens`, `completion_tokens` | The token sums of the requests that ended in the minute. |
 | `ttft_ms_p50`, `ttft_ms_p95` | The percentiles of the time to the first token, in milliseconds. Only requests with a status below 400 count. |
 | `duration_ms_p50`, `duration_ms_p95` | The percentiles of the total time, in milliseconds. Only requests with a status below 400 count. |
 | `gpu_memory_used_max`, `gpu_memory_total` | The largest used value and the total of the minute, in MiB. |
 
-A refused or failed request ends fast, so it stays out of the percentiles. A percentile is `null` for a minute without a matching request. A maximum or a GPU value is `null` when no sample of the minute had it.
+A refused or failed request ends fast, so it stays out of the percentiles. A percentile is `null` for a minute without a matching request. A maximum or a GPU value is `null` when no sample of the minute had it. A point in a file of an older version has no `kv_cache_use_max`. The service reads it as `null`.
 
 ### Read the load
 
@@ -520,11 +526,11 @@ curl http://llm-service/admin/metrics/live
 ```
 
 ```json
-{"now": {"ts": "2026-11-12T10:15:35Z", "in_flight": 3, "running": 3, "waiting": 0,
+{"now": {"ts": "2026-11-12T10:15:35Z", "in_flight": 3, "running": 3, "waiting": 0, "kv_cache_use": 0.37,
          "prompt_tokens_per_s": 210.0, "completion_tokens_per_s": 96.5,
          "gpu_memory_used": 14200, "gpu_memory_total": 15360},
  "points": [{"ts": "2026-11-12T10:14:00Z", "requests": 42, "failed_requests": 1,
-             "in_flight_max": 6, "waiting_max": 2,
+             "in_flight_max": 6, "waiting_max": 2, "kv_cache_use_max": 0.52,
              "prompt_tokens": 9100, "completion_tokens": 5200,
              "ttft_ms_p50": 310, "ttft_ms_p95": 900,
              "duration_ms_p50": 2100, "duration_ms_p95": 7400,
@@ -563,15 +569,15 @@ LLM_METRICS_RETENTION_DAYS=90 python deploy.py service
 
 The admin app has the Load tab, after the Usage tab, for an admin. With one service, the tab shows two rows of tiles and line charts.
 
-- Five tiles for this moment: requests in flight, requests that wait, completion tokens per second, prompt tokens per second and GPU memory used.
+- Six tiles for this moment: requests in flight, requests that wait, completion tokens per second, prompt tokens per second, KV cache use and GPU memory used. The KV cache use shows in percent.
 - Six tiles for the last complete minute. They show requests and failed requests. They show the time to the first token as p50 and p95. They show the total time as p50 and p95.
-- Line charts of the points.
+- Line charts of the points. The chart "Engine memory" shows the largest KV cache use of each point in percent, on an axis from 0 to 100. It shows the GPU memory used in GiB on a second axis, only when a point has that value.
 
 A range control has "Last hour", "6 hours", "24 hours", "7 days" and a custom range. With "Last hour", the tab reads the numbers again each 5 seconds. The other ranges read the history once. A history range shows the step of its points, for example 5 minutes. It also names the UTC days whose history the service did not read, from `missing_days`.
 
 A read that gets no answer in 30 seconds counts as a failed read. If 5 reads in a row fail, the tab stops the 5 second read and shows a note with the last error. Use the Reload button of the page bar to read again.
 
-With "All services" picked, the tab shows a table that reads the numbers each 5 seconds. It has one row for each service where the viewer is an admin, with the numbers of this moment. A service that is not usable has a row with the reason. A service where the viewer is not an admin is absent. The app route `GET /api/load` gives these rows. The routes `GET /api/services/{name}/metrics/live` and `GET /api/services/{name}/metrics/history` pass the two service calls through.
+With "All services" picked, the tab shows a table that reads the numbers each 5 seconds. It has one row for each service where the viewer is an admin, with the numbers of this moment and the KV cache use. A service that is not usable has a row with the reason. A service where the viewer is not an admin is absent. The app route `GET /api/load` gives these rows. The routes `GET /api/services/{name}/metrics/live` and `GET /api/services/{name}/metrics/history` pass the two service calls through.
 
 ## Admin app
 
