@@ -8,7 +8,8 @@ from fractions import Fraction
 
 WEIGHTS_MARGIN = 1.2  # covers the working memory of the engine for a short context
 
-_SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*([tgm])?(?:i?b?)?", re.IGNORECASE)
+_SIZE = re.compile(r"(\d{1,12}(?:\.\d{1,12})?)\s*(?:([tgm])(?:i?b?)?)?", re.IGNORECASE)
+_MARGIN = Fraction(str(WEIGHTS_MARGIN))  # exact, so the rounding up has no float error
 _UNIT_MIB = {"m": 1, "g": 1024, "t": 1024 * 1024}
 
 
@@ -24,7 +25,10 @@ def parse_memory_mib(value: str | None) -> int | None:
     if match is None:
         return None
     number, unit = match.group(1), (match.group(2) or "m").lower()
-    mib = int(Fraction(number) * _UNIT_MIB[unit])
+    try:
+        mib = int(Fraction(number) * _UNIT_MIB[unit])
+    except (ValueError, OverflowError, ZeroDivisionError):
+        return None
     return mib if mib > 0 else None
 
 
@@ -37,7 +41,7 @@ def needed_from(entry: dict | None, size_bytes: int | None) -> tuple[int | None,
     if entry is not None and entry.get("gpu_memory_mib") is not None:
         return entry["gpu_memory_mib"], "catalog"
     if size_bytes is not None:
-        return math.ceil(size_bytes / 2**20 * WEIGHTS_MARGIN), "weights"
+        return math.ceil(size_bytes * _MARGIN / 2**20), "weights"
     return None, "unknown"
 
 

@@ -3,7 +3,7 @@ import pytest
 from llm_service.deploy_config import admin_app_name, deploy_targets, resources, service_env, service_host, service_url
 
 
-def test_service_env_defaults_hold_only_the_two_required_variables():
+def test_service_env_defaults_hold_the_model_the_root_and_the_vram():
     assert service_env({}) == {
         "LLM_DEFAULT_MODEL": "Qwen/Qwen2.5-1.5B-Instruct",
         "LLM_BLOB_ROOT": "llm-service",

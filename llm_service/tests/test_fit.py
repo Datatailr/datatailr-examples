@@ -24,7 +24,7 @@ def test_parse_memory_mib_forms(value, expected):
     assert parse_memory_mib(value) == expected
 
 
-@pytest.mark.parametrize("value", ["", None, "lots", "0g", "-1g", "0", "g", "1x", "nang", "infg", "1e400g"])
+@pytest.mark.parametrize("value", ["", None, "lots", "0g", "-1g", "0", "g", "1x", "nang", "infg", "1e400g", "16b", "16i", "16ib", "9" * 5000, "9" * 5000 + "g", "1." + "9" * 5000])
 def test_parse_memory_mib_bad_values_give_none(value):
     assert parse_memory_mib(value) is None
 
@@ -71,3 +71,10 @@ def test_fit_unknown_when_a_number_is_missing():
         "basis": "unknown",
         "available_source": None,
     }
+
+
+def test_needed_from_uses_exact_math_near_a_whole_number():
+    # 5 * 2**20 bytes times 1.2 is exactly 6 MiB. Float math can give 6.000000000000001.
+    assert needed_from(None, 5 * MIB) == (6, "weights")
+    assert needed_from(None, 5 * MIB + 1) == (7, "weights")
+    assert needed_from(None, 5 * 10**6 * MIB) == (6 * 10**6, "weights")
