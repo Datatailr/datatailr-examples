@@ -484,3 +484,85 @@ def test_asgi_disconnect_after_the_usage_chunk_reports_the_usage():
 
     asyncio.run(run())
     assert done == [(499, USAGE)]
+
+
+# time to the first token
+
+ROLE = _chunk({"id": "x", "choices": [{"index": 0, "delta": {"role": "assistant"}}], "usage": None})
+EMPTY = _chunk({"id": "x", "choices": [{"index": 0, "delta": {"content": ""}}], "usage": None})
+TEXT = _chunk({"id": "x", "choices": [{"index": 0, "text": "Hi"}], "usage": None})
+DONE = b"data: [DONE]\n\n"
+
+
+def _stream_client(data, status=200, step=None):
+    class Parts(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            size = step or len(data)
+            for i in range(0, len(data), size):
+                yield data[i:i + size]
+
+    def handler(request):
+        return httpx.Response(status, headers={"content-type": "text/event-stream"}, stream=Parts())
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://fake")
+
+
+def _first_calls(data, body=None, status=200, step=None, on_first=None):
+    calls, seen = [], []
+
+    async def run():
+        async with _stream_client(data, status, step) as client:
+            response = await forward(
+                client, "http://fake", "/v1/chat/completions", body or {"stream": True},
+                lambda s, u: seen.append(len(calls)), on_first or (lambda: calls.append(1)),
+            )
+            return await _drain(response) if hasattr(response, "body_iterator") else response.body
+
+    out = asyncio.run(run())
+    return calls, seen, out
+
+
+def test_on_first_runs_once_at_the_first_content_chunk():
+    calls, seen, _ = _first_calls(ROLE + EMPTY + SSE)
+    assert calls == [1]
+    assert seen == [1]  # it ran before the end was reported
+
+
+def test_on_first_ignores_role_and_empty_chunks():
+    assert _first_calls(ROLE + EMPTY + DONE)[0] == []
+
+
+def test_on_first_runs_for_completion_text():
+    assert _first_calls(TEXT + DONE)[0] == [1]
+
+
+def test_on_first_runs_when_a_content_event_is_split_over_chunks():
+    calls, _, out = _first_calls(ROLE + SSE, step=7)
+    assert calls == [1]
+    assert out.endswith(DONE)
+
+
+def test_on_first_does_not_run_without_a_stream():
+    calls = []
+
+    async def run():
+        async with _client(fake_vllm_app()) as client:
+            await forward(client, "http://fake", "/v1/chat/completions", {}, lambda s, u: None, lambda: calls.append(1))
+
+    asyncio.run(run())
+    assert calls == []
+
+
+def test_on_first_does_not_run_for_an_error_answer():
+    assert _first_calls(SSE, status=500)[0] == []
+
+
+def test_failing_on_first_is_logged_and_does_not_break_the_stream(caplog):
+    def bad():
+        raise ValueError("clock down")
+
+    with caplog.at_level("WARNING", logger="llm_service.proxy"):
+        _, seen, out = _first_calls(SSE, on_first=bad)
+    assert out.endswith(DONE) and b"Hi" in out
+    assert seen == [0]
+    assert len([r for r in caplog.records if r.name == "llm_service.proxy"]) == 1

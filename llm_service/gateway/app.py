@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
 import httpx
@@ -23,6 +23,7 @@ from llm_service.gateway.audit import AuditLog, PromptUnreadable, iso, parse_tim
 from llm_service.gateway.audit_merge import MAINTENANCE_INTERVAL, AuditMerger, run_maintenance
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
+from llm_service.gateway.engine_metrics import EngineReader, GpuReader, metrics_client
 from llm_service.gateway.identity import (
     AccessCheck,
     AdminCheck,
@@ -32,6 +33,8 @@ from llm_service.gateway.identity import (
 )
 from llm_service.gateway.limiter import LimitExceeded, Limiter
 from llm_service.gateway.limits import InvalidLimit, LimitStore, StorageUnavailable
+from llm_service.gateway.load import LoadMonitor
+from llm_service.gateway.metrics_store import MAX_DAYS, MetricsStore
 from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.proxy import forward, prompt_of
 from llm_service.gateway.storage import BlobStore
@@ -44,6 +47,8 @@ SYSTEM_USER = "system"
 OPENAI_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings")
 MAX_AUDIT_LIMIT = 1000
 DAY_FORM = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+SAMPLE_INTERVAL = 5.0
+GPU_EVERY = 3  # the GPU memory is read at each third sample
 
 SERVICE_API = "datatailr-llm-service"
 SERVICE_API_VERSION = 1
@@ -87,6 +92,24 @@ def _check_day(name: str, value: str | None) -> str | None:
     return value
 
 
+def _check_instant(name: str, value: str | None) -> datetime:
+    """Return `value` as a time in UTC. A time without a zone counts as UTC. Raise `ApiError` otherwise."""
+    try:
+        if value is None:
+            raise ValueError(name)
+        text = value.strip()
+        # Python 3.13 accepts a capital `Z` only.
+        moment = datetime.fromisoformat(text[:-1] + "Z" if text.endswith("z") else text)
+        return moment.astimezone(timezone.utc) if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError):
+        raise ApiError(
+            400,
+            "invalid_request_error",
+            "invalid_time",
+            f"{name} is required and must be an ISO time like 2026-11-10T12:00:00Z",
+        ) from None
+
+
 def create_app(
     config: Config,
     store: BlobStore,
@@ -97,12 +120,19 @@ def create_app(
     now: Callable[[], datetime] = utc_now,
     maintenance_interval: float = MAINTENANCE_INTERVAL,
     access: AccessCheck | None = None,
+    gpu: GpuReader | None = None,
+    sample_interval: float = SAMPLE_INTERVAL,
+    metrics_http: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     """Build the gateway application from its parts.
 
     `now` is the clock of the audit log, the merger and the usage totals. Tests replace it.
     `maintenance_interval` is the sleep in seconds between two merge and retention steps.
     `access` decides who has access to the service. Without it, only admins have access.
+    `gpu` reads the GPU memory. Without it, the app builds a `GpuReader`.
+    `sample_interval` is the sleep in seconds between two load samples.
+    `metrics_http` is the client of the engine metrics read. Without it, the app builds a
+    client with its own small pool, so a busy proxy does not block the read.
     """
     access = access or AccessCheck(admin, None, lambda group: [])
     owns_http = http is None
@@ -118,7 +148,13 @@ def create_app(
 
     limiter = Limiter(usage.tokens_today, seconds_to_midnight)
     merger = AuditMerger(store, config.blob_root, audit, now, config.prompt_retention_days)
-    stopping = threading.Event()  # set before the last flusher cycle, which forces the checkpoint
+    stopping = threading.Event()  # set before the last flusher cycle, which forces the checkpoint and the metrics write
+    load = LoadMonitor(now)
+    metrics = MetricsStore(store, config.blob_root, now, config.metrics_retention_days)
+    gpu = gpu or GpuReader()
+    owns_metrics_http = metrics_http is None
+    metrics_http = metrics_http or metrics_client()
+    engine_reader = EngineReader(metrics_http, engine.base_url)
     weights = WeightCache(store, config.blob_root, config.local_dir, download)
 
     def write_audit(record: dict) -> None:
@@ -156,23 +192,54 @@ def create_app(
     manager = ModelManager(weights, engine, store, config.blob_root, config.default_model, on_event)
 
     def on_flusher_tick() -> None:
-        """Run the usage steps and the new read of the limits after each flush, in the flusher thread.
+        """Run the usage steps, the new read of the limits and the metrics write after each flush.
 
-        Each step has its own guard, so one failure does not stop the others. The last cycle
-        at shutdown forces the checkpoint. The limits file is read again only after a failed read.
-        The merge and the retention run in the maintenance task, so a flush never waits for their deletes.
+        The steps run in the flusher thread. Each step has its own guard, so one failure does not
+        stop the others. The last cycle at shutdown forces the checkpoint and the metrics write.
+        The limits file is read again only after a failed read. The merge and the retention run
+        in the maintenance task, so a flush never waits for their deletes.
         """
         last_cycle = stopping.is_set()
         steps = [
             ("close_days", usage.close_days),
             ("checkpoint", lambda: usage.checkpoint(force=last_cycle)),
             ("limits", limits.retry_load),
+            ("metrics", lambda: metrics.write(force=last_cycle)),
         ]
         for name, step in steps:
             try:
                 step()
             except Exception as error:
                 logger.warning("the flusher step %s failed: %s", name, error)
+
+    def maintenance_tick() -> None:
+        """Run the merge and the metrics retention, each with its own guard."""
+        for name, step in (("merge", merger.tick), ("metrics retention", metrics.retain)):
+            try:
+                step()
+            except Exception as error:
+                logger.warning("the maintenance step %s failed: %s", name, error)
+
+    async def sample_loop() -> None:
+        """Take a load sample each `sample_interval` seconds until a cancel.
+
+        Each round reads the engine numbers, and at each third round the GPU memory in a thread.
+        The loop logs a failed round and goes on.
+        """
+        gpu_memory = None
+        rounds = 0
+        while True:
+            try:
+                numbers = await engine_reader.read()
+                if rounds % GPU_EVERY == 0:
+                    gpu_memory = await asyncio.to_thread(gpu.read)
+                rounds += 1
+                metrics.add(load.add_sample(numbers, gpu_memory))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("a load sample failed: %s", error)
+            await asyncio.sleep(sample_interval)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -184,12 +251,14 @@ def create_app(
         days = await asyncio.to_thread(usage.load)
         logger.info("usage totals loaded in %.1f s for %d days", time.monotonic() - started, days)
         audit.listeners.append(usage.record)
+        audit.listeners.append(load.observe)
         audit.flushed_listeners.append(usage.flushed)
         audit.flushed_listeners.append(merger.flushed)
         flusher = asyncio.create_task(
             run_flusher(audit, config.flush_interval, on_tick=on_flusher_tick)
         )
-        maintenance = asyncio.create_task(run_maintenance(merger.tick, maintenance_interval))
+        maintenance = asyncio.create_task(run_maintenance(maintenance_tick, maintenance_interval))
+        sampler = asyncio.create_task(sample_loop())
         app.state.maintenance_task = maintenance
         app.state.startup_task = asyncio.create_task(manager.startup())
         try:
@@ -201,6 +270,10 @@ def create_app(
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
+            # The sampler ends before the engine, so no metrics read fails during the stop.
+            sampler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sampler
             try:
                 await engine.stop()
             finally:
@@ -208,12 +281,19 @@ def create_app(
                 maintenance.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await maintenance
+                # One last round with no reads, so the points of the last minutes reach the store.
+                try:
+                    metrics.add(load.add_sample({}, None))
+                except Exception as error:
+                    logger.warning("the last load sample failed: %s", error)
                 stopping.set()
                 flusher.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await flusher
                 if owns_http:
                     await client.aclose()
+                if owns_metrics_http:
+                    await metrics_http.aclose()
 
     app = FastAPI(title="LLM service", lifespan=lifespan)
     app.state.last_admin = SYSTEM_USER
@@ -226,6 +306,8 @@ def create_app(
     app.state.usage = usage
     app.state.limits = limits
     app.state.limiter = limiter
+    app.state.load = load
+    app.state.metrics = metrics
 
     # Error bodies
 
@@ -337,13 +419,22 @@ def create_app(
             body: dict | None = None
             model: str | None = None
 
+            first_ms: int | None = None  # time to the first content of a stream
+
+            def note_first() -> None:
+                nonlocal first_ms
+                first_ms = int((time.monotonic() - started) * 1000)
+
             slot = False  # True while the limiter holds a slot of this request
 
             def release_slot() -> None:
                 nonlocal slot
                 if slot:
                     slot = False
-                    limiter.release(user)
+                    try:
+                        limiter.release(user)
+                    finally:
+                        load.end()
 
             def record(status: int, usage_counts: dict | None = None) -> None:
                 release_slot()
@@ -360,6 +451,7 @@ def create_app(
                     "completion_tokens": counts.get("completion_tokens"),
                     "total_tokens": counts.get("total_tokens"),
                     "duration_ms": int((time.monotonic() - started) * 1000),
+                    "ttft_ms": first_ms,
                 }
                 if user != caller:
                     entry["via"] = caller
@@ -431,8 +523,9 @@ def create_app(
                     )
                 )
             slot = True
+            load.begin()
             try:
-                response = await forward(client, engine.base_url, path, body, record)
+                response = await forward(client, engine.base_url, path, body, record, note_first)
             except BaseException:
                 release_slot()
                 raise
@@ -689,6 +782,23 @@ def create_app(
                 }
             )
         return {"deleted": [{"model": model_id, "revision": name} for name in removed]}
+
+    @app.get("/admin/metrics/live")
+    async def get_live_metrics(admin_user: str = Depends(require_admin)) -> dict:
+        return load.live()
+
+    @app.get("/admin/metrics/history")
+    async def get_metrics_history(
+        since: str | None = None, until: str | None = None, admin_user: str = Depends(require_admin)
+    ) -> dict:
+        start = _check_instant("since", since)
+        end = _check_instant("until", until)
+        if start > end:
+            raise ApiError(400, "invalid_request_error", "invalid_time", "since is after until")
+        if end - start > timedelta(days=MAX_DAYS):
+            raise ApiError(400, "invalid_request_error", "invalid_time", f"the range is over {MAX_DAYS} days")
+        points, step, missing = await asyncio.to_thread(metrics.history, start, end)
+        return {"step_seconds": step, "points": points, "missing_days": missing}
 
     @app.get("/admin/audit")
     async def get_audit(

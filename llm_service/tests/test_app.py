@@ -61,6 +61,21 @@ def plain_download(model: str, revision: str, target: Path) -> None:
     (target / "config.json").write_text("{}")
 
 
+class FakeGpu:
+    """A GPU reader double. It gives `value` and counts its reads."""
+
+    def __init__(self, value) -> None:
+        self.value = value
+        self.reads = 0
+
+    def read(self):
+        self.reads += 1
+        return self.value
+
+
+NOT_GIVEN = object()
+
+
 def make_app(
     tmp_path,
     engine=None,
@@ -70,6 +85,9 @@ def make_app(
     now=None,
     maintenance_interval=None,
     with_access=True,
+    gpu=None,
+    sample_interval=None,
+    metrics_http=NOT_GIVEN,
     **config_args,
 ):
     store = store or MemoryBlobStore()
@@ -88,6 +106,13 @@ def make_app(
         extra["now"] = now
     if maintenance_interval is not None:
         extra["maintenance_interval"] = maintenance_interval
+    extra["gpu"] = gpu or FakeGpu(None)
+    if sample_interval is not None:
+        extra["sample_interval"] = sample_interval
+    if metrics_http is NOT_GIVEN:
+        # The engine reader answers 404 unless a test gives it a client. None lets the app build its own client.
+        metrics_http = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(404)))
+    extra["metrics_http"] = metrics_http
     return create_app(config, store, engine, admin, download, http, **extra)
 
 
@@ -1426,9 +1451,14 @@ class HeldEngine:
         self.fail = False
         self.crash = False
         self.hold_stream = False  # a stream waits for `gate` after its first chunk
+        self.metrics: str | None = None  # the text of GET /metrics, or None for a 404
 
     def transport(self) -> httpx.MockTransport:
         async def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET" and request.url.path == "/metrics":
+                if self.metrics is None:
+                    return httpx.Response(404)
+                return httpx.Response(200, text=self.metrics)
             if self.fail:
                 raise httpx.ConnectError("engine is gone")
             if self.crash:
@@ -1461,14 +1491,15 @@ class HeldEngine:
         return httpx.MockTransport(handler)
 
 
-def limited_client(tmp_path, limits, engine=None, now=None):
+def limited_client(tmp_path, limits, engine=None, now=None, **app_args):
     """Return a started TestClient whose store holds the limits file `limits` (a dict, bytes or None)."""
     store = MemoryBlobStore()
     if limits is not None:
         store.put(LIMITS_PATH, limits if isinstance(limits, bytes) else json.dumps(limits))
     engine = engine or HeldEngine()
     http = httpx.AsyncClient(transport=engine.transport(), base_url="http://engine")
-    return TestClient(make_app(tmp_path, store=store, http=http, now=now)), engine
+    app_args.setdefault("metrics_http", httpx.AsyncClient(transport=engine.transport()))
+    return TestClient(make_app(tmp_path, store=store, http=http, now=now, **app_args)), engine
 
 
 FULL_LIMITS = {"requests_per_minute": 5, "tokens_per_day": 1000, "parallel_requests": 2}
@@ -1585,48 +1616,54 @@ def test_parallel_counter_is_zero_after_forward_raises(tmp_path):
         assert parallel_of(c) == 0
 
 
+def leave_a_stream(c):
+    """Send a streamed request as bob, read its first chunk, then disconnect. Return the sent messages."""
+    sent = []
+
+    async def drop():
+        proceed = asyncio.Event()
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": CHAT,
+            "raw_path": CHAT.encode(),
+            "query_string": b"",
+            "headers": [(b"x-datatailr-user", b"bob"), (b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 1),
+            "server": ("test", 80),
+        }
+        payload = json.dumps({**HI, "stream": True}).encode()
+        given = False
+
+        async def receive():
+            nonlocal given
+            if not given:
+                given = True
+                return {"type": "http.request", "body": payload, "more_body": False}
+            await proceed.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "http.response.body" and message.get("body"):
+                proceed.set()
+                await asyncio.sleep(0.05)
+
+        await c.app(scope, receive, send)
+
+    c.portal.call(drop)
+    return sent
+
+
 def test_parallel_counter_is_zero_after_a_client_leaves_a_stream(tmp_path):
     c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
     with c:
         wait_ready(c)
         engine.hold_stream = True
-        sent = []
-
-        async def drop():
-            proceed = asyncio.Event()
-            scope = {
-                "type": "http",
-                "asgi": {"version": "3.0"},
-                "http_version": "1.1",
-                "method": "POST",
-                "scheme": "http",
-                "path": CHAT,
-                "raw_path": CHAT.encode(),
-                "query_string": b"",
-                "headers": [(b"x-datatailr-user", b"bob"), (b"content-type", b"application/json")],
-                "client": ("127.0.0.1", 1),
-                "server": ("test", 80),
-            }
-            payload = json.dumps({**HI, "stream": True}).encode()
-            given = False
-
-            async def receive():
-                nonlocal given
-                if not given:
-                    given = True
-                    return {"type": "http.request", "body": payload, "more_body": False}
-                await proceed.wait()
-                return {"type": "http.disconnect"}
-
-            async def send(message):
-                sent.append(message)
-                if message["type"] == "http.response.body" and message.get("body"):
-                    proceed.set()
-                    await asyncio.sleep(0.05)
-
-            await c.app(scope, receive, send)
-
-        c.portal.call(drop)
+        sent = leave_a_stream(c)
         engine.gate.set()
         assert any(m.get("body") for m in sent)
         assert parallel_of(c) == 0
@@ -2097,3 +2134,442 @@ def test_an_admin_whose_entry_goes_away_gets_no_limit_from_the_default(tmp_path)
         assert c.delete("/admin/limits/users/alice", headers=ALICE).status_code == 200
         for _ in range(FULL["requests_per_minute"] + 2):
             assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200
+
+
+def test_ttft_ms_is_set_for_a_stream_and_null_otherwise(client):
+    assert client.post(CHAT, headers=BOB, json={**HI, "stream": True}).status_code == 200
+    assert client.post(CHAT, headers=BOB, json=HI).status_code == 200
+    assert client.post(CHAT, headers=BOB, json={**HI, "model": "other"}).status_code == 404
+    rows = audit_records(client, user="bob")
+    streamed = [r for r in rows if r["stream"] is True]
+    others = [r for r in rows if r["stream"] is not True]
+    assert len(streamed) == 1 and len(others) == 2
+    assert isinstance(streamed[0]["ttft_ms"], int)
+    assert 0 <= streamed[0]["ttft_ms"] <= streamed[0]["duration_ms"]
+    assert all(r["ttft_ms"] is None for r in others)
+
+
+def test_ttft_ms_is_null_for_a_stream_without_content(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        data = (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":""}}]}\n\n'
+            b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":0,"total_tokens":3}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=data)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://engine")
+    with TestClient(make_app(tmp_path, http=http)) as c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json={**HI, "stream": True}).status_code == 200
+        (row,) = audit_records(c, user="bob")
+    assert row["stream"] is True and row["status"] == 200
+    assert row["ttft_ms"] is None
+
+
+# Live load and the metrics history
+
+METRICS_TEXT = (
+    "# TYPE vllm:num_requests_running gauge\n"
+    "vllm:num_requests_running 3\n"
+    "vllm:num_requests_waiting 2\n"
+    "vllm:prompt_tokens_total 100\n"
+    "vllm:generation_tokens_total 50\n"
+    'vllm:kv_cache_usage_perc{engine="0"} 0.37\n'
+)
+METRICS_DIR = "llm-service/metrics"
+OLD_WRITER = "20261109T080000Z-bbbbbbbb"  # the files of an earlier process
+DAY = "2026-11-10"
+
+
+def in_flight_counts(c):
+    """Wrap `begin` and `end` of the monitor to count calls. Return the two lists."""
+    begun, ended = [], []
+    load = c.app.state.load
+    begin, end = load.begin, load.end
+    load.begin = lambda: (begun.append(1), begin())[1]
+    load.end = lambda: (ended.append(1), end())[1]
+    return begun, ended
+
+
+def wait_until(predicate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("timeout")
+
+
+def test_in_flight_is_1_while_a_request_is_held_and_0_after(tmp_path):
+    c, engine = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        begun, ended = in_flight_counts(c)
+        engine.hold = True
+        first = []
+        worker = threading.Thread(target=lambda: first.append(c.post(CHAT, headers=BOB, json=HI)))
+        worker.start()
+        assert engine.entered.wait(10)
+        assert c.app.state.load.in_flight() == 1
+        engine.gate.set()
+        worker.join(10)
+        assert first[0].status_code == 200
+        assert c.app.state.load.in_flight() == 0
+        assert (len(begun), len(ended)) == (1, 1)
+
+
+def test_in_flight_is_0_after_a_stream_and_an_engine_failure(tmp_path):
+    c, engine = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        begun, ended = in_flight_counts(c)
+        assert c.post(CHAT, headers=BOB, json={**HI, "stream": True}).status_code == 200
+        assert c.app.state.load.in_flight() == 0
+        engine.fail = True
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 502
+        assert c.app.state.load.in_flight() == 0
+        engine.fail = False
+        engine.crash = True
+        with pytest.raises(RuntimeError):
+            c.post(CHAT, headers=BOB, json=HI)
+        assert c.app.state.load.in_flight() == 0
+        assert (len(begun), len(ended)) == (3, 3)
+
+
+def test_in_flight_is_0_after_a_client_leaves_a_stream(tmp_path):
+    c, engine = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        begun, ended = in_flight_counts(c)
+        engine.hold_stream = True
+        leave_a_stream(c)
+        engine.gate.set()
+        assert c.app.state.load.in_flight() == 0
+        assert (len(begun), len(ended)) == (1, 1)
+
+
+def test_a_refused_request_never_counts_as_in_flight(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=1))
+    with c:
+        wait_ready(c)
+        begun, ended = in_flight_counts(c)
+        assert c.post(CHAT, headers=BOB, json={**HI, "model": "org/other"}).status_code == 404
+        assert c.post(CHAT, headers=BOB, content=b"x").status_code == 400
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 429
+        assert (len(begun), len(ended)) == (1, 1)
+        assert c.app.state.load.in_flight() == 0
+
+
+def test_live_needs_an_admin(client):
+    assert client.get("/admin/metrics/live", headers=BOB).status_code == 403
+    assert client.get("/admin/metrics/live").status_code == 401
+    assert client.get("/admin/metrics/live", headers=ALICE).status_code == 200
+
+
+def test_live_shows_the_gpu_and_the_engine_numbers_after_a_round(tmp_path):
+    c, engine = limited_client(tmp_path, None, now=Clock(), gpu=FakeGpu((1000, 2000)), sample_interval=0.02)
+    engine.metrics = METRICS_TEXT
+    with c:
+        wait_ready(c)
+        wait_until(lambda: c.app.state.load.live()["now"]["running"] == 3)
+        body = c.get("/admin/metrics/live", headers=ALICE).json()
+        assert body["now"]["running"] == 3 and body["now"]["waiting"] == 2
+        assert body["now"]["kv_cache_use"] == 0.37
+        assert body["now"]["gpu_memory_used"] == 1000 and body["now"]["gpu_memory_total"] == 2000
+        assert body["now"]["in_flight"] == 0
+        assert body["points"] == []
+
+
+def test_live_has_null_numbers_without_a_metrics_endpoint(tmp_path):
+    c, engine = limited_client(tmp_path, None, sample_interval=0.02)
+    with c:
+        wait_ready(c)
+        wait_until(lambda: c.app.state.load.live()["now"]["ts"] is not None)
+        now = c.get("/admin/metrics/live", headers=ALICE).json()["now"]
+        assert now["running"] is None and now["waiting"] is None
+        assert now["kv_cache_use"] is None
+        assert now["prompt_tokens_per_s"] is None
+        assert now["gpu_memory_used"] is None and now["gpu_memory_total"] is None
+        assert now["in_flight"] == 0
+
+
+def test_the_gpu_is_read_at_each_third_round(tmp_path):
+    class CountingGpu:
+        """Each read gives a new value: (1, 1), then (2, 2), and so on."""
+
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read(self):
+            self.reads += 1
+            return (self.reads, self.reads)
+
+    c, _ = limited_client(tmp_path, None, gpu=CountingGpu(), sample_interval=0.01)
+    load = c.app.state.load
+    real, given = load.add_sample, []
+
+    def spy(engine_numbers, gpu):
+        given.append(gpu)
+        return real(engine_numbers, gpu)
+
+    load.add_sample = spy
+    with c:
+        wait_ready(c)
+        wait_until(lambda: len(given) >= 9)
+        assert given[:9] == [(1, 1)] * 3 + [(2, 2)] * 3 + [(3, 3)] * 3
+
+
+def test_a_minute_with_a_request_becomes_a_point(tmp_path):
+    clock = Clock()
+    c, _ = limited_client(tmp_path, None, now=clock, sample_interval=0.02)
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json={**HI, "stream": True}).status_code == 200
+        assert c.post(CHAT, headers=BOB, json={**HI, "model": "other"}).status_code == 404
+        clock.advance(minutes=1)
+        wait_until(lambda: c.app.state.load.live()["points"])
+        point = c.get("/admin/metrics/live", headers=ALICE).json()["points"][0]
+        assert point["ts"] == "2026-11-10T12:00:00Z"
+        assert point["requests"] == 2 and point["failed_requests"] == 1
+        assert point["prompt_tokens"] == 3 and point["completion_tokens"] == 2
+        assert isinstance(point["ttft_ms_p50"], int) and isinstance(point["ttft_ms_p95"], int)
+
+
+def test_a_round_that_raises_does_not_stop_the_next_round(tmp_path):
+    c, _ = limited_client(tmp_path, None, sample_interval=0.02)
+    with c:
+        wait_ready(c)
+        load = c.app.state.load
+        real = load.add_sample
+        calls = []
+
+        def broken(engine_numbers, gpu):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("one bad round")
+            return real(engine_numbers, gpu)
+
+        load.add_sample = broken
+        wait_until(lambda: len(calls) >= 3)
+
+
+def history(c, since, until, headers=ALICE):
+    return c.get("/admin/metrics/history", headers=headers, params={"since": since, "until": until})
+
+
+def test_history_returns_the_points_the_store_wrote(tmp_path):
+    clock = Clock()
+    store = MemoryBlobStore()
+    store.put(f"{METRICS_DIR}/2026-11-09/{OLD_WRITER}.jsonl", json.dumps({"ts": "2026-11-09T23:59:00Z", "requests": 4}) + "\n")
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    app = make_app(tmp_path, store=store, http=http, now=clock, sample_interval=0.02)
+    with TestClient(app) as c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        clock.advance(minutes=1)
+        wait_until(lambda: c.app.state.load.live()["points"])
+        c.app.state.metrics.write(force=True)
+        assert f"{METRICS_DIR}/{DAY}/{c.app.state.metrics.writer}.jsonl" in store.ls(METRICS_DIR)
+        body = history(c, "2026-11-09T23:00:00Z", "2026-11-10T13:00:00+00:00").json()
+        # The range touches 841 minutes, so a point covers 2 minutes and has the start of its bucket as ts.
+        assert body["step_seconds"] == 120 and body["missing_days"] == []
+        assert [p["ts"] for p in body["points"]] == ["2026-11-09T23:58:00Z", "2026-11-10T12:00:00Z"]
+        assert body["points"][1]["requests"] == 1
+        # A time without a zone counts as UTC.
+        naive = history(c, "2026-11-10T12:00:00", "2026-11-10T12:30:00").json()
+        assert [p["ts"] for p in naive["points"]] == ["2026-11-10T12:00:00Z"]
+        assert history(c, "2026-11-10T12:00:00Z", "2026-11-10T12:30:00Z", BOB).status_code == 403
+
+
+def test_history_names_the_days_that_cannot_be_read(tmp_path):
+    class Broken(MemoryBlobStore):
+        def get(self, path):
+            if path.startswith(f"{METRICS_DIR}/2026-11-09"):
+                raise OSError("the store is down")
+            return super().get(path)
+
+    store = Broken()
+    store.put(f"{METRICS_DIR}/2026-11-09/{OLD_WRITER}.jsonl", "{}\n")
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    with TestClient(make_app(tmp_path, store=store, http=http, now=Clock())) as c:
+        wait_ready(c)
+        body = history(c, "2026-11-09T00:00:00Z", "2026-11-10T13:00:00Z").json()
+        assert body["missing_days"] == ["2026-11-09"] and body["points"] == []
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"since": "2026-11-10T12:00:00Z"},
+        {"until": "2026-11-10T12:00:00Z"},
+        {"since": "yesterday", "until": "2026-11-10T12:00:00Z"},
+        {"since": "2026-11-10T12:00:00Z", "until": "x"},
+        {"since": "2026-11-10T13:00:00Z", "until": "2026-11-10T12:00:00Z"},
+        {"since": "2026-10-01T00:00:00Z", "until": "2026-11-10T12:00:00Z"},
+    ],
+)
+def test_history_refuses_a_bad_range(client, params):
+    r = client.get("/admin/metrics/history", headers=ALICE, params=params)
+    assert r.status_code == 400
+    error = r.json()["error"]
+    assert error["code"] == "invalid_time" and error["type"] == "invalid_request_error" and error["message"]
+
+
+@pytest.mark.parametrize(
+    "since,until",
+    [
+        ("0001-01-01T00:00:00+05:00", "2026-11-10T12:00:00Z"),
+        ("2026-11-10T12:00:00Z", "9999-12-31T23:59:59-05:00"),
+    ],
+)
+def test_history_answers_400_for_a_time_at_the_edge_of_the_range(client, since, until):
+    r = history(client, since, until)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_time"
+
+
+def test_history_range_of_31_days_passes_and_one_second_more_is_refused(client):
+    assert history(client, "2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z").status_code == 200
+    r = history(client, "2026-10-01T00:00:00Z", "2026-11-01T00:00:01Z")
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_time"
+
+
+def test_history_takes_a_lower_case_z(client):
+    r = history(client, "2026-11-10T12:00:00z", "2026-11-10T13:00:00z")
+    assert r.status_code == 200
+
+
+def test_a_failed_limiter_release_still_ends_the_in_flight_count(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+
+        def broken(user):
+            raise RuntimeError("release failed")
+
+        c.app.state.limiter.release = broken
+        c.post(CHAT, headers=BOB, json=HI)  # the proxy logs the failed callback
+        assert c.app.state.load.in_flight() == 0
+
+
+def test_the_points_reach_blob_storage_at_shutdown(tmp_path):
+    clock, store = Clock(), MemoryBlobStore()
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    app = make_app(tmp_path, store=store, http=http, now=clock, sample_interval=60)
+    with TestClient(app) as c:
+        wait_ready(c)
+        wait_until(lambda: c.app.state.load.live()["now"]["ts"] is not None)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        clock.advance(minutes=1)  # the sampler sleeps, so only the last round sees this minute
+        writer = c.app.state.metrics.writer
+    assert store.ls(METRICS_DIR) == [f"{METRICS_DIR}/{DAY}/{writer}.jsonl"]
+    lines = store.get(f"{METRICS_DIR}/{DAY}/{writer}.jsonl").decode().splitlines()
+    assert [json.loads(line)["requests"] for line in lines] == [1]
+
+
+def test_the_service_reads_the_files_of_today(tmp_path):
+    clock, store = Clock(), MemoryBlobStore()
+    store.put(f"{METRICS_DIR}/{DAY}/{OLD_WRITER}.jsonl", json.dumps({"ts": "2026-11-10T11:00:00Z", "requests": 7}) + "\n")
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    with TestClient(make_app(tmp_path, store=store, http=http, now=clock)) as c:
+        wait_ready(c)
+        body = history(c, "2026-11-10T00:00:00Z", "2026-11-10T13:00:00Z").json()
+        assert [p["requests"] for p in body["points"]] == [7]
+
+
+def test_history_shows_a_file_of_another_process_written_after_the_start(tmp_path):
+    clock, store = Clock(), MemoryBlobStore()
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    with TestClient(make_app(tmp_path, store=store, http=http, now=clock)) as c:
+        wait_ready(c)
+        store.put(f"{METRICS_DIR}/{DAY}/{OLD_WRITER}.jsonl", json.dumps({"ts": "2026-11-10T11:00:00Z", "requests": 3}) + "\n")
+        body = history(c, "2026-11-10T00:00:00Z", "2026-11-10T13:00:00Z").json()
+        assert [p["requests"] for p in body["points"]] == [3]
+    assert not hasattr(c.app.state.metrics, "load_today")
+
+
+def test_the_maintenance_task_removes_old_metrics_files(tmp_path):
+    store = MemoryBlobStore()
+    store.put(f"{METRICS_DIR}/2026-01-01.jsonl", "{}\n")
+    store.put(f"{METRICS_DIR}/2026-01-01/{OLD_WRITER}.jsonl", "{}\n")
+    store.put(f"{METRICS_DIR}/2026-11-01/{OLD_WRITER}.jsonl", "{}\n")
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    app = make_app(
+        tmp_path, store=store, http=http, now=Clock(), maintenance_interval=0.05, metrics_retention_days=30
+    )
+    with TestClient(app) as c:
+        wait_ready(c)
+        wait_until(lambda: store.ls(METRICS_DIR) == [f"{METRICS_DIR}/2026-11-01/{OLD_WRITER}.jsonl"])
+
+
+def test_the_engine_reader_does_not_use_the_proxy_client(tmp_path):
+    proxy_paths, reader_paths = [], []
+
+    def proxy(request: httpx.Request) -> httpx.Response:
+        proxy_paths.append(request.url.path)
+        return httpx.Response(200, json={"id": "x", "choices": [], "usage": None})
+
+    def reader(request: httpx.Request) -> httpx.Response:
+        reader_paths.append(request.url.path)
+        return httpx.Response(200, text=METRICS_TEXT)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(proxy), base_url="http://engine")
+    metrics_http = httpx.AsyncClient(transport=httpx.MockTransport(reader))
+    app = make_app(tmp_path, http=http, metrics_http=metrics_http, sample_interval=0.02)
+    with TestClient(app) as c:
+        wait_ready(c)
+        wait_until(lambda: c.app.state.load.live()["now"]["running"] == 3)
+    assert "/metrics" in reader_paths
+    assert "/metrics" not in proxy_paths
+
+
+def test_the_app_builds_its_own_client_for_the_engine_metrics(tmp_path):
+    proxy_paths = []
+
+    def proxy(request: httpx.Request) -> httpx.Response:
+        proxy_paths.append(request.url.path)
+        return httpx.Response(200, text=METRICS_TEXT)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(proxy), base_url="http://engine")
+    app = make_app(tmp_path, http=http, metrics_http=None, sample_interval=0.02)
+    with TestClient(app) as c:
+        wait_ready(c)
+        rounds = []
+        real = c.app.state.load.add_sample
+        c.app.state.load.add_sample = lambda numbers, gpu: rounds.append(numbers) or real(numbers, gpu)
+        wait_until(lambda: len(rounds) >= 3)
+    assert "/metrics" not in proxy_paths
+    assert rounds[0]["running"] is None
+
+
+def test_the_sampler_stops_before_the_engine_stops(tmp_path):
+    class SlowStop(FakeEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stopping = False
+
+        async def stop(self) -> None:
+            self.stopping = True
+            await asyncio.sleep(0.2)
+            await super().stop()
+
+    engine = SlowStop()
+    reads_during_stop = []
+    app = make_app(tmp_path, engine=engine, sample_interval=0.01)
+    with TestClient(app) as c:
+        wait_ready(c)
+        load = c.app.state.load
+        real = load.add_sample
+
+        def spy(numbers, gpu):
+            if engine.stopping and numbers:
+                reads_during_stop.append(numbers)
+            return real(numbers, gpu)
+
+        load.add_sample = spy
+        wait_until(lambda: load.live()["now"]["ts"] is not None)
+    assert engine.stopped == 1
+    assert reads_during_stop == []

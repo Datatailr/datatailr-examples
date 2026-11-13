@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -682,8 +683,9 @@ def test_page_has_the_elements_of_the_connect_tab(element_id):
 def test_connect_tab_comes_after_usage():
     page = (STATIC_DIR / "index.html").read_text()
     tabs = re.findall(r'role="tab" id="tab-(\w+)"', page)
-    assert tabs == ["usage", "connect", "audit", "models", "limits"]
-    assert "const TABS = ['usage', 'connect', 'audit', 'models', 'limits'];" in (STATIC_DIR / "app.js").read_text()
+    assert tabs == ["usage", "load", "connect", "audit", "models", "limits"]
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "const TABS = ['usage', 'load', 'connect', 'audit', 'models', 'limits'];" in text
 
 
 @pytest.mark.parametrize(
@@ -893,6 +895,189 @@ def test_page_limit_helpers(tmp_path):
     assert result["waits"] == [17, 0, None, None, None, None, None]
     assert result["texts"] == ["Try again in 1 second.", "Try again in 17 seconds.", "", ""]
     assert result["missing"] == [True, True, False, False, False]
+
+
+LOAD_IDS = (
+    "tab-load", "panel-load", "load-missing", "load-note", "load-note-text", "load-retry", "load-one", "load-all",
+    "load-dates", "load-since", "load-until", "load-dates-status", "load-now-text", "load-minute-text",
+    "load-in-flight", "load-waiting", "load-completion-rate", "load-prompt-rate", "load-kv-cache", "load-gpu",
+    "load-requests", "load-failed", "load-ttft-p50", "load-ttft-p95", "load-duration-p50", "load-duration-p95",
+    "load-range-text", "load-days-note", "load-charts", "chart-load-requests", "chart-load-tokens",
+    "chart-load-ttft", "chart-load-duration", "chart-load-queue", "chart-load-engine", "load-all-text", "load-all-body",
+)
+
+
+@pytest.mark.parametrize("element_id", LOAD_IDS)
+def test_page_has_the_elements_of_the_load_tab(element_id):
+    assert f'id="{element_id}"' in (STATIC_DIR / "index.html").read_text()
+
+
+def test_load_tab_shows_the_kv_cache_use():
+    page = (STATIC_DIR / "index.html").read_text()
+    assert 'id="chart-load-gpu"' not in page
+    assert page.index('id="load-kv-cache"') < page.index('id="load-gpu"')
+    assert '<div class="label">KV cache use</div>' in page
+    assert '<h2>Engine memory <span class="caption">Maximum</span></h2>' in page
+    head = page[page.index('id="load-all"'):page.index('id="load-all-body"')]
+    assert head.index(">KV cache use</th>") < head.index(">GPU memory used</th>")
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "$('load-kv-cache').textContent = percentText(at.kv_cache_use);" in text
+    assert "el('td', {className: 'num', text: percentText(now.kv_cache_use)})" in text
+    assert "colspan: 6," in text and "services.map(loadRow), 7," in text
+    assert "'load-kv-cache'" in text[text.index("const LOAD_TILES"):text.index("// The steps of the time axis")]
+
+
+def test_page_offers_the_ranges_of_the_load_tab():
+    page = (STATIC_DIR / "index.html").read_text()
+    assert re.findall(r'data-load-range="(\w+)"', page) == ["hour", "6h", "24h", "7d", "custom"]
+    for field in ("load-since", "load-until"):
+        tag = re.search(rf'<input[^>]*id="{field}"[^>]*>', page).group(0)
+        assert 'type="datetime-local"' in tag
+    assert "Times in your local time." in (STATIC_DIR / "app.js").read_text()
+
+
+def test_load_tab_is_for_an_admin_and_shows_the_table_for_all_services():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "load: {admin: true}" in text
+    assert "load: loadLoad" in text
+    rules = text[text.index("const TAB_RULES = "):text.index("function tabShown(")]
+    for rule in ("connect: {one: true}", "audit: {one: true, admin: true}", "models: {one: true, admin: true}",
+                 "limits: {one: true, admin: true}", "usage: {}"):
+        assert rule in rules, rule
+
+
+def test_page_calls_the_three_load_routes_and_drops_late_answers():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "current('loadLive', call, service, api(servicePath('metrics/live', service), loadRead()))" in text
+    assert "current('loadAll', call, null, api('api/load', loadRead()))" in text
+    assert "current('loadHistory', call, service," in text
+    assert "servicePath('metrics/history', service)" in text
+
+
+def test_load_tab_reads_on_a_timer_only_while_it_is_open_and_visible():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "const LOAD_MS = 5000;" in text and "const LOAD_MAX_FAILURES = 5;" in text
+    assert "addEventListener('visibilitychange'" in text
+    assert "document.visibilityState !== 'visible'" in text
+    body = text[text.index("function selectTab("):text.index("function tabKeys(")]
+    assert "stopLoadTimer()" in body
+    clear = text[text.index("function clearServiceData("):text.index("async function refreshServices(")]
+    assert "clearLoad();" in clear
+    # The page runs the timer unit that the harness tests below.
+    assert "const loadPoller = createPoller({" in text
+    assert "canRun: () => loadLive() && document.visibilityState === 'visible'" in text
+
+
+def test_load_charts_are_lines_on_a_linear_time_axis_updated_in_place():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("// ---- load"):text.index("// ---- connect")]
+    assert "type: 'line'" in body and "type: 'linear'" in body
+    assert "spanGaps: false" in body
+    assert ".destroy(" not in body and "type: 'time'" not in body
+    assert "chart.update(" in body
+    # Chart.js spreads its own ticks from min to max, so the axis takes the ticks of timeTicks.
+    assert "afterBuildTicks: scale => { scale.ticks = timeTicks(scale.min, scale.max)" in body
+    assert "stepSize" not in body
+    page = (STATIC_DIR / "index.html").read_text()
+    assert page.count("vendor/") == 1  # no new library
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_page_load_helpers(tmp_path):
+    harness = tmp_path / "harness.js"
+    harness.write_text(
+        "const vm = require('vm');\n"
+        "const fs = require('fs');\n"
+        "const context = {URL, console, document: {addEventListener() {}},\n"
+        "  location: {pathname: '/', origin: 'https://example.test'}};\n"
+        "vm.createContext(context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {loadSeries, loadRange, stepText,'\n"
+        "  + ' msText, rateText, gpuText, percentText, loadChartData, localInputValue, loadMissing, ApiError,'\n"
+        "  + ' LOAD_CHARTS};', context);\n"
+        "const h = context.h;\n"
+        "const point = (ts, extra = {}) => ({ts, requests: 2, failed_requests: 0, ttft_ms_p50: 300, ...extra});\n"
+        "const now = Date.parse('2026-11-12T12:00:00Z');\n"
+        "const pick = (series, name) => series[name].map(p => [new Date(p.x).toISOString().slice(11, 16), p.y]);\n"
+        "const live = h.loadSeries([point('2026-11-12T10:00:00Z'), point('2026-11-12T10:01:00Z', {ttft_ms_p50: null}),\n"
+        "                           point('2026-11-12T10:07:00Z'), {ts: 'bad'}, null, {requests: 4}], 60);\n"
+        "const merged = h.loadSeries([point('2026-11-12T10:05:00Z'), point('2026-11-12T10:00:00Z'),\n"
+        "                             point('2026-11-12T10:15:00Z')], 300);\n"
+        "const missing = (status, code) => h.loadMissing(new h.ApiError('x', {status, code}));\n"
+        "const engine = h.LOAD_CHARTS.find(c => c.id === 'chart-load-engine');\n"
+        "const kvSeries = h.loadSeries([point('2026-11-12T10:00:00Z', {kv_cache_use_max: 0.4}),\n"
+        "  point('2026-11-12T10:01:00Z', {kv_cache_use_max: null}), point('2026-11-12T10:02:00Z'),\n"
+        "  point('2026-11-12T10:03:00Z', {kv_cache_use_max: 0.9})], 60);\n"
+        "const gpuSeries = h.loadSeries([point('2026-11-12T10:00:00Z', {kv_cache_use_max: 0.1, gpu_memory_used_max: 2048}),\n"
+        "  point('2026-11-12T10:01:00Z', {gpu_memory_used_max: null})], 60);\n"
+        "console.log(JSON.stringify({\n"
+        "  requests: pick(live, 'requests'), ttft: pick(live, 'ttft_ms_p50'), prompt: pick(live, 'prompt_tokens'),\n"
+        "  merged: pick(merged, 'requests'), empty: h.loadSeries(undefined, 60).requests,\n"
+        "  ranges: ['hour', '6h', '24h', '7d'].map(r => h.loadRange(r, now, '', '')),\n"
+        "  custom: h.loadRange('custom', now, '2026-11-01T10:00', '2026-11-02T10:30'),\n"
+        "  longest: h.loadRange('custom', now, '2026-11-01T00:00', '2026-12-02T00:00'),\n"
+        "  errors: [h.loadRange('custom', now, '', '2026-11-02T10:30'), h.loadRange('custom', now, 'x', 'y'),\n"
+        "           h.loadRange('custom', now, '2026-11-02T10:30', '2026-11-02T10:30'),\n"
+        "           h.loadRange('custom', now, '2026-11-01T00:00', '2026-12-02T00:01')],\n"
+        "  ms: [h.msText(310), h.msText(2100), h.msText(0), h.msText(null), h.msText(undefined)],\n"
+        "  rates: [h.rateText(96.54), h.rateText(0), h.rateText(null), h.rateText('7')],\n"
+        "  gpu: [h.gpuText(14200, 15360), h.gpuText(14200, null), h.gpuText(null, 15360)],\n"
+        "  steps: [60, 300, 3600, 7200, 5400, null].map(h.stepText),\n"
+        "  percent: [0.37, 0.375, 0, 1, 0.004, null, undefined, '0.5'].map(h.percentText),\n"
+        "  engine: engine.series.map(([name, label, , , gib]) => [name, label, Boolean(gib)]),\n"
+        "  engineFormats: [engine.format(0.5), engine.format(null)],\n"
+        "  kv: pick(kvSeries, 'kv_cache_use_max'),\n"
+        "  kvData: h.loadChartData(engine, kvSeries).map(d => [d.data.map(p => p.y), d.shown, d.radius]),\n"
+        "  gpuData: h.loadChartData(engine, gpuSeries).map(d => [d.data.map(p => p.y), d.shown, d.radius]),\n"
+        "  input: h.localInputValue(new Date('2026-11-12T09:05:00Z')),\n"
+        "  missing: [missing(404, 'not_found'), missing(404, 'unknown_service'), missing(502, null)],\n"
+        "}));\n"
+    )
+    env = {**os.environ, "TZ": "Europe/Berlin", "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
+    out = subprocess.run(["node", str(harness), str(STATIC_DIR / "app.js")],
+                         check=True, capture_output=True, text=True, env=env).stdout
+    result = json.loads(out)
+    # A missing minute is a gap (null), not zero. A point without a time is skipped.
+    assert result["requests"] == [["10:00", 2], ["10:01", 2], ["10:02", None], ["10:07", 2]]
+    assert result["ttft"] == [["10:00", 300], ["10:01", None], ["10:02", None], ["10:07", 300]]
+    assert result["prompt"] == [["10:00", None], ["10:01", None], ["10:02", None], ["10:07", None]]
+    # Merged points: a gap needs more than 1.5 steps. The points come in time order.
+    assert result["merged"] == [["10:00", 2], ["10:05", 2], ["10:10", None], ["10:15", 2]]
+    assert result["empty"] == []
+    assert result["ranges"] == [
+        None,
+        {"since": "2026-11-12T06:00:00.000Z", "until": "2026-11-12T12:00:00.000Z"},
+        {"since": "2026-11-11T12:00:00.000Z", "until": "2026-11-12T12:00:00.000Z"},
+        {"since": "2026-11-05T12:00:00.000Z", "until": "2026-11-12T12:00:00.000Z"},
+    ]
+    # The fields are local time (Berlin, UTC+1 in November). The route gets UTC.
+    assert result["custom"] == {"since": "2026-11-01T09:00:00.000Z", "until": "2026-11-02T09:30:00.000Z"}
+    assert result["longest"] == {"since": "2026-10-31T23:00:00.000Z", "until": "2026-12-01T23:00:00.000Z"}
+    assert result["errors"] == [
+        {"error": "Fill in both times of the range."},
+        {"error": "The page cannot read a time of the range."},
+        {"error": "The end of the range must come after its start."},
+        {"error": "The range is longer than 31 days. Pick a shorter range."},
+    ]
+    assert result["ms"] == ["310 ms", "2.10 s", "0 ms", "-", "-"]
+    assert result["rates"] == ["96.5", "0", "-", "-"]
+    assert result["gpu"] == ["13.9 of 15 GiB", "13.9 GiB", "-"]
+    assert result["steps"] == ["One point for each minute.", "One point for each 5 minutes.",
+                               "One point for each hour.", "One point for each 2 hours.",
+                               "One point for each 90 minutes.", ""]
+    assert result["percent"] == ["37%", "38%", "0%", "100%", "0%", "-", "-", "-"]
+    # The engine chart: the KV cache use as a fraction on the first axis, the GPU memory on a second axis.
+    assert result["engine"] == [["kv_cache_use_max", "KV cache use", False],
+                                ["gpu_memory_used_max", "GPU memory used", True]]
+    assert result["engineFormats"] == ["50%", "-"]
+    # A null value, and a point without the field, are gaps.
+    assert result["kv"] == [["10:00", 0.4], ["10:01", None], ["10:02", None], ["10:03", 0.9]]
+    # The GPU memory line shows only when a point has a value. Its values are GiB.
+    # A value between two gaps has no line, so it gets a point of its own.
+    assert result["kvData"] == [[[0.4, None, None, 0.9], True, [3, 0, 0, 3]],
+                                [[None, None, None, None], False, [0, 0, 0, 0]]]
+    assert result["gpuData"] == [[[0.1, None], True, [3, 0]], [[2, None], True, [3, 0]]]
+    assert result["input"] == "2026-11-12T10:05"
+    assert result["missing"] == [True, False, False]
 
 
 def _timeout(request: httpx.Request) -> float:
@@ -1586,3 +1771,519 @@ def test_the_limits_put_routes_refuse_deeply_nested_json(client, fakes, route):
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_json"
     assert fakes.calls() == []
+
+
+LIVE_NOW = {
+    "ts": "2026-11-13T10:00:00Z",
+    "in_flight": 3,
+    "running": 3,
+    "waiting": 0,
+    "kv_cache_use": 0.37,
+    "prompt_tokens_per_s": 210.0,
+    "completion_tokens_per_s": None,
+    "gpu_memory_used": 14200,
+    "gpu_memory_total": 15360,
+}
+
+
+def _live_answer(now=None):
+    return 200, {"now": now if now is not None else LIVE_NOW, "points": []}
+
+
+def test_metrics_live_passes_through_with_the_acting_user(client, fakes):
+    answer = _live_answer()
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = answer
+    response = client.get("/api/services/svc/metrics/live", headers=ALICE)
+    assert response.status_code == 200
+    assert response.json() == answer[1]
+    (sent,) = fakes.calls("/admin/metrics")
+    assert sent.url.host == "svc" and sent.url.path == "/admin/metrics/live"
+    assert sent.headers["X-LLM-Acting-User"] == "alice"
+    assert sent.headers["Connection"] == "close"
+
+
+def test_metrics_live_passes_an_error_status_through(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = (403, ERROR_403)
+    response = client.get("/api/services/svc/metrics/live", headers=ALICE)
+    assert response.status_code == 403
+    assert response.json() == ERROR_403
+
+
+def test_metrics_history_passes_the_times_through(client, fakes):
+    answer = (200, {"step_seconds": 60, "points": [], "missing_days": ["2026-11-01"]})
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/history")] = answer
+    query = "since=2026-11-13T09:00:00Z&until=2026-11-13T10:00:00Z"
+    response = client.get(f"/api/services/svc/metrics/history?{query}", headers=ALICE)
+    assert response.status_code == 200
+    assert response.json() == answer[1]
+    (sent,) = fakes.calls("/admin/metrics")
+    assert sent.url.path == "/admin/metrics/history"
+    assert dict(sent.url.params) == {"since": "2026-11-13T09:00:00Z", "until": "2026-11-13T10:00:00Z"}
+    assert sent.headers["X-LLM-Acting-User"] == "alice"
+    assert sent.headers["Connection"] == "close"
+
+
+def test_metrics_history_passes_a_400_through(client, fakes):
+    bad = {"error": {"message": "bad time", "type": "invalid_request_error", "code": "invalid_time"}}
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/history")] = (400, bad)
+    response = client.get("/api/services/svc/metrics/history?since=nope", headers=ALICE)
+    assert response.status_code == 400
+    assert response.json() == bad
+
+
+def test_metrics_routes_need_a_user_and_a_known_service(client, fakes):
+    assert client.get("/api/services/svc/metrics/live").status_code == 401
+    assert client.get("/api/services/svc/metrics/history").status_code == 401
+    assert client.get("/api/services/unknown/metrics/live", headers=ALICE).status_code == 404
+    assert fakes.calls() == []
+
+
+def _load_calls(fakes):
+    return fakes.calls("/admin/metrics/live")
+
+
+def test_load_lists_two_admin_services_in_registry_order(client, fakes):
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    fakes.hosts["svc-two"].answers[("GET", "/admin/metrics/live")] = _live_answer({**LIVE_NOW, "in_flight": 9})
+    response = client.get("/api/load", headers=ALICE)
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "services": [
+            {"name": "svc", "ok": True, "now": LIVE_NOW},
+            {"name": "svc-two", "ok": True, "now": {**LIVE_NOW, "in_flight": 9}},
+        ]
+    }
+    sent = _load_calls(fakes)
+    assert {r.url.host for r in sent} == {"svc", "svc-two"}
+    assert all(r.headers["X-LLM-Acting-User"] == "alice" for r in sent)
+    assert all(r.headers["Connection"] == "close" for r in sent)
+
+
+def test_load_leaves_out_a_service_where_the_viewer_is_not_admin(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    body = client.get("/api/load", headers=ALICE).json()
+    assert [s["name"] for s in body["services"]] == ["svc"]
+    assert [r.url.host for r in _load_calls(fakes)] == ["svc"]
+
+
+def test_load_leaves_out_a_service_that_answers_403(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc-two"].answers[("GET", "/admin/metrics/live")] = (403, ERROR_403)
+    body = client.get("/api/load", headers=ALICE).json()
+    assert [s["name"] for s in body["services"]] == ["svc"]
+
+
+def test_load_lists_a_service_whose_role_call_failed(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    fakes.hosts["svc-two"].answers[("GET", "/v1/service")] = (500, {})
+    body = client.get("/api/load", headers=ALICE).json()
+    assert body["services"][0]["ok"] is True
+    assert body["services"][1] == {"name": "svc-two", "ok": False, "error": "The service did not answer."}
+
+
+def test_load_a_404_service_does_not_offer_load_numbers(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = (404, {})
+    response = client.get("/api/load", headers=ALICE)
+    assert response.status_code == 200
+    assert response.json()["services"] == [
+        {"name": "svc", "ok": False, "error": "The service does not offer load numbers."}
+    ]
+
+
+def test_load_answers_200_when_each_service_fails(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = (500, {})
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc-two"].error = httpx.ConnectError("down")
+    response = client.get("/api/load", headers=ALICE)
+    assert response.status_code == 200
+    assert [s["ok"] for s in response.json()["services"]] == [False, False]
+
+
+@pytest.mark.parametrize("now", ["x", [], 5, None])
+def test_load_a_now_that_is_not_an_object_fails_that_service_only(client, fakes, now):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = (200, {"now": now, "points": []})
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc-two"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    body = client.get("/api/load", headers=ALICE).json()
+    assert body["services"][0] == {
+        "name": "svc", "ok": False, "error": "The LLM service did not give a valid answer.",
+    }
+    assert body["services"][1]["ok"] is True
+
+
+def test_load_a_body_that_is_not_an_object_fails_that_service(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = (200, [1])
+    body = client.get("/api/load", headers=ALICE).json()
+    assert body["services"][0]["ok"] is False
+
+
+def test_load_an_unexpected_error_fails_one_service_only(client, fakes, monkeypatch):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    fakes.hosts["svc-two"].admins.add("alice")
+    original = app_module.ServiceClient.request
+
+    async def broken(self, service, method, path, viewer, **options):
+        if service == "svc-two" and path == "/admin/metrics/live":
+            raise RuntimeError("boom")
+        return await original(self, service, method, path, viewer, **options)
+
+    monkeypatch.setattr(app_module.ServiceClient, "request", broken)
+    body = client.get("/api/load", headers=ALICE).json()
+    assert [s["ok"] for s in body["services"]] == [True, False]
+
+
+def test_load_a_hanging_service_times_out_and_the_others_answer(client, fakes, monkeypatch):
+    assert app_module.LOAD_TIMEOUT_SECONDS == 5.0
+    monkeypatch.setattr(app_module, "LOAD_TIMEOUT_SECONDS", 0.05)
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc-two"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    original = fakes.hosts["svc"]
+
+    async def hang(request):
+        if request.url.path == "/admin/metrics/live":
+            await asyncio.sleep(5)
+        return original(request)
+
+    fakes.hosts["svc"] = hang
+    started = time.monotonic()
+    response = client.get("/api/load", headers=ALICE)
+    assert time.monotonic() - started < 2
+    assert response.status_code == 200
+    body = response.json()
+    assert body["services"][0] == {
+        "name": "svc", "ok": False, "error": "The LLM service did not answer in time.",
+    }
+    assert body["services"][1]["ok"] is True
+
+
+def test_load_lists_a_service_that_is_not_ok_and_does_not_call_it(client, fakes):
+    fakes.hosts["svc"].caller_admin = False
+    client.portal.call(client.app.state.registry.refresh)
+    fakes.requests.clear()
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc-two"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    entry = client.app.state.registry.entries()[0]
+    assert entry.name == "svc" and entry.state != "ok"
+    response = client.get("/api/load", headers=ALICE)
+    assert response.status_code == 200
+    services = response.json()["services"]
+    assert services[0] == {"name": "svc", "ok": False, "error": f"The service has the state {entry.state}."}
+    assert services[1]["name"] == "svc-two" and services[1]["ok"] is True
+    assert {r.url.host for r in fakes.requests} == {"svc-two"}
+
+
+def test_metrics_history_without_times_sends_no_time_parameters(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/history")] = (200, {"step_seconds": 60, "points": []})
+    assert client.get("/api/services/svc/metrics/history", headers=ALICE).status_code == 200
+    (sent,) = fakes.calls("/admin/metrics")
+    assert "since" not in sent.url.params and "until" not in sent.url.params
+
+
+@pytest.mark.parametrize("route", ["live", "history"])
+def test_metrics_routes_refuse_a_bad_service_name_without_a_call(client, fakes, route):
+    response = client.get(f"/api/services/Bad_Name/metrics/{route}", headers=ALICE)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_service"
+    assert fakes.calls() == []
+
+
+def test_load_needs_a_user(client, fakes):
+    assert client.get("/api/load").status_code == 401
+    assert fakes.requests == []
+
+
+def _run_load_harness(tmp_path, body, zone="UTC"):
+    """Run `body` in node over app.js with `h` bound to the load helpers. Return its JSON output."""
+    harness = tmp_path / "harness.js"
+    harness.write_text(
+        "const vm = require('vm');\n"
+        "const fs = require('fs');\n"
+        "const context = {URL, console, document: {addEventListener() {}},\n"
+        "  location: {pathname: '/', origin: 'https://example.test'}};\n"
+        "vm.createContext(context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {timeTicks, createPoller, readLimit, api, LOAD_READ_MS,'\n"
+        "  + ' pointRadii, createLatestQueue, anySignal, minuteStart};', context);\n"
+        "const h = context.h;\n"
+        "(async () => {\n" + body + "\n})();\n"
+    )
+    env = {**os.environ, "TZ": zone, "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
+    out = subprocess.run(["node", str(harness), str(STATIC_DIR / "app.js")],
+                         check=True, capture_output=True, text=True, env=env).stdout
+    return json.loads(out)
+
+
+TICKS_BODY = (
+    "const local = ms => { const d = new Date(ms); const p = n => String(n).padStart(2, '0');\n"
+    "  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; };\n"
+    "const at = iso => Date.parse(iso);\n"
+    "const ticks = (since, until) => h.timeTicks(at(since), at(until)).map(local);\n"
+    "console.log(JSON.stringify({\n"
+    "  hour: ticks('2026-11-12T10:03:20Z', '2026-11-12T11:03:20Z'),\n"
+    "  day: ticks('2026-11-11T12:00:00Z', '2026-11-12T12:00:00Z'),\n"
+    "  custom: ticks('2026-11-01T09:00:00Z', '2026-11-02T09:30:00Z'),\n"
+    "  week: ticks('2026-11-05T12:00:00Z', '2026-11-12T12:00:00Z'),\n"
+    "  month: ticks('2026-10-12T12:00:00Z', '2026-11-12T12:00:00Z'),\n"
+    "  dst: ticks('2026-10-22T00:00:00Z', '2026-10-29T00:00:00Z'),\n"
+    "  empty: [h.timeTicks(5, 5), h.timeTicks(NaN, 5)],\n"
+    "}));\n"
+)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_axis_ticks_are_round_steps_of_local_time(tmp_path):
+    # India is UTC+5:30, so a tick on a UTC hour is not on a local hour.
+    india = _run_load_harness(tmp_path, TICKS_BODY, "Asia/Kolkata")
+    assert india["hour"] == ["11-12 15:40", "11-12 15:50", "11-12 16:00", "11-12 16:10", "11-12 16:20",
+                             "11-12 16:30"]
+    assert india["day"] == ["11-11 18:00", "11-11 21:00", "11-12 00:00", "11-12 03:00", "11-12 06:00",
+                            "11-12 09:00", "11-12 12:00", "11-12 15:00"]
+    # 24.5 hours do not fit 8 steps of 3 hours, so the step is 6 hours.
+    assert india["custom"] == ["11-01 18:00", "11-02 00:00", "11-02 06:00", "11-02 12:00"]
+    assert india["week"] == [f"11-{day:02d} 00:00" for day in range(6, 13)]
+    assert india["month"] and len(india["month"]) <= 8
+    assert all(tick.endswith(" 00:00") for tick in india["month"])
+    assert india["empty"] == [[], []]
+    # Berlin changes from UTC+2 to UTC+1 on 25 October. Each day tick stays at local midnight.
+    berlin = _run_load_harness(tmp_path, TICKS_BODY, "Europe/Berlin")
+    assert berlin["dst"] == [f"10-{day} 00:00" for day in range(23, 30)]
+
+
+POLLER_BODY = """
+const timers = [];
+const pending = [];
+const shown = [];
+const failures = [];
+let reads = 0;
+let can = true;
+let view = 'svc-a';
+const poller = h.createPoller({
+  schedule: (fn, ms) => { timers.push({fn, ms}); return timers.length; }, cancel: () => {}, ms: 5000,
+  maxFailures: 5, canRun: () => can, viewOf: () => view, kindOf: v => (v ? 'live' : 'all'),
+  read: v => { reads += 1; return new Promise((resolve, reject) => pending.push({v, resolve, reject})); },
+  show: (v, answer) => shown.push([v, answer]), failed: (error, n, stopped) => failures.push([error.message, n, stopped]),
+});
+const flush = () => new Promise(resolve => setImmediate(resolve));
+const tick = () => timers[timers.length - 1].fn();
+const log = {};
+poller.start();
+log.first = {reads, timers: timers.length, ms: timers[0].ms, running: poller.running};
+tick();
+log.duringRead = reads;
+poller.start();
+log.sameView = {reads, timers: timers.length};
+poller.stop();
+poller.start();
+log.restart = {reads, timers: timers.length};
+pending[0].resolve('old');
+await flush();
+log.afterStale = {reads, shown: shown.length};
+pending[1].resolve('new');
+await flush();
+log.shown = shown.slice();
+for (let i = 0; i < 5; i += 1) {
+  tick();
+  await flush();
+  pending[pending.length - 1].reject(new Error('down'));
+  await flush();
+}
+log.failures = failures;
+log.stopped = {running: poller.running, failures: poller.failures, reads};
+tick();
+await flush();
+log.oldTimer = reads;
+can = false;
+poller.start();
+log.hidden = {running: poller.running, reads};
+can = true;
+poller.start();
+log.again = {running: poller.running, failures: poller.failures, reads};
+view = '';
+poller.stop();
+poller.start();
+log.otherKind = reads;
+console.log(JSON.stringify(log));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_load_timer_runs_one_read_of_a_kind_at_a_time(tmp_path):
+    log = _run_load_harness(tmp_path, POLLER_BODY)
+    assert log["first"] == {"reads": 1, "timers": 1, "ms": 5000, "running": True}
+    assert log["duringRead"] == 1  # a tick during a read is skipped
+    assert log["sameView"] == {"reads": 1, "timers": 1}  # a start for the same view changes nothing
+    assert log["restart"] == {"reads": 1, "timers": 2}  # a restart during a read makes no second read
+    assert log["afterStale"] == {"reads": 2, "shown": 0}  # the stale answer is dropped, the new run reads at once
+    assert log["shown"] == [["svc-a", "new"]]
+    assert log["failures"] == [["down", 1, False], ["down", 2, False], ["down", 3, False], ["down", 4, False],
+                               ["down", 5, True]]
+    assert log["stopped"] == {"running": False, "failures": 5, "reads": 7}
+    assert log["oldTimer"] == 7  # the callback of a stopped timer reads nothing
+    assert log["hidden"] == {"running": False, "reads": 7}
+    assert log["again"] == {"running": True, "failures": 0, "reads": 8}
+    assert log["otherKind"] == 9  # a running live read does not hold the read of all services
+
+
+READ_LIMIT_BODY = """
+const native = {timeout: ms => ({native: ms})};
+const scheduled = [];
+class Controller { constructor() { this.signal = {aborted: false}; } abort() { this.signal.aborted = true; } }
+const own = h.readLimit(h.LOAD_READ_MS, native);
+const fallback = h.readLimit(h.LOAD_READ_MS, {}, Controller, (fn, ms) => scheduled.push([fn, ms]));
+const before = fallback.aborted;
+scheduled[0][0]();
+const failure = async (signal, fetch) => {
+  context.fetch = fetch;
+  try { await h.api('x', {signal}); return null; } catch (error) { return error.message; }
+};
+const aborted = {aborted: true};
+const timeout = await failure(aborted, async () => { throw new Error('aborted'); });
+const body = await failure(aborted, async () => ({ok: true, status: 200, json: async () => { throw new Error('aborted'); }}));
+const down = await failure({aborted: false}, async () => { throw new Error('refused'); });
+console.log(JSON.stringify({own, before, after: fallback.aborted, ms: scheduled[0][1], timeout, body, down}));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_page_load_reads_have_a_time_limit(tmp_path):
+    result = _run_load_harness(tmp_path, READ_LIMIT_BODY)
+    assert result["own"] == {"native": 30000}
+    assert result["before"] is False and result["after"] is True and result["ms"] == 30000
+    # A read that ends by the time limit is a failed read with its own message.
+    assert result["timeout"] == result["body"] == "The admin app did not answer in 30 seconds."
+    assert result["down"] == "The admin app does not answer."
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "api(servicePath('metrics/live', service), loadRead())" in text
+    assert "api('api/load', loadRead())" in text
+    assert "query(range)}`, loadRead(signal))" in text
+
+
+RADII_BODY = """
+const s = ys => ys.map((y, x) => ({x, y}));
+console.log(JSON.stringify([
+  h.pointRadii(s([null, 310, null])), h.pointRadii(s([310])), h.pointRadii(s([310, 320, null, 5])),
+  h.pointRadii(s([5, null, null, 7, 8])), h.pointRadii(s([])), h.pointRadii(s([null, null])),
+]));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_chart_draws_a_point_only_for_an_isolated_value(tmp_path):
+    radii = _run_load_harness(tmp_path, RADII_BODY)
+    assert radii == [[0, 3, 0], [3], [0, 0, 0, 3], [3, 0, 0, 0, 0], [], [0, 0]]
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("function setLoadCharts("):text.index("function clearLoadRange(")]
+    # The charts update in place, so the list of radii comes with the data at each update.
+    assert "Object.assign(dataset, {data, hidden: !shown, pointRadius: radius})" in body
+
+
+QUEUE_BODY = """
+class Controller { constructor() { this.signal = {aborted: false}; } abort() { this.signal.aborted = true; } }
+const q = h.createLatestQueue(Controller);
+const pending = [];
+const started = [];
+const results = [];
+const task = name => signal => {
+  started.push(name);
+  return new Promise((resolve, reject) => pending.push({name, signal, resolve, reject}));
+};
+const track = (name, promise) => promise.then(v => results.push([name, 'ok', v]), e => results.push([name, 'error']));
+const flush = () => new Promise(resolve => setImmediate(resolve));
+const log = {};
+track('a', q.run(task('a')));
+log.first = {started: [...started], running: q.running, signal: Boolean(pending[0].signal)};
+track('b', q.run(task('b')));
+track('c', q.run(task('c')));
+await flush();
+log.queued = {started: [...started], aborted: pending[0].signal.aborted, results: [...results]};
+pending[0].reject(new Error('aborted'));
+await flush();
+log.afterFirst = {started: [...started], results: [...results], running: q.running};
+pending[1].resolve('C');
+await flush();
+log.done = {results: [...results], running: q.running};
+track('d', q.run(task('d')));
+track('e', q.run(task('e')));
+q.cancel();
+await flush();
+log.cancel = {aborted: pending[2].signal.aborted, results: [...results]};
+pending[2].resolve('D');
+await flush();
+log.afterCancel = {started: [...started], results: [...results], running: q.running};
+const plain = h.createLatestQueue(null);
+const signals = [];
+let release;
+const first = plain.run(signal => { signals.push(signal); return new Promise(resolve => { release = resolve; }); });
+const second = plain.run(signal => { signals.push(signal); return Promise.resolve(2); });
+await flush();
+const whileFirst = signals.length;
+release(1);
+log.plain = {whileFirst, results: [await first, await second], signals: signals.map(x => x === undefined)};
+console.log(JSON.stringify(log));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_history_reads_run_one_at_a_time_and_the_latest_wins(tmp_path):
+    log = _run_load_harness(tmp_path, QUEUE_BODY)
+    assert log["first"] == {"started": ["a"], "running": True, "signal": True}
+    # A read during a read waits. A newer one replaces it. The running read gets an abort.
+    assert log["queued"] == {"started": ["a"], "aborted": True, "results": [["b", "error"]]}
+    # The waiting read starts when the running read ends.
+    assert log["afterFirst"] == {"started": ["a", "c"], "results": [["b", "error"], ["a", "error"]], "running": True}
+    assert log["done"] == {"results": [["b", "error"], ["a", "error"], ["c", "ok", "C"]], "running": False}
+    # A cancel aborts the running read and drops the waiting one.
+    assert log["cancel"]["aborted"] is True and log["cancel"]["results"][-1] == ["e", "error"]
+    assert log["afterCancel"]["started"] == ["a", "c", "d"] and log["afterCancel"]["running"] is False
+    # A browser without AbortController still runs the reads one at a time, without an abort.
+    assert log["plain"] == {"whileFirst": 1, "results": [1, 2], "signals": [True, True]}
+
+
+SIGNAL_BODY = """
+const native = {any: list => ({any: list.length})};
+class Controller { constructor() { this.signal = {aborted: false}; } abort() { this.signal.aborted = true; } }
+const source = () => { const listeners = []; return {aborted: false, listeners,
+  addEventListener(type, fn) { listeners.push(fn); }, fire() { this.aborted = true; listeners.forEach(fn => fn()); }}; };
+const a = source();
+const b = source();
+const both = h.anySignal([a, b], {}, Controller);
+const before = both.aborted;
+b.fire();
+const done = source();
+done.aborted = true;
+console.log(JSON.stringify({
+  native: h.anySignal([a, b], native, Controller), before, after: both.aborted,
+  early: h.anySignal([done, source()], {}, Controller).aborted,
+}));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_history_read_ends_by_its_abort_or_by_its_time_limit(tmp_path):
+    result = _run_load_harness(tmp_path, SIGNAL_BODY)
+    assert result == {"native": {"any": 2}, "before": False, "after": True, "early": True}
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("async function readHistory("):text.index("function setLoadRange(")]
+    assert "historyQueue.run(signal =>" in body
+    for name in ("function setLoadRange(", "function clearLoad("):
+        part = text[text.index(name):]
+        assert "historyQueue.cancel();" in part[:part.index("\n}\n")], name
+
+
+MINUTE_BODY = """
+console.log(JSON.stringify([
+  new Date(h.minuteStart(Date.parse('2026-11-12T10:03:20.500Z'))).toISOString(),
+  new Date(h.minuteStart(Date.parse('2026-11-12T10:03:00Z'))).toISOString(),
+]));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_history_axis_starts_at_the_minute_of_since(tmp_path):
+    # The service puts the buckets on the minute of `since`, so the first point is at that minute.
+    assert _run_load_harness(tmp_path, MINUTE_BODY) == ["2026-11-12T10:03:00.000Z", "2026-11-12T10:03:00.000Z"]
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("async function readHistory("):text.index("function setLoadRange(")]
+    assert "minuteStart(Date.parse(range.since))" in body

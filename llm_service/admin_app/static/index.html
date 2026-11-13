@@ -82,6 +82,7 @@ if (!location.pathname.endsWith('/')) {
 <main id="main" hidden>
   <div class="tabs" role="tablist" aria-label="Sections">
     <button type="button" role="tab" id="tab-usage" aria-controls="panel-usage" data-tab="usage">Usage</button>
+    <button type="button" role="tab" id="tab-load" aria-controls="panel-load" data-tab="load">Load</button>
     <button type="button" role="tab" id="tab-connect" aria-controls="panel-connect" data-tab="connect">Connect</button>
     <button type="button" role="tab" id="tab-audit" aria-controls="panel-audit" data-tab="audit">Audit</button>
     <button type="button" role="tab" id="tab-models" aria-controls="panel-models" data-tab="models">Models</button>
@@ -175,6 +176,98 @@ if (!location.pathname.endsWith('/')) {
             <tbody id="detail-days"></tbody>
           </table>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Load -->
+  <section class="panel" role="tabpanel" id="panel-load" aria-labelledby="tab-load" hidden>
+    <p class="note" id="load-missing" role="status" hidden>This service does not offer load numbers. A newer version of the service has them.</p>
+    <div class="note with-action" id="load-note" role="status" hidden>
+      <span id="load-note-text"></span>
+      <button type="button" class="ghost small" id="load-retry" hidden>Reload</button>
+    </div>
+
+    <div class="panel" id="load-one">
+      <div class="toolbar">
+        <div class="segmented" role="group" aria-label="Range of the charts">
+          <button type="button" data-load-range="hour">Last hour</button>
+          <button type="button" data-load-range="6h">6 hours</button>
+          <button type="button" data-load-range="24h">24 hours</button>
+          <button type="button" data-load-range="7d">7 days</button>
+          <button type="button" data-load-range="custom">Custom</button>
+        </div>
+        <form class="dates" id="load-dates" hidden>
+          <label>From <input type="datetime-local" id="load-since" required></label>
+          <label>To <input type="datetime-local" id="load-until" required></label>
+          <button type="submit">Apply</button>
+          <span class="caption">Your local time. At most 31 days.</span>
+          <span class="caption bad" id="load-dates-status" role="status"></span>
+        </form>
+      </div>
+
+      <h2 class="group">This moment <span class="caption" id="load-now-text"></span></h2>
+      <div class="tiles load-tiles">
+        <div class="tile"><div class="label">Requests in flight</div><div class="value" id="load-in-flight">-</div></div>
+        <div class="tile"><div class="label">Requests that wait</div><div class="value" id="load-waiting">-</div></div>
+        <div class="tile"><div class="label">Completion tokens per second</div><div class="value" id="load-completion-rate">-</div></div>
+        <div class="tile"><div class="label">Prompt tokens per second</div><div class="value" id="load-prompt-rate">-</div></div>
+        <div class="tile"><div class="label">KV cache use</div><div class="value" id="load-kv-cache">-</div></div>
+        <div class="tile"><div class="label">GPU memory used</div><div class="value" id="load-gpu">-</div></div>
+      </div>
+
+      <h2 class="group">Last complete minute <span class="caption" id="load-minute-text"></span></h2>
+      <div class="tiles load-tiles">
+        <div class="tile"><div class="label">Requests</div><div class="value" id="load-requests">-</div></div>
+        <div class="tile"><div class="label">Failed requests</div><div class="value" id="load-failed">-</div></div>
+        <div class="tile"><div class="label">Time to the first token p50</div><div class="value" id="load-ttft-p50">-</div></div>
+        <div class="tile"><div class="label">Time to the first token p95</div><div class="value" id="load-ttft-p95">-</div></div>
+        <div class="tile"><div class="label">Total time p50</div><div class="value" id="load-duration-p50">-</div></div>
+        <div class="tile"><div class="label">Total time p95</div><div class="value" id="load-duration-p95">-</div></div>
+      </div>
+
+      <p class="caption" id="load-range-text"></p>
+      <p class="note" id="load-days-note" role="status" hidden></p>
+      <div class="charts load-charts" id="load-charts">
+        <div class="card">
+          <h2>Requests</h2>
+          <div class="chart"><canvas id="chart-load-requests" aria-label="Line chart of the requests and the failed requests" role="img"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Tokens</h2>
+          <div class="chart"><canvas id="chart-load-tokens" aria-label="Line chart of the prompt tokens and the completion tokens" role="img"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Time to the first token</h2>
+          <div class="chart"><canvas id="chart-load-ttft" aria-label="Line chart of the time to the first token, p50 and p95" role="img"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Total time</h2>
+          <div class="chart"><canvas id="chart-load-duration" aria-label="Line chart of the total time of a request, p50 and p95" role="img"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Requests in flight and waiting <span class="caption">Maximum</span></h2>
+          <div class="chart"><canvas id="chart-load-queue" aria-label="Line chart of the maximum of the requests in flight and of the requests that wait" role="img"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Engine memory <span class="caption">Maximum</span></h2>
+          <div class="chart"><canvas id="chart-load-engine" aria-label="Line chart of the KV cache use in percent and of the GPU memory used" role="img"></canvas></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="load-all">
+      <h2>Services <span class="caption" id="load-all-text"></span></h2>
+      <div class="scroll">
+        <table class="grid">
+          <thead><tr>
+            <th scope="col">Service</th><th scope="col" class="num">Requests in flight</th>
+            <th scope="col" class="num">Requests that wait</th><th scope="col" class="num">Completion tokens per second</th>
+            <th scope="col" class="num">Prompt tokens per second</th><th scope="col" class="num">KV cache use</th>
+            <th scope="col" class="num">GPU memory used</th>
+          </tr></thead>
+          <tbody id="load-all-body"></tbody>
+        </table>
       </div>
     </div>
   </section>

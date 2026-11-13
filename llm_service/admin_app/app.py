@@ -32,6 +32,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 TIMEOUT_SECONDS = 30.0
 # The total limit of the usage call of one service. A slow service must not hold the merged answer.
 USAGE_TIMEOUT_SECONDS = 10.0
+# The total limit of the live load call of one service.
+LOAD_TIMEOUT_SECONDS = 5.0
 DAY_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 # A switch or a delete can wait for the weight cache lock while another model downloads.
 ACTION_TIMEOUT_SECONDS = 300.0
@@ -46,6 +48,7 @@ NO_ANSWER = "The service did not answer."
 READY_WAIT_SECONDS = 10.0
 BAD_NAME = "The service name has 1 to 63 characters from a-z, 0-9 and -."
 UNREACHABLE = "The LLM service did not give a valid answer."
+NO_LOAD = "The service does not offer load numbers."
 USAGE_GROUPS = ("user", "model", "day", "service")
 MODEL_BY_DAY = "The model filter by day needs an admin of the service."
 UNKNOWN_SERVICE = "This service is unknown."
@@ -687,6 +690,78 @@ def create_app(
         if chosen and not per_service:
             return _error(502, "service_unreachable", UNREACHABLE)
         return JSONResponse({"data": merge_rows(per_service, group_by), "services": services})
+
+    @app.get("/api/services/{name}/metrics/live")
+    async def metrics_live(name: str, request: Request) -> JSONResponse:
+        return await call(request, name, "GET", "/admin/metrics/live")
+
+    @app.get("/api/services/{name}/metrics/history")
+    async def metrics_history(name: str, request: Request) -> JSONResponse:
+        params = _query(request, ("since", "until"))
+        return await call(request, name, "GET", "/admin/metrics/history", params=params)
+
+    async def one_load(viewer: str, name: str) -> tuple[dict | None, str | None, bool]:
+        """Return `(now, None, True)`, `(None, error text, True)` or `(None, None, False)`.
+
+        The last form means the viewer is not an admin of the service, so the
+        service stays out. A cancel passes through.
+        """
+        try:
+            limit = LOAD_TIMEOUT_SECONDS
+            pending = service.request(name, "GET", "/admin/metrics/live", viewer, timeout=limit)
+            status, body = await asyncio.wait_for(pending, limit)
+            if status == 403:
+                return None, None, False
+            if status == 404:
+                return None, NO_LOAD, True
+            if status != 200:
+                return None, UNREACHABLE, True
+            now = body.get("now") if isinstance(body, dict) else None
+            if not isinstance(now, dict):
+                return None, UNREACHABLE, True
+            return now, None, True
+        except asyncio.TimeoutError:
+            return None, USAGE_TOO_SLOW, True
+        except ServiceUnreachable:
+            return None, UNREACHABLE, True
+        except Exception:  # one bad service must not fail the others. A cancel passes through.
+            log.exception("The load call to the service %s failed.", name)
+            return None, UNREACHABLE, True
+
+    @app.get("/api/load")
+    async def load(request: Request) -> JSONResponse:
+        """Return the numbers of this moment of each service where the viewer is an admin.
+
+        The answer is 200 also when each service fails. A service whose role
+        call fails appears with `ok` false. So does a service with a state other
+        than `ok`, and it gets no call. A service where the viewer is not an
+        admin stays out.
+        """
+        viewer = viewer_or_error(request)
+        if isinstance(viewer, JSONResponse):
+            return viewer
+        all_entries = registry.entries()
+        entries = [e for e in all_entries if e.state == "ok"]
+        found = await asyncio.gather(*(roles(viewer, e.name) for e in entries))
+        rows: dict[str, dict] = {
+            e.name: {"name": e.name, "ok": False, "error": f"The service has the state {e.state}."}
+            for e in all_entries
+            if e.state != "ok"
+        }
+        chosen = []
+        for entry, role in zip(entries, found):
+            if role["access"] is None:
+                rows[entry.name] = {"name": entry.name, "ok": False, "error": role["error"]}
+            elif role["admin"]:
+                chosen.append(entry.name)
+        results = await asyncio.gather(*(one_load(viewer, n) for n in chosen))
+        for name, (now, error, shown) in zip(chosen, results):
+            if not shown:
+                continue
+            rows[name] = {"name": name, "ok": True, "now": now} if error is None else {
+                "name": name, "ok": False, "error": error
+            }
+        return JSONResponse({"services": [rows[e.name] for e in all_entries if e.name in rows]})
 
     @app.get("/")
     async def index() -> FileResponse:

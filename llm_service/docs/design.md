@@ -65,6 +65,9 @@ llm_service/
 │   ├── usage.py           # usage totals by user, model and day
 │   ├── limits.py          # the limits file and the lookup of the limits of one user
 │   ├── limiter.py         # request window, token budget and parallel counter
+│   ├── engine_metrics.py  # readers of the vLLM metrics endpoint and of nvidia-smi
+│   ├── load.py            # live load: samples each 5 seconds, one point each minute
+│   ├── metrics_store.py   # the history files in blob storage and the history read
 │   ├── weights.py         # local disk and blob storage weight cache
 │   ├── engine.py          # start, stop and health of the vLLM process
 │   ├── models.py          # active model state and the switch state machine
@@ -129,6 +132,8 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 | `PUT /admin/limits/default` | Replaces the default limits. The body has the three limit fields. |
 | `PUT /admin/limits/users/{name}` | Sets the entry of one user. The body has one to three limit fields. |
 | `DELETE /admin/limits/users/{name}` | Removes the entry of one user. The answer is 404 `limit_not_found` without an entry. |
+| `GET /admin/metrics/live` | The last sample of the load (`now`) and the last 60 points, from memory. |
+| `GET /admin/metrics/history` | The points of a time range from the history files. Query: `since`, `until` (ISO times, at most 31 days apart). The answer has `step_seconds`, `points` and `missing_days`. The error is 400 `invalid_time`. |
 | `DELETE /admin/models/{model}` | Removes the stored revisions of a model from blob storage, with or without a `.complete` marker. The query parameter `revision` limits it to one revision. Returns 200 with `{"deleted": [...]}`. The errors are 404 `model_not_found`, 409 `model_in_use`, 400 `invalid_model` and 500 `delete_failed`. One audit record has the event `model_delete`. |
 
 A caller who is not an admin gets 403.
@@ -213,6 +218,7 @@ Blob storage layout, under a root set by `LLM_BLOB_ROOT` (default `llm-service`)
 <root>/prompts/<day>/<time>-<id>.jsonl               # prompts of one flush
 <root>/usage/<day>.json                              # totals of one finished day
 <root>/usage/<day>.partial.json                      # checkpoint of the current day
+<root>/metrics/<day>/<writer>.jsonl                  # load points of one process on one UTC day
 ```
 
 To get a model on local disk, `weights.py` does these steps:
@@ -343,8 +349,10 @@ Other requests produce no record. A request record looks like this:
  "endpoint": "/v1/chat/completions", "model": "org/name", "stream": true,
  "prompt": {"messages": [...]}, "status": 200,
  "prompt_tokens": 42, "completion_tokens": 128, "total_tokens": 170,
- "duration_ms": 950}
+ "duration_ms": 950, "ttft_ms": 310}
 ```
+
+`ttft_ms` is the time from the start of the request to the first content of a stream. It is null for a request without a stream and for a request without content. A row of an older request has no such field.
 
 `prompt` holds the `messages`, `prompt` or `input` field of the request, in
 full. The log does not store the model answer.
@@ -459,6 +467,20 @@ page shows a note.
 The design is in [limits-load-catalog-design.md](limits-load-catalog-design.md),
 Part 1. The README has the usage.
 
+## Load numbers
+
+An admin sees how busy the service is: requests in flight, requests that wait,
+tokens per second, latency, the KV cache use of the engine and GPU memory.
+`engine_metrics.py` reads the vLLM metrics endpoint and `nvidia-smi`. The metrics read has its own HTTP client
+with two connections, so the streams of the proxy never block it. `load.py` keeps a sample each 5 seconds and
+builds one point for each minute from the samples and the audit records.
+`metrics_store.py` writes the points of each process to its own file,
+`<root>/metrics/<day>/<writer>.jsonl`, and reads the history from all files of a day. A sampler task runs next to the flusher. A request never waits for
+the reads or for blob storage.
+
+The design is in [limits-load-catalog-design.md](limits-load-catalog-design.md),
+Part 2. The README has the usage.
+
 ## Concurrency
 
 The gateway is asynchronous and forwards requests with one shared `httpx`
@@ -483,6 +505,7 @@ they do not block request handling.
 | `LLM_HF_TOKEN_KEY` | not set | Secret store key of the Hugging Face token. |
 | `LLM_VLLM_ARGS` | not set | Extra arguments for `vllm serve`. |
 | `LLM_PROMPT_RETENTION_DAYS` | not set | Days to keep prompts in the audit log. A whole number from 1 to 36500. |
+| `LLM_METRICS_RETENTION_DAYS` | `30` | Days to keep the load history files. A whole number from 1 to 36500. |
 | `LLM_ENVIRONMENT` | `dev` | Platform environment. |
 | `LLM_ADMIN_APP_NAME` | `LLM Service Admin` | Name of the admin app. |
 

@@ -69,3 +69,16 @@ def test_access_group():
 def test_job_name_and_environment():
     c = Config.from_env({"DATATAILR_JOB_NAME": "llm-service", "DATATAILR_JOB_ENVIRONMENT": "dev"})
     assert c.job_name == "llm-service" and c.environment == "dev"
+
+
+def test_metrics_retention_days():
+    assert Config.from_env({}).metrics_retention_days == 30
+    assert Config.from_env({"LLM_METRICS_RETENTION_DAYS": ""}).metrics_retention_days == 30
+    assert Config.from_env({"LLM_METRICS_RETENTION_DAYS": " 7 "}).metrics_retention_days == 7
+    assert Config.from_env({"LLM_METRICS_RETENTION_DAYS": "36500"}).metrics_retention_days == 36500
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "x", "36501", "9" * 5000])
+def test_metrics_retention_days_rejects_anything_else(value):
+    with pytest.raises(ValueError, match="LLM_METRICS_RETENTION_DAYS"):
+        Config.from_env({"LLM_METRICS_RETENTION_DAYS": value})

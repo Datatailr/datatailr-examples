@@ -156,7 +156,7 @@ Each change writes an audit event `limits_change` with the admin name, the targe
 
 ### Requirements
 
-1. An admin sees how busy a service is now: requests in flight, requests that wait, tokens per second, latency and GPU memory.
+1. An admin sees how busy a service is now: requests in flight, requests that wait, tokens per second, latency, KV cache use and GPU memory.
 2. An admin sees the same numbers for the last hour without a read from blob storage.
 3. The service writes the history to blob storage, so an admin can load older days.
 4. A failure of a number source does not stop the service. The number is null then.
@@ -168,12 +168,15 @@ Each change writes an audit event `limits_change` with the admin name, the targe
 | Requests in flight | A counter in the gateway. |
 | Requests that run and that wait in the engine | The metrics endpoint of vLLM, `GET /metrics` on the engine port. |
 | Generated tokens and prompt tokens | The token counters of the same endpoint. The rate is the change between two samples. |
-| GPU memory used and total | `nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits` |
+| KV cache use | The same endpoint: `vllm:kv_cache_usage_perc`, or `vllm:gpu_cache_usage_perc` of older versions. It is a fraction from 0 to 1. Over more than one label set it is the maximum, not the sum. A value above 1.5 is a percent and is divided by 100. Each value is limited to 0 to 1. |
+| GPU memory used and total | `nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits`. The task reads it at each third sample, so each 15 seconds. The samples between use the last value. |
 | Time to the first token, total time | The gateway measures each request. |
 
 The names of the vLLM metrics changed between versions. The gateway reads each number from a short list of known names and takes the first that exists. The first step of the work checks the names against the installed vLLM version.
 
 With more than one GPU, the memory numbers are the sums.
+
+vLLM takes most of the GPU memory at its start, so the GPU memory used says little about the load. The KV cache use shows how full the engine is. A container without `nvidia-smi` has no GPU memory numbers.
 
 ### Time to the first token
 
@@ -181,13 +184,13 @@ The proxy records the time from the start of the request to the first content ch
 
 ### Samples and points
 
-A background task takes one sample each 5 seconds. A sample has: time, in flight, running, waiting, prompt tokens per second, completion tokens per second, GPU memory used, GPU memory total.
+A background task takes one sample each 5 seconds. A sample has: time, in flight, running, waiting, KV cache use, prompt tokens per second, completion tokens per second, GPU memory used, GPU memory total.
 
 At the end of each minute the task makes one point:
 
 ```json
 {"ts": "2026-11-12T10:15:00Z", "requests": 42, "failed_requests": 1,
- "in_flight_max": 6, "waiting_max": 2,
+ "in_flight_max": 6, "waiting_max": 2, "kv_cache_use_max": 0.52,
  "prompt_tokens": 9100, "completion_tokens": 5200,
  "ttft_ms_p50": 310, "ttft_ms_p95": 900,
  "duration_ms_p50": 2100, "duration_ms_p95": 7400,
@@ -195,19 +198,32 @@ At the end of each minute the task makes one point:
 ```
 
 - `requests`, `failed_requests` and the token sums come from the requests that ended in that minute.
-- The percentiles come from the same requests. They are null for a minute without a request.
-- The maximum values come from the samples of that minute.
+- The percentiles come from the requests of that minute with a status below 400. A refused or failed request ends fast and stays out of them. They are null for a minute without such a request.
+- The maximum values come from the samples of that minute. `kv_cache_use_max` is a fraction from 0 to 1.
+- A point of a file from before `kv_cache_use_max` existed has no such field. Each reader takes it as null.
 - GPU memory is in MiB.
 
 The service keeps the last 60 points and the last 12 samples in memory.
 
 ### History in blob storage
 
-Each 5 minutes, and at shutdown, the task writes the new points to one file: `<blob root>/metrics/<day>/<HHMM>.jsonl`. `<HHMM>` is the time of the first point in the file. A file has one JSON line for each point. A day has at most 288 files.
+The history has one directory for each UTC day and one file in it for each process: `<blob root>/metrics/<day>/<writer>.jsonl`. `<writer>` is fixed for the life of a process. It is the start time of the process as `YYYYMMDDTHHMMSSZ`, a dash and 8 random hex characters. A file holds the points of that day that this process produced, one JSON line for each point, in time order. A full day of one process has 1440 lines.
 
-The variable `LLM_METRICS_RETENTION_DAYS` sets how many days the service keeps. The default is 30, and the range is 1 to 36500. The maintenance task of the audit log removes older day directories, with its delete budget.
+Each process writes only its own files. No process writes a file of another process. Blob storage has no conditional write, so this rule is the protection against a lost minute. During a redeploy, the old and the new container both write, each to its own file.
 
-A failed write keeps the points in memory for the next try. After one hour without a good write, the service drops the oldest points and logs an error.
+Each 5 minutes, and at shutdown, the task writes the own file of each day that has new points. It writes the whole file again, with all own points of the day so far. It reads nothing before the put. A restart starts a new file. The files of earlier processes stay as they are.
+
+The service keeps no copy of the files of other processes. Each history read sees the files as they are in storage, for the current day too. So the last points of an old container show at once. The points of the minutes when no process ran are missing.
+
+A history read lists `<blob root>/metrics/` once. The listing is recursive and holds only files. A missing directory gives an empty list. From the names, the read picks the files of the days in the range: `<day>/<writer>.jsonl` and the legacy `<day>.jsonl`. It reads them with up to 8 threads. The own points in memory count too. For a minute in the own file and in memory, the memory wins. Two points of one minute from different writers are two parts of that minute. They combine by the rules of the merge below: sums add, maximum values take the maximum, and `gpu_memory_total` takes the value that is not null. A failed file read puts its day into `missing_days`. A failed listing puts each day of the range into `missing_days`. The own points in memory still show then. A day without a file is an empty day.
+
+Cost: a history read makes one listing and one read for each file of the range. A file exists for each process that ran on a day. A day with many restarts has many small files. The listing names all files of the retention, not only the files of the range.
+
+An earlier test version wrote one file for each day: `<blob root>/metrics/<day>.jsonl`. The history reads such a legacy file as one more source of its day. No process writes it.
+
+The variable `LLM_METRICS_RETENTION_DAYS` sets how many days the service keeps. The default is 30, and the range is 1 to 36500. The maintenance task of the audit log removes the files of older days, in the day directories and the legacy files. It uses the same listing and the same name rules as the history read. It lists `metrics/` at most once in an hour. One call deletes at most 64 files, and the next call continues.
+
+A failed write keeps the points in memory for the next try. If the file of a past day has no good write for one hour, the service drops its points and logs an error.
 
 ### Endpoints
 
@@ -216,22 +232,24 @@ Both are for admins.
 `GET /admin/metrics/live` answers from memory:
 
 ```json
-{"now": {"ts": "...", "in_flight": 3, "running": 3, "waiting": 0,
+{"now": {"ts": "...", "in_flight": 3, "running": 3, "waiting": 0, "kv_cache_use": 0.37,
          "prompt_tokens_per_s": 210.0, "completion_tokens_per_s": 96.5,
          "gpu_memory_used": 14200, "gpu_memory_total": 15360},
  "points": [ ... the last 60 points ... ]}
 ```
 
-`GET /admin/metrics/history?since=<time>&until=<time>` reads the files of the days in the range. `since` and `until` are ISO times. The range is at most 31 days. If the range has more than 500 points, the service merges neighbor points into at most 500: sums stay sums, maximum values stay maximum values, and a percentile becomes the maximum of the merged percentiles. The answer names the step in seconds.
+`GET /admin/metrics/history?since=<time>&until=<time>` reads the files of the days in the range. `since` and `until` are ISO times. The range is at most 31 days as a duration. The range touches a count of minutes, counted from the minute of `since`. The step is that count divided by 500 and rounded up, at least 1 minute. The service puts each point into the time bucket of one step that holds it. The buckets start at the minute of `since`. Each bucket with points gives one point, with the start of the bucket as `ts`. A bucket without points gives no point, so a gap stays a gap. A range of up to 500 minutes keeps each point as it is. Sums stay sums and maximum values stay maximum values. A percentile becomes the maximum of the merged percentiles. The answer names the step in seconds.
 
-A bad time or a range that is too long gets 400 `invalid_time`.
+The answer has `step_seconds`, `points` and `missing_days`. `missing_days` lists the UTC days with a failed file read, or each day of the range after a failed listing. A day with no file is not a failure. The list is empty when each read worked.
+
+A bad time, a `since` after `until` or a range that is too long gets 400 `invalid_time`.
 
 ### The app
 
 - New routes that pass through: `GET /api/services/{name}/metrics/live` and `GET /api/services/{name}/metrics/history`.
 - New route `GET /api/load`: the `now` part of each service where the viewer is an admin, in parallel, with the same failure rules as the combined usage.
-- A Load tab, for an admin. With one service: tiles for the numbers of this moment and charts of the last hour. The tab reads the live endpoint each 5 seconds while it is open and the page is visible. A range picker loads the history and stops the refresh.
-- With "All services": one table row for each service with the numbers of this moment.
+- A Load tab, for an admin. With one service: tiles for the numbers of this moment and charts of the last hour. A tile and the chart "Engine memory" show the KV cache use in percent. That chart shows the GPU memory used on a second axis when a point has it. The tab reads the live endpoint each 5 seconds while it is open and the page is visible. Each read of the tab has a time limit of 30 seconds. A read over the limit counts as a failed read. A range picker loads the history and stops the refresh. The axis of a history range starts at the minute of `since`, as the buckets do. At most one history read runs. A new range aborts the running read and waits for its end. A newer range replaces a range that waits. A value between two gaps in a chart shows as a dot.
+- With "All services": one table row for each service with the numbers of this moment, the KV cache use among them.
 
 ## Part 3: model catalog
 
@@ -319,7 +337,7 @@ A change of the catalog writes an audit event `catalog_change`.
 ## Testing
 
 - Limits: unit tests for the lookup order, each limit with a fake clock and the `Retry-After` values. Other tests cover the parallel counter on each end of a request, the audit records, and each endpoint with its errors.
-- Load: unit tests for the metric parser with sample texts of two vLLM versions, and for the `nvidia-smi` parser. Other tests cover the point builder with percentiles and the merge to 500 points. They also cover the write to blob storage with a failed write, and the retention.
+- Load: unit tests for the metric parser with sample texts of two vLLM versions, and for the `nvidia-smi` parser. Other tests cover the point builder with percentiles and the merge into at most 500 time buckets. They also cover the write to blob storage with a failed write, and the retention.
 - Catalog: unit tests for the file checks, the download states, the 409 cases and the fit rules.
 - App: route tests with fake services, as for the existing routes. The page gets static checks and a check in a browser.
 - On a cluster: a load test with two users, one over each limit. The Load tab during that test. A download of a second model and a switch to it.
@@ -327,7 +345,7 @@ A change of the catalog writes an audit event `catalog_change`.
 ## Known limits
 
 - The service checks the token budget before a request. So a user can pass it by the size of the requests in flight.
-- A restart clears the request window, the parallel counters and the points that are not in blob storage yet. This is at most 5 minutes of points.
+- A restart clears the request window, the parallel counters and the points that are not in blob storage yet. A clean stop loses only the point of the open minute. A crash loses up to the last 5 minutes of points and the open minute.
 - The limits are for each service. A user with access to two services has two budgets.
 - The percentiles of a merged history point are the maximum of the merged minutes, not a true percentile of the longer time.
 - The fit check does not know the context length or the engine arguments.

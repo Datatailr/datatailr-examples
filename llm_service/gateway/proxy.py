@@ -56,6 +56,18 @@ def prompt_of(body: dict) -> dict:
     return {}
 
 
+def _has_content(obj: dict) -> bool:
+    """Say whether a stream chunk carries text: a delta content or a completion text."""
+    choices = obj.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return False
+    choice = choices[0]
+    delta = choice.get("delta")
+    if isinstance(delta, dict) and isinstance(delta.get("content"), str) and delta["content"]:
+        return True
+    return isinstance(choice.get("text"), str) and bool(choice["text"])
+
+
 class StreamUsageFilter:
     """Read the usage object from an SSE stream and hide it when not wanted.
 
@@ -66,6 +78,7 @@ class StreamUsageFilter:
     def __init__(self, keep_usage_chunk: bool) -> None:
         self.keep_usage_chunk = keep_usage_chunk
         self.usage: dict | None = None
+        self.content_seen = False  # True after an event with content went through
         self._buffer = b""
 
     def feed(self, data: bytes) -> bytes:
@@ -98,7 +111,11 @@ class StreamUsageFilter:
                 obj = json.loads(payload)
             except ValueError:
                 continue
-            if not isinstance(obj, dict) or "usage" not in obj:
+            if not isinstance(obj, dict):
+                continue
+            if not self.content_seen and _has_content(obj):
+                self.content_seen = True
+            if "usage" not in obj:
                 continue
             if isinstance(obj["usage"], dict):
                 self.usage = obj["usage"]
@@ -129,6 +146,14 @@ def _call_on_done(on_done: Callable[[int, dict | None], None], status: int, usag
         LOGGER.warning("the on_done callback failed", exc_info=True)
 
 
+def _call_on_first(on_first: Callable[[], None]) -> None:
+    """Call `on_first` and log a failure instead of raising it."""
+    try:
+        on_first()
+    except Exception:
+        LOGGER.warning("the on_first callback failed", exc_info=True)
+
+
 class _UsageStream(StreamingResponse):
     """Stream the upstream answer and report the outcome exactly once.
 
@@ -142,7 +167,9 @@ class _UsageStream(StreamingResponse):
         upstream: httpx.Response,
         usage_filter: StreamUsageFilter,
         on_done: Callable[[int, dict | None], None],
+        on_first: Callable[[], None] | None = None,
     ) -> None:
+        self._on_first = on_first
         self._upstream = upstream
         self._filter = usage_filter
         self._on_done = on_done
@@ -165,6 +192,12 @@ class _UsageStream(StreamingResponse):
             except Exception:
                 LOGGER.warning("closing the engine response failed", exc_info=True)
 
+    def _first_content(self) -> None:
+        """Run `on_first` once, after the first content went to the client."""
+        if self._on_first is not None and self._filter.content_seen:
+            on_first, self._on_first = self._on_first, None
+            _call_on_first(on_first)
+
     async def _events(self) -> AsyncIterator[bytes]:
         status, usage = 200, None
         try:
@@ -172,9 +205,11 @@ class _UsageStream(StreamingResponse):
                 out = self._filter.feed(chunk)
                 if out:
                     yield out
+                self._first_content()
             tail = self._filter.flush()
             if tail:
                 yield tail
+                self._first_content()
             usage = self._filter.usage
         except (asyncio.CancelledError, GeneratorExit):
             status = 499
@@ -203,6 +238,7 @@ async def forward(
     path: str,
     body: dict,
     on_done: Callable[[int, dict | None], None],
+    on_first: Callable[[], None] | None = None,
 ) -> Response:
     """Send `body` to the engine and return its answer.
 
@@ -210,6 +246,10 @@ async def forward(
     complete, when the client disconnects (status 499) or when the engine fails
     (status 502). After a disconnect, `usage` holds the counts if the usage
     chunk came before the disconnect. An error in `on_done` is logged and does not break the response.
+
+    `on_first()` is optional. For a streamed answer it runs once, after the first chunk with content
+    went to the client. Content is a non-empty `delta.content` or `text` of `choices[0]`. It never runs for an answer
+    without a stream. An error in `on_first` is logged and does not break the stream.
     """
     prepared, usage_wanted = prepare_body(body)
     streaming = bool(prepared.get("stream"))
@@ -247,4 +287,4 @@ async def forward(
         _call_on_done(on_done, upstream.status_code, None)
         return Response(content, upstream.status_code, _passthrough_headers(upstream))
 
-    return _UsageStream(upstream, StreamUsageFilter(keep_usage_chunk=usage_wanted), on_done)
+    return _UsageStream(upstream, StreamUsageFilter(keep_usage_chunk=usage_wanted), on_done, on_first)

@@ -168,7 +168,10 @@ def split_record(record: dict, seg: str, line: int | None) -> tuple[dict, dict |
 
 
 def public_row(row: dict) -> dict:
-    """Return the row without the storage fields `seg` and `prompt_ref`."""
+    """Return the row without the storage fields `seg` and `prompt_ref`.
+
+    An old row has no `ttft_ms`. A reader takes `row.get("ttft_ms")`, which is null then.
+    """
     return {key: value for key, value in row.items() if key not in ("seg", "prompt_ref")}
 
 
