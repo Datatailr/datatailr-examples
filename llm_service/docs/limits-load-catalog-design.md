@@ -292,18 +292,23 @@ The service writes an audit event `model_download` at the end, with the admin na
 
 ### GPU memory check
 
-`GET /admin/models/fit?model=<name>&revision=<revision>` answers:
+`GET /admin/models/fit?model=<name>&revision=<revision>` answers. The revision is `main` when absent. A bad name gives 400 `invalid_model`.
 
 ```json
-{"fits": "yes", "needed_mib": 6000, "available_mib": 15360, "basis": "catalog"}
+{"fits": "yes", "needed_mib": 6000, "available_mib": 15360, "basis": "catalog", "available_source": "container"}
 ```
 
-- `available_mib` is the total GPU memory from `nvidia-smi`. It is null without that number.
+- `available_mib` and `available_source`:
+  - `nvidia-smi`: the total GPU memory from `nvidia-smi` in the last load sample, when the service has it.
+  - `container`: the GPU memory of the container from the deploy value `LLM_VRAM`. The service uses it when `nvidia-smi` gives no number. On a cluster without `nvidia-smi` in the container, this is the usual case. The deploy script always passes `LLM_VRAM` to the service, with the default `16g`.
+  - null for both: `nvidia-smi` gives no number and `LLM_VRAM` is bad.
 - `needed_mib` and `basis`:
   - `catalog`: the `gpu_memory_mib` of the catalog entry.
-  - `weights`: the size of the cached weights, times 1.2. The margin covers the working memory of the engine for a short context.
-  - `unknown`: the model is not in the catalog and not in the cache. `needed_mib` is null.
+  - `weights`: the size of the cached weights, times 1.2, rounded up to a whole MiB. The margin covers the working memory of the engine for a short context.
+  - `unknown`: the entry has no `gpu_memory_mib` and the pair is not in the cache, or the cache list is not readable now. `needed_mib` is null.
 - `fits` is `yes` when the needed memory is at most the available memory, `no` when it is more, and `unknown` when a number is missing.
+
+A read error of the cache list never fails the endpoint. The answer then uses the catalog only.
 
 The check is an estimate. A model that fits can still fail with a long context. The switch does not use the check: an admin can start a switch with each result.
 

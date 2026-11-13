@@ -32,6 +32,8 @@ from llm_service.gateway.identity import (
     user_from_headers,
 )
 from llm_service.gateway.limiter import LimitExceeded, Limiter
+from llm_service.gateway.catalog import CatalogStore
+from llm_service.gateway.fit import fit, needed_from
 from llm_service.gateway.limits import InvalidLimit, LimitStore, StorageUnavailable
 from llm_service.gateway.load import LoadMonitor
 from llm_service.gateway.metrics_store import MAX_DAYS, MetricsStore
@@ -140,6 +142,7 @@ def create_app(
     audit = AuditLog(store, config.blob_root, config.flush_size, now=now)
     usage = UsageTotals(store, config.blob_root, audit, lambda: iso(now())[:10], now=now)
     limits = LimitStore(store, config.blob_root)
+    catalog = CatalogStore(store, config.blob_root)
 
     def seconds_to_midnight() -> float:
         current = now()
@@ -217,7 +220,7 @@ def create_app(
 
         The steps run in the flusher thread. Each step has its own guard, so one failure does not
         stop the others. The last cycle at shutdown forces the checkpoint and the metrics write.
-        The limits file is read again only after a failed read. The merge and the retention run
+        The limits file and the catalog file are read again only after a failed read. The merge and the retention run
         in the maintenance task, so a flush never waits for their deletes.
         """
         last_cycle = stopping.is_set()
@@ -225,6 +228,7 @@ def create_app(
             ("close_days", usage.close_days),
             ("checkpoint", lambda: usage.checkpoint(force=last_cycle)),
             ("limits", limits.retry_load),
+            ("catalog", catalog.retry_load),
             ("metrics", lambda: metrics.write(force=last_cycle)),
         ]
         for name, step in steps:
@@ -268,6 +272,7 @@ def create_app(
         # in between, so that no record is counted twice and no flush runs against
         # a half-loaded day.
         await asyncio.to_thread(limits.load)
+        await asyncio.to_thread(catalog.load)
         started = time.monotonic()
         days = await asyncio.to_thread(usage.load)
         logger.info("usage totals loaded in %.1f s for %d days", time.monotonic() - started, days)
@@ -332,6 +337,7 @@ def create_app(
     app.state.audit = audit
     app.state.usage = usage
     app.state.limits = limits
+    app.state.catalog = catalog
     app.state.limiter = limiter
     app.state.load = load
     app.state.metrics = metrics
@@ -756,6 +762,45 @@ def create_app(
             raise ApiError(409, "invalid_request_error", "model_in_use", str(error)) from None
         app.state.last_admin = admin_user
         return manager.status()
+
+    async def fit_of(model: str, revision: str, cached: list[dict] | None = None) -> dict:
+        """Return the GPU memory check of one pair.
+
+        The needed memory comes from the catalog entry, else from the size of the cached pair.
+        `cached` is an already read list of `weights.cached()`. Without it, the function reads
+        the list in a thread. A store error then leaves the size unknown. The available memory is
+        the total of `nvidia-smi` in the last load sample, else the memory of the container.
+        """
+        entry = catalog.get(model, revision)
+        size_bytes = None
+        if cached is None:
+            try:
+                cached = await asyncio.to_thread(weights.cached)
+            except Exception as error:
+                logger.warning("the cache list for the fit of %s %s failed: %s", model, revision, error)
+                cached = []
+        for item in cached:
+            if item["model"] == model and item["revision"] == revision:
+                size_bytes = item["size_bytes"]
+        needed, basis = needed_from(entry, size_bytes)
+        available = load.live()["now"]["gpu_memory_total"]
+        source = "nvidia-smi"
+        if available is None:
+            available, source = config.gpu_memory_mib, "container"
+        if available is None:
+            source = None
+        return fit(needed, basis, available, source)
+
+    app.state.fit_of = fit_of
+
+    @app.get("/admin/models/fit")
+    async def get_model_fit(model: str = "", revision: str = "main", admin_user: str = Depends(require_admin)) -> dict:
+        try:
+            validate_model_name(model)
+            validate_revision(revision)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
+        return await fit_of(model, revision)
 
     @app.post("/admin/models/download", status_code=202)
     async def download_model(request: Request, admin_user: str = Depends(require_admin)):

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
+from .fit import parse_memory_mib
+
 MAX_RETENTION_DAYS = 36500  # 100 years
 
 
@@ -41,6 +43,7 @@ class Config:
     flush_size: int = 100
     prompt_retention_days: int | None = None
     metrics_retention_days: int = 30
+    gpu_memory_mib: int | None = None
     job_name: str = "unknown"
     environment: str = "unknown"
 
@@ -62,6 +65,7 @@ class Config:
                 _retention_days(env.get("LLM_METRICS_RETENTION_DAYS"), "LLM_METRICS_RETENTION_DAYS")
                 or cls.metrics_retention_days
             ),
+            gpu_memory_mib=parse_memory_mib(env.get("LLM_VRAM")),
             job_name=env.get("DATATAILR_JOB_NAME") or cls.job_name,
             environment=env.get("DATATAILR_JOB_ENVIRONMENT") or cls.environment,
         )

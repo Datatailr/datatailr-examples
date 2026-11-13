@@ -91,7 +91,7 @@ The script reads these variables at deploy time:
 |---|---|---|
 | `LLM_SERVICE_NAME` | `LLM Service` | Service name. The internal host name comes from it. |
 | `LLM_DEFAULT_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` | Model loaded at the first start. |
-| `LLM_VRAM` | `16g` | GPU memory of the container. |
+| `LLM_VRAM` | `16g` | GPU memory of the container. The service also reads it for the GPU memory check. |
 | `LLM_MEMORY` | `24g` | Memory of the container. |
 | `LLM_CPU` | `4` | CPU count of the container. |
 | `LLM_ADMIN_GROUP` | not set | Platform group whose members are admins. |

@@ -393,6 +393,7 @@ ADMIN_ROUTES = [
     ("GET", "/admin/audit/records/abc?day=2026-11-10", {}),
     ("GET", "/admin/usage", {}),
     ("GET", "/admin/usage/bob", {}),
+    ("GET", "/admin/models/fit?model=org/a", {}),
 ]
 
 
@@ -2729,3 +2730,143 @@ def test_download_cache_check_error_is_500_with_the_error_body(tmp_path):
         assert error["code"] == "cache_check_failed" and error["type"] == "server_error"
         assert set(error) == {"message", "type", "code"}
         assert c.get("/admin/model", headers=ALICE).json()["download"] is None
+
+
+FIT = "/admin/models/fit"
+
+
+def put_catalog(store, *entries):
+    models = [{"note": "", "gpu_memory_mib": None, **entry} for entry in entries]
+    store.put("llm-service/catalog.json", json.dumps({"models": models}))
+
+
+def big_download(model: str, revision: str, target: Path) -> None:
+    (target / "weights.bin").write_bytes(b"x" * (10 * 2**20))
+
+
+def fit_answer(client, **params):
+    r = client.get(FIT, headers=ALICE, params=params)
+    assert r.status_code == 200
+    return r.json()
+
+
+def test_fit_uses_the_catalog_entry_and_the_container_memory(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert fit_answer(c, model="org/b") == {
+            "fits": "yes",
+            "needed_mib": 6000,
+            "available_mib": 15360,
+            "basis": "catalog",
+            "available_source": "container",
+        }
+
+
+def test_fit_no_when_the_catalog_needs_more(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, {"model": "org/b", "revision": "dev", "gpu_memory_mib": 20000})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert fit_answer(c, model="org/b", revision="dev")["fits"] == "no"
+
+
+def test_fit_uses_the_cached_size_with_the_margin(tmp_path):
+    with TestClient(make_app(tmp_path, download=big_download, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+        wait_download(c, "done")
+        answer = fit_answer(c, model="org/b")
+        assert answer["basis"] == "weights" and answer["needed_mib"] == 12
+        assert answer["fits"] == "yes"
+
+
+def test_fit_is_unknown_for_a_pair_in_neither_place(tmp_path):
+    with TestClient(make_app(tmp_path, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert fit_answer(c, model="org/zzz") == {
+            "fits": "unknown",
+            "needed_mib": None,
+            "available_mib": 15360,
+            "basis": "unknown",
+            "available_source": "container",
+        }
+
+
+def test_fit_takes_nvidia_smi_before_the_container_value(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
+    app = make_app(
+        tmp_path, store=store, gpu=FakeGpu((1000, 4000)), sample_interval=0.02, gpu_memory_mib=15360
+    )
+    with TestClient(app) as c:
+        wait_ready(c)
+        wait_until(lambda: c.app.state.load.live()["now"]["gpu_memory_total"] == 4000)
+        answer = fit_answer(c, model="org/b")
+        assert answer["available_mib"] == 4000 and answer["available_source"] == "nvidia-smi"
+        assert answer["fits"] == "no"
+
+
+def test_fit_has_null_available_with_neither_number(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        answer = fit_answer(c, model="org/a")
+        assert answer["available_mib"] is None and answer["available_source"] is None
+        assert answer["fits"] == "unknown"
+
+
+def test_fit_bad_name_is_400(client):
+    for params in ({"model": "../x"}, {"model": "org/a", "revision": "a b"}, {}):
+        r = client.get(FIT, headers=ALICE, params=params)
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "invalid_model"
+
+
+class FailingLsStore(MemoryBlobStore):
+    """A memory store whose listing of the models raises after the start."""
+
+    broken = False
+
+    def ls(self, prefix: str) -> list[str]:
+        if self.broken and "/models/" in prefix:
+            raise OSError("store down")
+        return super().ls(prefix)
+
+
+def test_fit_survives_a_store_error_of_the_cache_list(tmp_path):
+    store = FailingLsStore()
+    put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        store.broken = True
+        assert fit_answer(c, model="org/b")["basis"] == "catalog"
+        answer = fit_answer(c, model="org/a")
+        assert answer["basis"] == "unknown" and answer["fits"] == "unknown"
+
+
+def test_fit_of_takes_a_list_of_cached_entries(tmp_path):
+    with TestClient(make_app(tmp_path, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        cached = [{"model": "org/q", "revision": "main", "size_bytes": 10 * 2**20}]
+        answer = c.portal.call(c.app.state.fit_of, "org/q", "main", cached)
+        assert answer["basis"] == "weights" and answer["needed_mib"] == 12
+
+
+def test_catalog_is_loaded_at_start_and_read_again_by_the_flusher(tmp_path):
+    class FlakyStore(MemoryBlobStore):
+        broken = True
+
+        def get(self, path: str) -> bytes:
+            if self.broken and path.endswith("catalog.json"):
+                raise OSError("store down")
+            return super().get(path)
+
+    store = FlakyStore()
+    put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert not c.app.state.catalog.loaded()
+        store.broken = False
+        wait_until(lambda: c.app.state.catalog.loaded())
+        assert fit_answer(c, model="org/b")["basis"] == "catalog"

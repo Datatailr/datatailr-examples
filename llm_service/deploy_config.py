@@ -16,6 +16,7 @@ TARGETS = ("service", "app")
 USAGE = "usage: python deploy.py [service|app]"
 
 # Optional variables. The service gets each one only when it is set.
+# `LLM_VRAM` is not here: the service always gets it, with the value that `resources` uses.
 OPTIONAL_VARIABLES = ("LLM_ADMIN_GROUP", "LLM_ACCESS_GROUP", "LLM_HF_TOKEN_KEY", "LLM_VLLM_ARGS", "LLM_PROMPT_RETENTION_DAYS", "LLM_METRICS_RETENTION_DAYS")
 
 
@@ -29,6 +30,7 @@ def service_env(env: Mapping[str, str]) -> dict[str, str]:
     result = {
         "LLM_DEFAULT_MODEL": _value(env, "LLM_DEFAULT_MODEL", DEFAULT_MODEL),
         "LLM_BLOB_ROOT": _value(env, "LLM_BLOB_ROOT", DEFAULT_BLOB_ROOT).strip("/") or DEFAULT_BLOB_ROOT,
+        "LLM_VRAM": _value(env, "LLM_VRAM", DEFAULT_VRAM),
     }
     for name in OPTIONAL_VARIABLES:
         value = _value(env, name)
