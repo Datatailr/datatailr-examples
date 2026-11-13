@@ -213,15 +213,15 @@ Each process writes only its own files. No process writes a file of another proc
 
 Each 5 minutes, and at shutdown, the task writes the own file of each day that has new points. It writes the whole file again, with all own points of the day so far. It reads nothing before the put. A restart starts a new file. The files of earlier processes stay as they are.
 
-At the start, the service reads each file of the current day into a read-only part of the memory. The history of the current day then needs no blob read. The service never writes these points. After a failed read, that part stays empty, and the history reads the files itself. Points that another process writes after this read do not show in the history of the current day in this process. The points of the minutes when no process ran are missing.
+The service keeps no copy of the files of other processes. Each history read sees the files as they are in storage, for the current day too. So the last points of an old container show at once. The points of the minutes when no process ran are missing.
 
-A history read lists the directory of each day and reads each file in it, with up to 8 threads over all files of the range. The own points in memory count too. For a minute in the own file and in memory, the memory wins. Two points of one minute from different writers are two parts of that minute. They combine by the rules of the merge below: sums add, maximum values take the maximum, and `gpu_memory_total` takes the value that is not null. A failed listing or a failed file read puts the day into `missing_days`. A missing directory is an empty day.
+A history read lists `<blob root>/metrics/` once. The listing is recursive and holds only files. A missing directory gives an empty list. From the names, the read picks the files of the days in the range: `<day>/<writer>.jsonl` and the legacy `<day>.jsonl`. It reads them with up to 8 threads. The own points in memory count too. For a minute in the own file and in memory, the memory wins. Two points of one minute from different writers are two parts of that minute. They combine by the rules of the merge below: sums add, maximum values take the maximum, and `gpu_memory_total` takes the value that is not null. A failed file read puts its day into `missing_days`. A failed listing puts each day of the range into `missing_days`. The own points in memory still show then. A day without a file is an empty day.
 
-Cost: a history read lists one directory for each day and reads one file for each process that ran on that day. A day with many restarts has many small files.
+Cost: a history read makes one listing and one read for each file of the range. A file exists for each process that ran on a day. A day with many restarts has many small files. The listing names all files of the retention, not only the files of the range.
 
 An earlier test version wrote one file for each day: `<blob root>/metrics/<day>.jsonl`. The history reads such a legacy file as one more source of its day. No process writes it.
 
-The variable `LLM_METRICS_RETENTION_DAYS` sets how many days the service keeps. The default is 30, and the range is 1 to 36500. The maintenance task of the audit log removes the files of older days, in the day directories and the legacy files. It lists `metrics/` at most once in an hour. One call deletes at most 64 files, and the next call continues.
+The variable `LLM_METRICS_RETENTION_DAYS` sets how many days the service keeps. The default is 30, and the range is 1 to 36500. The maintenance task of the audit log removes the files of older days, in the day directories and the legacy files. It uses the same listing and the same name rules as the history read. It lists `metrics/` at most once in an hour. One call deletes at most 64 files, and the next call continues.
 
 A failed write keeps the points in memory for the next try. If the file of a past day has no good write for one hour, the service drops its points and logs an error.
 
@@ -240,7 +240,7 @@ Both are for admins.
 
 `GET /admin/metrics/history?since=<time>&until=<time>` reads the files of the days in the range. `since` and `until` are ISO times. The range is at most 31 days as a duration. The range touches a count of minutes, counted from the minute of `since`. The step is that count divided by 500 and rounded up, at least 1 minute. The service puts each point into the time bucket of one step that holds it. The buckets start at the minute of `since`. Each bucket with points gives one point, with the start of the bucket as `ts`. A bucket without points gives no point, so a gap stays a gap. A range of up to 500 minutes keeps each point as it is. Sums stay sums and maximum values stay maximum values. A percentile becomes the maximum of the merged percentiles. The answer names the step in seconds.
 
-The answer has `step_seconds`, `points` and `missing_days`. `missing_days` lists the UTC days with a failed listing or a failed file read. A day with no file is not a failure. The list is empty when each read worked.
+The answer has `step_seconds`, `points` and `missing_days`. `missing_days` lists the UTC days with a failed file read, or each day of the range after a failed listing. A day with no file is not a failure. The list is empty when each read worked.
 
 A bad time, a `since` after `until` or a range that is too long gets 400 `invalid_time`.
 

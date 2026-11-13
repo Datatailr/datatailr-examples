@@ -294,31 +294,27 @@ def test_bad_writer_name_is_rejected(bad):
         MetricsStore(MemoryBlobStore(), ROOT, Clock(), writer=bad)
 
 
-# load_today
+# history of today
 
 
-def test_load_today_missing_directory_means_no_points():
-    ms, store, _ = make()
-    ms.load_today()
-    assert ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC)) == ([], 60, [])
-
-
-def test_load_today_reads_the_files_of_other_writers():
+def test_history_sees_a_file_that_another_process_writes_later():
+    # The old container writes its last points after the new one started. They show at once.
     store = MemoryBlobStore()
-    pts = [minute(DAY1, 9, 0), minute(DAY1, 9, 1)]
-    store.put(path(DAY1, OTHER), body(*pts))
-    ms, _, _ = make(store)
-    ms.load_today()
-    got, _, _ = ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC))
-    assert got == pts
+    ms, _, clock = make(store)
+    ms.add([minute(DAY1, 9, 1)])
+    old, _, _ = make(store, clock, writer=OTHER)
+    old.add([minute(DAY1, 9, 0)])
+    old.write(force=True)
+    got, _, failed = ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC))
+    assert [p["ts"] for p in got] == ["2026-11-12T09:00:00Z", "2026-11-12T09:01:00Z"]
+    assert failed == []
 
 
-def test_load_today_skips_broken_lines():
+def test_history_skips_broken_lines():
     store = MemoryBlobStore()
     good = minute(DAY1, 9, 0)
     store.put(path(DAY1, OTHER), json.dumps(good) + "\n{broken\n[1, 2]\n" + json.dumps({"ts": 5}) + "\n\n")
     ms, _, _ = make(store)
-    ms.load_today()
     got, _, _ = ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC))
     assert got == [good]
 
@@ -327,7 +323,7 @@ def test_points_of_other_writers_are_never_written():
     store = Counting()
     store.put(path(DAY1, OTHER), body(minute(DAY1, 9, 0)))
     ms, _, _ = make(store)
-    ms.load_today()
+    ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC))
     ms.add([minute(DAY1, 9, 1)])
     ms.write(force=True)
     assert store.ls(f"{ROOT}/metrics") == [path(DAY1, OTHER), path(DAY1)]
@@ -335,55 +331,8 @@ def test_points_of_other_writers_are_never_written():
     assert store.get(path(DAY1, OTHER)) == body(minute(DAY1, 9, 0)).encode()
 
 
-def test_history_uses_memory_only_after_good_load_today():
-    store = Counting()
-    store.put(path(DAY1, OTHER), body(minute(DAY1, 9, 0)))
-    ms, _, _ = make(store)
-    ms.load_today()
-    ms.add([minute(DAY1, 9, 1)])
-    before = (store.gets, store.lists)
-    got, _, failed = ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC))
-    assert (store.gets, store.lists) == before
-    assert [p["ts"] for p in got] == ["2026-11-12T09:00:00Z", "2026-11-12T09:01:00Z"]
-    assert failed == []
-
-
-def test_history_after_failed_load_today_reads_the_files_and_merges_memory(caplog):
-    store = FailingGet()
-    store.fail = False
-    store.put(path(DAY1, OTHER), body(minute(DAY1, 9, 0)))
-    store.fail = True
-    ms, _, _ = make(store)
-    with caplog.at_level(logging.ERROR):
-        ms.load_today()
-    assert "storage down" in caplog.text
-    ms.add([minute(DAY1, 9, 1)])
-    store.fail = False
-    before = store.gets
-    got, _, _ = ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC))
-    assert store.gets > before
-    assert [p["ts"] for p in got] == ["2026-11-12T09:00:00Z", "2026-11-12T09:01:00Z"]
-
-
-def test_load_today_failed_listing_leaves_the_day_unread(caplog):
-    class BadLs(MemoryBlobStore):
-        fail = True
-
-        def ls(self, prefix):
-            if self.fail:
-                raise OSError("no listing")
-            return super().ls(prefix)
-
-    store = BadLs()
-    store.put(path(DAY1, OTHER), body(minute(DAY1, 9, 0)))
-    ms, _, _ = make(store)
-    with caplog.at_level(logging.ERROR):
-        ms.load_today()
-    assert "no listing" in caplog.text
-    store.fail = False
-    got, _, failed = ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC))
-    assert [p["ts"] for p in got] == ["2026-11-12T09:00:00Z"]
-    assert failed == []
+def test_store_has_no_cache_of_today():
+    assert not hasattr(MetricsStore, "load_today")
 
 
 # add and write
@@ -391,7 +340,6 @@ def test_load_today_failed_listing_leaves_the_day_unread(caplog):
 
 def test_add_then_write_gives_sorted_own_file():
     ms, store, _ = make()
-    ms.load_today()
     ms.add([minute(DAY1, 9, 5), minute(DAY1, 9, 3)])
     ms.write(force=True)
     assert store.ls(f"{ROOT}/metrics") == [path(DAY1)]
@@ -416,7 +364,6 @@ def test_add_alone_writes_nothing():
 
 def test_same_ts_replaces_point():
     ms, store, _ = make()
-    ms.load_today()
     ms.add([minute(DAY1, 9, 5, requests=1)])
     ms.add([minute(DAY1, 9, 5, requests=7)])
     ms.write(force=True)
@@ -426,7 +373,6 @@ def test_same_ts_replaces_point():
 def test_second_write_inside_five_minutes_writes_nothing():
     store = Counting()
     ms, _, clock = make(store)
-    ms.load_today()
     ms.add([minute(DAY1, 9, 0)])
     ms.write()
     assert store.puts == 1
@@ -443,7 +389,6 @@ def test_second_write_inside_five_minutes_writes_nothing():
 def test_force_writes_inside_five_minutes():
     store = Counting()
     ms, _, _ = make(store)
-    ms.load_today()
     ms.add([minute(DAY1, 9, 0)])
     ms.write()
     ms.add([minute(DAY1, 9, 1)])
@@ -454,7 +399,6 @@ def test_force_writes_inside_five_minutes():
 def test_write_without_new_points_writes_nothing():
     store = Counting()
     ms, _, _ = make(store)
-    ms.load_today()
     ms.add([minute(DAY1, 9, 0)])
     ms.write(force=True)
     ms.write(force=True)
@@ -463,7 +407,6 @@ def test_write_without_new_points_writes_nothing():
 
 def test_write_at_midnight_gives_two_files():
     ms, store, clock = make(clock=Clock("2026-11-12T23:59:30"))
-    ms.load_today()
     ms.add([minute(DAY1, 23, 59), minute(DAY2, 0, 0)])
     clock.move(minutes=1)
     ms.write(force=True)
@@ -473,11 +416,9 @@ def test_write_at_midnight_gives_two_files():
 
 def test_restart_starts_a_new_file_and_keeps_the_old_one():
     first, store, _ = make(writer=OTHER)
-    first.load_today()
     first.add([minute(DAY1, 9, 0)])
     first.write(force=True)
     again, _, _ = make(store)
-    again.load_today()
     again.add([minute(DAY1, 9, 1)])
     again.write(force=True)
     assert store.ls(f"{ROOT}/metrics") == [path(DAY1, OTHER), path(DAY1)]
@@ -492,8 +433,6 @@ def test_two_writers_at_the_same_time_lose_no_minute():
     store = MemoryBlobStore()
     old, _, clock = make(store, writer=OTHER)
     new, _, _ = make(store, clock)
-    old.load_today()
-    new.load_today()
     old.add([minute(DAY1, 9, 0)])
     new.add([minute(DAY1, 9, 1)])
     old.write(force=True)
@@ -508,7 +447,6 @@ def test_two_writers_at_the_same_time_lose_no_minute():
 def test_failed_put_keeps_points_for_next_write(caplog):
     store = FailingPut()
     ms, _, _ = make(store)
-    ms.load_today()
     ms.add([minute(DAY1, 9, 0)])
     with caplog.at_level(logging.ERROR):
         ms.write(force=True)
@@ -523,7 +461,6 @@ def test_failed_put_keeps_points_for_next_write(caplog):
 def test_past_day_dropped_after_one_hour_without_good_write(caplog):
     store = FailingPut()
     ms, _, clock = make(store, Clock("2026-11-12T23:58:00"))
-    ms.load_today()
     ms.add([minute(DAY1, 23, 58), minute(DAY2, 0, 1)])
     clock.move(minutes=5)  # now on day 2
     ms.write(force=True)
@@ -546,7 +483,6 @@ def test_past_day_dropped_after_one_hour_without_good_write(caplog):
 def test_past_day_leaves_memory_after_good_write():
     store = Counting()
     ms, _, clock = make(store, Clock("2026-11-12T23:58:00"))
-    ms.load_today()
     ms.add([minute(DAY1, 23, 58)])
     clock.move(minutes=5)
     ms.write(force=True)
@@ -569,7 +505,6 @@ def test_point_added_during_put_of_past_day_stays():
     store = AddDuring()
     ms, _, clock = make(store, Clock("2026-11-12T23:58:00"))
     holder["ms"] = ms
-    ms.load_today()
     ms.add([minute(DAY1, 23, 58)])
     clock.move(minutes=5)
     holder["go"] = True
@@ -599,7 +534,6 @@ def test_write_never_raises_on_unexpected_error(caplog, monkeypatch):
 def test_history_over_two_days_with_memory_only_point():
     ms, store, clock = make(clock=Clock("2026-11-13T10:00:00"))
     store.put(path(DAY1, OTHER), body(minute(DAY1, 23, 0), minute(DAY1, 23, 1)))
-    ms.load_today()
     ms.add([minute(DAY2, 0, 5)])
     got, step, _ = ms.history(datetime(2026, 11, 12, 22, tzinfo=UTC), datetime(2026, 11, 13, 2, tzinfo=UTC))
     assert [p["ts"] for p in got] == ["2026-11-12T23:00:00Z", "2026-11-12T23:01:00Z", "2026-11-13T00:05:00Z"]
@@ -660,7 +594,6 @@ def test_legacy_day_file_is_never_written():
     store = MemoryBlobStore()
     store.put(legacy(DAY1), body(minute(DAY1, 8, 0)))
     ms, _, _ = make(store)
-    ms.load_today()
     ms.add([minute(DAY1, 9, 0)])
     ms.write(force=True)
     assert store.get(legacy(DAY1)) == body(minute(DAY1, 8, 0)).encode()
@@ -668,7 +601,6 @@ def test_legacy_day_file_is_never_written():
 
 def test_history_bounds_are_inclusive():
     ms, store, _ = make()
-    ms.load_today()
     ms.add([minute(DAY1, 9, m) for m in range(5)])
     got, _, _ = ms.history(
         datetime(2026, 11, 12, 9, 1, tzinfo=UTC), datetime(2026, 11, 12, 9, 3, tzinfo=UTC)
@@ -678,7 +610,6 @@ def test_history_bounds_are_inclusive():
 
 def test_history_missing_day_directory_is_empty():
     ms, _, _ = make()
-    ms.load_today()
     got, step, failed = ms.history(datetime(2026, 11, 1, tzinfo=UTC), datetime(2026, 11, 5, tzinfo=UTC))
     assert (got, step, failed) == ([], 60 * 12, [])
 
@@ -775,19 +706,35 @@ def test_history_failed_read_of_one_file_fails_only_its_day():
     assert failed == ["2026-10-02"]
 
 
-def test_history_failed_listing_fails_the_day():
+def test_history_failed_listing_fails_each_day_of_the_range(caplog):
     class BadLs(MemoryBlobStore):
         def ls(self, prefix):
-            if prefix.rstrip("/").endswith("2026-10-02"):
-                raise OSError("no listing")
-            return super().ls(prefix)
+            raise OSError("no listing")
 
     store = BadLs()
     store.put(path("2026-10-01", OTHER), body(minute("2026-10-01", 1, 0)))
+    ms, _, _ = make(store, Clock("2026-10-02T10:00:00"))
+    ms.add([minute("2026-10-02", 2, 0)])
+    with caplog.at_level(logging.ERROR):
+        got, _, failed = ms.history(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 2, 23, tzinfo=UTC))
+    assert [p["ts"] for p in got] == ["2026-10-02T02:00:00Z"]  # the own points in memory still count
+    assert failed == ["2026-10-01", "2026-10-02"]
+    assert "no listing" in caplog.text
+
+
+def test_history_lists_once_and_reads_only_the_files_of_the_range():
+    store = Counting()
+    store.put(path("2026-10-01", OTHER), body(minute("2026-10-01", 1, 0)))
+    store.put(path("2026-10-01", "20261001T000000Z-cccccccc"), body(minute("2026-10-01", 1, 1)))
+    store.put(legacy("2026-10-02"), body(minute("2026-10-02", 1, 0)))
+    store.put(path("2026-09-30", OTHER), body(minute("2026-09-30", 1, 0)))
+    store.put(legacy("2026-10-04"), body(minute("2026-10-04", 1, 0)))
+    store.put(f"{ROOT}/metrics/readme.txt", "x")
     ms, _, _ = make(store)
-    got, _, failed = ms.history(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 2, 23, tzinfo=UTC))
-    assert [p["ts"] for p in got] == ["2026-10-01T01:00:00Z"]
-    assert failed == ["2026-10-02"]
+    got, _, failed = ms.history(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 3, 23, tzinfo=UTC))
+    assert store.lists == 1
+    assert store.gets == 3  # no read of a legacy file that the listing does not name
+    assert sum(p["requests"] for p in got) == 3 and failed == []
 
 
 def test_history_file_deleted_after_the_listing_is_not_failed():

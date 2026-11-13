@@ -128,6 +128,7 @@ class MetricsStore:
 
     `writer` names the files of this process. It is the start time of the process and 8 random
     hex characters. A test can fix it. A legacy file `<blob_root>/metrics/<day>.jsonl` is read too.
+    Each history read lists `metrics/` once, so it always sees the files as they are in storage.
     """
 
     def __init__(
@@ -154,55 +155,26 @@ class MetricsStore:
         self._version: dict[str, int] = {}  # day -> count of changes
         self._written: dict[str, int] = {}  # day -> version of the last good write
         self._last_good: dict[str, datetime] = {}  # day -> time of the last good write
-        self._others_day: str | None = None  # the day that `load_today` read with success
-        self._others: dict[str, dict[str, dict]] = {}  # path -> ts -> point of other writers, read only
         self._last_write: datetime | None = None
         self._last_retain: datetime | None = None
         self._doomed: list[str] = []  # old files that the next calls of `retain` delete
         self._write_error: str | None = None
 
-    def _day_dir(self, day: str) -> str:
-        return f"{self._dir}/{day}/"
-
     def _own_path(self, day: str) -> str:
-        return f"{self._day_dir(day)}{self.writer}.jsonl"
+        return f"{self._dir}/{day}/{self.writer}.jsonl"
 
-    def _legacy_path(self, day: str) -> str:
-        return f"{self._dir}/{day}.jsonl"
+    def _listing(self) -> list[str]:
+        """List `metrics/` once. The listing is recursive and holds files only. Raise on a failure."""
+        return self._store.ls(self._dir)
 
-    def _today(self) -> str:
-        return _day_of(self._now())
+    def _read_files(self, files: list[tuple[str, str]]) -> tuple[dict[str, dict[str, dict[str, dict]]], dict[str, str]]:
+        """Read the `(day, path)` files with up to `READ_THREADS` threads.
 
-    def _list_day(self, day: str) -> list[str]:
-        """Return the paths of the point files of `day`, with the legacy file. Raise on a failed listing.
-
-        A point file is a `.jsonl` file directly in the day directory. A missing directory gives
-        no file. The legacy file is in the list even if it does not exist.
-        """
-        prefix = self._day_dir(day)
-        files = []
-        for path in self._store.ls(prefix):
-            name = path[len(prefix):] if path.startswith(prefix) else ""
-            if "/" in name or not name.endswith(".jsonl") or name == ".jsonl":
-                continue
-            files.append(path)
-        return files + [self._legacy_path(day)]
-
-    def _read_days(self, days: list[str]) -> tuple[dict[str, dict[str, dict[str, dict]]], dict[str, str]]:
-        """Read all point files of `days` with up to `READ_THREADS` threads.
-
-        Return day -> path -> ts -> point, and day -> error for each day with a failed listing or
-        a failed read. A file that is missing at the read gives no points and no error.
+        Return day -> path -> ts -> point, and day -> error for each day with a failed read. A
+        file that is missing at the read gives no points and no error.
         """
         errors: dict[str, str] = {}
-        stored: dict[str, dict[str, dict[str, dict]]] = {day: {} for day in days}
-
-        def listing(day: str) -> list[str]:
-            try:
-                return self._list_day(day)
-            except Exception as exc:  # noqa: BLE001
-                errors.setdefault(day, str(exc))
-                return []
+        stored: dict[str, dict[str, dict[str, dict]]] = {}
 
         def read(task: tuple[str, str]) -> dict[str, dict] | None:
             day, path = task
@@ -215,28 +187,12 @@ class MetricsStore:
                 return None
             return _parse_lines(raw, day)
 
-        with ThreadPoolExecutor(max_workers=READ_THREADS) as pool:
-            tasks = [(day, path) for day, paths in zip(days, pool.map(listing, days)) for path in paths]
-            for (day, path), found in zip(tasks, pool.map(read, tasks)):
-                if found:
-                    stored[day][path] = found
+        if files:
+            with ThreadPoolExecutor(max_workers=min(READ_THREADS, len(files))) as pool:
+                for (day, path), found in zip(files, pool.map(read, files)):
+                    if found:
+                        stored.setdefault(day, {})[path] = found
         return stored, errors
-
-    def load_today(self) -> None:
-        """Read the files of the other writers of the current day into a read-only part of the memory.
-
-        `history` then answers for the current day without a blob read. After a failure the part
-        stays empty and unread, and `history` reads the files itself.
-        """
-        day = self._today()
-        stored, errors = self._read_days([day])
-        if errors:
-            logger.error("cannot read the metrics of %s: %s", day, errors[day])
-            return
-        own = self._own_path(day)
-        with self._lock:
-            self._others = {path: points for path, points in stored[day].items() if path != own}
-            self._others_day = day
 
     def add(self, points: list[dict]) -> None:
         """Keep the points in memory. A point with the `ts` of an older point replaces it."""
@@ -254,11 +210,8 @@ class MetricsStore:
             table.pop(day, None)
 
     def _drop_stale(self, now: datetime, today: str) -> None:
-        """Drop each past day that has no good write for an hour, each past day that is clean, and a past read-only part."""
+        """Drop each past day that has no good write for an hour, and each past day that is clean."""
         with self._lock:
-            if self._others_day is not None and self._others_day < today:
-                self._others_day = None
-                self._others = {}
             dirty = set(self._dirty_days())
             for day in [d for d in self._points if d < today and d not in dirty]:
                 self._forget(day)
@@ -319,12 +272,13 @@ class MetricsStore:
     def history(self, since: datetime, until: datetime) -> tuple[list[dict], int, list[str]]:
         """Return the points with `since <= ts <= until`, the step and the failed days.
 
-        The points of all files of a day and the own points in memory count. For a `ts` in the
-        own file and in memory, the memory wins. Points of one `ts` from different writers are
-        partial minutes. They combine by the rules of `merge_points`. The points then merge into
-        at most `MAX_POINTS` time buckets. The failed days are the sorted days with a failed
-        listing or a failed file read. A missing directory is not a failure. A failure logs one
-        error for the call. Raise `ValueError` if `since` is after `until` or if the range is
+        The call lists `metrics/` once and reads each file of the days of the range, the current
+        day too. The own points in memory count as well. For a `ts` in the own file and in memory,
+        the memory wins. Points of one `ts` from different writers are partial minutes. They
+        combine by the rules of `merge_points`. The points then merge into at most `MAX_POINTS`
+        time buckets. The failed days are the sorted days with a failed file read. A failed
+        listing fails each day of the range. A day without a file is not a failure. A failure
+        logs one error for the call. Raise `ValueError` if `since` is after `until` or if the range is
         longer than `MAX_DAYS` days.
         """
         since = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
@@ -338,13 +292,16 @@ class MetricsStore:
         days = [(first + timedelta(days=i)).isoformat() for i in range(count)]
         with self._lock:
             memory = {d: dict(self._points.get(d, {})) for d in days}
-            loaded_day = self._others_day if self._others_day in days else None
-            loaded = dict(self._others)
-        stored, errors = self._read_days([d for d in days if d != loaded_day])
-        if errors:
-            logger.error("cannot read the metrics of %d of %d days", len(errors), len(days))
-        if loaded_day is not None:
-            stored[loaded_day] = loaded
+        wanted = set(days)
+        try:
+            files = [(day, path) for path in self._listing() if (day := self._day_of_path(path)) in wanted]
+        except Exception as exc:  # noqa: BLE001
+            logger.error("cannot list the metrics files: %s", exc)
+            stored, errors = {}, dict.fromkeys(days, str(exc))
+        else:
+            stored, errors = self._read_files(files)
+            if errors:
+                logger.error("cannot read the metrics of %d of %d days", len(errors), len(days))
         chosen = []
         for day in days:
             sources = dict(stored.get(day, {}))
@@ -397,7 +354,7 @@ class MetricsStore:
             if not pending:
                 oldest = (now.astimezone(timezone.utc) - timedelta(days=self._retention_days)).date().isoformat()
                 doomed = []
-                for path in self._store.ls(self._dir):
+                for path in self._listing():
                     day = self._day_of_path(path)
                     if day is not None and day < oldest:
                         doomed.append(path)

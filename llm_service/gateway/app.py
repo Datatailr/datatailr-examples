@@ -247,7 +247,6 @@ def create_app(
         # in between, so that no record is counted twice and no flush runs against
         # a half-loaded day.
         await asyncio.to_thread(limits.load)
-        await asyncio.to_thread(metrics.load_today)
         started = time.monotonic()
         days = await asyncio.to_thread(usage.load)
         logger.info("usage totals loaded in %.1f s for %d days", time.monotonic() - started, days)

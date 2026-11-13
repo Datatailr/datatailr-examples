@@ -2391,8 +2391,10 @@ def test_history_names_the_days_that_cannot_be_read(tmp_path):
                 raise OSError("the store is down")
             return super().get(path)
 
+    store = Broken()
+    store.put(f"{METRICS_DIR}/2026-11-09/{OLD_WRITER}.jsonl", "{}\n")
     http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
-    with TestClient(make_app(tmp_path, store=Broken(), http=http, now=Clock())) as c:
+    with TestClient(make_app(tmp_path, store=store, http=http, now=Clock())) as c:
         wait_ready(c)
         body = history(c, "2026-11-09T00:00:00Z", "2026-11-10T13:00:00Z").json()
         assert body["missing_days"] == ["2026-11-09"] and body["points"] == []
@@ -2476,6 +2478,17 @@ def test_the_service_reads_the_files_of_today(tmp_path):
         wait_ready(c)
         body = history(c, "2026-11-10T00:00:00Z", "2026-11-10T13:00:00Z").json()
         assert [p["requests"] for p in body["points"]] == [7]
+
+
+def test_history_shows_a_file_of_another_process_written_after_the_start(tmp_path):
+    clock, store = Clock(), MemoryBlobStore()
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    with TestClient(make_app(tmp_path, store=store, http=http, now=clock)) as c:
+        wait_ready(c)
+        store.put(f"{METRICS_DIR}/{DAY}/{OLD_WRITER}.jsonl", json.dumps({"ts": "2026-11-10T11:00:00Z", "requests": 3}) + "\n")
+        body = history(c, "2026-11-10T00:00:00Z", "2026-11-10T13:00:00Z").json()
+        assert [p["requests"] for p in body["points"]] == [3]
+    assert not hasattr(c.app.state.metrics, "load_today")
 
 
 def test_the_maintenance_task_removes_old_metrics_files(tmp_path):
