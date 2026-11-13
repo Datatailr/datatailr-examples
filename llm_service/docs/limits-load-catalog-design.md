@@ -203,11 +203,15 @@ The service keeps the last 60 points and the last 12 samples in memory.
 
 ### History in blob storage
 
-Each 5 minutes, and at shutdown, the task writes the new points to one file: `<blob root>/metrics/<day>/<HHMM>.jsonl`. `<HHMM>` is the time of the first point in the file. A file has one JSON line for each point. A day has at most 288 files.
+The history has one file for each UTC day: `<blob root>/metrics/<day>.jsonl`. A file has one JSON line for each point of that day, in time order. A full day has 1440 lines.
 
-The variable `LLM_METRICS_RETENTION_DAYS` sets how many days the service keeps. The default is 30, and the range is 1 to 36500. The maintenance task of the audit log removes older day directories, with its delete budget.
+Each 5 minutes, and at shutdown, the task writes the file of each day that has new points. It writes the whole file again, with all points of the day so far. So a read of the history needs one file for each day.
 
-A failed write keeps the points in memory for the next try. After one hour without a good write, the service drops the oldest points and logs an error.
+At the start, the service reads the file of the current day and continues it. The points of the minutes when the service did not run are missing.
+
+The variable `LLM_METRICS_RETENTION_DAYS` sets how many days the service keeps. The default is 30, and the range is 1 to 36500. The maintenance task of the audit log removes older files.
+
+A failed write keeps the points in memory for the next try. If the file of a past day has no good write for one hour, the service drops its points and logs an error.
 
 ### Endpoints
 
