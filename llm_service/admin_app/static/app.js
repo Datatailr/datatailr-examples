@@ -1847,6 +1847,7 @@ async function confirmDelete() {
   setBusy(state.switching);
   guarded(loadStatus);
   loadCatalog(service);  // the cached badge of the catalog changes
+  recheckFit();  // without cached weights, the memory check can lose its estimate
 }
 
 // The catalog card and the memory check of the serve form.
@@ -2060,7 +2061,9 @@ async function confirmRemoveEntry() {
     await api(`${servicePath('catalog', service)}${query({model, revision})}`, {method: 'DELETE'});
     showBanner(`The service ${service} removed ${model} @ ${revision} from the catalog. The cached weights stay.`, 'ok');
   });
-  if (service === state.service) loadCatalog(service);
+  if (service !== state.service) return;
+  loadCatalog(service);
+  recheckFit();  // the entry can have given the needed memory of the model in the serve form
 }
 
 /** Show the result of the memory check under the serve form. A `no` result is a warning. Null hides the note. */

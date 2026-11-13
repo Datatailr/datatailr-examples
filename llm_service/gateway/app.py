@@ -792,7 +792,9 @@ def create_app(
         """
         entry = catalog.get(model, revision)
         size_bytes = None
-        if cached is None:
+        if entry is not None and entry.get("gpu_memory_mib") is not None:
+            pass  # the catalog value wins, so the size of the weights is not needed
+        elif cached is None:
             try:
                 size_bytes = await asyncio.to_thread(weights.size_of, model, revision)
             except Exception as error:

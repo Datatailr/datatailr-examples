@@ -3263,3 +3263,17 @@ def test_each_catalog_change_is_audited_with_old_and_new(tmp_path):
         )
         prompt = full_record(c, events[0])["prompt"]
         assert prompt["event"] == "catalog_change" and set(prompt) == {"event", "target", "old", "new"}
+
+
+def test_a_fit_with_a_catalog_value_reads_no_marker(tmp_path):
+    store = MarkerCountingStore()
+    put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        store.listings, store.marker_reads = 0, []
+        answer = fit_answer(c, model="org/b")
+        assert answer["basis"] == "catalog" and answer["needed_mib"] == 6000
+        assert store.marker_reads == [] and store.listings == 0
+        # Without a catalog value the fit still reads the one marker of the pair.
+        assert fit_answer(c, model="org/c")["basis"] == "unknown"
+        assert store.marker_reads == ["llm-service/models/org--c/main/.complete"]

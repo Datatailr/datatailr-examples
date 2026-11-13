@@ -2653,3 +2653,11 @@ def test_page_catalog_helpers(tmp_path):
         {"text": "The download of org/a @ main is complete. The model is in the cache now.", "ok": True},
         {"text": "The download of org/a @ main failed: no space.", "ok": False},
     ]
+
+
+def test_a_delete_and_a_removed_entry_check_the_serve_fit_again():
+    text = (STATIC_DIR / "app.js").read_text()
+    delete = text[text.index("async function confirmDelete("):text.index("// The catalog card and the memory check")]
+    assert "recheckFit();" in delete
+    remove = text[text.index("async function confirmRemoveEntry("):text.index("function showFit(")]
+    assert "recheckFit();" in remove
