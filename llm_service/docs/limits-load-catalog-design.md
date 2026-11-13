@@ -284,8 +284,10 @@ A model that is not in the catalog still works with the switch and the download,
 - One download runs at a time. A second request gets 409 `download_in_progress`.
 - A download of a model that is in the cache already answers 200 with `{"state": "cached", "model", "revision"}` and starts nothing.
 - A bad name or revision gets 400 `invalid_model`. A store error in the check of the cache gets 500 `cache_check_failed`.
-- A model switch during a download waits for the lock of the weight cache, as two switches do today.
+- An admin switch during a download waits for the lock of the weight cache, also a switch to another model.
+- An automatic reload after an engine exit and a rollback after a failed switch do not wait. They read the complete local copy of the model without the lock. No delete or prune removes that copy, because the model is active or the previous one.
 - A delete of the model that downloads gets 409 `model_in_use`. This holds also before the files reach blob storage, so the delete does not remove a half-written download.
+- A delete of another model gets 409 `download_in_progress` with the message "A model download runs now. Delete after it ends." The delete needs the lock of the weight cache, and the download holds it for the whole fetch.
 - A download of a pair that a delete removes now gets 409 `model_in_use`.
 
 `GET /admin/model` gets the new field `download`: null, or `{"model", "revision", "state", "error", "started_at"}`. `state` is `running`, `done` or `failed`. The last result stays until the next download starts. A download that the service cancels at shutdown ends as `failed` with the error `cancelled`. The field `error` has at most 300 characters.

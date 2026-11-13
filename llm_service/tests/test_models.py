@@ -221,6 +221,8 @@ def test_failed_reload_without_weights_is_failed(tmp_path):
             raise OSError("disk gone")
 
         mgr._weights.ensure = broken_ensure
+        # Without a complete local copy, the reload fetches the files.
+        (tmp_path / "local" / "org--a" / "main" / ".complete").unlink()
         engine.alive_flag = False
         await mgr.check_engine()
         assert mgr.state == "failed" and mgr.active is None
@@ -987,3 +989,80 @@ def test_download_during_the_start_prunes_nothing(tmp_path):
         asyncio.run(run())
     finally:
         store.gate.set()
+
+
+async def _wait_ready(task: asyncio.Task) -> None:
+    """Wait at most 5 seconds for `task`. A task that waits for the cache lock stays pending."""
+    await asyncio.wait({task}, timeout=5)
+
+
+def test_reload_after_an_engine_exit_does_not_wait_for_a_download(tmp_path):
+    mgr, engine, gate, fetching = _make_gated(tmp_path, "org/c")
+
+    async def run():
+        await mgr.startup()
+        download = mgr.request_download("org/c", "main", "alice")
+        await _in_fetch_phase(fetching)
+        engine.alive_flag = False
+        reload = mgr.check_engine()
+        for _ in range(500):
+            if mgr.state == "ready":
+                break
+            await asyncio.sleep(0.01)
+        # The prune after the load still waits for the cache lock. It is harmless.
+        assert mgr.state == "ready" and mgr.active == A and mgr.serving == A
+        assert [name for _, name in engine.started] == ["org/a", "org/a"]
+        assert mgr.download["state"] == "running"
+        gate.set()
+        await download
+        await reload
+        assert mgr.download["state"] == "done"
+
+    try:
+        asyncio.run(run())
+    finally:
+        gate.set()
+
+
+def test_reload_uses_a_complete_local_copy_without_ensure(tmp_path):
+    async def run():
+        mgr, engine, store, events = _make(tmp_path)
+        await mgr.startup()
+
+        def broken_ensure(model, revision):
+            raise OSError("disk gone")
+
+        mgr._weights.ensure = broken_ensure
+        engine.alive_flag = False
+        await mgr.check_engine()
+        assert mgr.state == "ready" and mgr.active == A
+
+    asyncio.run(run())
+
+
+def test_rollback_after_a_failed_switch_does_not_wait_for_a_download(tmp_path):
+    mgr, _, gate, fetching = _make_gated(tmp_path, "org/c")
+    engine = HoldingEngine("org/b")
+    mgr._engine = engine
+
+    async def run():
+        await mgr.startup()
+        engine.armed = True
+        engine.fail_on = {"org/b"}
+        switch = mgr.request_switch("org/b")
+        assert await asyncio.to_thread(engine.waiting.wait, 10)
+        download = mgr.request_download("org/c", "main", "alice")
+        await _in_fetch_phase(fetching)
+        engine.gate.set()  # the start of org/b fails, the rollback to org/a runs
+        await _wait_ready(switch)
+        assert switch.done() and mgr.state == "ready" and mgr.active == A
+        assert mgr.download["state"] == "running"
+        gate.set()
+        await download
+        assert mgr.download["state"] == "done"
+
+    try:
+        asyncio.run(run())
+    finally:
+        gate.set()
+        engine.gate.set()

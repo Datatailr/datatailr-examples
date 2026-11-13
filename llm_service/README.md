@@ -342,6 +342,7 @@ The other errors:
 
 - 400 `invalid_model`: the model name or the revision is not valid.
 - 404 `model_not_found`: no stored revision matches.
+- 409 `download_in_progress`: a download of another model runs now. Delete after it ends.
 - 500 `delete_failed`: a removal failed. The revisions removed before the error stay removed.
 
 After a failed delete, send the same delete again. The second delete removes the files that the failed delete left. Each delete makes one audit record.
@@ -454,8 +455,10 @@ The rules of the download:
 
 - One download runs at a time. A second call gets 409 `download_in_progress`.
 - A model that is in the cache already gets status 200 and the body `{"state": "cached", "model": ..., "revision": ...}`. The service starts nothing.
-- A switch during a download waits for the lock of the weight cache, as two switches do. A switch to the same model then finds the files.
+- An admin switch during a download waits for the lock of the weight cache, also a switch to another model. A switch to the same model then finds the files.
+- An automatic reload after an engine exit and a rollback after a failed switch do not wait for a download. They use the complete local copy of the model when it exists.
 - A delete of the model that downloads gets 409 `model_in_use`. This holds also before the first file reaches blob storage.
+- A delete of another model during a download gets 409 `download_in_progress` with the message "A model download runs now. Delete after it ends."
 - A pair that a delete removes now gets 409 `model_in_use`.
 - A bad name or revision gets 400 `invalid_model`.
 - A store error in the check of the cache gets 500 `cache_check_failed`.

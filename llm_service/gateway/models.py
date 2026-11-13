@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Callable
 
 from .audit import iso, utc_now
@@ -304,13 +305,31 @@ class ModelManager:
         except Exception as exc:  # noqa: BLE001
             log.warning("the delete of old local weights failed: %s", exc)
 
+    async def _served_copy(self, model: str, revision: str) -> Path:
+        """Return the local copy of a model that the engine served last.
+
+        A complete local copy is used without the cache lock, so a download
+        does not hold up a reload or a rollback. That is safe: the pair is the
+        active or previous model, so no delete or prune removes it. Without a
+        local copy, `ensure` fetches the files.
+        """
+        local = await asyncio.to_thread(self._weights.local_copy, model, revision)
+        if local is not None:
+            return local
+        return await asyncio.to_thread(self._weights.ensure, model, revision)
+
     async def _load(self, wanted: dict, previous: dict | None, trigger: str) -> None:
         model, revision = wanted["model"], wanted["revision"]
         try:
             try:
-                model_dir = await asyncio.to_thread(
-                    self._weights.ensure, model, revision
-                )
+                if trigger == "reload":
+                    model_dir = await self._served_copy(model, revision)
+                else:
+                    # An admin switch takes the cache lock: a prune at the
+                    # same time can delete the local copy of a new target.
+                    model_dir = await asyncio.to_thread(
+                        self._weights.ensure, model, revision
+                    )
             except Exception as exc:  # noqa: BLE001
                 self._fail_before_stop(wanted, previous, f"{model}: {exc}", trigger)
                 return
@@ -365,8 +384,8 @@ class ModelManager:
             self.rolling_back = dict(previous)
             try:
                 try:
-                    model_dir = await asyncio.to_thread(
-                        self._weights.ensure, previous["model"], previous["revision"]
+                    model_dir = await self._served_copy(
+                        previous["model"], previous["revision"]
                     )
                     await self._engine.start(model_dir, previous["model"])
                 except Exception as exc:  # noqa: BLE001

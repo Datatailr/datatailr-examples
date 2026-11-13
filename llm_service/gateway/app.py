@@ -951,6 +951,16 @@ def create_app(
             found.append(downloading["revision"])
         if not found:
             raise ApiError(404, "invalid_request_error", "model_not_found", f"no stored copy of {model_id!r} matches")
+        # A download holds the cache lock for its whole fetch, and `remove`
+        # needs that lock. A delete of the pair of the download gets
+        # `model_in_use` from `begin_remove`. Each other delete gets this answer.
+        if downloading is not None and not (
+            downloading["model"] == model_id and downloading["revision"] in found
+        ):
+            raise ApiError(
+                409, "invalid_request_error", "download_in_progress",
+                "A model download runs now. Delete after it ends.",
+            )
         try:
             manager.begin_remove(model_id, found)
         except ModelInUse as error:

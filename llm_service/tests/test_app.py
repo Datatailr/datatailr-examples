@@ -2674,6 +2674,37 @@ def test_download_conflicts_and_delete_during_a_download_are_409(tmp_path):
         download.gate.set()
 
 
+def test_delete_of_another_model_during_a_download_is_409_download_in_progress(tmp_path):
+    download = GatedDownload("org/b")
+    store = MemoryBlobStore()
+    try:
+        with TestClient(make_app(tmp_path, store=store, download=download)) as c:
+            wait_ready(c)
+            switch_and_wait(c, "org/other")
+            switch_and_wait(c, "org/a")
+            assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+            assert download.fetching.wait(10)
+            for path in ("/admin/models/org/other", "/admin/models/org/other?revision=main"):
+                r = c.delete(path, headers=ALICE)
+                assert r.status_code == 409
+                assert r.json()["error"] == {
+                    "message": "A model download runs now. Delete after it ends.",
+                    "type": "invalid_request_error",
+                    "code": "download_in_progress",
+                }
+            # The pair of the download keeps its own answer.
+            r = c.delete("/admin/models/org/b", headers=ALICE)
+            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            assert c.app.state.manager.removing == set()
+            assert store.exists("llm-service/models/org--other/main/.complete")
+            assert delete_events(c) == []
+            download.gate.set()
+            wait_download(c, "done")
+            assert c.delete("/admin/models/org/other", headers=ALICE).status_code == 200
+    finally:
+        download.gate.set()
+
+
 def test_download_of_a_pair_under_removal_is_409(tmp_path):
     store = SlowDeleteStore()
     try:

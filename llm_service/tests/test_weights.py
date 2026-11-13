@@ -514,3 +514,23 @@ def test_is_cached_ignores_the_local_copy(fx):
 def test_is_cached_validates_the_names(fx, model, revision):
     with pytest.raises(ValueError):
         fx.cache.is_cached(model, revision)
+
+
+def test_local_copy_gives_the_directory_of_a_complete_local_copy(fx):
+    assert fx.cache.local_copy("org/m", "main") is None
+    path = fx.cache.ensure("org/m", "main")
+    assert fx.cache.local_copy("org/m", "main") == path
+    (path / ".complete").unlink()  # a partial copy does not count
+    assert fx.cache.local_copy("org/m", "main") is None
+
+
+def test_local_copy_does_not_take_the_cache_lock(fx):
+    path = fx.cache.ensure("org/m", "main")
+    with fx.cache._lock:
+        assert fx.cache.local_copy("org/m", "main") == path
+
+
+@pytest.mark.parametrize("model,revision", [("nonsense", "main"), ("org/m", "a/b"), ("org/m", "..")])
+def test_local_copy_validates_the_names(fx, model, revision):
+    with pytest.raises(ValueError):
+        fx.cache.local_copy(model, revision)

@@ -141,7 +141,7 @@ Errors use the OpenAI error body: `{"error": {"message", "type", "code"}}`.
 | `GET /admin/models/fit` | The GPU memory check of one model. Query: `model` and `revision`. The answer has `fits`, `needed_mib`, `available_mib`, `basis` and `available_source`. The error is 400 `invalid_model`. |
 | `GET /admin/metrics/live` | The last sample of the load (`now`) and the last 60 points, from memory. |
 | `GET /admin/metrics/history` | The points of a time range from the history files. Query: `since`, `until` (ISO times, at most 31 days apart). The answer has `step_seconds`, `points` and `missing_days`. The error is 400 `invalid_time`. |
-| `DELETE /admin/models/{model}` | Removes the stored revisions of a model from blob storage, with or without a `.complete` marker. The query parameter `revision` limits it to one revision. Returns 200 with `{"deleted": [...]}`. The errors are 404 `model_not_found`, 409 `model_in_use` (also for the model that downloads), 400 `invalid_model` and 500 `delete_failed`. One audit record has the event `model_delete`. |
+| `DELETE /admin/models/{model}` | Removes the stored revisions of a model from blob storage, with or without a `.complete` marker. The query parameter `revision` limits it to one revision. Returns 200 with `{"deleted": [...]}`. The errors are 404 `model_not_found`, 409 `model_in_use` (also for the model that downloads), 409 `download_in_progress` (a download of another model runs now), 400 `invalid_model` and 500 `delete_failed`. One audit record has the event `model_delete`. |
 
 A caller who is not an admin gets 403.
 
@@ -309,7 +309,9 @@ The gateway checks the vLLM process at each request to
 exited while `serving` is set, the gateway clears `serving`. If the state is
 `ready`, the gateway also starts one automatic reload of the active model. The
 reload uses the startup load path and runs as a background task. The state is
-`loading` during the reload. The audit log gets an `engine_reload` event with
+`loading` during the reload. The reload reads a complete local copy of the
+active model without the lock of the weight cache, so a running download does
+not hold it up. A rollback after a failed switch does the same. The audit log gets an `engine_reload` event with
 the user `system`.
 
 If the process exits during the fetch phase of a switch, the gateway starts no
