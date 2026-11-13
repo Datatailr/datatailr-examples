@@ -281,7 +281,10 @@ def test_getters_return_copies():
     old["note"] = "changed"
     assert catalog.get("org/a", "main")["note"] == "new"
     removed = catalog.remove("org/a", "main")
+    assert removed == {**FULL, "note": "new"}
     removed["note"] = "changed"
+    assert catalog.get("org/a", "main") is None
+    assert catalog.entries() == []
 
 
 def test_put_copies_input():

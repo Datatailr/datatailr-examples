@@ -279,7 +279,7 @@ A model that is not in the catalog still works with the switch and the download,
 
 ### Download without a switch
 
-`POST /admin/models/download` with `{"model", "revision"}` starts a download and answers 202. The service runs `WeightCache.ensure` in the background. That step downloads the files and stores them in blob storage. After the step, the service removes the local copy unless the service needs the model. It keeps the copy of the served, target and rollback model, and removes nothing while the service starts.
+`POST /admin/models/download` with `{"model", "revision"}` starts a download and answers 202. The body of the 202 answer is the model status of `GET /admin/model`. Its `state` is the state of the engine, and its `download` field holds the new download. A client tells a new download from a cached pair by the HTTP status: 202 or 200. The service runs `WeightCache.ensure` in the background. That step downloads the files and stores them in blob storage. After the step, the service removes the local copy unless the service needs the model. It keeps the copy of the served, target and rollback model, and removes nothing while the service starts.
 
 - One download runs at a time. A second request gets 409 `download_in_progress`.
 - A download of a model that is in the cache already answers 200 with `{"state": "cached", "model", "revision"}` and starts nothing.
@@ -360,6 +360,8 @@ A change of the catalog writes an audit event `catalog_change` with the target (
 - The percentiles of a merged history point are the maximum of the merged minutes, not a true percentile of the longer time.
 - The fit check does not know the context length or the engine arguments.
 - A restart of the service forgets a running download. The next download of the pair starts again.
+- A stop of the service during a download lasts until the fetch thread ends or the platform ends the process. The audit event then says `cancelled`, although the files can be complete.
+- The `nvidia-smi` total is the sum over all GPUs of the node. On a node with several GPUs, the check can say `fits` for a model that needs one GPU.
 
 ## Out of scope
 

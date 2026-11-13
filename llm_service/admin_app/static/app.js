@@ -1778,8 +1778,18 @@ async function poll(run) {
   if (follows.switching) reports.push(switchReport(status.engine));
   if (follows.downloading && status.engine.download) reports.push(downloadReport(status.engine.download));
   if (reports.length) showBanner(reports.map(({text}) => text).join(' '), reports.every(({ok}) => ok) ? 'ok' : 'error');
-  // The status read above has the new list of cached models. The catalog shows the new cached badge.
-  if (follows.downloading && status.engine.download && status.engine.download.state === 'done') loadCatalog(service);
+  // The status read above follows the new cached models. The catalog shows the new cached badges.
+  const reloads = pollEndReloads(follows, status.engine);
+  if (reloads.catalog) loadCatalog(service);
+  if (reloads.fit) recheckFit();
+}
+
+/** What the end of a poll makes stale. A switch can download its model, so its end reloads the catalog.
+ * A finished download changes the cached badges and the memory check of the serve form. */
+function pollEndReloads(follows, engine) {
+  const download = engine && engine.download;
+  const done = Boolean(follows.downloading && download && download.state === 'done');
+  return {catalog: Boolean(follows.switching) || done, fit: done};
 }
 
 /** How the switch ended. The poll ends only after a rollback, so no rollback runs now. A successful
@@ -1877,10 +1887,14 @@ function catalogEntry({model, revision, note, memory}) {
   return {entry: {model: name, revision: rev, note: text, gpu_memory_mib: mib}};
 }
 
-/** MiB as GiB with one decimal: "15.0 GiB". */
-const mibText = mib => (numeric(mib) === null ? '-' : `${(mib / 1024).toFixed(1)} GiB`);
+/** MiB as text: below 1024 MiB in MiB, "40 MiB", else in GiB with one decimal, "15.0 GiB". */
+function mibText(mib) {
+  const value = numeric(mib);
+  if (value === null) return '-';
+  return value < 1024 ? `${value} MiB` : `${(value / 1024).toFixed(1)} GiB`;
+}
 const BASIS_TEXTS = {catalog: 'from the catalog', weights: 'from the size of the cached weights, plus 20 percent'};
-const SOURCE_TEXTS = {'nvidia-smi': 'GPU memory of the node', container: 'GPU memory of the container'};
+const SOURCE_TEXTS = {'nvidia-smi': 'GPU memory that nvidia-smi reports', container: 'GPU memory of the container'};
 const FIT_LABELS = {yes: 'fits', no: 'does not fit'};
 
 /** The label and the kind of the fit badge of a memory check. */
@@ -2003,11 +2017,14 @@ async function saveCatalogEntry(event) {
   event.preventDefault();
   const service = state.service;
   if (!service) return;
+  if ($('catalog-save').disabled) return;
   const checked = catalogEntry({model: $('catalog-model').value, revision: $('catalog-revision').value,
                                 note: $('catalog-note-text').value, memory: $('catalog-memory').value});
   $('catalog-status').textContent = checked.error || '';
   if (checked.error) return;
   const {model, revision} = checked.entry;
+  // One PUT at a time: each PUT writes an audit event.
+  $('catalog-save').disabled = true;
   try {
     await api(servicePath('catalog', service), {method: 'PUT', headers: {'Content-Type': 'application/json'},
                                                 body: JSON.stringify(checked.entry)});
@@ -2016,11 +2033,14 @@ async function saveCatalogEntry(event) {
       $('catalog-status').textContent = error instanceof ApiError ? error.message : String(error);
     }
     return;
+  } finally {
+    $('catalog-save').disabled = false;
   }
   showBanner(`The service ${service} saved ${model} @ ${revision} in the catalog.`, 'ok');
   if (service !== state.service) return;
   $('catalog-form').reset();
   loadCatalog(service);
+  recheckFit();  // the entry can change the needed memory of the model in the serve form
 }
 
 function askRemoveEntry(model, revision) {
@@ -2058,13 +2078,27 @@ function scheduleFit() {
   state.fitTimer = setTimeout(checkFit, FIT_WAIT_MS);
 }
 
+/** The pair of the text of a model and a revision field, or null for a bad name. An empty revision is `main`. */
+function validPair(model, revision) {
+  const pair = {model: model.trim(), revision: revision.trim() || 'main'};
+  return validModelName(pair.model) && validRevision(pair.revision) ? pair : null;
+}
+
+/** The pair in the serve form, or null. */
+const servePair = () => validPair($('serve-model').value, $('serve-revision').value);
+
+/** Run the memory check again when the serve form holds a valid pair. */
+function recheckFit() {
+  if (servePair()) checkFit();
+}
+
 /** Read the memory check of the model in the serve form. It never blocks the Serve button. */
 async function checkFit() {
   const service = state.service;
-  const model = $('serve-model').value.trim();
-  const revision = $('serve-revision').value.trim() || 'main';
+  const pair = servePair();
   const call = nextCall('fit');
-  if (!service || !validModelName(model) || !validRevision(revision)) return;
+  if (!service || !pair) return;
+  const {model, revision} = pair;
   try {
     showFit(fitText(await current('fit', call, service,
       api(`${servicePath('models/fit', service)}${query({model, revision})}`))));

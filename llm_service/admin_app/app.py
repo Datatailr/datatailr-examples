@@ -260,7 +260,7 @@ def create_app(
 
         The answer is the status, the body and the headers to pass on.
 
-        `action` marks a switch or a delete. It waits longer. Its timeout message
+        `action` marks a switch, a delete or a download. It waits longer. Its timeout message
         says that the action can still finish.
         """
         viewer = viewer_or_error(request)
@@ -535,6 +535,7 @@ def create_app(
 
     async def json_body(request: Request) -> object | JSONResponse:
         """Return the JSON body of a write request, or the error response to send."""
+        # A form on another site cannot send this content type without a CORS preflight.
         if not _is_json(request):
             return _error(
                 415, "unsupported_media_type", "The request body must be application/json.", "invalid_request_error"

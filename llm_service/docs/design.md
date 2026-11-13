@@ -496,8 +496,11 @@ switch and checks the GPU memory before a switch. `catalog.py` holds the
 catalog file, `<root>/catalog.json`, and the checks of its entries. `fit.py`
 holds the parse of memory sizes and the rules of the answer. The download runs
 in `models.py` as a background task that calls `WeightCache.ensure`. The
-download holds the lock of the weight cache, so a switch to the same model
-waits for it. No request of a user waits for the catalog, a download or blob
+download holds the lock of the weight cache for its whole fetch. An admin
+switch waits for that lock, also a switch to another model. A delete gets 409
+`download_in_progress`, or 409 `model_in_use` for the pair of the download.
+An automatic reload and a rollback do not wait: they read the complete local
+copy of their model without the lock. No request of a user waits for the catalog, a download or blob
 storage.
 
 The design is in [limits-load-catalog-design.md](limits-load-catalog-design.md),

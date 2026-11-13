@@ -3218,6 +3218,7 @@ def test_delete_with_a_bad_name_is_400(tmp_path, params):
         assert r.status_code == 400
         assert r.json()["error"]["code"] == "invalid_catalog_entry"
         assert len(r.json()["error"]["message"]) <= 300
+        assert catalog_events(c) == []
 
 
 def test_each_catalog_change_is_audited_with_old_and_new(tmp_path):

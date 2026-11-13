@@ -440,7 +440,7 @@ curl -X POST "$BASE/admin/models/download" \
   -d '{"model": "Qwen/Qwen2.5-0.5B-Instruct", "revision": "main"}'
 ```
 
-The field `revision` is optional. The call returns status 202 and the download runs in the background. The service downloads the files from Hugging Face and stores them in blob storage. Then it removes the local copy, unless the service needs the model.
+The field `revision` is optional. The call returns status 202 and the download runs in the background. The body of the 202 answer is the model status of `GET /admin/model`. Its field `state` is the state of the engine, not of the download. The field `download` holds the new download. A client tells a new download from a cached model by the HTTP status: 202 or 200. The service downloads the files from Hugging Face and stores them in blob storage. Then it removes the local copy, unless the service needs the model.
 
 Read the state in the field `download` of `GET /admin/model`. The field is null before the first download. It has these keys:
 
@@ -536,7 +536,7 @@ The admin app has a route for each endpoint under `/api/services/{name}/`: `cata
 
 The Models tab of the admin app has the card "Catalog". It has one row for each entry, with the model, the revision, the note, the needed memory, a fit badge and a cached badge. The badges read `fits`, `does not fit` or `unknown`, and `cached` or `not cached`. Each row has the buttons Serve and Remove from the list. A row that is not cached also has the button Download. Serve fills the serve form and starts the switch. Remove asks for a confirmation and keeps the cached weights. A form under the table adds an entry or replaces the entry with the same pair. A Reload button reads the catalog again. A service without the catalog endpoints shows a note instead of the table.
 
-Under the form "Serve a model", a note shows the fit result for the typed model. A result `does not fit` is a warning. The note says that a switch can still start. It does not block the Serve button.
+Under the form "Serve a model", a note shows the fit result for the typed model. A result `does not fit` is a warning. The note says that a switch can still start. It does not block the Serve button. The page runs the check again when a download ends or an entry of the catalog is saved. The end of a switch or a download reads the catalog again.
 
 A running download shows in the engine card with its state, its model and its start time. The tab reads the state of the service each 3 seconds while a switch or a download runs.
 
@@ -546,6 +546,8 @@ A running download shows in the engine card with its state, its model and its st
 - The switch does not use the check. An admin can start a switch with each result.
 - A restart of the service forgets a running download. The partial files do not count as a cached copy, so the next download of the pair starts again.
 - One download runs at a time, and the service has no queue.
+- A stop of the service during a download lasts until the fetch thread ends or the platform ends the process. The audit event then says `cancelled`, although the files can be complete.
+- The `nvidia-smi` total is the sum over all GPUs of the node. On a node with several GPUs, the check can say `fits` for a model that needs one GPU.
 
 ## Limits for each user
 

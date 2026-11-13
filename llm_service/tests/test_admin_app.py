@@ -2509,9 +2509,28 @@ def test_the_models_tab_loads_the_catalog_and_polls_for_a_download():
     assert "if (pollNeeded(status.engine))" in status
     poll = text[text.index("async function poll("):text.index("function switchReport(")]
     assert "if (pollNeeded(status.engine))" in poll
-    assert "loadCatalog(" in poll  # a finished download changes the cached badges of the catalog
-    # The catalog reload of a finished download runs only when the download ended with done.
-    assert "status.engine.download.state === 'done'" in poll
+    # A finished download and the end of a switch change the cached badges of the catalog.
+    assert "const reloads = pollEndReloads(follows, status.engine);" in poll
+    assert "if (reloads.catalog) loadCatalog(service);" in poll
+    assert "if (reloads.fit) recheckFit();" in poll
+
+
+def test_the_catalog_save_is_off_while_its_put_runs():
+    text = (STATIC_DIR / "app.js").read_text()
+    save = text[text.index("async function saveCatalogEntry("):text.index("function askRemoveEntry(")]
+    assert "if ($('catalog-save').disabled) return;" in save
+    assert save.index("$('catalog-save').disabled = true;") < save.index("{method: 'PUT'")
+    assert "} finally {\n    $('catalog-save').disabled = false;\n  }" in save
+    # A saved entry changes the memory check of the serve form.
+    assert "recheckFit();" in save
+
+
+def test_the_memory_check_runs_again_only_for_a_valid_pair():
+    text = (STATIC_DIR / "app.js").read_text()
+    recheck = text[text.index("function recheckFit("):text.index("async function checkFit(")]
+    assert "if (servePair()) checkFit();" in recheck
+    check = text[text.index("async function checkFit("):text.index("function clearCatalog(")]
+    assert "const pair = servePair();" in check
 
 
 def test_the_remove_of_a_catalog_entry_says_that_the_weights_stay():
@@ -2538,7 +2557,8 @@ def test_page_catalog_helpers(tmp_path):
         "  location: {pathname: '/', origin: 'https://example.test'}};\n"
         "vm.createContext(context);\n"
         "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {validModelName, validRevision,'\n"
-        "  + ' catalogEntry, fitText, fitBadge, needText, mibText, pollNeeded, downloadReport};', context);\n"
+        "  + ' catalogEntry, fitText, fitBadge, needText, mibText, pollNeeded, downloadReport, pollEndReloads,'\n"
+        "  + ' validPair};', context);\n"
         "const h = context.h;\n"
         "const input = JSON.parse(process.argv[3]);\n"
         "const fit = (fits, needed, available, basis, source) => h.fitText({fits, needed_mib: needed,\n"
@@ -2557,7 +2577,15 @@ def test_page_catalog_helpers(tmp_path):
         "  badges: ['yes', 'no', 'unknown', undefined].map(fits => h.fitBadge({fits})),\n"
         "  needs: [h.needText({needed_mib: 6000, basis: 'catalog'}), h.needText({needed_mib: null, basis: 'unknown'}),\n"
         "          h.needText(undefined)],\n"
-        "  mib: [h.mibText(15360), h.mibText(6000), h.mibText(1), h.mibText(null)],\n"
+        "  mib: [h.mibText(15360), h.mibText(6000), h.mibText(1), h.mibText(40), h.mibText(1023), h.mibText(1024),\n"
+        "        h.mibText(null)],\n"
+        "  reloads: [h.pollEndReloads({switching: true, downloading: false}, {download: null}),\n"
+        "            h.pollEndReloads({switching: false, downloading: true}, {download: {state: 'done'}}),\n"
+        "            h.pollEndReloads({switching: false, downloading: true}, {download: {state: 'failed'}}),\n"
+        "            h.pollEndReloads({switching: true, downloading: true}, {download: {state: 'done'}}),\n"
+        "            h.pollEndReloads({switching: false, downloading: false}, {download: {state: 'done'}})],\n"
+        "  pairs: [h.validPair(' org/a ', ''), h.validPair('org/a', ' v1 '), h.validPair('org', 'main'),\n"
+        "          h.validPair('org/a', 'a/b')],\n"
         "  polls: [h.pollNeeded({state: 'loading'}), h.pollNeeded({state: 'ready', rolling_back: {model: 'org/a'}}),\n"
         "          h.pollNeeded({state: 'ready', download: {state: 'running'}}),\n"
         "          h.pollNeeded({state: 'ready', download: {state: 'done'}}),\n"
@@ -2599,7 +2627,7 @@ def test_page_catalog_helpers(tmp_path):
         {"kind": "yes", "text": "The model fits. It needs 5.9 GiB, from the catalog. "
                                 "The GPU memory of the container is 15.0 GiB."},
         {"kind": "no", "text": "The model does not fit. It needs 20.0 GiB, from the size of the cached weights, "
-                               "plus 20 percent. The GPU memory of the node is 15.0 GiB. "
+                               "plus 20 percent. The GPU memory that nvidia-smi reports is 15.0 GiB. "
                                "A switch can still start, but the load can fail."},
         {"kind": "unknown", "text": "The memory check has no result. The service does not know the GPU memory "
                                     "that the model needs. Add the model to the catalog with its memory, "
@@ -2614,7 +2642,12 @@ def test_page_catalog_helpers(tmp_path):
                                 {"label": "unknown", "kind": "unknown"}, {"label": "unknown", "kind": "unknown"}]
     assert result["needs"] == [{"value": "5.9 GiB", "basis": "from the catalog"},
                                {"value": "unknown", "basis": ""}, {"value": "unknown", "basis": ""}]
-    assert result["mib"] == ["15.0 GiB", "5.9 GiB", "0.0 GiB", "-"]
+    assert result["mib"] == ["15.0 GiB", "5.9 GiB", "1 MiB", "40 MiB", "1023 MiB", "1.0 GiB", "-"]
+    assert result["reloads"] == [{"catalog": True, "fit": False}, {"catalog": True, "fit": True},
+                                 {"catalog": False, "fit": False}, {"catalog": True, "fit": True},
+                                 {"catalog": False, "fit": False}]
+    assert result["pairs"] == [{"model": "org/a", "revision": "main"}, {"model": "org/a", "revision": "v1"},
+                               None, None]
     assert result["polls"] == [True, True, True, False, False, False]
     assert result["reports"] == [
         {"text": "The download of org/a @ main is complete. The model is in the cache now.", "ok": True},
