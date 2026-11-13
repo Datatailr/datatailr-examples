@@ -948,8 +948,9 @@ def test_load_tab_reads_on_a_timer_only_while_it_is_open_and_visible():
     assert "stopLoadTimer()" in body
     clear = text[text.index("function clearServiceData("):text.index("async function refreshServices(")]
     assert "clearLoad();" in clear
-    tick = text[text.index("async function loadTick("):text.index("function startLoadTimer(")]
-    assert "if (stale() || state.loadBusy) return;" in tick
+    # The page runs the timer unit that the harness tests below.
+    assert "const loadPoller = createPoller({" in text
+    assert "canRun: () => loadLive() && document.visibilityState === 'visible'" in text
 
 
 def test_load_charts_are_lines_on_a_linear_time_axis_updated_in_place():
@@ -959,6 +960,9 @@ def test_load_charts_are_lines_on_a_linear_time_axis_updated_in_place():
     assert "spanGaps: false" in body
     assert ".destroy(" not in body and "type: 'time'" not in body
     assert "chart.update(" in body
+    # Chart.js spreads its own ticks from min to max, so the axis takes the ticks of timeTicks.
+    assert "afterBuildTicks: scale => { scale.ticks = timeTicks(scale.min, scale.max)" in body
+    assert "stepSize" not in body
     page = (STATIC_DIR / "index.html").read_text()
     assert page.count("vendor/") == 1  # no new library
 
@@ -973,7 +977,7 @@ def test_page_load_helpers(tmp_path):
         "  location: {pathname: '/', origin: 'https://example.test'}};\n"
         "vm.createContext(context);\n"
         "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {loadSeries, loadRange, stepText,'\n"
-        "  + ' msText, rateText, gpuText, tickStep, localInputValue, loadMissing, ApiError};', context);\n"
+        "  + ' msText, rateText, gpuText, localInputValue, loadMissing, ApiError, LOAD_CHARTS};', context);\n"
         "const h = context.h;\n"
         "const point = (ts, extra = {}) => ({ts, requests: 2, failed_requests: 0, ttft_ms_p50: 300, ...extra});\n"
         "const now = Date.parse('2026-11-12T12:00:00Z');\n"
@@ -996,7 +1000,7 @@ def test_page_load_helpers(tmp_path):
         "  rates: [h.rateText(96.54), h.rateText(0), h.rateText(null), h.rateText('7')],\n"
         "  gpu: [h.gpuText(14200, 15360), h.gpuText(14200, null), h.gpuText(null, 15360)],\n"
         "  steps: [60, 300, 3600, 7200, 5400, null].map(h.stepText),\n"
-        "  ticks: [3600000, 6 * 3600000, 24 * 3600000, 7 * 86400000, 31 * 86400000].map(h.tickStep),\n"
+        "  gpuFormat: [null, 13.5].map(h.LOAD_CHARTS.find(c => c.id === 'chart-load-gpu').format),\n"
         "  input: h.localInputValue(new Date('2026-11-12T09:05:00Z')),\n"
         "  missing: [missing(404, 'not_found'), missing(404, 'unknown_service'), missing(502, null)],\n"
         "}));\n"
@@ -1033,7 +1037,7 @@ def test_page_load_helpers(tmp_path):
     assert result["steps"] == ["One point for each minute.", "One point for each 5 minutes.",
                                "One point for each hour.", "One point for each 2 hours.",
                                "One point for each 90 minutes.", ""]
-    assert result["ticks"] == [600000, 3600000, 10800000, 86400000, 604800000]
+    assert result["gpuFormat"] == ["-", "13.5 GiB"]
     assert result["input"] == "2026-11-12T10:05"
     assert result["missing"] == [True, False, False]
 
@@ -1950,3 +1954,133 @@ def test_metrics_routes_refuse_a_bad_service_name_without_a_call(client, fakes, 
 def test_load_needs_a_user(client, fakes):
     assert client.get("/api/load").status_code == 401
     assert fakes.requests == []
+
+
+def _run_load_harness(tmp_path, body, zone="UTC"):
+    """Run `body` in node over app.js with `h` bound to the load helpers. Return its JSON output."""
+    harness = tmp_path / "harness.js"
+    harness.write_text(
+        "const vm = require('vm');\n"
+        "const fs = require('fs');\n"
+        "const context = {URL, console, document: {addEventListener() {}},\n"
+        "  location: {pathname: '/', origin: 'https://example.test'}};\n"
+        "vm.createContext(context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {timeTicks, createPoller};', context);\n"
+        "const h = context.h;\n"
+        "(async () => {\n" + body + "\n})();\n"
+    )
+    env = {**os.environ, "TZ": zone, "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
+    out = subprocess.run(["node", str(harness), str(STATIC_DIR / "app.js")],
+                         check=True, capture_output=True, text=True, env=env).stdout
+    return json.loads(out)
+
+
+TICKS_BODY = (
+    "const local = ms => { const d = new Date(ms); const p = n => String(n).padStart(2, '0');\n"
+    "  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; };\n"
+    "const at = iso => Date.parse(iso);\n"
+    "const ticks = (since, until) => h.timeTicks(at(since), at(until)).map(local);\n"
+    "console.log(JSON.stringify({\n"
+    "  hour: ticks('2026-11-12T10:03:20Z', '2026-11-12T11:03:20Z'),\n"
+    "  day: ticks('2026-11-11T12:00:00Z', '2026-11-12T12:00:00Z'),\n"
+    "  custom: ticks('2026-11-01T09:00:00Z', '2026-11-02T09:30:00Z'),\n"
+    "  week: ticks('2026-11-05T12:00:00Z', '2026-11-12T12:00:00Z'),\n"
+    "  month: ticks('2026-10-12T12:00:00Z', '2026-11-12T12:00:00Z'),\n"
+    "  dst: ticks('2026-10-22T00:00:00Z', '2026-10-29T00:00:00Z'),\n"
+    "  empty: [h.timeTicks(5, 5), h.timeTicks(NaN, 5)],\n"
+    "}));\n"
+)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_axis_ticks_are_round_steps_of_local_time(tmp_path):
+    # India is UTC+5:30, so a tick on a UTC hour is not on a local hour.
+    india = _run_load_harness(tmp_path, TICKS_BODY, "Asia/Kolkata")
+    assert india["hour"] == ["11-12 15:40", "11-12 15:50", "11-12 16:00", "11-12 16:10", "11-12 16:20",
+                             "11-12 16:30"]
+    assert india["day"] == ["11-11 18:00", "11-11 21:00", "11-12 00:00", "11-12 03:00", "11-12 06:00",
+                            "11-12 09:00", "11-12 12:00", "11-12 15:00"]
+    # 24.5 hours do not fit 8 steps of 3 hours, so the step is 6 hours.
+    assert india["custom"] == ["11-01 18:00", "11-02 00:00", "11-02 06:00", "11-02 12:00"]
+    assert india["week"] == [f"11-{day:02d} 00:00" for day in range(6, 13)]
+    assert india["month"] and len(india["month"]) <= 8
+    assert all(tick.endswith(" 00:00") for tick in india["month"])
+    assert india["empty"] == [[], []]
+    # Berlin changes from UTC+2 to UTC+1 on 25 October. Each day tick stays at local midnight.
+    berlin = _run_load_harness(tmp_path, TICKS_BODY, "Europe/Berlin")
+    assert berlin["dst"] == [f"10-{day} 00:00" for day in range(23, 30)]
+
+
+POLLER_BODY = """
+const timers = [];
+const pending = [];
+const shown = [];
+const failures = [];
+let reads = 0;
+let can = true;
+let view = 'svc-a';
+const poller = h.createPoller({
+  schedule: (fn, ms) => { timers.push({fn, ms}); return timers.length; }, cancel: () => {}, ms: 5000,
+  maxFailures: 5, canRun: () => can, viewOf: () => view, kindOf: v => (v ? 'live' : 'all'),
+  read: v => { reads += 1; return new Promise((resolve, reject) => pending.push({v, resolve, reject})); },
+  show: (v, answer) => shown.push([v, answer]), failed: (error, n, stopped) => failures.push([error.message, n, stopped]),
+});
+const flush = () => new Promise(resolve => setImmediate(resolve));
+const tick = () => timers[timers.length - 1].fn();
+const log = {};
+poller.start();
+log.first = {reads, timers: timers.length, ms: timers[0].ms, running: poller.running};
+tick();
+log.duringRead = reads;
+poller.start();
+log.sameView = {reads, timers: timers.length};
+poller.stop();
+poller.start();
+log.restart = {reads, timers: timers.length};
+pending[0].resolve('old');
+await flush();
+log.afterStale = {reads, shown: shown.length};
+pending[1].resolve('new');
+await flush();
+log.shown = shown.slice();
+for (let i = 0; i < 5; i += 1) {
+  tick();
+  await flush();
+  pending[pending.length - 1].reject(new Error('down'));
+  await flush();
+}
+log.failures = failures;
+log.stopped = {running: poller.running, failures: poller.failures, reads};
+tick();
+await flush();
+log.oldTimer = reads;
+can = false;
+poller.start();
+log.hidden = {running: poller.running, reads};
+can = true;
+poller.start();
+log.again = {running: poller.running, failures: poller.failures, reads};
+view = '';
+poller.stop();
+poller.start();
+log.otherKind = reads;
+console.log(JSON.stringify(log));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_load_timer_runs_one_read_of_a_kind_at_a_time(tmp_path):
+    log = _run_load_harness(tmp_path, POLLER_BODY)
+    assert log["first"] == {"reads": 1, "timers": 1, "ms": 5000, "running": True}
+    assert log["duringRead"] == 1  # a tick during a read is skipped
+    assert log["sameView"] == {"reads": 1, "timers": 1}  # a start for the same view changes nothing
+    assert log["restart"] == {"reads": 1, "timers": 2}  # a restart during a read makes no second read
+    assert log["afterStale"] == {"reads": 2, "shown": 0}  # the stale answer is dropped, the new run reads at once
+    assert log["shown"] == [["svc-a", "new"]]
+    assert log["failures"] == [["down", 1, False], ["down", 2, False], ["down", 3, False], ["down", 4, False],
+                               ["down", 5, True]]
+    assert log["stopped"] == {"running": False, "failures": 5, "reads": 7}
+    assert log["oldTimer"] == 7  # the callback of a stopped timer reads nothing
+    assert log["hidden"] == {"running": False, "reads": 7}
+    assert log["again"] == {"running": True, "failures": 0, "reads": 8}
+    assert log["otherKind"] == 9  # a running live read does not hold the read of all services

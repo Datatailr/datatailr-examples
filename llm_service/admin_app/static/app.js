@@ -26,7 +26,7 @@ const number = new Intl.NumberFormat();
 const state = {tab: null, service: null, services: null, range: '30', loaded: {}, offset: 0,
                polling: false, pollTimer: null, pollFailures: 0, pollService: null,
                detailUser: null, chartsOff: false,
-               loadRange: 'hour', loadTimer: null, loadFailures: 0, loadBusy: null, loadCharts: {},
+               loadRange: 'hour', loadCharts: {}, loadNow: null,
                charts: {}, pendingDelete: null, pendingRemove: null, auditUsersRead: false, calls: {},
                chat: {messages: [], controller: null, defaultModel: ''}};
 
@@ -663,8 +663,27 @@ function gpuText(used, total) {
   return numeric(total) === null ? `${gib(used)} GiB` : `${gib(used)} of ${gib(total)} GiB`;
 }
 
-/** The step of the time axis for a span in milliseconds: at most 8 steps. */
-const tickStep = span => TICK_STEPS.find(step => span / step <= 8) || TICK_STEPS[TICK_STEPS.length - 1];
+/** The offset of the local zone from UTC at the time `ms`, in milliseconds (UTC+1 gives 3600000). */
+const zoneOffset = ms => -new Date(ms).getTimezoneOffset() * 60000;
+
+/** The ticks of a time axis from `min` to `max` (milliseconds): at most 8 multiples of the
+ * smallest round step that fits. The multiples count in local time, so an hour tick sits on a
+ * whole local hour and a day tick at local midnight. */
+function timeTicks(min, max) {
+  if (!(Number.isFinite(min) && Number.isFinite(max) && max > min)) return [];
+  for (const step of TICK_STEPS) {
+    if ((max - min) / step > 8) continue;
+    const ticks = [];
+    for (let local = Math.ceil((min + zoneOffset(min)) / step) * step; ticks.length <= 8; local += step) {
+      // A local time back to UTC. The second pass takes the offset of the tick itself, for a change of the clock.
+      const at = local - zoneOffset(local - zoneOffset(local));
+      if (at > max) break;
+      if (at >= min) ticks.push(at);
+    }
+    if (ticks.length <= 8) return ticks;
+  }
+  return [];
+}
 
 /** A label of the time axis in local time. A span of more than a day adds the date. */
 function timeTick(ms, span) {
@@ -702,7 +721,7 @@ const LOAD_CHARTS = [
    series: [['duration_ms_p50', 'p50', COLORS.bar], ['duration_ms_p95', 'p95', COLORS.yellow]]},
   {id: 'chart-load-queue', format: fmt, whole: true,
    series: [['in_flight_max', 'In flight', COLORS.bar], ['waiting_max', 'Waiting', COLORS.yellow]]},
-  {id: 'chart-load-gpu', format: value => `${oneDecimal.format(value)} GiB`, gib: true,
+  {id: 'chart-load-gpu', format: value => (numeric(value) === null ? '-' : `${oneDecimal.format(value)} GiB`), gib: true,
    series: [['gpu_memory_used_max', 'Used', COLORS.bar2], ['gpu_memory_total', 'Total', COLORS.text, true]]},
 ];
 
@@ -717,8 +736,10 @@ function lineChart({id, format, axis, whole, series}) {
     options: {
       interaction: {mode: 'index', intersect: false},
       scales: {
+        // Chart.js spreads its own ticks from min to max, so the axis takes the round ticks of `timeTicks`.
         x: {type: 'linear', grid: {display: false},
-            ticks: {maxRotation: 0, includeBounds: false, callback(value) { return timeTick(value, this.max - this.min); }}},
+            afterBuildTicks: scale => { scale.ticks = timeTicks(scale.min, scale.max).map(value => ({value})); },
+            ticks: {maxRotation: 0, callback(value) { return timeTick(value, this.max - this.min); }}},
         y: {beginAtZero: true, ticks: {...(whole ? {precision: 0} : {}), callback: value => (axis || format)(value)}},
       },
       plugins: {
@@ -741,12 +762,28 @@ function setLoadCharts(series, min, max) {
           ? series[name].map(({x, y}) => ({x, y: y === null ? null : y / 1024})) : series[name];
       });
       Object.assign(chart.options.scales.x, {min, max});
-      chart.options.scales.x.ticks.stepSize = tickStep(max - min);
       chart.update('none');
     }
   } catch {
     chartsFailed();  // only once: the charts stay off after this
   }
+}
+
+/** Empty the charts and the caption of the range, so an older range never shows under another button. */
+function clearLoadRange() {
+  $('load-range-text').textContent = '';
+  $('load-days-note').hidden = true;
+  for (const chart of Object.values(state.loadCharts)) {
+    for (const dataset of chart.data.datasets) dataset.data = [];
+    chart.update('none');
+  }
+}
+
+/** The caption of the tiles of this moment. On a history range the tiles keep the last live read. */
+function showNowText() {
+  const now = state.loadNow;
+  $('load-now-text').textContent = !now ? '' : !now.ts ? 'The service has no sample yet.'
+    : state.loadRange === 'hour' ? `Read at ${localText(now.ts)}` : `Numbers of the last live read at ${localText(now.ts)}`;
 }
 
 function showLoadNote(text, stopped = false) {
@@ -783,7 +820,8 @@ function showLive({now, points}) {
   $('load-completion-rate').textContent = rateText(at.completion_tokens_per_s);
   $('load-prompt-rate').textContent = rateText(at.prompt_tokens_per_s);
   $('load-gpu').textContent = gpuText(at.gpu_memory_used, at.gpu_memory_total);
-  $('load-now-text').textContent = at.ts ? `Read at ${localText(at.ts)}` : 'The service has no sample yet.';
+  state.loadNow = {ts: at.ts || null};
+  showNowText();
   const list = Array.isArray(points) ? points : [];
   const last = list.length ? list[list.length - 1] || {} : {};
   $('load-requests').textContent = fmt(numeric(last.requests));
@@ -823,70 +861,125 @@ function showAll(answer) {
     `Read at ${new Date().toLocaleTimeString()}, your local time. The page reads the numbers every 5 seconds.`;
 }
 
-/** One read of the timer `run`: the live route of the picked service, or `api/load` for "All
- * services". A tick while a read runs does nothing. A stopped timer drops the answer. */
-async function loadTick(run) {
-  const stale = () => run !== state.calls.loadTimer;
-  if (stale() || state.loadBusy) return;
-  const service = state.service;
-  state.loadBusy = run;
-  try {
-    if (service) {
-      const call = nextCall('loadLive');
-      const answer = await current('loadLive', call, service, api(servicePath('metrics/live', service)));
-      if (stale()) return;
-      showLive(answer);
-    } else {
-      const call = nextCall('loadAll');
-      const answer = await current('loadAll', call, null, api('api/load'));
-      if (stale()) return;
-      showAll(answer);
+/** A timer that reads every `ms` milliseconds, with at most one read of a kind at a time.
+ *
+ * The dependencies come as arguments, so the node harness tests the unit with fakes:
+ * `schedule(fn, ms)` and `cancel(id)` run the timer, `canRun()` says if the view reads now,
+ * `viewOf()` names the view (one service, or "" for "All services"), `kindOf(view)` names the kind
+ * of read, `read(view)` returns a promise of the answer, `show(view, answer)` shows it and
+ * `failed(error, failures, stopped)` shows a failure. After `maxFailures` failures in a row the
+ * timer stops. A stop drops the answer of a read that still runs. When that read ends and a timer
+ * of the same kind runs, the new timer reads at once. */
+function createPoller({schedule, cancel, ms, maxFailures, canRun, viewOf, kindOf, read, show, failed}) {
+  let timer = null;
+  let run = 0;
+  let view = null;
+  let failures = 0;
+  const busy = new Set();
+  async function tick(mine) {
+    const kind = kindOf(view);
+    if (mine !== run || busy.has(kind)) return;  // a tick while a read of this kind runs does nothing
+    const shown = view;
+    busy.add(kind);
+    let stale = false;
+    try {
+      const answer = await read(shown);
+      stale = mine !== run;
+      if (stale) return;
+      failures = 0;
+      show(shown, answer);
+    } catch (error) {
+      stale = mine !== run;
+      if (stale) return;
+      failures += 1;
+      const stopped = failures >= maxFailures;
+      if (stopped) poller.stop();
+      failed(error, failures, stopped);
+    } finally {
+      busy.delete(kind);
+      if (stale && timer !== null && kindOf(view) === kind) tick(run);
     }
-    state.loadFailures = 0;
-    showLoadNote('');
-  } catch (error) {
-    if (stale() || error instanceof StaleAnswer) return;
-    if (service && loadMissing(error)) {
-      stopLoadTimer();
-      showLoadView(true);
-      return;
-    }
-    state.loadFailures += 1;
-    const message = error instanceof ApiError ? error.message : String(error);
-    if (state.loadFailures < LOAD_MAX_FAILURES) {
-      showLoadNote(`The page did not get the load numbers: ${message} The page tries again in 5 seconds.`);
-    } else {
-      stopLoadTimer();
-      showLoadNote(`The page did not get the load numbers ${LOAD_MAX_FAILURES} times in a row: ${message} ` +
-                   'The page stopped. Use Reload to read the numbers again.', true);
-    }
-  } finally {
-    if (state.loadBusy === run) state.loadBusy = null;
+  }
+  const poller = {
+    /** Start to read, unless the view does not read now. A timer of the same view keeps running. */
+    start() {
+      if (!canRun()) {
+        poller.stop();
+        return;
+      }
+      const next = viewOf();
+      if (timer !== null && next === view) return;
+      poller.stop();
+      view = next;
+      failures = 0;
+      const mine = run;
+      timer = schedule(() => tick(mine), ms);
+      tick(mine);
+    },
+    stop() {
+      if (timer !== null) cancel(timer);
+      timer = null;
+      run += 1;
+    },
+    get running() { return timer !== null; },
+    get failures() { return failures; },
+  };
+  return poller;
+}
+
+/** Read the numbers of this moment: the live route of one service, or `api/load` for "All services". */
+async function readNow(service) {
+  if (service) {
+    const call = nextCall('loadLive');
+    return current('loadLive', call, service, api(servicePath('metrics/live', service)));
+  }
+  const call = nextCall('loadAll');
+  return current('loadAll', call, null, api('api/load'));
+}
+
+function showNow(service, answer) {
+  if (service) showLive(answer);
+  else showAll(answer);
+  showLoadNote('');
+}
+
+function nowFailed(error, failures, stopped) {
+  if (error instanceof StaleAnswer) return;
+  if (state.service && loadMissing(error)) {
+    stopLoadTimer();
+    showLoadView(true);
+    return;
+  }
+  const message = error instanceof ApiError ? error.message : String(error);
+  if (!stopped) {
+    showLoadNote(`The page did not get the load numbers: ${message} The page tries again in 5 seconds.`);
+  } else {
+    showLoadNote(`The page did not get the load numbers ${failures} times in a row: ${message} ` +
+                 'The page stopped. Use Reload to read the numbers again.', true);
   }
 }
 
-/** Read now and then every 5 seconds, while the tab shows numbers of this moment and the page is
- * visible. A start drops the timer before it. */
+/** The timer of the Load tab. It reads while the tab shows numbers of this moment and the page is visible. */
+const loadPoller = createPoller({
+  schedule: (fn, ms) => setInterval(fn, ms), cancel: id => clearInterval(id), ms: LOAD_MS,
+  maxFailures: LOAD_MAX_FAILURES, canRun: () => loadLive() && document.visibilityState === 'visible',
+  viewOf: () => state.service || '', kindOf: view => (view ? 'live' : 'all'),
+  read: readNow, show: showNow, failed: nowFailed,
+});
+
+/** Read now and then every 5 seconds. A timer that runs for the same view keeps running. */
 function startLoadTimer() {
-  stopLoadTimer();
-  if (!loadLive() || document.visibilityState !== 'visible') return;
-  state.loadFailures = 0;
-  const run = nextCall('loadTimer');
-  state.loadTimer = setInterval(() => loadTick(run), LOAD_MS);
-  loadTick(run);
+  loadPoller.start();
 }
 
 /** Stop the timer. A read of the timer that still runs drops its answer. */
 function stopLoadTimer() {
-  clearInterval(state.loadTimer);
-  state.loadTimer = null;
-  state.loadBusy = null;
-  nextCall('loadTimer');
+  loadPoller.stop();
 }
 
 function onVisibility() {
   if (document.visibilityState !== 'visible') stopLoadTimer();
-  else if (state.loaded.load && state.loadFailures < LOAD_MAX_FAILURES) startLoadTimer();
+  else if (state.loaded.load && loadPoller.failures < LOAD_MAX_FAILURES) startLoadTimer();
 }
 
 /** Read the history of the picked service for the picked range. The timer stops. */
@@ -898,7 +991,10 @@ async function readHistory() {
   if (!range) return;
   const call = nextCall('loadHistory');
   $('load-dates-status').textContent = range.error || '';
-  if (range.error) return;
+  if (range.error) {
+    clearLoadRange();
+    return;
+  }
   showLoadNote('');
   let answer;
   try {
@@ -910,6 +1006,7 @@ async function readHistory() {
       showLoadView(true);
       return;
     }
+    clearLoadRange();
     showLoadNote(`The page did not get the history: ${error instanceof ApiError ? error.message : String(error)}`);
     return;
   }
@@ -925,6 +1022,7 @@ async function readHistory() {
 function setLoadRange(range) {
   state.loadRange = range;
   showLoadRange();
+  showNowText();
   if (range === 'custom' && !$('load-since').value) {
     const now = new Date();
     $('load-until').value = localInputValue(now);
@@ -952,20 +1050,14 @@ function clearLoad() {
   stopLoadTimer();
   for (const name of ['loadLive', 'loadAll', 'loadHistory']) nextCall(name);
   state.loadRange = 'hour';
-  state.loadFailures = 0;
+  state.loadNow = null;
   showLoadRange();
   showLoadNote('');
   $('load-missing').hidden = true;
-  $('load-days-note').hidden = true;
+  clearLoadRange();
   for (const id of LOAD_TILES) $(id).textContent = '-';
-  for (const id of ['load-now-text', 'load-minute-text', 'load-range-text', 'load-dates-status', 'load-all-text']) {
-    $(id).textContent = '';
-  }
+  for (const id of ['load-now-text', 'load-minute-text', 'load-dates-status', 'load-all-text']) $(id).textContent = '';
   $('load-all-body').replaceChildren();
-  for (const chart of Object.values(state.loadCharts)) {
-    for (const dataset of chart.data.datasets) dataset.data = [];
-    chart.update('none');
-  }
 }
 
 // ---- connect
