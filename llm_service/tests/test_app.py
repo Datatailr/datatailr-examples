@@ -73,6 +73,9 @@ class FakeGpu:
         return self.value
 
 
+NOT_GIVEN = object()
+
+
 def make_app(
     tmp_path,
     engine=None,
@@ -84,6 +87,7 @@ def make_app(
     with_access=True,
     gpu=None,
     sample_interval=None,
+    metrics_http=NOT_GIVEN,
     **config_args,
 ):
     store = store or MemoryBlobStore()
@@ -105,6 +109,10 @@ def make_app(
     extra["gpu"] = gpu or FakeGpu(None)
     if sample_interval is not None:
         extra["sample_interval"] = sample_interval
+    if metrics_http is NOT_GIVEN:
+        # The engine reader answers 404 unless a test gives it a client. None lets the app build its own client.
+        metrics_http = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(404)))
+    extra["metrics_http"] = metrics_http
     return create_app(config, store, engine, admin, download, http, **extra)
 
 
@@ -1490,6 +1498,7 @@ def limited_client(tmp_path, limits, engine=None, now=None, **app_args):
         store.put(LIMITS_PATH, limits if isinstance(limits, bytes) else json.dumps(limits))
     engine = engine or HeldEngine()
     http = httpx.AsyncClient(transport=engine.transport(), base_url="http://engine")
+    app_args.setdefault("metrics_http", httpx.AsyncClient(transport=engine.transport()))
     return TestClient(make_app(tmp_path, store=store, http=http, now=now, **app_args)), engine
 
 
@@ -2454,3 +2463,43 @@ def test_the_maintenance_task_removes_old_metrics_files(tmp_path):
     with TestClient(app) as c:
         wait_ready(c)
         wait_until(lambda: store.ls(METRICS_DIR) == [f"{METRICS_DIR}/2026-11-01.jsonl"])
+
+
+def test_the_engine_reader_does_not_use_the_proxy_client(tmp_path):
+    proxy_paths, reader_paths = [], []
+
+    def proxy(request: httpx.Request) -> httpx.Response:
+        proxy_paths.append(request.url.path)
+        return httpx.Response(200, json={"id": "x", "choices": [], "usage": None})
+
+    def reader(request: httpx.Request) -> httpx.Response:
+        reader_paths.append(request.url.path)
+        return httpx.Response(200, text=METRICS_TEXT)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(proxy), base_url="http://engine")
+    metrics_http = httpx.AsyncClient(transport=httpx.MockTransport(reader))
+    app = make_app(tmp_path, http=http, metrics_http=metrics_http, sample_interval=0.02)
+    with TestClient(app) as c:
+        wait_ready(c)
+        wait_until(lambda: c.app.state.load.live()["now"]["running"] == 3)
+    assert "/metrics" in reader_paths
+    assert "/metrics" not in proxy_paths
+
+
+def test_the_app_builds_its_own_client_for_the_engine_metrics(tmp_path):
+    proxy_paths = []
+
+    def proxy(request: httpx.Request) -> httpx.Response:
+        proxy_paths.append(request.url.path)
+        return httpx.Response(200, text=METRICS_TEXT)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(proxy), base_url="http://engine")
+    app = make_app(tmp_path, http=http, metrics_http=None, sample_interval=0.02)
+    with TestClient(app) as c:
+        wait_ready(c)
+        rounds = []
+        real = c.app.state.load.add_sample
+        c.app.state.load.add_sample = lambda numbers, gpu: rounds.append(numbers) or real(numbers, gpu)
+        wait_until(lambda: len(rounds) >= 3)
+    assert "/metrics" not in proxy_paths
+    assert rounds[0]["running"] is None

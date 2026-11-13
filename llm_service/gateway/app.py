@@ -23,7 +23,7 @@ from llm_service.gateway.audit import AuditLog, PromptUnreadable, iso, parse_tim
 from llm_service.gateway.audit_merge import MAINTENANCE_INTERVAL, AuditMerger, run_maintenance
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
-from llm_service.gateway.engine_metrics import EngineReader, GpuReader
+from llm_service.gateway.engine_metrics import EngineReader, GpuReader, metrics_client
 from llm_service.gateway.identity import (
     AccessCheck,
     AdminCheck,
@@ -119,6 +119,7 @@ def create_app(
     access: AccessCheck | None = None,
     gpu: GpuReader | None = None,
     sample_interval: float = SAMPLE_INTERVAL,
+    metrics_http: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     """Build the gateway application from its parts.
 
@@ -127,6 +128,8 @@ def create_app(
     `access` decides who has access to the service. Without it, only admins have access.
     `gpu` reads the GPU memory. Without it, the app builds a `GpuReader`.
     `sample_interval` is the sleep in seconds between two load samples.
+    `metrics_http` is the client of the engine metrics read. Without it, the app builds a
+    client with its own small pool, so a busy proxy does not block the read.
     """
     access = access or AccessCheck(admin, None, lambda group: [])
     owns_http = http is None
@@ -146,7 +149,9 @@ def create_app(
     load = LoadMonitor(now)
     metrics = MetricsStore(store, config.blob_root, now, config.metrics_retention_days)
     gpu = gpu or GpuReader()
-    engine_reader = EngineReader(client, engine.base_url)
+    owns_metrics_http = metrics_http is None
+    metrics_http = metrics_http or metrics_client()
+    engine_reader = EngineReader(metrics_http, engine.base_url)
     weights = WeightCache(store, config.blob_root, config.local_dir, download)
 
     def write_audit(record: dict) -> None:
@@ -283,6 +288,8 @@ def create_app(
                     await flusher
                 if owns_http:
                     await client.aclose()
+                if owns_metrics_http:
+                    await metrics_http.aclose()
 
     app = FastAPI(title="LLM service", lifespan=lifespan)
     app.state.last_admin = SYSTEM_USER

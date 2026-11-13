@@ -108,8 +108,20 @@ def parse_gpu_memory(text: str) -> tuple[int, int] | None:
     return (used, total) if count else None
 
 
+def metrics_client(timeout: float = 2.0) -> httpx.AsyncClient:
+    """Return a client for the metrics endpoint with its own small pool.
+
+    The proxy client can have each connection busy with a stream. A read with its own
+    pool does not wait for a free connection of the proxy.
+    """
+    return httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_connections=2))
+
+
 class EngineReader:
-    """Read the four load numbers from the metrics endpoint of the engine."""
+    """Read the four load numbers from the metrics endpoint of the engine.
+
+    Give it a client of its own, not the client of the proxy. `metrics_client` builds one.
+    """
 
     def __init__(self, client: httpx.AsyncClient, base_url: str, timeout: float = 2.0) -> None:
         self._client = client
@@ -123,7 +135,7 @@ class EngineReader:
         try:
             # The httpx timeout is a limit for each phase. The outer limit covers the total.
             response = await asyncio.wait_for(
-                self._client.get(self._url, timeout=self._timeout), self._timeout
+                self._client.get(self._url, timeout=self._timeout, follow_redirects=True), self._timeout
             )
             response.raise_for_status()
             text = response.text

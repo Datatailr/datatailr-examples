@@ -505,11 +505,11 @@ A point has these fields:
 | `requests`, `failed_requests` | The requests that ended in the minute, and those with status 400 or higher. |
 | `in_flight_max`, `waiting_max` | The largest values of the samples of the minute. |
 | `prompt_tokens`, `completion_tokens` | The token sums of the requests that ended in the minute. |
-| `ttft_ms_p50`, `ttft_ms_p95` | The percentiles of the time to the first token, in milliseconds. |
-| `duration_ms_p50`, `duration_ms_p95` | The percentiles of the total time, in milliseconds. |
+| `ttft_ms_p50`, `ttft_ms_p95` | The percentiles of the time to the first token, in milliseconds. Only requests with a status below 400 count. |
+| `duration_ms_p50`, `duration_ms_p95` | The percentiles of the total time, in milliseconds. Only requests with a status below 400 count. |
 | `gpu_memory_used_max`, `gpu_memory_total` | The largest used value and the total of the minute, in MiB. |
 
-A percentile is `null` for a minute without a matching request. A maximum or a GPU value is `null` when no sample of the minute had it.
+A refused or failed request ends fast, so it stays out of the percentiles. A percentile is `null` for a minute without a matching request. A maximum or a GPU value is `null` when no sample of the minute had it.
 
 ### Read the load
 

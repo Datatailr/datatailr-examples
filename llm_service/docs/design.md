@@ -471,7 +471,8 @@ Part 1. The README has the usage.
 
 An admin sees how busy the service is: requests in flight, requests that wait,
 tokens per second, latency and GPU memory. `engine_metrics.py` reads the vLLM
-metrics endpoint and `nvidia-smi`. `load.py` keeps a sample each 5 seconds and
+metrics endpoint and `nvidia-smi`. The metrics read has its own HTTP client
+with two connections, so the streams of the proxy never block it. `load.py` keeps a sample each 5 seconds and
 builds one point for each minute from the samples and the audit records.
 `metrics_store.py` writes the points to `<root>/metrics/<day>.jsonl` and reads
 the history. A sampler task runs next to the flusher. A request never waits for

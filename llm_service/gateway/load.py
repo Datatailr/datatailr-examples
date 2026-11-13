@@ -129,10 +129,12 @@ class LoadMonitor:
             with self._lock:
                 minute = self._open_minute(self._now())
                 minute.requests += 1
-                if status >= 400:
-                    minute.failed += 1
                 minute.prompt_tokens += prompt or 0
                 minute.completion_tokens += completion or 0
+                if status >= 400:
+                    # A refused or failed request ends fast. It stays out of the latency percentiles.
+                    minute.failed += 1
+                    return
                 if ttft is not None and len(minute.ttft) < VALUES_KEPT:
                     minute.ttft.append(ttft)
                 if duration is not None and len(minute.duration) < VALUES_KEPT:

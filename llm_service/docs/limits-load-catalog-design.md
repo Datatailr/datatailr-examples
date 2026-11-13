@@ -195,7 +195,7 @@ At the end of each minute the task makes one point:
 ```
 
 - `requests`, `failed_requests` and the token sums come from the requests that ended in that minute.
-- The percentiles come from the same requests. They are null for a minute without a request.
+- The percentiles come from the requests of that minute with a status below 400. A refused or failed request ends fast and stays out of them. They are null for a minute without such a request.
 - The maximum values come from the samples of that minute.
 - GPU memory is in MiB.
 

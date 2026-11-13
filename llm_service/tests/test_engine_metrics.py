@@ -492,3 +492,17 @@ def test_parse_metrics_splits_on_newline_only():
     text = "vllm:num_requests_running{a=\"x\x0by\x1cz\u2028w\"} 4\n"
     numbers, _ = parse_metrics(text)
     assert numbers["running"] == 4.0
+
+
+def test_engine_reader_follows_a_redirect():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/metrics":
+            return httpx.Response(307, headers={"location": "http://engine:8001/metrics/"})
+        return httpx.Response(200, text=FULL_TEXT)
+
+    (numbers,) = _run_reads(handler)
+    assert seen == ["/metrics", "/metrics/"]
+    assert numbers["running"] == 3.0

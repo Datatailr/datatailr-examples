@@ -189,8 +189,8 @@ def test_point_for_minute_with_records_and_samples(env):
         "completion_tokens": 20,
         "ttft_ms_p50": 200,
         "ttft_ms_p95": 400,
-        "duration_ms_p50": 3000,
-        "duration_ms_p95": 5000,
+        "duration_ms_p50": 2000,
+        "duration_ms_p95": 4000,
         "gpu_memory_used_max": 1500,
         "gpu_memory_total": 2000,
     }]
@@ -419,3 +419,25 @@ def test_values_of_one_minute_are_bounded(env, monkeypatch):
 
 def test_values_limit_is_one_hundred_thousand():
     assert load_module.VALUES_KEPT == 100_000
+
+
+def test_percentiles_use_only_good_requests(env):
+    env.record(ttft_ms=300, duration_ms=2000)
+    for _ in range(9):
+        env.record(status=429, ttft_ms=None, duration_ms=1)
+    env.record(status=502, ttft_ms=5, duration_ms=1)
+    env.now = START + timedelta(seconds=60)
+    (point,) = env.sample()
+    assert point["requests"] == 11
+    assert point["failed_requests"] == 10
+    assert point["duration_ms_p50"] == 2000
+    assert point["duration_ms_p95"] == 2000
+    assert point["ttft_ms_p50"] == 300
+
+
+def test_percentiles_are_null_for_a_minute_of_failed_requests(env):
+    env.record(status=500, ttft_ms=7, duration_ms=9)
+    env.now = START + timedelta(seconds=60)
+    (point,) = env.sample()
+    assert point["requests"] == 1 and point["failed_requests"] == 1
+    assert point["ttft_ms_p50"] is None and point["duration_ms_p95"] is None
