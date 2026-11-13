@@ -2179,6 +2179,7 @@ METRICS_TEXT = (
     'vllm:kv_cache_usage_perc{engine="0"} 0.37\n'
 )
 METRICS_DIR = "llm-service/metrics"
+OLD_WRITER = "20261109T080000Z-bbbbbbbb"  # the files of an earlier process
 DAY = "2026-11-10"
 
 
@@ -2362,7 +2363,7 @@ def history(c, since, until, headers=ALICE):
 def test_history_returns_the_points_the_store_wrote(tmp_path):
     clock = Clock()
     store = MemoryBlobStore()
-    store.put(f"{METRICS_DIR}/2026-11-09.jsonl", json.dumps({"ts": "2026-11-09T23:59:00Z", "requests": 4}) + "\n")
+    store.put(f"{METRICS_DIR}/2026-11-09/{OLD_WRITER}.jsonl", json.dumps({"ts": "2026-11-09T23:59:00Z", "requests": 4}) + "\n")
     http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
     app = make_app(tmp_path, store=store, http=http, now=clock, sample_interval=0.02)
     with TestClient(app) as c:
@@ -2371,7 +2372,7 @@ def test_history_returns_the_points_the_store_wrote(tmp_path):
         clock.advance(minutes=1)
         wait_until(lambda: c.app.state.load.live()["points"])
         c.app.state.metrics.write(force=True)
-        assert f"{METRICS_DIR}/{DAY}.jsonl" in store.ls(METRICS_DIR)
+        assert f"{METRICS_DIR}/{DAY}/{c.app.state.metrics.writer}.jsonl" in store.ls(METRICS_DIR)
         body = history(c, "2026-11-09T23:00:00Z", "2026-11-10T13:00:00+00:00").json()
         # The range touches 841 minutes, so a point covers 2 minutes and has the start of its bucket as ts.
         assert body["step_seconds"] == 120 and body["missing_days"] == []
@@ -2386,7 +2387,7 @@ def test_history_returns_the_points_the_store_wrote(tmp_path):
 def test_history_names_the_days_that_cannot_be_read(tmp_path):
     class Broken(MemoryBlobStore):
         def get(self, path):
-            if path.startswith(METRICS_DIR) and path.endswith("2026-11-09.jsonl"):
+            if path.startswith(f"{METRICS_DIR}/2026-11-09"):
                 raise OSError("the store is down")
             return super().get(path)
 
@@ -2461,13 +2462,15 @@ def test_the_points_reach_blob_storage_at_shutdown(tmp_path):
         wait_until(lambda: c.app.state.load.live()["now"]["ts"] is not None)
         assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
         clock.advance(minutes=1)  # the sampler sleeps, so only the last round sees this minute
-    lines = store.get(f"{METRICS_DIR}/{DAY}.jsonl").decode().splitlines()
+        writer = c.app.state.metrics.writer
+    assert store.ls(METRICS_DIR) == [f"{METRICS_DIR}/{DAY}/{writer}.jsonl"]
+    lines = store.get(f"{METRICS_DIR}/{DAY}/{writer}.jsonl").decode().splitlines()
     assert [json.loads(line)["requests"] for line in lines] == [1]
 
 
-def test_the_service_continues_the_file_of_today(tmp_path):
+def test_the_service_reads_the_files_of_today(tmp_path):
     clock, store = Clock(), MemoryBlobStore()
-    store.put(f"{METRICS_DIR}/{DAY}.jsonl", json.dumps({"ts": "2026-11-10T11:00:00Z", "requests": 7}) + "\n")
+    store.put(f"{METRICS_DIR}/{DAY}/{OLD_WRITER}.jsonl", json.dumps({"ts": "2026-11-10T11:00:00Z", "requests": 7}) + "\n")
     http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
     with TestClient(make_app(tmp_path, store=store, http=http, now=clock)) as c:
         wait_ready(c)
@@ -2478,14 +2481,15 @@ def test_the_service_continues_the_file_of_today(tmp_path):
 def test_the_maintenance_task_removes_old_metrics_files(tmp_path):
     store = MemoryBlobStore()
     store.put(f"{METRICS_DIR}/2026-01-01.jsonl", "{}\n")
-    store.put(f"{METRICS_DIR}/2026-11-01.jsonl", "{}\n")
+    store.put(f"{METRICS_DIR}/2026-01-01/{OLD_WRITER}.jsonl", "{}\n")
+    store.put(f"{METRICS_DIR}/2026-11-01/{OLD_WRITER}.jsonl", "{}\n")
     http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
     app = make_app(
         tmp_path, store=store, http=http, now=Clock(), maintenance_interval=0.05, metrics_retention_days=30
     )
     with TestClient(app) as c:
         wait_ready(c)
-        wait_until(lambda: store.ls(METRICS_DIR) == [f"{METRICS_DIR}/2026-11-01.jsonl"])
+        wait_until(lambda: store.ls(METRICS_DIR) == [f"{METRICS_DIR}/2026-11-01/{OLD_WRITER}.jsonl"])
 
 
 def test_the_engine_reader_does_not_use_the_proxy_client(tmp_path):

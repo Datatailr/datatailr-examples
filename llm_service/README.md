@@ -549,17 +549,17 @@ curl "http://llm-service/admin/metrics/history?since=2026-11-12T00:00:00Z&until=
 {"step_seconds": 60, "points": [ ... ], "missing_days": []}
 ```
 
-The range is at most 31 days as a duration. The range touches a count of minutes, counted from the minute of `since`. The step is that count divided by 500 and rounded up, at least 1 minute. The service puts each point into the time bucket of one step that holds it. The buckets start at the minute of `since`. Each bucket with points gives one point, with the start of the bucket as `ts`. A bucket without points gives no point, so a gap stays a gap. A range of up to 500 minutes keeps each point as it is. Counts and token sums add up. Maximum values stay maximum values. A percentile becomes the maximum of the merged percentiles. `step_seconds` is the time that one returned point covers. `missing_days` lists the UTC days whose file the service did not manage to read. A day with no file is not a failure.
+The range is at most 31 days as a duration. The range touches a count of minutes, counted from the minute of `since`. The step is that count divided by 500 and rounded up, at least 1 minute. The service puts each point into the time bucket of one step that holds it. The buckets start at the minute of `since`. Each bucket with points gives one point, with the start of the bucket as `ts`. A bucket without points gives no point, so a gap stays a gap. A range of up to 500 minutes keeps each point as it is. Counts and token sums add up. Maximum values stay maximum values. A percentile becomes the maximum of the merged percentiles. `step_seconds` is the time that one returned point covers. `missing_days` lists the UTC days with a failed listing or a failed file read. A day with no file is not a failure.
 
 A time that is not valid, a `since` after `until` or a range over 31 days gets 400 `invalid_time`. A caller who is not an admin gets 403.
 
 ### The history files
 
-The service writes one file for each UTC day: `<root>/metrics/<day>.jsonl`. It has one JSON line for each point of the day, in time order. Each 5 minutes, and at a clean stop, the service writes the whole file of each day that has new points. Before each write, the service reads the file again and keeps each stored point that its memory does not have. For a minute in both, the memory wins. So the last points of an old container that still runs for a moment stay in the file. A failed read or write keeps the points in memory for the next try. If a past day has no good write for one hour, the service drops its points and logs an error.
+Each process of the service writes its own file for each UTC day: `<root>/metrics/<day>/<writer>.jsonl`. `<writer>` is the start time of the process and 8 random hex characters, like `20261112T093000Z-3f9a0c1d`. The file has one JSON line for each point of that process, in time order. Each 5 minutes, and at a clean stop, the process writes its whole file of each day that has new points. It never writes the file of another process. So during a redeploy, the old and the new container cannot overwrite the points of each other. A restart starts a new file. A failed write keeps the points in memory for the next try. If a past day has no good write for one hour, the service drops its points and logs an error.
 
-At the start, the service reads the file of the current day and continues it.
+At the start, the service reads the files of the current day. A history read lists the directory of each day in the range and reads each file in it. Two points of one minute from two processes combine: sums add and maximum values take the maximum. A file `<root>/metrics/<day>.jsonl` of an earlier test version counts too.
 
-`LLM_METRICS_RETENTION_DAYS` sets how many days the service keeps. The default is 30. The value is a whole number from 1 to 36500. A background task deletes the older files. Set the variable and deploy the service again:
+`LLM_METRICS_RETENTION_DAYS` sets how many days the service keeps. The default is 30. The value is a whole number from 1 to 36500. A background task deletes the files of older days, at most 64 in one run. Set the variable and deploy the service again:
 
 ```bash
 LLM_METRICS_RETENTION_DAYS=90 python deploy.py service
@@ -649,7 +649,7 @@ All data is in blob storage, under the root directory in `LLM_BLOB_ROOT`:
 <root>/usage/<day>.json                              # totals of one finished day
 <root>/usage/<day>.partial.json                      # checkpoint of the current day
 <root>/limits.json                                   # the limits of the users, if an admin set any
-<root>/metrics/<day>.jsonl                           # load points of one UTC day
+<root>/metrics/<day>/<writer>.jsonl                  # load points of one process on one UTC day
 ```
 
 The service writes `.complete` after the last weight file. The marker lists each file with its size. An upload that stops half way is not used. When the service downloads a model from blob storage, it downloads only the listed files and checks their sizes. If a file is missing or has the wrong size, the load fails with an error that names the file.
@@ -686,6 +686,8 @@ The first start after the upgrade reads every old layout file of the days withou
 - The limits are for each service. Each service has its own limits file, and the app shows the limits of the picked service.
 - A clean stop of the service loses only the load point of the open minute. A crash loses the points of up to the last 5 minutes and the open minute, the points that are not in blob storage yet.
 - The service has no load numbers for the minutes when it did not run.
+- A history read lists one directory for each day and reads one file for each process that ran on that day. A day with many restarts has many small files, and its read takes longer.
+- The history of the current day comes from the files as the service read them at its start, plus its own points. The last points of an old container after that read show only in a later process.
 - A point of a merged history range holds the maximum of the merged percentiles. It is not the true percentile of the longer time.
 - The platform does not start GPU nodes. You must start one.
 

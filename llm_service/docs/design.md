@@ -218,7 +218,7 @@ Blob storage layout, under a root set by `LLM_BLOB_ROOT` (default `llm-service`)
 <root>/prompts/<day>/<time>-<id>.jsonl               # prompts of one flush
 <root>/usage/<day>.json                              # totals of one finished day
 <root>/usage/<day>.partial.json                      # checkpoint of the current day
-<root>/metrics/<day>.jsonl                           # load points of one UTC day
+<root>/metrics/<day>/<writer>.jsonl                  # load points of one process on one UTC day
 ```
 
 To get a model on local disk, `weights.py` does these steps:
@@ -474,8 +474,8 @@ tokens per second, latency, the KV cache use of the engine and GPU memory.
 `engine_metrics.py` reads the vLLM metrics endpoint and `nvidia-smi`. The metrics read has its own HTTP client
 with two connections, so the streams of the proxy never block it. `load.py` keeps a sample each 5 seconds and
 builds one point for each minute from the samples and the audit records.
-`metrics_store.py` writes the points to `<root>/metrics/<day>.jsonl` and reads
-the history. A sampler task runs next to the flusher. A request never waits for
+`metrics_store.py` writes the points of each process to its own file,
+`<root>/metrics/<day>/<writer>.jsonl`, and reads the history from all files of a day. A sampler task runs next to the flusher. A request never waits for
 the reads or for blob storage.
 
 The design is in [limits-load-catalog-design.md](limits-load-catalog-design.md),

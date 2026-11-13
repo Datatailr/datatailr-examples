@@ -1,10 +1,16 @@
-"""Metrics store: one file for each UTC day in blob storage, and the read of the history."""
+"""Metrics store: one file for each process and UTC day in blob storage, and the read of the history.
+
+Each process writes only its own files, `<blob root>/metrics/<day>/<writer>.jsonl`. No process
+writes a file of another process, so two processes never overwrite their points.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import math
+import re
+import secrets
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +26,10 @@ DROP_AFTER_SECONDS = 3600.0
 WRITE_EVERY_SECONDS = 300.0
 RETAIN_EVERY_SECONDS = 3600.0
 READ_THREADS = 8
+DELETES_PER_CALL = 64
+
+_WRITER = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}")  # the start time of the process and 8 random hex characters
+_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 _SUM_FIELDS = ("requests", "failed_requests", "prompt_tokens", "completion_tokens")
 _MAX_FIELDS = (
@@ -55,18 +65,20 @@ def merge_points(
     for p in points:
         index = int((_parse_ts(p["ts"]) - start).total_seconds() // (60 * step))
         buckets.setdefault(index, []).append(p)
-    merged = []
-    for index in sorted(buckets):
-        group = buckets[index]
-        out = {"ts": _iso(start + timedelta(minutes=step * index))}
-        for name in _SUM_FIELDS:
-            out[name] = sum(p.get(name) or 0 for p in group)
-        for name in _MAX_FIELDS:
-            out[name] = _maximum([p.get(name) for p in group])
-        totals = [p.get("gpu_memory_total") for p in group if p.get("gpu_memory_total") is not None]
-        out["gpu_memory_total"] = totals[-1] if totals else None
-        merged.append(out)
+    merged = [_combine(_iso(start + timedelta(minutes=step * i)), buckets[i]) for i in sorted(buckets)]
     return merged, 60 * step
+
+
+def _combine(ts: str, group: list[dict]) -> dict:
+    """Combine the points of `group` into one point with the time `ts`, by the rules of `merge_points`."""
+    out: dict = {"ts": ts}
+    for name in _SUM_FIELDS:
+        out[name] = sum(p.get(name) or 0 for p in group)
+    for name in _MAX_FIELDS:
+        out[name] = _maximum([p.get(name) for p in group])
+    totals = [p.get("gpu_memory_total") for p in group if p.get("gpu_memory_total") is not None]
+    out["gpu_memory_total"] = totals[-1] if totals else None
+    return out
 
 
 def _with_defaults(point: dict) -> dict:
@@ -85,7 +97,7 @@ def _parse_ts(ts: str) -> datetime:
 
 
 def _parse_lines(raw: bytes, day: str) -> dict[str, dict]:
-    """Return the points of a day file by `ts`. Skip each line that is not a point of `day`."""
+    """Return the points of a point file by `ts`. Skip each line that is not a point of `day`."""
     found: dict[str, dict] = {}
     for line in raw.decode("utf-8", errors="replace").splitlines():
         if not line.strip():
@@ -112,81 +124,119 @@ def _day_end(day: str) -> datetime:
 
 
 class MetricsStore:
-    """The points of the load history, in memory and in `<blob_root>/metrics/<day>.jsonl`."""
+    """The points of the load history, in memory and in `<blob_root>/metrics/<day>/<writer>.jsonl`.
+
+    `writer` names the files of this process. It is the start time of the process and 8 random
+    hex characters. A test can fix it. A legacy file `<blob_root>/metrics/<day>.jsonl` is read too.
+    """
 
     def __init__(
-        self, store: BlobStore, blob_root: str, now: Callable[[], datetime], retention_days: int = 30
+        self,
+        store: BlobStore,
+        blob_root: str,
+        now: Callable[[], datetime],
+        retention_days: int = 30,
+        writer: str | None = None,
     ) -> None:
+        if writer is None:
+            started = now().astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            writer = f"{started}-{secrets.token_hex(4)}"
+        if not _WRITER.fullmatch(writer):
+            raise ValueError(f"not a writer name: {writer!r}")
+        self.writer = writer
         self._store = store
         self._dir = f"{blob_root.strip('/')}/metrics"
         self._now = now
         self._retention_days = retention_days
         self._write_lock = threading.Lock()  # serializes the writers across a blob call
         self._lock = threading.Lock()  # guards the fields below, never held for a blob call
-        self._points: dict[str, dict[str, dict]] = {}  # day -> ts -> point
-        self._read: set[str] = set()  # days whose file is read, so memory has all of their points
+        self._points: dict[str, dict[str, dict]] = {}  # day -> ts -> own point
         self._version: dict[str, int] = {}  # day -> count of changes
         self._written: dict[str, int] = {}  # day -> version of the last good write
         self._last_good: dict[str, datetime] = {}  # day -> time of the last good write
+        self._others_day: str | None = None  # the day that `load_today` read with success
+        self._others: dict[str, dict[str, dict]] = {}  # path -> ts -> point of other writers, read only
         self._last_write: datetime | None = None
         self._last_retain: datetime | None = None
-        self._read_errors: dict[str, str] = {}
+        self._doomed: list[str] = []  # old files that the next calls of `retain` delete
         self._write_error: str | None = None
 
-    def _path(self, day: str) -> str:
+    def _day_dir(self, day: str) -> str:
+        return f"{self._dir}/{day}/"
+
+    def _own_path(self, day: str) -> str:
+        return f"{self._day_dir(day)}{self.writer}.jsonl"
+
+    def _legacy_path(self, day: str) -> str:
         return f"{self._dir}/{day}.jsonl"
 
     def _today(self) -> str:
         return _day_of(self._now())
 
-    def _fetch(self, day: str) -> dict[str, dict] | None:
-        """Read the file of `day`. A missing or broken file gives no points. None means an error."""
-        try:
-            raw = self._store.get(self._path(day))
-        except KeyError:
-            self._read_errors.pop(day, None)
-            return {}
-        except Exception as exc:  # noqa: BLE001
-            if str(exc) != self._read_errors.get(day):
-                logger.error("cannot read %s: %s", self._path(day), exc)
-            self._read_errors[day] = str(exc)
-            return None
-        self._read_errors.pop(day, None)
-        return _parse_lines(raw, day)
+    def _list_day(self, day: str) -> list[str]:
+        """Return the paths of the point files of `day`, with the legacy file. Raise on a failed listing.
 
-    def _ensure_read(self, day: str) -> bool:
-        """Merge the stored points of `day` under the points in memory once. Return False on an error.
-
-        Call it with the write lock held. The current day stays read. A past day leaves memory.
+        A point file is a `.jsonl` file directly in the day directory. A missing directory gives
+        no file. The legacy file is in the list even if it does not exist.
         """
-        with self._lock:
-            if day in self._read:
-                return True
-        return self._read_again(day)
+        prefix = self._day_dir(day)
+        files = []
+        for path in self._store.ls(prefix):
+            name = path[len(prefix):] if path.startswith(prefix) else ""
+            if "/" in name or not name.endswith(".jsonl") or name == ".jsonl":
+                continue
+            files.append(path)
+        return files + [self._legacy_path(day)]
 
-    def _read_again(self, day: str) -> bool:
-        """Read the file of `day` and keep each stored point whose `ts` memory lacks. Return False on an error.
+    def _read_days(self, days: list[str]) -> tuple[dict[str, dict[str, dict[str, dict]]], dict[str, str]]:
+        """Read all point files of `days` with up to `READ_THREADS` threads.
 
-        Call it with the write lock held. The memory wins for a `ts` that both have. A write
-        calls it before each put, so a point of another writer stays in the file.
+        Return day -> path -> ts -> point, and day -> error for each day with a failed listing or
+        a failed read. A file that is missing at the read gives no points and no error.
         """
-        stored = self._fetch(day)
-        if stored is None:
-            return False
-        with self._lock:
-            mine = self._points.setdefault(day, {})
-            mine.update({ts: p for ts, p in stored.items() if ts not in mine})
-            self._read.add(day)
-        return True
+        errors: dict[str, str] = {}
+        stored: dict[str, dict[str, dict[str, dict]]] = {day: {} for day in days}
+
+        def listing(day: str) -> list[str]:
+            try:
+                return self._list_day(day)
+            except Exception as exc:  # noqa: BLE001
+                errors.setdefault(day, str(exc))
+                return []
+
+        def read(task: tuple[str, str]) -> dict[str, dict] | None:
+            day, path = task
+            try:
+                raw = self._store.get(path)
+            except KeyError:
+                return {}
+            except Exception as exc:  # noqa: BLE001
+                errors.setdefault(day, str(exc))
+                return None
+            return _parse_lines(raw, day)
+
+        with ThreadPoolExecutor(max_workers=READ_THREADS) as pool:
+            tasks = [(day, path) for day, paths in zip(days, pool.map(listing, days)) for path in paths]
+            for (day, path), found in zip(tasks, pool.map(read, tasks)):
+                if found:
+                    stored[day][path] = found
+        return stored, errors
 
     def load_today(self) -> None:
-        """Read the file of the current day. A missing or broken file means no points.
+        """Read the files of the other writers of the current day into a read-only part of the memory.
 
-        After another read error the day stays unread. The next write reads again, and
-        it skips the day while the read fails.
+        `history` then answers for the current day without a blob read. After a failure the part
+        stays empty and unread, and `history` reads the files itself.
         """
-        with self._write_lock:
-            self._ensure_read(self._today())
+        day = self._today()
+        stored, errors = self._read_days([day])
+        if errors:
+            logger.error("cannot read the metrics of %s: %s", day, errors[day])
+            return
+        own = self._own_path(day)
+        with self._lock:
+            self._others = {path: points for path, points in stored[day].items() if path != own}
+            self._others_day = day
 
     def add(self, points: list[dict]) -> None:
         """Keep the points in memory. A point with the `ts` of an older point replaces it."""
@@ -202,11 +252,13 @@ class MetricsStore:
     def _forget(self, day: str) -> None:
         for table in (self._points, self._version, self._written, self._last_good):
             table.pop(day, None)
-        self._read.discard(day)
 
     def _drop_stale(self, now: datetime, today: str) -> None:
-        """Drop each past day that has no good write for an hour, and each past day that is clean."""
+        """Drop each past day that has no good write for an hour, each past day that is clean, and a past read-only part."""
         with self._lock:
+            if self._others_day is not None and self._others_day < today:
+                self._others_day = None
+                self._others = {}
             dirty = set(self._dirty_days())
             for day in [d for d in self._points if d < today and d not in dirty]:
                 self._forget(day)
@@ -222,9 +274,10 @@ class MetricsStore:
                     self._forget(day)
 
     def write(self, force: bool = False) -> None:
-        """Write the whole file of each day with new points. Never raises.
+        """Write the own file of each day with new points, with all own points of that day. Never raises.
 
-        Without `force` the store writes at most once in `WRITE_EVERY_SECONDS`.
+        The store reads nothing before a put. Without `force` the store writes at most once
+        in `WRITE_EVERY_SECONDS`.
         """
         try:
             with self._write_lock:
@@ -245,17 +298,15 @@ class MetricsStore:
                     return
             self._last_write = now
         for day in days:
-            if not self._read_again(day):
-                continue  # the points stay in memory, a later write reads again
             with self._lock:
                 version = self._version.get(day, 0)
-                points = [self._points[day][ts] for ts in sorted(self._points[day])]
+                points = [self._points[day][ts] for ts in sorted(self._points.get(day, {}))]
             body = "".join(json.dumps(p) + "\n" for p in points)
             try:
-                self._store.put(self._path(day), body)
+                self._store.put(self._own_path(day), body)
             except Exception as exc:  # noqa: BLE001
                 if str(exc) != self._write_error:
-                    logger.error("cannot write %s: %s", self._path(day), exc)
+                    logger.error("cannot write %s: %s", self._own_path(day), exc)
                 self._write_error = str(exc)
                 continue
             self._write_error = None
@@ -268,10 +319,13 @@ class MetricsStore:
     def history(self, since: datetime, until: datetime) -> tuple[list[dict], int, list[str]]:
         """Return the points with `since <= ts <= until`, the step and the failed days.
 
-        The points merge into at most `MAX_POINTS` time buckets, see `merge_points`. The failed days are the sorted days
-        whose file read failed. A missing file is not a failure. A failed read logs one
-        error for the call. Raise `ValueError` if `since` is after `until` or if the
-        range is longer than `MAX_DAYS` days.
+        The points of all files of a day and the own points in memory count. For a `ts` in the
+        own file and in memory, the memory wins. Points of one `ts` from different writers are
+        partial minutes. They combine by the rules of `merge_points`. The points then merge into
+        at most `MAX_POINTS` time buckets. The failed days are the sorted days with a failed
+        listing or a failed file read. A missing directory is not a failure. A failure logs one
+        error for the call. Raise `ValueError` if `since` is after `until` or if the range is
+        longer than `MAX_DAYS` days.
         """
         since = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
         until = until.astimezone(timezone.utc) if until.tzinfo else until.replace(tzinfo=timezone.utc)
@@ -284,68 +338,78 @@ class MetricsStore:
         days = [(first + timedelta(days=i)).isoformat() for i in range(count)]
         with self._lock:
             memory = {d: dict(self._points.get(d, {})) for d in days}
-            complete = [d for d in days if d in self._read]
-        stored: dict[str, dict[str, dict]] = {}
-        failed: list[str] = []
-        missing = [d for d in days if d not in complete]
-        if missing:
-            with ThreadPoolExecutor(max_workers=min(READ_THREADS, len(missing))) as pool:
-                for day, found in zip(missing, pool.map(self._fetch_for_history, missing)):
-                    if found is None:
-                        failed.append(day)
-                    else:
-                        stored[day] = found
-            if failed:
-                logger.error("cannot read the metrics of %d of %d days", len(failed), len(days))
+            loaded_day = self._others_day if self._others_day in days else None
+            loaded = dict(self._others)
+        stored, errors = self._read_days([d for d in days if d != loaded_day])
+        if errors:
+            logger.error("cannot read the metrics of %d of %d days", len(errors), len(days))
+        if loaded_day is not None:
+            stored[loaded_day] = loaded
         chosen = []
         for day in days:
-            merged = {**stored.get(day, {}), **memory[day]}
-            for ts in sorted(merged):
+            sources = dict(stored.get(day, {}))
+            own = self._own_path(day)
+            sources[own] = {**sources.get(own, {}), **memory[day]}
+            groups: dict[str, list[dict]] = {}
+            for points in sources.values():
+                for ts, p in points.items():
+                    groups.setdefault(ts, []).append(p)
+            for ts in sorted(groups):
                 try:
                     moment = _parse_ts(ts)
                 except ValueError:
                     continue
                 if since <= moment <= until:
-                    chosen.append(merged[ts])
+                    group = groups[ts]
+                    chosen.append(group[0] if len(group) == 1 else _combine(ts, group))
         merged_points, step = merge_points(chosen, since, until)
-        return merged_points, step, sorted(failed)
+        return merged_points, step, sorted(errors)
 
-    def _fetch_for_history(self, day: str) -> dict[str, dict] | None:
-        """Return the points of a day file. None means a read error."""
-        try:
-            raw = self._store.get(self._path(day))
-        except KeyError:
-            return {}
-        except Exception:  # noqa: BLE001
+    def _day_of_path(self, path: str) -> str | None:
+        """Return the day of a point file or a legacy file under `metrics/`, or None for any other path."""
+        prefix = f"{self._dir}/"
+        if not path.startswith(prefix):
             return None
-        return _parse_lines(raw, day)
+        parts = path[len(prefix):].split("/")
+        if len(parts) == 1 and parts[0].endswith(".jsonl"):
+            day = parts[0][: -len(".jsonl")]
+        elif len(parts) == 2 and parts[1].endswith(".jsonl") and parts[1] != ".jsonl":
+            day = parts[0]
+        else:
+            return None
+        return day if _DAY.fullmatch(day) else None
 
     def retain(self) -> None:
         """Delete the files of days older than the retention. Never raises.
 
-        The store lists the directory at most once in an hour.
+        The store lists the directory at most once in an hour. One call deletes at most
+        `DELETES_PER_CALL` files, and the next call continues with the rest.
         """
         try:
             now = self._now()
             with self._lock:
-                if self._last_retain is not None:
-                    if (now - self._last_retain).total_seconds() < RETAIN_EVERY_SECONDS:
-                        return
-                self._last_retain = now
-            oldest = (now.astimezone(timezone.utc) - timedelta(days=self._retention_days)).date().isoformat()
-            for name in self._store.ls(self._dir):
-                base = name.rsplit("/", 1)[-1]
-                if not base.endswith(".jsonl"):
-                    continue
-                day = base[: -len(".jsonl")]
+                pending = bool(self._doomed)
+                if not pending:
+                    if self._last_retain is not None:
+                        if (now - self._last_retain).total_seconds() < RETAIN_EVERY_SECONDS:
+                            return
+                    self._last_retain = now
+            if not pending:
+                oldest = (now.astimezone(timezone.utc) - timedelta(days=self._retention_days)).date().isoformat()
+                doomed = []
+                for path in self._store.ls(self._dir):
+                    day = self._day_of_path(path)
+                    if day is not None and day < oldest:
+                        doomed.append(path)
+                with self._lock:
+                    self._doomed = doomed
+            with self._lock:
+                batch = self._doomed[:DELETES_PER_CALL]
+                self._doomed = self._doomed[DELETES_PER_CALL:]
+            for path in batch:
                 try:
-                    datetime.fromisoformat(day)
-                except ValueError:
-                    continue
-                if day < oldest:
-                    try:
-                        self._store.delete(name)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("cannot delete %s: %s", name, exc)
+                    self._store.delete(path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("cannot delete %s: %s", path, exc)
         except Exception as exc:  # noqa: BLE001
             logger.error("the clean up of the metrics files failed: %s", exc)
