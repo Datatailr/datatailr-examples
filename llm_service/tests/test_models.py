@@ -913,3 +913,77 @@ def test_switch_to_the_pair_of_a_running_download_finds_the_files(tmp_path):
         assert (tmp_path / "local" / "org--b" / "main" / ".complete").exists()
 
     asyncio.run(run())
+
+
+def test_a_cancelled_download_is_failed_and_a_new_one_starts(tmp_path):
+    async def run():
+        mgr, engine, gate, fetching = _make_gated(tmp_path, "org/b")
+        await mgr.startup()
+        task = mgr.request_download("org/b", "main", "alice")
+        await _in_fetch_phase(fetching)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert mgr.download["state"] == "failed" and mgr.download["error"] == "cancelled"
+        mgr.begin_remove("org/b", ["main"])  # the cancelled download holds nothing
+        mgr.end_remove("org/b", ["main"])
+        gate.set()
+        await mgr.request_download("org/c", "main", "alice")
+        assert mgr.download["model"] == "org/c" and mgr.download["state"] == "done"
+
+    asyncio.run(run())
+
+
+def test_download_during_a_rollback_keeps_the_local_copy_of_the_rollback_model(tmp_path):
+    async def run():
+        mgr, _, store, _ = _make(tmp_path)
+        engine = HoldingEngine("org/a")
+        mgr._engine = engine
+        await mgr.startup()
+        engine.armed = True
+        engine.fail_on = {"org/b"}
+        task = mgr.request_switch("org/b")
+        while not engine.waiting.is_set():
+            await asyncio.sleep(0.01)
+        assert mgr.active is None and mgr.target is None and mgr.rolling_back == A
+        await mgr.request_download("org/c", "main", "alice")
+        assert mgr.download["state"] == "done"
+        assert (tmp_path / "local" / "org--a" / "main" / ".complete").exists()
+        engine.gate.set()
+        await task
+        assert mgr.state == "ready" and mgr.active == A
+
+    asyncio.run(run())
+
+
+def test_in_use_names_the_serving_and_the_rollback_model(tmp_path):
+    mgr, *_ = _make(tmp_path)
+    mgr.serving = {"model": "org/s", "revision": "main"}
+    mgr.rolling_back = {"model": "org/r", "revision": "v1"}
+    assert {"model": "org/s", "revision": "main"} in mgr._in_use()
+    assert {"model": "org/r", "revision": "v1"} in mgr._in_use()
+
+
+def test_download_during_the_start_prunes_nothing(tmp_path):
+    first, _ = _with_store(tmp_path, MemoryBlobStore())
+    asyncio.run(first.startup())
+    saved = tmp_path / "local" / "org--a" / "main" / ".complete"
+    assert saved.exists()
+    store = HeldActiveStore()
+
+    async def run():
+        mgr, _ = _with_store(tmp_path, store)
+        task = asyncio.create_task(mgr.startup())
+        assert await asyncio.to_thread(store.reading.wait, 10)
+        assert mgr.starting is True and mgr.active is None and mgr.target is None
+        await mgr.request_download("org/c", "main", "alice")
+        assert mgr.download["state"] == "done"
+        assert saved.exists()
+        store.gate.set()
+        await task
+        assert mgr.state == "ready"
+
+    try:
+        asyncio.run(run())
+    finally:
+        store.gate.set()

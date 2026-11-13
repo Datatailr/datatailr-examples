@@ -2659,10 +2659,14 @@ def test_download_conflicts_and_delete_during_a_download_are_409(tmp_path):
             r = c.post(DOWNLOAD, headers=ALICE, json={"model": "org/c"})
             assert r.status_code == 409 and r.json()["error"]["code"] == "download_in_progress"
             assert r.json()["error"]["type"] == "invalid_request_error"
-            # A file of the running download is in blob storage before the marker.
-            store.put("llm-service/models/org--b/main/config.json", "{}")
-            r = c.delete("/admin/models/org/b", headers=ALICE)
-            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            # Blob storage has no file of the pair during the Hugging Face phase.
+            assert store.ls("llm-service/models/org--b/") == []
+            for path in ("/admin/models/org/b", "/admin/models/org/b?revision=main"):
+                r = c.delete(path, headers=ALICE)
+                assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            r = c.delete("/admin/models/org/b?revision=v2", headers=ALICE)
+            assert r.status_code == 404 and r.json()["error"]["code"] == "model_not_found"
+            assert delete_events(c) == []
             download.gate.set()
             wait_download(c, "done")
     finally:
@@ -2701,5 +2705,27 @@ def test_shutdown_cancels_a_running_download(tmp_path):
             assert download.fetching.wait(10)
             task = c.app.state.download_task
         assert task.cancelled()
+        download_state = c.app.state.manager.download
+        assert download_state["state"] == "failed" and download_state["error"] == "cancelled"
     finally:
         download.gate.set()
+
+
+class FailingExistsStore(MemoryBlobStore):
+    """A memory store whose `exists` of a model marker raises."""
+
+    def exists(self, path: str) -> bool:
+        if "/models/" in path:
+            raise OSError("store down")
+        return super().exists(path)
+
+
+def test_download_cache_check_error_is_500_with_the_error_body(tmp_path):
+    with TestClient(make_app(tmp_path, store=FailingExistsStore())) as c:
+        wait_ready(c)
+        r = c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"})
+        assert r.status_code == 500
+        error = r.json()["error"]
+        assert error["code"] == "cache_check_failed" and error["type"] == "server_error"
+        assert set(error) == {"message", "type", "code"}
+        assert c.get("/admin/model", headers=ALICE).json()["download"] is None

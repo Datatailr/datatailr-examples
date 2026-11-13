@@ -135,7 +135,7 @@ class ModelManager:
         validate_model_name(model)
         validate_revision(revision)
         if (model, revision) in self.removing:
-            raise ModelInUse(f"{model} {revision} is being removed")
+            raise ModelInUse(f"a delete removes {model} {revision} now")
         if self.state == "loading":
             raise SwitchInProgress("a model switch is already running")
         if self.rolling_back is not None:
@@ -157,8 +157,8 @@ class ModelManager:
         validate_model_name(model)
         validate_revision(revision)
         if (model, revision) in self.removing:
-            raise ModelInUse(f"{model} {revision} is being removed")
-        if self.download is not None and self.download["state"] == "running":
+            raise ModelInUse(f"a delete removes {model} {revision} now")
+        if self.running_download() is not None:
             raise DownloadInProgress("a model download is already running")
         self.download = {
             "model": model,
@@ -169,27 +169,46 @@ class ModelManager:
         }
         return asyncio.create_task(self._download(model, revision, admin))
 
+    def running_download(self) -> dict | None:
+        """Return the pair of the running download as `model` and `revision`, or None."""
+        if self.download is None or self.download["state"] != "running":
+            return None
+        return {"model": self.download["model"], "revision": self.download["revision"]}
+
     async def _download(self, model: str, revision: str, admin: str) -> None:
         # `ensure` holds the cache lock for the whole fetch. A switch to the
         # same pair waits for it and then finds the files.
+        error = None
         try:
-            await asyncio.to_thread(self._weights.ensure, model, revision)
-        except Exception as exc:  # noqa: BLE001
-            error = f"{type(exc).__name__}: {exc}"[:DOWNLOAD_ERROR_CHARS]
-            log.warning("the download of %s %s failed: %s", model, revision, error)
-            self.download = {**self.download, "state": "failed", "error": error}
-        else:
-            # The local copy goes unless the engine uses the pair.
-            await self._prune()
-            self.download = {**self.download, "state": "done"}
+            try:
+                await asyncio.to_thread(self._weights.ensure, model, revision)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}: {exc}"[:DOWNLOAD_ERROR_CHARS]
+                log.warning("the download of %s %s failed: %s", model, revision, error)
+            else:
+                # The local copy goes unless the engine uses the pair. During
+                # the start, `startup` has not named the saved model yet.
+                if not self.starting:
+                    await self._prune()
+        except asyncio.CancelledError:
+            self._end_download(model, revision, admin, "cancelled")
+            raise
+        self._end_download(model, revision, admin, error)
+
+    def _end_download(self, model: str, revision: str, admin: str, error: str | None) -> None:
+        """Set the end state of the download and report it."""
+        state = "done" if error is None else "failed"
+        self.download = {**self.download, "state": state, "error": error}
         try:
             self._on_event(
                 {
                     "event": "model_download",
                     "model": model,
                     "revision": revision,
-                    "result": "ok" if self.download["state"] == "done" else "error",
-                    "error": self.download["error"],
+                    "result": "ok" if error is None else "error",
+                    "error": error,
                     "admin": admin,
                 }
             )
@@ -214,8 +233,9 @@ class ModelManager:
             for entry in (self.active, self.serving, self.target, self.rolling_back)
             if entry
         }
-        if self.download is not None and self.download["state"] == "running":
-            busy.add((self.download["model"], self.download["revision"]))
+        downloading = self.running_download()
+        if downloading is not None:
+            busy.add((downloading["model"], downloading["revision"]))
         if pairs & busy:
             name, revision = sorted(pairs & busy)[0]
             raise ModelInUse(f"{name} {revision} is in use")
@@ -257,8 +277,16 @@ class ModelManager:
             self.active = None
 
     def _in_use(self) -> list[dict]:
-        """Return the active model and the model that loads, if any."""
-        return [entry for entry in (self.active, self.target) if entry]
+        """Return the active, loading, serving and rollback models, if any.
+
+        During a rollback, only `rolling_back` names the model that the engine
+        starts. A prune keeps the local copies of all of them.
+        """
+        return [
+            entry
+            for entry in (self.active, self.target, self.serving, self.rolling_back)
+            if entry
+        ]
 
     async def _save_active(self) -> None:
         """Write `active.json` in a worker thread. A failure only logs a warning."""

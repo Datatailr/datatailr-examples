@@ -775,8 +775,18 @@ def create_app(
             raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
         # A delete removes the marker first. Until then the pair looks cached.
         if (model, revision) in manager.removing:
-            raise ApiError(409, "invalid_request_error", "model_in_use", f"{model} {revision} is being removed")
-        if await asyncio.to_thread(weights.is_cached, model, revision):
+            raise ApiError(
+                409, "invalid_request_error", "model_in_use", f"a delete removes {model} {revision} now"
+            )
+        try:
+            cached = await asyncio.to_thread(weights.is_cached, model, revision)
+        except Exception as error:
+            logger.warning("the cache check of %s %s failed: %s", model, revision, error)
+            raise ApiError(
+                500, "server_error", "cache_check_failed",
+                f"the cache check of the model {model!r} failed ({type(error).__name__})",
+            ) from None
+        if cached:
             return JSONResponse({"state": "cached", "model": model, "revision": revision})
         try:
             app.state.download_task = manager.request_download(model, revision, admin_user)
@@ -800,6 +810,16 @@ def create_app(
         # So a second delete also removes what a failed delete left.
         stored = await asyncio.to_thread(weights.stored, model_id)
         found = [name for name in stored if revision in (None, name)]
+        # During the Hugging Face phase, blob storage has no file of the
+        # download yet. `begin_remove` refuses its pair with 409.
+        downloading = manager.running_download()
+        if (
+            downloading is not None
+            and downloading["model"] == model_id
+            and revision in (None, downloading["revision"])
+            and downloading["revision"] not in found
+        ):
+            found.append(downloading["revision"])
         if not found:
             raise ApiError(404, "invalid_request_error", "model_not_found", f"no stored copy of {model_id!r} matches")
         try:

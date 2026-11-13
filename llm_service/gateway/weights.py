@@ -260,7 +260,7 @@ class WeightCache:
     def is_cached(self, model: str, revision: str) -> bool:
         """Return True when blob storage has the `.complete` marker of the pair.
 
-        The local copy does not count. A store error is raised.
+        The local copy does not count. A store error goes to the caller.
         """
         validate_model_name(model)
         validate_revision(revision)
