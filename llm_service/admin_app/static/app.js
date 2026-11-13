@@ -1212,7 +1212,7 @@ const EXAMPLE_PROMPT = 'Say hello in one sentence.';
 const EXAMPLE_IDS = ['example-curl', 'example-python', 'example-outside', 'example-chat'];
 
 /** The text of each example for the service `name` and the model `model`, by element id. The
- * outside example reads the token from LLM_TOKEN, so no example has a token value. */
+ * outside example sends the login of the Datatailr CLI, so no example has a token value. */
 function examples(name, model) {
   const internal = internalBaseUrl(name);
   const outside = outsideBaseUrl(name) || `https://<your-domain>/job/<environment>/${name}/v1`;
@@ -1239,22 +1239,24 @@ function examples(name, model) {
       ...ask,
     ].join('\n'),
     'example-outside': [
-      'import os',
-      '',
+      '# pip install openai datatailr, then run: datatailr login',
+      'import datatailr',
       'from openai import OpenAI',
       '',
       'client = OpenAI(',
       `    base_url="${outside}",`,
       '    api_key="unused",',
-      '    default_headers={"Cookie": "__datatailr_user_cookie__=" + os.environ["LLM_TOKEN"]},',
+      '    default_headers={"Cookie": datatailr.get_remote_oidc_cookie_line()},',
       ')',
       ...ask,
     ].join('\n'),
     'example-chat': [
-      'pip install openai',
       '# On the platform:',
+      'pip install openai',
       `LLM_BASE_URL="${internal}"${chosen} python chat.py`,
-      '# Outside the platform, with your token in the variable LLM_TOKEN:',
+      '# Outside the platform, with the login of the Datatailr CLI:',
+      'pip install openai datatailr',
+      'datatailr login',
       `LLM_BASE_URL="${outside}"${chosen} python chat.py`,
     ].join('\n'),
   };
@@ -1302,6 +1304,20 @@ function clearConnect() {
   for (const id of EXAMPLE_IDS) $(id).textContent = '';
   $('chat-model').value = '';
   state.chat.defaultModel = '';
+}
+
+/** Read the text of chat.py once and show it in the Connect tab. A failure shows a note there. */
+async function loadChatScript() {
+  const target = $('chat-script');
+  try {
+    const response = await fetch(new URL('api/chat-script', BASE));
+    if (!response.ok) throw new Error(String(response.status));
+    target.textContent = await response.text();
+    // The Copy button works only with the real file, not with the note of a load or a failure.
+    $('chat-script-copy').disabled = false;
+  } catch {
+    target.textContent = 'The app did not give the file. Use the Download link, or take chat.py from the example folder.';
+  }
 }
 
 async function copyExample(button) {
@@ -2099,6 +2115,7 @@ async function start() {
     state.chartsOff = true;  // without Chart.js, the tiles and tables still work
   }
   const wanted = readHash();
+  loadChatScript();
   try {
     await loadServices();
   } catch (error) {

@@ -291,3 +291,10 @@ pre.json {
   .limit-form label, fieldset.choice { flex: 1 1 100%; }
   #limits-user { flex: 1; }
 }
+.card-head .actions { display: flex; align-items: center; gap: 8px; }
+a.button.ghost {
+  display: inline-block; padding: 3px 10px; font-size: 12px; border: 1px solid var(--border2);
+  border-radius: 6px; color: var(--text); text-decoration: none;
+}
+a.button.ghost:hover { background: var(--panel2); }
+pre.code.script { max-height: 420px; overflow-y: auto; }

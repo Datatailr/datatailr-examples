@@ -261,10 +261,12 @@ Examples, each with a copy button:
 
 - curl, from a job on the platform.
 - Python with the `openai` package, from a job on the platform.
-- Python with the `openai` package, from outside the platform, with the token in the cookie header.
+- Python with the `openai` package, from outside the platform, with the login of the Datatailr CLI in the cookie header.
 - The command line for `chat.py`, with `LLM_BASE_URL` set.
 
-The page fills in the URL and the model name. An example never has a token value. The outside example reads the token from the variable `LLM_TOKEN`, and a sentence says where a user gets a token.
+The page fills in the URL and the model name. An example never has a token value. The outside example takes the login from the `datatailr` package. A sentence says that an API token works only as the query argument `__datatailr_user_cookie__`.
+
+A card shows the text of `chat.py`, with a Copy button and a Download link. The app serves the file at `GET /api/chat-script`.
 
 Testing area:
 

@@ -189,16 +189,13 @@ service container.
 
 ### Outside clients
 
-The platform edge accepts an API token as the `__datatailr_user_cookie__`
-cookie, not as `Authorization: Bearer`. The README shows this form:
-
-```python
-client = OpenAI(
-    base_url="https://<domain>/<service path>/v1",
-    api_key="unused",
-    default_headers={"Cookie": "__datatailr_user_cookie__=<token>"},
-)
-```
+On the URL of a job, the platform edge accepts two things from an outside client.
+The first is the login cookie of the Datatailr CLI, `X-Datatailr-Oidc-Data`,
+which `datatailr.get_remote_oidc_cookie_line()` returns after `datatailr login`.
+The second is an API token of a user, only as the query argument
+`__datatailr_user_cookie__`. The edge does not read a cookie with that name on
+a job URL, and it does not read `Authorization: Bearer`. The README shows both
+forms.
 
 A tool that accepts only a base URL and an API key does not work until the
 platform edge accepts a Bearer token. That change belongs to the platform and is not part of this example.
