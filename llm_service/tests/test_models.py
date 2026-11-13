@@ -830,10 +830,11 @@ def test_download_refuses_a_pair_that_is_being_removed(tmp_path):
         mgr, *_ = _make(tmp_path)
         await mgr.startup()
         mgr.begin_remove("org/b", ["main"])
-        with pytest.raises(ModelInUse):
+        with pytest.raises(ModelInUse, match="a delete removes org/b main now"):
             mgr.request_download("org/b", "main", "alice")
         assert mgr.download is None
-        await mgr.request_download("org/b", "v2", "alice")  # another revision is fine
+        mgr.end_remove("org/b", ["main"])
+        await mgr.request_download("org/b", "v2", "alice")  # no delete runs now
 
     asyncio.run(run())
 
@@ -1060,6 +1061,66 @@ def test_rollback_after_a_failed_switch_does_not_wait_for_a_download(tmp_path):
         gate.set()
         await download
         assert mgr.download["state"] == "done"
+
+    try:
+        asyncio.run(run())
+    finally:
+        gate.set()
+        engine.gate.set()
+
+
+def test_download_waits_for_a_running_delete_of_another_pair(tmp_path):
+    async def run():
+        mgr, *_ = _make(tmp_path)
+        await mgr.startup()
+        mgr.begin_remove("org/b", ["main", "v1"])
+        for model in ("org/c", "org/b"):
+            with pytest.raises(ModelInUse, match=r"^A delete runs now\. Download after it ends\.$"):
+                mgr.request_download(model, "v2", "alice")
+        assert mgr.download is None
+        mgr.end_remove("org/b", ["main", "v1"])
+        await mgr.request_download("org/c", "v2", "alice")
+        assert mgr.download["state"] == "done"
+
+    asyncio.run(run())
+
+
+def test_a_reload_during_a_download_does_not_hold_its_prune_or_fail_a_later_switch(tmp_path):
+    mgr, _, gate, fetching = _make_gated(tmp_path, "org/c")
+    engine = HoldingEngine("org/b")
+    mgr._engine = engine
+    states: list[str] = []
+
+    async def watch():
+        while True:
+            states.append(mgr.state)
+            await asyncio.sleep(0.005)
+
+    async def run():
+        await mgr.startup()
+        watcher = asyncio.create_task(watch())
+        download = mgr.request_download("org/c", "main", "alice")
+        await _in_fetch_phase(fetching)
+        engine.alive_flag = False
+        reload = mgr.check_engine()
+        # The reload task ends while the download still holds the cache lock.
+        await asyncio.wait({reload}, timeout=5)
+        assert reload.done() and mgr.state == "ready" and mgr.active == A
+        engine.armed = True
+        switch = mgr.request_switch("org/b")
+        gate.set()  # the download ends, the switch fetches org/b and is held in its start
+        assert await asyncio.to_thread(engine.waiting.wait, 10)
+        await download
+        for _ in range(20):  # time for a waiting prune to end
+            await asyncio.sleep(0.01)
+        assert mgr.state == "loading" and mgr.target == B
+        with pytest.raises(SwitchInProgress):
+            mgr.request_switch("org/c")
+        engine.gate.set()
+        await switch
+        assert mgr.state == "ready" and mgr.active == B and mgr.serving == B
+        watcher.cancel()
+        assert "failed" not in states
 
     try:
         asyncio.run(run())

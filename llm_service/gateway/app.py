@@ -925,6 +925,10 @@ def create_app(
                 raise ApiError(
                     409, "invalid_request_error", "model_in_use", f"a delete removes {model} {revision} now"
                 )
+            if manager.removing:
+                raise ApiError(
+                    409, "invalid_request_error", "model_in_use", "A delete runs now. Download after it ends."
+                )
 
         check_removing()
         try:

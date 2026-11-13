@@ -2728,6 +2728,27 @@ def test_download_of_a_pair_under_removal_is_409(tmp_path):
         store.gate.set()
 
 
+def test_download_during_a_delete_of_another_model_is_409(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        switch_and_wait(c, "org/other")
+        switch_and_wait(c, "org/a")
+        manager = c.app.state.manager
+        manager.begin_remove("org/x", ["main"])
+        for model in ("org/b", "org/other"):  # a new pair and a cached pair
+            r = c.post(DOWNLOAD, headers=ALICE, json={"model": model})
+            assert r.status_code == 409
+            assert r.json()["error"] == {
+                "message": "A delete runs now. Download after it ends.",
+                "type": "invalid_request_error",
+                "code": "model_in_use",
+            }
+        assert manager.download is None
+        manager.end_remove("org/x", ["main"])
+        assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+        wait_download(c, "done")
+
+
 class MarkingExistsStore(MemoryBlobStore):
     """A store whose check of the org/other marker starts a delete mark of that pair while `manager` is set."""
 

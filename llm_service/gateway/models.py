@@ -64,6 +64,8 @@ class ModelManager:
         self._default_model = default_model
         self._on_event = on_event
         self._task: asyncio.Task | None = None
+        # The prune after a reload. Nothing waits for it. `_prune` logs its errors.
+        self._prune_task: asyncio.Task | None = None
         self.state = "empty"
         self.active: dict | None = None
         self.target: dict | None = None
@@ -151,14 +153,18 @@ class ModelManager:
     def request_download(self, model: str, revision: str, admin: str) -> asyncio.Task:
         """Start a download of the weights without a switch. Call it inside a running loop.
 
-        Raise `ValueError` for a bad name, `ModelInUse` for a pair that a delete
-        removes, and `DownloadInProgress` while a download runs. The check and
+        Raise `ValueError` for a bad name, `ModelInUse` while a delete runs, and
+        `DownloadInProgress` while a download runs. The check and
         the mark run without an `await`, so no delete can start between them.
         """
         validate_model_name(model)
         validate_revision(revision)
         if (model, revision) in self.removing:
             raise ModelInUse(f"a delete removes {model} {revision} now")
+        if self.removing:
+            # A delete takes the cache lock once for each revision. A download
+            # between two of them makes the rest of the delete wait.
+            raise ModelInUse("A delete runs now. Download after it ends.")
         if self.running_download() is not None:
             raise DownloadInProgress("a model download is already running")
         self.download = {
@@ -272,8 +278,10 @@ class ModelManager:
         return self._task
 
     async def _reload(self, wanted: dict) -> None:
-        await self._load(wanted, previous=None, trigger="reload")
-        if self.state != "ready":
+        loaded = await self._load(wanted, previous=None, trigger="reload")
+        # The decision uses the result of this load. No `await` runs between
+        # the end of `_load` and this line, so the state is still its own.
+        if not loaded:
             self.state = "failed"
             self.active = None
 
@@ -318,7 +326,8 @@ class ModelManager:
             return local
         return await asyncio.to_thread(self._weights.ensure, model, revision)
 
-    async def _load(self, wanted: dict, previous: dict | None, trigger: str) -> None:
+    async def _load(self, wanted: dict, previous: dict | None, trigger: str) -> bool:
+        """Load `wanted` and return True if the engine serves it at the end."""
         model, revision = wanted["model"], wanted["revision"]
         try:
             try:
@@ -332,7 +341,7 @@ class ModelManager:
                     )
             except Exception as exc:  # noqa: BLE001
                 self._fail_before_stop(wanted, previous, f"{model}: {exc}", trigger)
-                return
+                return False
             if previous is not None:
                 self.serving = None
                 await self._engine.stop()
@@ -340,7 +349,7 @@ class ModelManager:
                 await self._engine.start(model_dir, model)
             except Exception as exc:  # noqa: BLE001
                 await self._fail_after_stop(wanted, previous, f"{model}: {exc}", trigger)
-                return
+                return False
             self.active = dict(wanted)
             self.serving = dict(wanted)
             self.target = None
@@ -355,8 +364,14 @@ class ModelManager:
             self.state = "failed"
             self.error = f"{model}: {exc}"
             self._emit(wanted, "failed", self.error, trigger)
-            return
-        await self._prune()
+            return False
+        if trigger == "reload":
+            # A download can hold the cache lock for a long time. The reload
+            # task ends now, and the prune runs on its own.
+            self._prune_task = asyncio.create_task(self._prune())
+        else:
+            await self._prune()
+        return True
 
     def _fail_before_stop(
         self, wanted: dict, previous: dict | None, error: str, trigger: str

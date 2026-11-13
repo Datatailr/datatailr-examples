@@ -459,7 +459,7 @@ The rules of the download:
 - An automatic reload after an engine exit and a rollback after a failed switch do not wait for a download. They use the complete local copy of the model when it exists.
 - A delete of the model that downloads gets 409 `model_in_use`. This holds also before the first file reaches blob storage.
 - A delete of another model during a download gets 409 `download_in_progress` with the message "A model download runs now. Delete after it ends."
-- A pair that a delete removes now gets 409 `model_in_use`.
+- A pair that a delete removes now gets 409 `model_in_use`. While a delete of another model runs, a download also gets 409 `model_in_use` with the message "A delete runs now. Download after it ends."
 - A bad name or revision gets 400 `invalid_model`.
 - A store error in the check of the cache gets 500 `cache_check_failed`.
 
