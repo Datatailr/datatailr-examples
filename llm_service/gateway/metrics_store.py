@@ -36,7 +36,7 @@ def _maximum(values: list) -> object:
 def merge_points(points: list[dict], limit: int = MAX_POINTS) -> tuple[list[dict], int]:
     """Return at most `limit` points and the step in seconds.
 
-    Neighbor points merge in groups of equal size. Counts and token numbers add up.
+    Neighbor points merge in groups of the same size. The last group can be smaller. Counts and token numbers add up.
     Maximum values and percentiles take the maximum, or null if each value is null.
     `gpu_memory_total` takes the last value that is not null. `ts` is the `ts` of
     the first point of the group.
@@ -135,7 +135,7 @@ class MetricsStore:
     def _ensure_read(self, day: str) -> bool:
         """Merge the stored points of `day` under the points in memory. Return False on an error.
 
-        Call it with the write lock held. A day that is read stays read.
+        Call it with the write lock held. The current day stays read. A past day leaves memory.
         """
         with self._lock:
             if day in self._read:
@@ -175,7 +175,11 @@ class MetricsStore:
         self._read.discard(day)
 
     def _drop_stale(self, now: datetime, today: str) -> None:
+        """Drop each past day that has no good write for an hour, and each past day that is clean."""
         with self._lock:
+            dirty = set(self._dirty_days())
+            for day in [d for d in self._points if d < today and d not in dirty]:
+                self._forget(day)
             for day in self._dirty_days():
                 if day >= today:
                     continue
@@ -231,29 +235,38 @@ class MetricsStore:
                 if day < today and self._version.get(day) == version:
                     self._forget(day)
 
-    def history(self, since: datetime, until: datetime) -> tuple[list[dict], int]:
-        """Return the points with `since <= ts <= until`, merged to at most `MAX_POINTS`.
+    def history(self, since: datetime, until: datetime) -> tuple[list[dict], int, list[str]]:
+        """Return the points with `since <= ts <= until`, the step and the failed days.
 
-        Raise `ValueError` if `since` is after `until` or if the range has over `MAX_DAYS` days.
+        The points merge to at most `MAX_POINTS`. The failed days are the sorted days
+        whose file read failed. A missing file is not a failure. A failed read logs one
+        error for the call. Raise `ValueError` if `since` is after `until` or if the
+        range is longer than `MAX_DAYS` days.
         """
         since = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
         until = until.astimezone(timezone.utc) if until.tzinfo else until.replace(tzinfo=timezone.utc)
         if since > until:
             raise ValueError("since is after until")
         first = since.date()
-        count = (until.date() - first).days + 1
-        if count > MAX_DAYS:
+        if until - since > timedelta(days=MAX_DAYS):
             raise ValueError(f"the range is over {MAX_DAYS} days")
+        count = (until.date() - first).days + 1
         days = [(first + timedelta(days=i)).isoformat() for i in range(count)]
         with self._lock:
             memory = {d: dict(self._points.get(d, {})) for d in days}
             complete = [d for d in days if d in self._read]
         stored: dict[str, dict[str, dict]] = {}
+        failed: list[str] = []
         missing = [d for d in days if d not in complete]
         if missing:
             with ThreadPoolExecutor(max_workers=min(READ_THREADS, len(missing))) as pool:
                 for day, found in zip(missing, pool.map(self._fetch_for_history, missing)):
-                    stored[day] = found
+                    if found is None:
+                        failed.append(day)
+                    else:
+                        stored[day] = found
+            if failed:
+                logger.error("cannot read the metrics of %d of %d days", len(failed), len(days))
         chosen = []
         for day in days:
             merged = {**stored.get(day, {}), **memory[day]}
@@ -264,16 +277,17 @@ class MetricsStore:
                     continue
                 if since <= moment <= until:
                     chosen.append(merged[ts])
-        return merge_points(chosen)
+        merged_points, step = merge_points(chosen)
+        return merged_points, step, sorted(failed)
 
-    def _fetch_for_history(self, day: str) -> dict[str, dict]:
+    def _fetch_for_history(self, day: str) -> dict[str, dict] | None:
+        """Return the points of a day file. None means a read error."""
         try:
             raw = self._store.get(self._path(day))
         except KeyError:
             return {}
-        except Exception as exc:  # noqa: BLE001
-            logger.error("cannot read %s: %s", self._path(day), exc)
-            return {}
+        except Exception:  # noqa: BLE001
+            return None
         return _parse_lines(raw, day)
 
     def retain(self) -> None:

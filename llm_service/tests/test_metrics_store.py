@@ -209,7 +209,7 @@ def test_merge_empty():
 def test_load_today_missing_file_means_no_points():
     ms, store, _ = make()
     ms.load_today()
-    assert ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 13, tzinfo=UTC)) == ([], 60)
+    assert ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 13, tzinfo=UTC)) == ([], 60, [])
 
 
 def test_load_today_reads_good_file():
@@ -218,7 +218,7 @@ def test_load_today_reads_good_file():
     store.put(path(DAY1), "\n".join(json.dumps(p) for p in pts) + "\n")
     ms, _, _ = make(store)
     ms.load_today()
-    got, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, tzinfo=UTC))
+    got, _, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, tzinfo=UTC))
     assert got == pts
 
 
@@ -228,7 +228,7 @@ def test_load_today_skips_broken_lines():
     store.put(path(DAY1), json.dumps(good) + "\n{broken\n[1, 2]\n" + json.dumps({"ts": 5}) + "\n\n")
     ms, _, _ = make(store)
     ms.load_today()
-    got, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, tzinfo=UTC))
+    got, _, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, tzinfo=UTC))
     assert got == [good]
 
 
@@ -373,7 +373,7 @@ def test_history_after_failed_load_today_reads_file_and_merges_memory():
     ms.load_today()
     ms.add([minute(DAY1, 9, 1)])
     store.fail = False
-    got, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, tzinfo=UTC))
+    got, _, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, tzinfo=UTC))
     assert [p["ts"] for p in got] == ["2026-11-12T09:00:00Z", "2026-11-12T09:01:00Z"]
 
 
@@ -420,7 +420,7 @@ def test_past_day_leaves_memory_after_good_write():
     clock.move(minutes=5)
     ms.write(force=True)
     before = store.gets
-    got, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, 59, tzinfo=UTC))
+    got, _, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, 59, tzinfo=UTC))
     assert store.gets == before + 1  # read from the file, not from memory
     assert [p["ts"] for p in got] == ["2026-11-12T23:58:00Z"]
 
@@ -433,7 +433,7 @@ def test_history_over_two_days_with_memory_only_point():
     store.put(path(DAY1), json.dumps(minute(DAY1, 23, 0)) + "\n" + json.dumps(minute(DAY1, 23, 1)) + "\n")
     ms.load_today()
     ms.add([minute(DAY2, 0, 5)])
-    got, step = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 14, tzinfo=UTC))
+    got, step, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 14, tzinfo=UTC))
     assert [p["ts"] for p in got] == ["2026-11-12T23:00:00Z", "2026-11-12T23:01:00Z", "2026-11-13T00:05:00Z"]
     assert step == 60
 
@@ -442,7 +442,7 @@ def test_history_bounds_are_inclusive():
     ms, store, _ = make()
     ms.load_today()
     ms.add([minute(DAY1, 9, m) for m in range(5)])
-    got, _ = ms.history(
+    got, _, _ = ms.history(
         datetime(2026, 11, 12, 9, 1, tzinfo=UTC), datetime(2026, 11, 12, 9, 3, tzinfo=UTC)
     )
     assert [p["ts"] for p in got] == [f"2026-11-12T09:0{m}:00Z" for m in (1, 2, 3)]
@@ -451,14 +451,14 @@ def test_history_bounds_are_inclusive():
 def test_history_missing_day_file_is_empty():
     ms, _, _ = make()
     ms.load_today()
-    got, step = ms.history(datetime(2026, 11, 1, tzinfo=UTC), datetime(2026, 11, 5, tzinfo=UTC))
+    got, step, _ = ms.history(datetime(2026, 11, 1, tzinfo=UTC), datetime(2026, 11, 5, tzinfo=UTC))
     assert (got, step) == ([], 60)
 
 
 def test_history_broken_line_skipped_in_past_day():
     ms, store, _ = make()
     store.put(path("2026-11-05"), json.dumps(minute("2026-11-05", 1, 0)) + "\nnot json\n")
-    got, _ = ms.history(datetime(2026, 11, 5, tzinfo=UTC), datetime(2026, 11, 5, 23, tzinfo=UTC))
+    got, _, _ = ms.history(datetime(2026, 11, 5, tzinfo=UTC), datetime(2026, 11, 5, 23, tzinfo=UTC))
     assert len(got) == 1
 
 
@@ -466,7 +466,7 @@ def test_history_merges_to_limit():
     ms, store, _ = make()
     pts = [minute("2026-11-05", h, m) for h in range(24) for m in range(60)]
     store.put(path("2026-11-05"), "\n".join(json.dumps(p) for p in pts))
-    got, step = ms.history(datetime(2026, 11, 5, tzinfo=UTC), datetime(2026, 11, 6, tzinfo=UTC))
+    got, step, _ = ms.history(datetime(2026, 11, 5, tzinfo=UTC), datetime(2026, 11, 6, tzinfo=UTC))
     assert len(got) <= MAX_POINTS
     assert step == 180
     assert sum(p["requests"] for p in got) == 1440
@@ -475,9 +475,10 @@ def test_history_merges_to_limit():
 def test_history_accepts_31_days_and_rejects_32():
     ms, _, _ = make()
     start = datetime(2026, 10, 1, tzinfo=UTC)
-    ms.history(start, start + timedelta(days=MAX_DAYS - 1, hours=23))
+    start = start + timedelta(hours=10)
+    ms.history(start, start + timedelta(days=MAX_DAYS))
     with pytest.raises(ValueError):
-        ms.history(start, start + timedelta(days=MAX_DAYS))
+        ms.history(start, start + timedelta(days=MAX_DAYS, seconds=1))
 
 
 def test_history_rejects_since_after_until():
@@ -487,16 +488,73 @@ def test_history_rejects_since_after_until():
 
 
 def test_history_reads_days_in_parallel_threads():
+    barrier = threading.Barrier(2, timeout=5)
     names = set()
 
     class Spy(MemoryBlobStore):
         def get(self, p):
+            barrier.wait()  # two reads must run at the same time
             names.add(threading.current_thread().name)
             return super().get(p)
 
     ms, _, _ = make(Spy())
-    ms.history(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 20, tzinfo=UTC))
-    assert names
+    ms.history(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 2, tzinfo=UTC))
+    assert len(names) == 2
+
+
+def test_history_reports_failed_days_with_one_error(caplog):
+    store = FailingGet()
+    ms, _, _ = make(store)
+    with caplog.at_level(logging.ERROR):
+        got, _, failed = ms.history(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
+    assert got == []
+    assert failed == ["2026-10-01", "2026-10-02", "2026-10-03"]
+    assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1
+
+
+def test_history_missing_day_is_not_failed():
+    ms, store, _ = make()
+    store.put(path("2026-10-02"), json.dumps(minute("2026-10-02", 1, 0)))
+    got, _, failed = ms.history(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
+    assert len(got) == 1
+    assert failed == []
+
+
+def test_clean_past_day_read_by_load_today_leaves_memory():
+    store = FailingGet()
+    store.fail = False
+    store.put(path(DAY1), json.dumps(minute(DAY1, 9, 0)) + "\n")
+    ms, _, clock = make(store)
+    ms.load_today()
+    clock.move(days=1)
+    ms.write(force=True)
+    before = store.gets
+    got, _, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, tzinfo=UTC))
+    assert store.gets == before + 1
+    assert len(got) == 1
+
+
+def test_point_added_during_put_of_past_day_stays(caplog):
+    holder = {}
+
+    class AddDuring(MemoryBlobStore):
+        def put(self, p, data):
+            if holder.get("go"):
+                holder["go"] = False
+                holder["ms"].add([minute(DAY1, 23, 59)])
+            super().put(p, data)
+
+    store = AddDuring()
+    ms, _, clock = make(store, Clock("2026-11-12T23:58:00"))
+    holder["ms"] = ms
+    ms.load_today()
+    ms.add([minute(DAY1, 23, 58)])
+    clock.move(minutes=5)
+    holder["go"] = True
+    ms.write(force=True)
+    assert len(lines(store, DAY1)) == 1
+    ms.write(force=True)
+    assert [p["ts"] for p in lines(store, DAY1)] == ["2026-11-12T23:58:00Z", "2026-11-12T23:59:00Z"]
 
 
 # retain
@@ -555,3 +613,19 @@ def test_write_never_raises_on_read_error():
     ms.load_today()
     ms.add([minute(DAY1, 9, 0)])
     ms.write(force=True)
+    store.fail = False
+    assert store.ls(f"{ROOT}/metrics") == []
+
+
+def test_write_never_raises_on_unexpected_error(caplog, monkeypatch):
+    ms, store, _ = make()
+    ms.add([minute(DAY1, 9, 0)])
+
+    def boom(day):
+        raise RuntimeError("surprise")
+
+    monkeypatch.setattr(ms, "_ensure_read", boom)
+    with caplog.at_level(logging.ERROR):
+        ms.write(force=True)
+    assert "surprise" in caplog.text
+    assert store.ls(f"{ROOT}/metrics") == []
