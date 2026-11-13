@@ -1574,3 +1574,15 @@ def test_a_retry_after_that_is_not_1_to_5_digits_is_dropped(client, fakes, value
 def test_a_response_without_retry_after_has_none(client, fakes):
     fakes.hosts["svc-two"].answers[("GET", "/v1/limits/me")] = (429, ERROR_429)
     assert "retry-after" not in client.get("/api/services/svc-two/limits/me", headers=ALICE).headers
+
+
+@pytest.mark.parametrize("route", ["/limits/default", "/limits/users/carol"])
+def test_the_limits_put_routes_refuse_deeply_nested_json(client, fakes, route):
+    response = client.put(
+        "/api/services/svc/" + route.lstrip("/"),
+        content=b"[" * 100_000,
+        headers={**ALICE, "Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_json"
+    assert fakes.calls() == []

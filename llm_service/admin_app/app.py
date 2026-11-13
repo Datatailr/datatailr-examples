@@ -322,7 +322,7 @@ def create_app(
             )
         try:
             body = await request.json()
-        except ValueError:
+        except (ValueError, RecursionError):  # deeply nested JSON raises RecursionError
             return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
         name = body.get("name") if isinstance(body, dict) else None
         if not valid_name(name):
@@ -382,7 +382,7 @@ def create_app(
             )
         try:
             body = await request.json()
-        except ValueError:
+        except (ValueError, RecursionError):  # deeply nested JSON raises RecursionError
             return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
         return await call(request, name, "POST", "/admin/model", action=True, json=body)
 
@@ -402,7 +402,7 @@ def create_app(
             )
         try:
             body = await request.json()
-        except ValueError:
+        except (ValueError, RecursionError):  # deeply nested JSON raises RecursionError
             return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
         try:
             built = chat_request(body)
@@ -495,7 +495,7 @@ def create_app(
             )
         try:
             body = await request.json()
-        except ValueError:
+        except (ValueError, RecursionError):  # deeply nested JSON raises RecursionError
             return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
         return await call(request, name, "PUT", "/admin/limits/default", json=body)
 
@@ -510,7 +510,7 @@ def create_app(
             )
         try:
             body = await request.json()
-        except ValueError:
+        except (ValueError, RecursionError):  # deeply nested JSON raises RecursionError
             return _error(400, "invalid_json", "The request body is not valid JSON.", "invalid_request_error")
         return await call(request, name, "PUT", path, json=body)
 

@@ -406,6 +406,15 @@ class UsageTotals:
                 self._rebuild_day_tokens()
             return self._day_tokens.get(user, 0)
 
+    def users_today(self) -> list[str]:
+        """Return the users with tokens in the current UTC day, sorted. Reads memory only."""
+        today = self._today()
+        with self._lock:
+            if today != self._tokens_day:
+                self._tokens_day = today
+                self._rebuild_day_tokens()
+            return sorted(user for user, tokens in self._day_tokens.items() if tokens > 0)
+
     def summary(
         self,
         since: str | None,

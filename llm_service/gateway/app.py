@@ -413,9 +413,11 @@ def create_app(
                     )
                 )
 
-            # Only a user without an entry, while a default exists, needs the admin lookup.
-            user_admin = limits.needs_admin(user) and await asyncio.to_thread(admin.is_admin, user)
-            user_limits, _ = limits.limits_for(user, user_admin)
+            # One read decides whether the admin right matters: only the default depends on it.
+            # A second read after the lookup takes the limits as they are at that moment.
+            user_limits, source = limits.limits_for(user, False)
+            if source == "default" and await asyncio.to_thread(admin.is_admin, user):
+                user_limits, _ = limits.limits_for(user, True)
             try:
                 limiter.acquire(user, user_limits)
             except LimitExceeded as exceeded:
@@ -556,7 +558,8 @@ def create_app(
     @app.get("/admin/limits")
     async def get_limits(admin_user: str = Depends(require_admin)) -> dict:
         entries = limits.users()
-        names = sorted(set(limiter.active_users()) | set(entries))
+        # A user with tokens today stays in the list after the request window ends and after a restart.
+        names = sorted(set(limiter.active_users()) | set(entries) | set(usage.users_today()))
 
         def effective() -> dict:
             """The limits of each listed user and their source, with one admin lookup for each."""
