@@ -492,3 +492,25 @@ def test_remove_after_a_failed_remove_deletes_the_rest(tmp_path):
     fx.cache.remove("org/m", "main")
     assert fx.cache.stored("org/m") == []
     assert fx.store.ls("root/models/org--m") == []
+
+
+def test_is_cached_is_true_only_with_the_blob_marker(fx):
+    assert fx.cache.is_cached("org/m", "main") is False
+    fx.store.put("root/models/org--m/main/config.json", "{}")
+    assert fx.cache.is_cached("org/m", "main") is False
+    fx.cache.ensure("org/m", "main")
+    assert fx.cache.is_cached("org/m", "main") is True
+    assert fx.cache.is_cached("org/m", "v2") is False
+
+
+def test_is_cached_ignores_the_local_copy(fx):
+    fx.cache.ensure("org/m", "main")
+    fx.store.delete(MARKER)
+    assert (fx.local / "org--m" / "main" / ".complete").exists()
+    assert fx.cache.is_cached("org/m", "main") is False
+
+
+@pytest.mark.parametrize("model,revision", [("nonsense", "main"), ("org/m", "a/b"), ("org/m", "..")])
+def test_is_cached_validates_the_names(fx, model, revision):
+    with pytest.raises(ValueError):
+        fx.cache.is_cached(model, revision)

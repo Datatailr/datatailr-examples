@@ -35,7 +35,7 @@ from llm_service.gateway.limiter import LimitExceeded, Limiter
 from llm_service.gateway.limits import InvalidLimit, LimitStore, StorageUnavailable
 from llm_service.gateway.load import LoadMonitor
 from llm_service.gateway.metrics_store import MAX_DAYS, MetricsStore
-from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
+from llm_service.gateway.models import DownloadInProgress, ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.proxy import forward, prompt_of
 from llm_service.gateway.storage import BlobStore
 from llm_service.gateway.usage import UsageTotals
@@ -168,6 +168,27 @@ def create_app(
 
     def on_event(event: dict) -> None:
         failed = event["result"] != "ok"
+        if event["event"] == "model_download":
+            # A download names its own admin. It does not change `last_admin`.
+            write_audit(
+                {
+                    "user": event["admin"],
+                    "endpoint": "/admin/models/download",
+                    "model": event["model"],
+                    "stream": False,
+                    "prompt": {
+                        "event": "model_download",
+                        "revision": event["revision"],
+                        "error": event["error"],
+                    },
+                    "status": 500 if failed else 200,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
+                    "duration_ms": None,
+                }
+            )
+            return
         trigger = event.get("trigger")
         write_audit(
             {
@@ -264,7 +285,12 @@ def create_app(
         try:
             yield
         finally:
-            tasks = (app.state.startup_task, app.state.switch_task, app.state.reload_task)
+            tasks = (
+                app.state.startup_task,
+                app.state.switch_task,
+                app.state.reload_task,
+                app.state.download_task,
+            )
             for task in tasks:
                 if task is not None and not task.done():
                     task.cancel()
@@ -300,6 +326,7 @@ def create_app(
     app.state.switch_task = None
     app.state.startup_task = None
     app.state.reload_task = None
+    app.state.download_task = None
     app.state.maintenance_task = None
     app.state.manager = manager
     app.state.audit = audit
@@ -728,6 +755,35 @@ def create_app(
         except ModelInUse as error:
             raise ApiError(409, "invalid_request_error", "model_in_use", str(error)) from None
         app.state.last_admin = admin_user
+        return manager.status()
+
+    @app.post("/admin/models/download", status_code=202)
+    async def download_model(request: Request, admin_user: str = Depends(require_admin)):
+        try:
+            body = json.loads(await request.body())
+        except (ValueError, RecursionError):
+            body = None
+        if not isinstance(body, dict) or not isinstance(body.get("model"), str):
+            raise ApiError(400, "invalid_request_error", "invalid_model", "the body needs a string 'model'")
+        model, revision = body["model"], body.get("revision", "main")
+        if not isinstance(revision, str):
+            raise ApiError(400, "invalid_request_error", "invalid_model", "'revision' must be a string")
+        try:
+            validate_model_name(model)
+            validate_revision(revision)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
+        # A delete removes the marker first. Until then the pair looks cached.
+        if (model, revision) in manager.removing:
+            raise ApiError(409, "invalid_request_error", "model_in_use", f"{model} {revision} is being removed")
+        if await asyncio.to_thread(weights.is_cached, model, revision):
+            return JSONResponse({"state": "cached", "model": model, "revision": revision})
+        try:
+            app.state.download_task = manager.request_download(model, revision, admin_user)
+        except DownloadInProgress as error:
+            raise ApiError(409, "invalid_request_error", "download_in_progress", str(error)) from None
+        except ModelInUse as error:
+            raise ApiError(409, "invalid_request_error", "model_in_use", str(error)) from None
         return manager.status()
 
     @app.delete("/admin/models/{model_id:path}")

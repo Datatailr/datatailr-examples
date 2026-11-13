@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 from pathlib import Path
 
 import pytest
 
-from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
+from llm_service.gateway.models import DownloadInProgress, ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.storage import MemoryBlobStore
 from llm_service.gateway.weights import WeightCache
 from llm_service.tests.fakes import FakeEngine
@@ -239,7 +240,7 @@ def test_status_shape(tmp_path):
     mgr, *_ = _make(tmp_path)
     assert mgr.status() == {
         "state": "empty", "active": None, "target": None, "error": None, "serving": None,
-        "rolling_back": None,
+        "rolling_back": None, "download": None,
     }
 
 
@@ -744,3 +745,171 @@ def test_begin_remove_refuses_while_the_service_starts(tmp_path, fail):
         asyncio.run(run())
     finally:
         store.gate.set()
+
+
+def _download_events(events: list[dict]) -> list[dict]:
+    return [e for e in events if e["event"] == "model_download"]
+
+
+def test_download_runs_then_is_done_and_emits_the_event(tmp_path):
+    async def run():
+        mgr, engine, store, events = _make(tmp_path)
+        await mgr.startup()
+        task = mgr.request_download("org/b", "v1", "alice")
+        download = mgr.status()["download"]
+        assert download["model"] == "org/b" and download["revision"] == "v1"
+        assert download["state"] == "running" and download["error"] is None
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", download["started_at"])
+        await task
+        assert mgr.download["state"] == "done" and mgr.download["error"] is None
+        assert mgr.download["started_at"] == download["started_at"]
+        assert store.exists("root/models/org--b/v1/.complete")
+        assert _download_events(events) == [
+            {"event": "model_download", "model": "org/b", "revision": "v1",
+             "result": "ok", "error": None, "admin": "alice"}
+        ]
+        # A download changes nothing of the served model.
+        assert mgr.state == "ready" and mgr.active == A and mgr.target is None
+        assert [name for _, name in engine.started] == ["org/a"]
+
+    asyncio.run(run())
+
+
+def test_failed_download_keeps_the_error_and_leaves_no_marker(tmp_path):
+    async def run():
+        mgr, engine, store, events = _make(tmp_path, bad_download="org/b")
+        await mgr.startup()
+        await mgr.request_download("org/b", "main", "bob")
+        assert mgr.download["state"] == "failed"
+        assert mgr.download["error"] == "OSError: download failed"
+        assert not store.exists("root/models/org--b/main/.complete")
+        assert _download_events(events) == [
+            {"event": "model_download", "model": "org/b", "revision": "main",
+             "result": "error", "error": "OSError: download failed", "admin": "bob"}
+        ]
+        assert mgr.state == "ready" and mgr.error is None
+
+    asyncio.run(run())
+
+
+def test_download_error_text_is_at_most_300_characters(tmp_path):
+    async def run():
+        store = MemoryBlobStore()
+
+        def download(model: str, revision: str, target: Path) -> None:
+            raise RuntimeError("x" * 1000)
+
+        weights = WeightCache(store, "root", tmp_path / "local", download)
+        mgr = ModelManager(weights, FakeEngine(), store, "root", "org/a")
+        await mgr.request_download("org/b", "main", "alice")
+        assert mgr.download["error"] == ("RuntimeError: " + "x" * 1000)[:300]
+
+    asyncio.run(run())
+
+
+def test_second_download_while_one_runs_raises_download_in_progress(tmp_path):
+    async def run():
+        mgr, engine, gate, fetching = _make_gated(tmp_path, "org/b")
+        await mgr.startup()
+        task = mgr.request_download("org/b", "main", "alice")
+        await _in_fetch_phase(fetching)
+        with pytest.raises(DownloadInProgress):
+            mgr.request_download("org/c", "main", "alice")
+        assert mgr.download["model"] == "org/b" and mgr.download["state"] == "running"
+        gate.set()
+        await task
+        assert mgr.download["state"] == "done"
+
+    asyncio.run(run())
+
+
+def test_download_refuses_a_pair_that_is_being_removed(tmp_path):
+    async def run():
+        mgr, *_ = _make(tmp_path)
+        await mgr.startup()
+        mgr.begin_remove("org/b", ["main"])
+        with pytest.raises(ModelInUse):
+            mgr.request_download("org/b", "main", "alice")
+        assert mgr.download is None
+        await mgr.request_download("org/b", "v2", "alice")  # another revision is fine
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("model,revision", [("nonsense", "main"), ("org/b", "a/b")])
+def test_download_validates_the_names(tmp_path, model, revision):
+    async def run():
+        mgr, *_ = _make(tmp_path)
+        with pytest.raises(ValueError):
+            mgr.request_download(model, revision, "alice")
+        assert mgr.download is None
+
+    asyncio.run(run())
+
+
+def test_a_new_download_after_a_failed_one_starts_again(tmp_path):
+    async def run():
+        mgr, engine, store, events = _make(tmp_path, bad_download="org/b")
+        await mgr.startup()
+        await mgr.request_download("org/b", "main", "alice")
+        assert mgr.download["state"] == "failed"
+        task = mgr.request_download("org/c", "main", "bob")
+        assert mgr.download["model"] == "org/c" and mgr.download["state"] == "running"
+        assert mgr.download["error"] is None
+        await task
+        assert mgr.download["state"] == "done"
+        assert [e["result"] for e in _download_events(events)] == ["error", "ok"]
+
+    asyncio.run(run())
+
+
+def test_begin_remove_refuses_the_pair_of_a_running_download(tmp_path):
+    async def run():
+        mgr, engine, gate, fetching = _make_gated(tmp_path, "org/b")
+        await mgr.startup()
+        task = mgr.request_download("org/b", "main", "alice")
+        await _in_fetch_phase(fetching)
+        with pytest.raises(ModelInUse):
+            mgr.begin_remove("org/b", ["main"])
+        assert mgr.removing == set()
+        mgr.begin_remove("org/b", ["v2"])  # another revision is fine
+        mgr.end_remove("org/b", ["v2"])
+        gate.set()
+        await task
+        mgr.begin_remove("org/b", ["main"])  # a finished download holds nothing
+        assert mgr.removing == {("org/b", "main")}
+
+    asyncio.run(run())
+
+
+def test_download_leaves_no_local_copy_unless_the_engine_uses_it(tmp_path):
+    async def run():
+        mgr, engine, store, _ = _make(tmp_path)
+        await mgr.startup()
+        local = tmp_path / "local"
+        await mgr.request_download("org/b", "main", "alice")
+        assert not (local / "org--b").exists()
+        assert store.exists("root/models/org--b/main/.complete")
+        assert (local / "org--a" / "main" / ".complete").exists()
+        await mgr.request_download("org/a", "main", "alice")  # the served pair stays
+        assert (local / "org--a" / "main" / ".complete").exists()
+        assert mgr.download["state"] == "done"
+
+    asyncio.run(run())
+
+
+def test_switch_to_the_pair_of_a_running_download_finds_the_files(tmp_path):
+    async def run():
+        mgr, engine, gate, fetching = _make_gated(tmp_path, "org/b")
+        await mgr.startup()
+        download = mgr.request_download("org/b", "main", "alice")
+        await _in_fetch_phase(fetching)
+        switch = mgr.request_switch("org/b")
+        gate.set()
+        await download
+        await switch
+        assert mgr.download["state"] == "done"
+        assert mgr.state == "ready" and mgr.active == B
+        assert (tmp_path / "local" / "org--b" / "main" / ".complete").exists()
+
+    asyncio.run(run())

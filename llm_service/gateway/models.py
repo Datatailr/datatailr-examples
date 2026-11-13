@@ -7,6 +7,7 @@ import json
 import logging
 from typing import Callable
 
+from .audit import iso, utc_now
 from .engine import Engine
 from .storage import BlobStore
 from .weights import WeightCache, validate_model_name, validate_revision
@@ -22,6 +23,14 @@ class ModelInUse(Exception):
     """A model revision is in use or is being removed."""
 
 
+class DownloadInProgress(Exception):
+    """A download without a switch is already running."""
+
+
+# The longest error text that `download` keeps.
+DOWNLOAD_ERROR_CHARS = 300
+
+
 class ModelManager:
     """Hold the state of the served model: empty, loading, ready or failed.
 
@@ -33,6 +42,9 @@ class ModelManager:
     `removing` holds the (model, revision) pairs that a delete removes now.
     `starting` is True while `startup` reads the saved model, before `target`
     names it.
+    `download` is the last download without a switch, or None. It holds
+    `model`, `revision`, `state` (`running`, `done` or `failed`), `error` and
+    `started_at`.
     """
 
     def __init__(
@@ -58,6 +70,7 @@ class ModelManager:
         self.serving: dict | None = None
         self.rolling_back: dict | None = None
         self.removing: set[tuple[str, str]] = set()
+        self.download: dict | None = None
         # `startup` sets the flag. A manager that never starts accepts deletes.
         self.starting = False
 
@@ -74,6 +87,7 @@ class ModelManager:
             "error": self.error,
             "serving": self.serving,
             "rolling_back": self.rolling_back,
+            "download": dict(self.download) if self.download else None,
         }
 
     async def startup(self) -> None:
@@ -133,11 +147,61 @@ class ModelManager:
         )
         return self._task
 
+    def request_download(self, model: str, revision: str, admin: str) -> asyncio.Task:
+        """Start a download of the weights without a switch. Call it inside a running loop.
+
+        Raise `ValueError` for a bad name, `ModelInUse` for a pair that a delete
+        removes, and `DownloadInProgress` while a download runs. The check and
+        the mark run without an `await`, so no delete can start between them.
+        """
+        validate_model_name(model)
+        validate_revision(revision)
+        if (model, revision) in self.removing:
+            raise ModelInUse(f"{model} {revision} is being removed")
+        if self.download is not None and self.download["state"] == "running":
+            raise DownloadInProgress("a model download is already running")
+        self.download = {
+            "model": model,
+            "revision": revision,
+            "state": "running",
+            "error": None,
+            "started_at": iso(utc_now()),
+        }
+        return asyncio.create_task(self._download(model, revision, admin))
+
+    async def _download(self, model: str, revision: str, admin: str) -> None:
+        # `ensure` holds the cache lock for the whole fetch. A switch to the
+        # same pair waits for it and then finds the files.
+        try:
+            await asyncio.to_thread(self._weights.ensure, model, revision)
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"[:DOWNLOAD_ERROR_CHARS]
+            log.warning("the download of %s %s failed: %s", model, revision, error)
+            self.download = {**self.download, "state": "failed", "error": error}
+        else:
+            # The local copy goes unless the engine uses the pair.
+            await self._prune()
+            self.download = {**self.download, "state": "done"}
+        try:
+            self._on_event(
+                {
+                    "event": "model_download",
+                    "model": model,
+                    "revision": revision,
+                    "result": "ok" if self.download["state"] == "done" else "error",
+                    "error": self.download["error"],
+                    "admin": admin,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("event handler failed")
+
     def begin_remove(self, model: str, revisions: list[str]) -> None:
         """Mark revisions of a model as being removed.
 
         Raise `ModelInUse` while the service starts, or if one of them is the
-        active, serving, target or rollback model, or is already being removed.
+        active, serving, target, rollback or downloading model, or is already
+        being removed.
         Nothing is marked in that case.
         Call `end_remove` when the removal ends. The check and the mark run
         without an `await`, so no switch can start between them.
@@ -150,6 +214,8 @@ class ModelManager:
             for entry in (self.active, self.serving, self.target, self.rolling_back)
             if entry
         }
+        if self.download is not None and self.download["state"] == "running":
+            busy.add((self.download["model"], self.download["revision"]))
         if pairs & busy:
             name, revision = sorted(pairs & busy)[0]
             raise ModelInUse(f"{name} {revision} is in use")

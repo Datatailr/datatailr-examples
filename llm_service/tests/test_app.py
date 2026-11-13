@@ -386,6 +386,7 @@ def test_retrieve_one_model(client):
 
 ADMIN_ROUTES = [
     ("POST", "/admin/model", {"json": {"model": "org/b"}}),
+    ("POST", "/admin/models/download", {"json": {"model": "org/b"}}),
     ("GET", "/admin/model", {}),
     ("GET", "/admin/audit", {}),
     ("GET", "/admin/audit/users", {}),
@@ -2573,3 +2574,132 @@ def test_the_sampler_stops_before_the_engine_stops(tmp_path):
         wait_until(lambda: load.live()["now"]["ts"] is not None)
     assert engine.stopped == 1
     assert reads_during_stop == []
+
+
+DOWNLOAD = "/admin/models/download"
+
+
+def download_events(client):
+    return [r for r in audit_records(client) if r["event"] == "model_download"]
+
+
+def wait_download(client, state):
+    return wait_for(client, lambda s: (s["download"] or {}).get("state") == state)
+
+
+def test_download_202_then_done_and_audited_under_the_admin(tmp_path):
+    store = MemoryBlobStore()
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        r = c.post(DOWNLOAD, headers=ALICE | {ACTING: "carol"}, json={"model": "org/b"})
+        assert r.status_code == 202
+        assert r.json()["download"]["model"] == "org/b"
+        assert r.json()["download"]["revision"] == "main"
+        status = wait_download(c, "done")
+        assert status["download"]["error"] is None
+        assert status["active"] == {"model": "org/a", "revision": "main"}
+        assert store.exists("llm-service/models/org--b/main/.complete")
+        events = download_events(c)
+        assert len(events) == 1
+        event = events[0]
+        assert event["user"] == "carol" and event["status"] == 200
+        assert event["endpoint"] == DOWNLOAD and event["model"] == "org/b"
+        assert event["detail"] == {"revision": "main", "error": None}
+        prompt = full_record(c, event)["prompt"]
+        assert prompt == {"event": "model_download", "revision": "main", "error": None}
+        # A download does not change the admin of a later switch event.
+        assert c.app.state.last_admin == "system"
+
+
+def test_download_of_a_cached_pair_answers_200_and_starts_nothing(client):
+    r = client.post(DOWNLOAD, headers=ALICE, json={"model": "org/a", "revision": "main"})
+    assert r.status_code == 200
+    assert r.json() == {"state": "cached", "model": "org/a", "revision": "main"}
+    assert client.get("/admin/model", headers=ALICE).json()["download"] is None
+    assert download_events(client) == []
+
+
+def test_failed_download_is_audited_with_status_500_and_leaves_no_marker(tmp_path):
+    store = MemoryBlobStore()
+
+    def download(model: str, revision: str, target: Path) -> None:
+        if model == "org/b":
+            raise OSError("no network")
+        plain_download(model, revision, target)
+
+    with TestClient(make_app(tmp_path, store=store, download=download)) as c:
+        wait_ready(c)
+        assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+        status = wait_download(c, "failed")
+        assert status["download"]["error"] == "OSError: no network"
+        assert not store.exists("llm-service/models/org--b/main/.complete")
+        event = download_events(c)[0]
+        assert event["status"] == 500 and event["user"] == "alice"
+        assert event["detail"] == {"revision": "main", "error": "OSError: no network"}
+
+
+def test_download_bad_body_or_name_is_400(client):
+    for body in ({"model": "nonsense"}, {"model": "org/b", "revision": "a/b"},
+                 {"model": 5}, {"model": "org/b", "revision": 5}, {}, [1]):
+        r = client.post(DOWNLOAD, headers=ALICE, json=body)
+        assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_model"
+    r = client.post(DOWNLOAD, headers=ALICE, content=b"nope")
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_model"
+    assert client.get("/admin/model", headers=ALICE).json()["download"] is None
+
+
+def test_download_conflicts_and_delete_during_a_download_are_409(tmp_path):
+    download = GatedDownload("org/b")
+    store = MemoryBlobStore()
+    try:
+        with TestClient(make_app(tmp_path, store=store, download=download)) as c:
+            wait_ready(c)
+            assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+            assert download.fetching.wait(10)
+            r = c.post(DOWNLOAD, headers=ALICE, json={"model": "org/c"})
+            assert r.status_code == 409 and r.json()["error"]["code"] == "download_in_progress"
+            assert r.json()["error"]["type"] == "invalid_request_error"
+            # A file of the running download is in blob storage before the marker.
+            store.put("llm-service/models/org--b/main/config.json", "{}")
+            r = c.delete("/admin/models/org/b", headers=ALICE)
+            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            download.gate.set()
+            wait_download(c, "done")
+    finally:
+        download.gate.set()
+
+
+def test_download_of_a_pair_under_removal_is_409(tmp_path):
+    store = SlowDeleteStore()
+    try:
+        with TestClient(make_app(tmp_path, store=store)) as c:
+            wait_ready(c)
+            switch_and_wait(c, "org/other")
+            switch_and_wait(c, "org/a")
+            store.armed = True
+            result = {}
+            worker = threading.Thread(
+                target=lambda: result.update(r=c.delete("/admin/models/org/other", headers=ALICE))
+            )
+            worker.start()
+            assert store.deleting.wait(10)
+            r = c.post(DOWNLOAD, headers=ALICE, json={"model": "org/other"})
+            assert r.status_code == 409 and r.json()["error"]["code"] == "model_in_use"
+            store.gate.set()
+            worker.join(10)
+            assert result["r"].status_code == 200
+    finally:
+        store.gate.set()
+
+
+def test_shutdown_cancels_a_running_download(tmp_path):
+    download = GatedDownload("org/b")
+    try:
+        with TestClient(make_app(tmp_path, download=download)) as c:
+            wait_ready(c)
+            assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+            assert download.fetching.wait(10)
+            task = c.app.state.download_task
+        assert task.cancelled()
+    finally:
+        download.gate.set()
