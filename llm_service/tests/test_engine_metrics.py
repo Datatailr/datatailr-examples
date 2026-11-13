@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import time
 
 import httpx
 
@@ -333,6 +334,7 @@ def test_gpu_reader_good_run():
     assert kwargs["timeout"] == 3.0
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True
+    assert "shell" not in kwargs
 
 
 def test_gpu_reader_non_zero_exit():
@@ -422,3 +424,71 @@ def test_gpu_reader_warns_again_after_a_recovery(caplog):
     reader.read()
     assert len(_messages(caplog, logging.WARNING)) == 2
     assert len(_messages(caplog, logging.INFO)) == 1
+
+
+def test_gpu_reader_any_exception_of_run_is_a_failure(caplog):
+    caplog.set_level(logging.DEBUG, logger=LOGGER_NAME)
+
+    def run(cmd, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad byte")
+
+    reader = GpuReader(run=run)
+    assert reader.read() is None
+    assert reader.read() is None
+    assert len(_messages(caplog, logging.WARNING)) == 1
+
+
+def test_gpu_reader_passes_a_copy_of_the_command():
+    seen = []
+
+    def run(cmd, **kwargs):
+        seen.append(list(cmd))
+        cmd.append("changed")
+        return _completed("1, 2\n")
+
+    reader = GpuReader(run=run)
+    reader.read()
+    reader.read()
+    assert seen[1] == [
+        "nvidia-smi",
+        "--query-gpu=memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+
+
+def test_engine_reader_total_time_limit():
+    async def go():
+        async def slow(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(5)
+            return httpx.Response(200, text=FULL_TEXT)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+        reader = EngineReader(client, "http://engine:8001", timeout=0.05)
+        try:
+            begin = time.monotonic()
+            numbers = await reader.read()
+            return numbers, time.monotonic() - begin
+        finally:
+            await client.aclose()
+
+    numbers, elapsed = asyncio.run(go())
+    assert numbers == ALL_NONE
+    assert elapsed < 1.0
+
+
+def test_parse_metrics_created_name_is_not_a_token_counter():
+    numbers, names = parse_metrics("vllm:prompt_tokens_total_created 5\n")
+    assert numbers["prompt_tokens_total"] is None
+    assert names == ["vllm:prompt_tokens_total_created"]
+
+
+def test_parse_metrics_overflowing_sum_is_missing():
+    text = "vllm:num_requests_running{a=\"1\"} 1e308\nvllm:num_requests_running{a=\"2\"} 1e308\n"
+    numbers, _ = parse_metrics(text)
+    assert numbers["running"] is None
+
+
+def test_parse_metrics_splits_on_newline_only():
+    text = "vllm:num_requests_running{a=\"x\x0by\x1cz\u2028w\"} 4\n"
+    numbers, _ = parse_metrics(text)
+    assert numbers["running"] == 4.0

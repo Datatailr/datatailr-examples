@@ -7,6 +7,7 @@ never raises. The number is None then.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
@@ -66,7 +67,7 @@ def parse_metrics(text: str) -> tuple[dict[str, float | None], list[str]]:
     """
     sums: dict[str, float] = {}
     seen: set[str] = set()
-    for raw in text.splitlines():
+    for raw in text.split("\n"):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -81,7 +82,8 @@ def parse_metrics(text: str) -> tuple[dict[str, float | None], list[str]]:
             sums[name] = sums.get(name, 0.0) + value
     numbers: dict[str, float | None] = {}
     for key, names in METRIC_NAMES.items():
-        numbers[key] = next((sums[n] for n in names if n in sums), None)
+        total = next((sums[n] for n in names if n in sums), None)
+        numbers[key] = total if total is not None and math.isfinite(total) else None
     return numbers, sorted(seen)
 
 
@@ -119,7 +121,10 @@ class EngineReader:
     async def read(self) -> dict[str, float | None]:
         """Return the four numbers. Each one is None on a failure."""
         try:
-            response = await self._client.get(self._url, timeout=self._timeout)
+            # The httpx timeout is a limit for each phase. The outer limit covers the total.
+            response = await asyncio.wait_for(
+                self._client.get(self._url, timeout=self._timeout), self._timeout
+            )
             response.raise_for_status()
             text = response.text
         except Exception as exc:
@@ -162,12 +167,12 @@ class GpuReader:
         if self._no_binary:
             return None
         try:
-            done = self._run(GPU_COMMAND, capture_output=True, text=True, timeout=self._timeout)
+            done = self._run(list(GPU_COMMAND), capture_output=True, text=True, timeout=self._timeout)
         except FileNotFoundError:
             self._no_binary = True
             logger.warning("The nvidia-smi binary is missing. GPU memory is not read.")
             return None
-        except (OSError, subprocess.SubprocessError) as exc:
+        except Exception as exc:
             return self._fail(f"nvidia-smi did not run: {exc!r}")
         if done.returncode != 0:
             return self._fail(f"nvidia-smi exited with code {done.returncode}")
