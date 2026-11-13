@@ -571,9 +571,9 @@ The admin app has the Load tab, after the Usage tab, for an admin. With one serv
 
 - Six tiles for this moment: requests in flight, requests that wait, completion tokens per second, prompt tokens per second, KV cache use and GPU memory used. The KV cache use shows in percent.
 - Six tiles for the last complete minute. They show requests and failed requests. They show the time to the first token as p50 and p95. They show the total time as p50 and p95.
-- Line charts of the points. The chart "Engine memory" shows the largest KV cache use of each point in percent, on an axis from 0 to 100. It shows the GPU memory used in GiB on a second axis, only when a point has that value.
+- Line charts of the points. The chart "Engine memory" shows the largest KV cache use of each point in percent, on an axis from 0 to 100. It shows the GPU memory used in GiB on a second axis, only when a point has that value. A minute without a value is a gap in the line. A value between two gaps shows as a dot, so thin traffic stays visible.
 
-A range control has "Last hour", "6 hours", "24 hours", "7 days" and a custom range. With "Last hour", the tab reads the numbers again each 5 seconds. The other ranges read the history once. A history range shows the step of its points, for example 5 minutes. It also names the UTC days whose history the service did not read, from `missing_days`.
+A range control has "Last hour", "6 hours", "24 hours", "7 days" and a custom range. With "Last hour", the tab reads the numbers again each 5 seconds. The other ranges read the history once. A history range shows the step of its points, for example 5 minutes. Its time axis starts at the minute of the start of the range, as the points do. It also names the UTC days whose history the service did not read, from `missing_days`. The tab runs one history read at a time. A new range during a read ends that read, and only the latest range reads next.
 
 A read that gets no answer in 30 seconds counts as a failed read. If 5 reads in a row fail, the tab stops the 5 second read and shows a note with the last error. Use the Reload button of the page bar to read again.
 

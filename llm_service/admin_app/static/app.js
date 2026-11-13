@@ -114,8 +114,23 @@ function readLimit(ms, signals = globalThis.AbortSignal, Controller = globalThis
   return controller.signal;
 }
 
-/** The fetch options of a read of the Load tab, with its time limit. */
-const loadRead = () => ({signal: readLimit(LOAD_READ_MS)});
+/** A signal that aborts when one of `list` aborts. A browser without `AbortSignal.any` gets a
+ * controller and listeners. The tests pass fakes for the two dependencies. */
+function anySignal(list, signals = globalThis.AbortSignal, Controller = globalThis.AbortController) {
+  if (signals && typeof signals.any === 'function') return signals.any(list);
+  const controller = new Controller();
+  for (const signal of list) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', () => controller.abort(), {once: true});
+  }
+  return controller.signal;
+}
+
+/** The fetch options of a read of the Load tab, with its time limit. A `signal` can end the read earlier. */
+const loadRead = (signal = undefined) => {
+  const limit = readLimit(LOAD_READ_MS);
+  return {signal: signal ? anySignal([signal, limit]) : limit};
+};
 
 /** Call the app. Return the JSON answer, or throw an ApiError with the message of the service.
  *
@@ -757,17 +772,28 @@ const LOAD_CHARTS = [
             ['gpu_memory_used_max', 'GPU memory used', COLORS.bar2, false, true]]},
 ];
 
-/** The data of each series of the chart `spec` from `series`, and whether the series shows. A `gib` series
- * changes from MiB to GiB and shows only with a value. Each other series shows always. */
+// The radius of the point of a value that has no line to a neighbor.
+const ISOLATED_RADIUS = 3;
+
+/** The point radius of each value of `data`. A value whose two neighbors are null or absent has no
+ * line, so it gets a point. Each other value gets no point. A null value stays a gap. */
+function pointRadii(data) {
+  const empty = index => index < 0 || index >= data.length || data[index].y === null;
+  return data.map(({y}, index) => (y !== null && empty(index - 1) && empty(index + 1) ? ISOLATED_RADIUS : 0));
+}
+
+/** The data of each series of the chart `spec` from `series`, its point radii, and whether the series
+ * shows. A `gib` series changes from MiB to GiB and shows only with a value. Each other series shows always. */
 function loadChartData(spec, series) {
   return spec.series.map(([name, , , , gib]) => {
     const data = gib ? series[name].map(({x, y}) => ({x, y: y === null ? null : y / 1024})) : series[name];
-    return {data, shown: !gib || data.some(({y}) => y !== null)};
+    return {data, radius: pointRadii(data), shown: !gib || data.some(({y}) => y !== null)};
   });
 }
 
 /** A line chart over a linear time axis. The build of Chart.js has no date adapter, so the axis
- * holds milliseconds and its labels come from `timeTick`. A null value is a gap in the line. */
+ * holds milliseconds and its labels come from `timeTick`. A null value is a gap in the line. Only an
+ * isolated value has a point, see `pointRadii`. */
 function lineChart({id, format, axis, whole, max, series}) {
   const gib = series.some(([, , , , onGib]) => onGib);
   return new Chart($(id), {
@@ -805,9 +831,9 @@ function setLoadCharts(series, min, max) {
   try {
     for (const spec of LOAD_CHARTS) {
       const chart = (state.loadCharts[spec.id] ||= lineChart(spec));
-      loadChartData(spec, series).forEach(({data, shown}, index) => {
+      loadChartData(spec, series).forEach(({data, radius, shown}, index) => {
         const dataset = chart.data.datasets[index];
-        Object.assign(dataset, {data, hidden: !shown});
+        Object.assign(dataset, {data, hidden: !shown, pointRadius: radius});
         if (dataset.yAxisID === 'gib') chart.options.scales.gib.display = shown;
       });
       Object.assign(chart.options.scales.x, {min, max});
@@ -1034,6 +1060,59 @@ function onVisibility() {
   else if (state.loaded.load && loadPoller.failures < LOAD_MAX_FAILURES) startLoadTimer();
 }
 
+/** A queue that runs at most one task at a time, and the latest task wins.
+ *
+ * `run(task)` calls `task(signal)` and returns its promise. During a running task, a new task waits.
+ * It replaces a task that already waits, whose promise rejects. The running task gets an abort, and
+ * the waiting task starts when the running one ends. `cancel()` aborts the running task and drops the
+ * waiting one. Without `Controller` the signal is undefined and no abort happens. The node harness
+ * passes a fake `Controller`. */
+function createLatestQueue(Controller = globalThis.AbortController) {
+  let running = null;
+  let waiting = null;
+  const replaced = () => new Error('A newer read replaced this read.');
+  function start(task) {
+    const controller = Controller ? new Controller() : null;
+    running = {abort: () => { if (controller) controller.abort(); }};
+    const done = () => {
+      running = null;
+      const next = waiting;
+      waiting = null;
+      if (next) next.start();
+    };
+    let result;
+    try {
+      result = Promise.resolve(task(controller ? controller.signal : undefined));
+    } catch (error) {
+      result = Promise.reject(error);
+    }
+    return result.finally(done);
+  }
+  const abortRunning = () => { if (running) running.abort(); };
+  return {
+    run(task) {
+      if (running === null && waiting === null) return start(task);
+      if (waiting) waiting.drop();
+      abortRunning();
+      return new Promise((resolve, reject) => {
+        waiting = {start: () => start(task).then(resolve, reject), drop: () => reject(replaced())};
+      });
+    },
+    cancel() {
+      if (waiting) waiting.drop();
+      waiting = null;
+      abortRunning();
+    },
+    get running() { return running !== null || waiting !== null; },
+  };
+}
+
+/** The history reads of the Load tab: at most one runs, and a newer read replaces a waiting one. */
+const historyQueue = createLatestQueue();
+
+/** The start of the minute of the time `ms`, in milliseconds. */
+const minuteStart = ms => Math.floor(ms / 60000) * 60000;
+
 /** Read the history of the picked service for the picked range. The timer stops. */
 async function readHistory() {
   const service = state.service;
@@ -1050,8 +1129,8 @@ async function readHistory() {
   showLoadNote('');
   let answer;
   try {
-    answer = await current('loadHistory', call, service,
-      api(`${servicePath('metrics/history', service)}${query(range)}`, loadRead()));
+    answer = await current('loadHistory', call, service, historyQueue.run(signal =>
+      api(`${servicePath('metrics/history', service)}${query(range)}`, loadRead(signal))));
   } catch (error) {
     if (error instanceof StaleAnswer) return;
     if (loadMissing(error)) {
@@ -1062,7 +1141,9 @@ async function readHistory() {
     showLoadNote(`The page did not get the history: ${error instanceof ApiError ? error.message : String(error)}`);
     return;
   }
-  setLoadCharts(loadSeries(answer.points, answer.step_seconds), Date.parse(range.since), Date.parse(range.until));
+  // The service puts the buckets on the minute of `since`, so the axis starts at that minute.
+  setLoadCharts(loadSeries(answer.points, answer.step_seconds), minuteStart(Date.parse(range.since)),
+                Date.parse(range.until));
   $('load-range-text').textContent = `${localText(range.since, true)} to ${localText(range.until, true)}. ` +
     `${stepText(answer.step_seconds)} Times in your local time.`;
   const days = Array.isArray(answer.missing_days) ? answer.missing_days : [];
@@ -1082,6 +1163,7 @@ function setLoadRange(range) {
   }
   if (range === 'hour') {
     nextCall('loadHistory');  // a history read that still runs drops its answer
+    historyQueue.cancel();
     $('load-dates-status').textContent = '';
     startLoadTimer();
   } else {
@@ -1101,6 +1183,7 @@ async function loadLoad() {
 function clearLoad() {
   stopLoadTimer();
   for (const name of ['loadLive', 'loadAll', 'loadHistory']) nextCall(name);
+  historyQueue.cancel();
   state.loadRange = 'hour';
   state.loadNow = null;
   showLoadRange();

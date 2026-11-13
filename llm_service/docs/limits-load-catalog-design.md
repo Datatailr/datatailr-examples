@@ -248,7 +248,7 @@ A bad time, a `since` after `until` or a range that is too long gets 400 `invali
 
 - New routes that pass through: `GET /api/services/{name}/metrics/live` and `GET /api/services/{name}/metrics/history`.
 - New route `GET /api/load`: the `now` part of each service where the viewer is an admin, in parallel, with the same failure rules as the combined usage.
-- A Load tab, for an admin. With one service: tiles for the numbers of this moment and charts of the last hour. A tile and the chart "Engine memory" show the KV cache use in percent. That chart shows the GPU memory used on a second axis when a point has it. The tab reads the live endpoint each 5 seconds while it is open and the page is visible. Each read of the tab has a time limit of 30 seconds. A read over the limit counts as a failed read. A range picker loads the history and stops the refresh.
+- A Load tab, for an admin. With one service: tiles for the numbers of this moment and charts of the last hour. A tile and the chart "Engine memory" show the KV cache use in percent. That chart shows the GPU memory used on a second axis when a point has it. The tab reads the live endpoint each 5 seconds while it is open and the page is visible. Each read of the tab has a time limit of 30 seconds. A read over the limit counts as a failed read. A range picker loads the history and stops the refresh. The axis of a history range starts at the minute of `since`, as the buckets do. At most one history read runs. A new range aborts the running read and waits for its end. A newer range replaces a range that waits. A value between two gaps in a chart shows as a dot.
 - With "All services": one table row for each service with the numbers of this moment, the KV cache use among them.
 
 ## Part 3: model catalog

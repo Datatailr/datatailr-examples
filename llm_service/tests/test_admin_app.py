@@ -1026,8 +1026,8 @@ def test_page_load_helpers(tmp_path):
         "  engine: engine.series.map(([name, label, , , gib]) => [name, label, Boolean(gib)]),\n"
         "  engineFormats: [engine.format(0.5), engine.format(null)],\n"
         "  kv: pick(kvSeries, 'kv_cache_use_max'),\n"
-        "  kvData: h.loadChartData(engine, kvSeries).map(d => [d.data.map(p => p.y), d.shown]),\n"
-        "  gpuData: h.loadChartData(engine, gpuSeries).map(d => [d.data.map(p => p.y), d.shown]),\n"
+        "  kvData: h.loadChartData(engine, kvSeries).map(d => [d.data.map(p => p.y), d.shown, d.radius]),\n"
+        "  gpuData: h.loadChartData(engine, gpuSeries).map(d => [d.data.map(p => p.y), d.shown, d.radius]),\n"
         "  input: h.localInputValue(new Date('2026-11-12T09:05:00Z')),\n"
         "  missing: [missing(404, 'not_found'), missing(404, 'unknown_service'), missing(502, null)],\n"
         "}));\n"
@@ -1072,8 +1072,10 @@ def test_page_load_helpers(tmp_path):
     # A null value, and a point without the field, are gaps.
     assert result["kv"] == [["10:00", 0.4], ["10:01", None], ["10:02", None], ["10:03", 0.9]]
     # The GPU memory line shows only when a point has a value. Its values are GiB.
-    assert result["kvData"] == [[[0.4, None, None, 0.9], True], [[None, None, None, None], False]]
-    assert result["gpuData"] == [[[0.1, None], True], [[2, None], True]]
+    # A value between two gaps has no line, so it gets a point of its own.
+    assert result["kvData"] == [[[0.4, None, None, 0.9], True, [3, 0, 0, 3]],
+                                [[None, None, None, None], False, [0, 0, 0, 0]]]
+    assert result["gpuData"] == [[[0.1, None], True, [3, 0]], [[2, None], True, [3, 0]]]
     assert result["input"] == "2026-11-12T10:05"
     assert result["missing"] == [True, False, False]
 
@@ -2002,7 +2004,8 @@ def _run_load_harness(tmp_path, body, zone="UTC"):
         "const context = {URL, console, document: {addEventListener() {}},\n"
         "  location: {pathname: '/', origin: 'https://example.test'}};\n"
         "vm.createContext(context);\n"
-        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {timeTicks, createPoller, readLimit, api, LOAD_READ_MS};', context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {timeTicks, createPoller, readLimit, api, LOAD_READ_MS,'\n"
+        "  + ' pointRadii, createLatestQueue, anySignal, minuteStart};', context);\n"
         "const h = context.h;\n"
         "(async () => {\n" + body + "\n})();\n"
     )
@@ -2154,4 +2157,133 @@ def test_page_load_reads_have_a_time_limit(tmp_path):
     text = (STATIC_DIR / "app.js").read_text()
     assert "api(servicePath('metrics/live', service), loadRead())" in text
     assert "api('api/load', loadRead())" in text
-    assert "query(range)}`, loadRead())" in text
+    assert "query(range)}`, loadRead(signal))" in text
+
+
+RADII_BODY = """
+const s = ys => ys.map((y, x) => ({x, y}));
+console.log(JSON.stringify([
+  h.pointRadii(s([null, 310, null])), h.pointRadii(s([310])), h.pointRadii(s([310, 320, null, 5])),
+  h.pointRadii(s([5, null, null, 7, 8])), h.pointRadii(s([])), h.pointRadii(s([null, null])),
+]));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_chart_draws_a_point_only_for_an_isolated_value(tmp_path):
+    radii = _run_load_harness(tmp_path, RADII_BODY)
+    assert radii == [[0, 3, 0], [3], [0, 0, 0, 3], [3, 0, 0, 0, 0], [], [0, 0]]
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("function setLoadCharts("):text.index("function clearLoadRange(")]
+    # The charts update in place, so the list of radii comes with the data at each update.
+    assert "Object.assign(dataset, {data, hidden: !shown, pointRadius: radius})" in body
+
+
+QUEUE_BODY = """
+class Controller { constructor() { this.signal = {aborted: false}; } abort() { this.signal.aborted = true; } }
+const q = h.createLatestQueue(Controller);
+const pending = [];
+const started = [];
+const results = [];
+const task = name => signal => {
+  started.push(name);
+  return new Promise((resolve, reject) => pending.push({name, signal, resolve, reject}));
+};
+const track = (name, promise) => promise.then(v => results.push([name, 'ok', v]), e => results.push([name, 'error']));
+const flush = () => new Promise(resolve => setImmediate(resolve));
+const log = {};
+track('a', q.run(task('a')));
+log.first = {started: [...started], running: q.running, signal: Boolean(pending[0].signal)};
+track('b', q.run(task('b')));
+track('c', q.run(task('c')));
+await flush();
+log.queued = {started: [...started], aborted: pending[0].signal.aborted, results: [...results]};
+pending[0].reject(new Error('aborted'));
+await flush();
+log.afterFirst = {started: [...started], results: [...results], running: q.running};
+pending[1].resolve('C');
+await flush();
+log.done = {results: [...results], running: q.running};
+track('d', q.run(task('d')));
+track('e', q.run(task('e')));
+q.cancel();
+await flush();
+log.cancel = {aborted: pending[2].signal.aborted, results: [...results]};
+pending[2].resolve('D');
+await flush();
+log.afterCancel = {started: [...started], results: [...results], running: q.running};
+const plain = h.createLatestQueue(null);
+const signals = [];
+let release;
+const first = plain.run(signal => { signals.push(signal); return new Promise(resolve => { release = resolve; }); });
+const second = plain.run(signal => { signals.push(signal); return Promise.resolve(2); });
+await flush();
+const whileFirst = signals.length;
+release(1);
+log.plain = {whileFirst, results: [await first, await second], signals: signals.map(x => x === undefined)};
+console.log(JSON.stringify(log));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_history_reads_run_one_at_a_time_and_the_latest_wins(tmp_path):
+    log = _run_load_harness(tmp_path, QUEUE_BODY)
+    assert log["first"] == {"started": ["a"], "running": True, "signal": True}
+    # A read during a read waits. A newer one replaces it. The running read gets an abort.
+    assert log["queued"] == {"started": ["a"], "aborted": True, "results": [["b", "error"]]}
+    # The waiting read starts when the running read ends.
+    assert log["afterFirst"] == {"started": ["a", "c"], "results": [["b", "error"], ["a", "error"]], "running": True}
+    assert log["done"] == {"results": [["b", "error"], ["a", "error"], ["c", "ok", "C"]], "running": False}
+    # A cancel aborts the running read and drops the waiting one.
+    assert log["cancel"]["aborted"] is True and log["cancel"]["results"][-1] == ["e", "error"]
+    assert log["afterCancel"]["started"] == ["a", "c", "d"] and log["afterCancel"]["running"] is False
+    # A browser without AbortController still runs the reads one at a time, without an abort.
+    assert log["plain"] == {"whileFirst": 1, "results": [1, 2], "signals": [True, True]}
+
+
+SIGNAL_BODY = """
+const native = {any: list => ({any: list.length})};
+class Controller { constructor() { this.signal = {aborted: false}; } abort() { this.signal.aborted = true; } }
+const source = () => { const listeners = []; return {aborted: false, listeners,
+  addEventListener(type, fn) { listeners.push(fn); }, fire() { this.aborted = true; listeners.forEach(fn => fn()); }}; };
+const a = source();
+const b = source();
+const both = h.anySignal([a, b], {}, Controller);
+const before = both.aborted;
+b.fire();
+const done = source();
+done.aborted = true;
+console.log(JSON.stringify({
+  native: h.anySignal([a, b], native, Controller), before, after: both.aborted,
+  early: h.anySignal([done, source()], {}, Controller).aborted,
+}));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_history_read_ends_by_its_abort_or_by_its_time_limit(tmp_path):
+    result = _run_load_harness(tmp_path, SIGNAL_BODY)
+    assert result == {"native": {"any": 2}, "before": False, "after": True, "early": True}
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("async function readHistory("):text.index("function setLoadRange(")]
+    assert "historyQueue.run(signal =>" in body
+    for name in ("function setLoadRange(", "function clearLoad("):
+        part = text[text.index(name):]
+        assert "historyQueue.cancel();" in part[:part.index("\n}\n")], name
+
+
+MINUTE_BODY = """
+console.log(JSON.stringify([
+  new Date(h.minuteStart(Date.parse('2026-11-12T10:03:20.500Z'))).toISOString(),
+  new Date(h.minuteStart(Date.parse('2026-11-12T10:03:00Z'))).toISOString(),
+]));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_history_axis_starts_at_the_minute_of_since(tmp_path):
+    # The service puts the buckets on the minute of `since`, so the first point is at that minute.
+    assert _run_load_harness(tmp_path, MINUTE_BODY) == ["2026-11-12T10:03:00.000Z", "2026-11-12T10:03:00.000Z"]
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("async function readHistory("):text.index("function setLoadRange(")]
+    assert "minuteStart(Date.parse(range.since))" in body
