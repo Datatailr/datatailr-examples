@@ -2325,3 +2325,128 @@ def test_history_axis_starts_at_the_minute_of_since(tmp_path):
     text = (STATIC_DIR / "app.js").read_text()
     body = text[text.index("async function readHistory("):text.index("function setLoadRange(")]
     assert "minuteStart(Date.parse(range.since))" in body
+
+
+CATALOG_BODY = {"entries": [{"model": "org/a", "revision": "main", "note": "", "gpu_memory_mib": 9000}]}
+DOWNLOAD_ERROR = {"error": {"message": "busy", "type": "conflict", "code": "download_in_progress"}}
+
+CATALOG_ROUTES = [
+    ("GET", "/api/services/svc-two/catalog", None, "GET", "/admin/catalog", {}),
+    ("PUT", "/api/services/svc-two/catalog", CATALOG_BODY, "PUT", "/admin/catalog", {}),
+    (
+        "DELETE",
+        "/api/services/svc-two/catalog?model=org/a&revision=main",
+        None,
+        "DELETE",
+        "/admin/catalog",
+        {"model": "org/a", "revision": "main"},
+    ),
+    (
+        "POST",
+        "/api/services/svc-two/models/download",
+        {"model": "org/a", "revision": "main"},
+        "POST",
+        "/admin/models/download",
+        {},
+    ),
+    (
+        "GET",
+        "/api/services/svc-two/models/fit?model=org/a&revision=main",
+        None,
+        "GET",
+        "/admin/models/fit",
+        {"model": "org/a", "revision": "main"},
+    ),
+]
+CATALOG_WRITE_ROUTES = ["catalog", "models/download"]
+
+
+@pytest.mark.parametrize("method,route,body,service_method,service_path,params", CATALOG_ROUTES)
+def test_each_catalog_route_reaches_its_service_endpoint(
+    client, fakes, method, route, body, service_method, service_path, params
+):
+    fakes.hosts["svc-two"].answers[(service_method, service_path)] = (200, {"ok": True})
+    response = client.request(method, route, json=body, headers=ALICE)
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    sent = fakes.calls()
+    assert len(sent) == 1
+    assert (sent[0].url.host, sent[0].method, sent[0].url.path) == ("svc-two", service_method, service_path)
+    assert dict(sent[0].url.params) == params
+    assert sent[0].headers["X-LLM-Acting-User"] == "alice"
+    assert sent[0].headers["Connection"] == "close"
+    if body is not None:
+        assert json.loads(sent[0].content) == body
+
+
+def test_the_catalog_routes_pass_only_model_and_revision_as_query(client, fakes):
+    client.delete("/api/services/svc/catalog?model=org/a&revision=main&x=1", headers=ALICE)
+    client.get("/api/services/svc/models/fit?model=org/a&other=2", headers=ALICE)
+    delete, fit = fakes.calls()
+    assert dict(delete.url.params) == {"model": "org/a", "revision": "main"}
+    assert dict(fit.url.params) == {"model": "org/a"}
+
+
+def test_only_the_download_route_waits_the_long_action_time(client, fakes):
+    for method, route, body, *_ in CATALOG_ROUTES:
+        client.request(method, route, json=body, headers=ALICE)
+    timeouts = {(r.method, r.url.path): _timeout(r) for r in fakes.calls()}
+    assert timeouts[("POST", "/admin/models/download")] == 300
+    assert [t for key, t in timeouts.items() if key[1] != "/admin/models/download"] == [30] * 4
+
+
+@pytest.mark.parametrize("route", CATALOG_WRITE_ROUTES)
+def test_the_catalog_write_routes_need_json(client, fakes, route):
+    method = "PUT" if route == "catalog" else "POST"
+    response = client.request(
+        method, f"/api/services/svc/{route}", content=b"{}", headers={**ALICE, "Content-Type": "text/plain"}
+    )
+    assert response.status_code == 415
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize("route", CATALOG_WRITE_ROUTES)
+@pytest.mark.parametrize("content", [b"{oops", b"[" * 100_000])
+def test_the_catalog_write_routes_need_valid_json(client, fakes, route, content):
+    method = "PUT" if route == "catalog" else "POST"
+    response = client.request(
+        method, f"/api/services/svc/{route}", content=content, headers={**ALICE, "Content-Type": "application/json"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_json"
+    assert fakes.calls() == []
+
+
+def test_the_catalog_routes_of_an_unknown_service_are_404(client, fakes):
+    for method, route, body, *_ in CATALOG_ROUTES:
+        response = client.request(method, route.replace("svc-two", "nope"), json=body, headers=ALICE)
+        assert response.status_code == 404
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize(
+    "status,body", [(202, {"state": "downloading"}), (200, {"state": "cached"}), (400, ERROR_403), (409, DOWNLOAD_ERROR), (500, ERROR_403)]
+)
+def test_the_download_answers_of_the_service_pass_through(client, fakes, status, body):
+    fakes.hosts["svc"].answers[("POST", "/admin/models/download")] = (status, body)
+    response = client.post("/api/services/svc/models/download", json={"model": "org/a"}, headers=ALICE)
+    assert response.status_code == status
+    assert response.json() == body
+
+
+def test_a_catalog_409_and_a_dead_service_pass_through(client, fakes):
+    fakes.hosts["svc"].answers[("PUT", "/admin/catalog")] = (409, DOWNLOAD_ERROR)
+    response = client.put("/api/services/svc/catalog", json=CATALOG_BODY, headers=ALICE)
+    assert (response.status_code, response.json()) == (409, DOWNLOAD_ERROR)
+    fakes.hosts["svc"].error = httpx.ConnectError("refused")
+    response = client.get("/api/services/svc/models/fit?model=org/a", headers=ALICE)
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "service_unreachable"
+
+
+def test_a_catalog_retry_after_passes_through_when_valid(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/catalog")] = (429, ERROR_429)
+    fakes.hosts["svc"].answer_headers[("GET", "/admin/catalog")] = {"Retry-After": "9"}
+    assert client.get("/api/services/svc/catalog", headers=ALICE).headers["retry-after"] == "9"
+    fakes.hosts["svc"].answer_headers[("GET", "/admin/catalog")] = {"Retry-After": "soon"}
+    assert "retry-after" not in client.get("/api/services/svc/catalog", headers=ALICE).headers
