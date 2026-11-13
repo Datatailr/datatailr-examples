@@ -2149,6 +2149,25 @@ def test_ttft_ms_is_set_for_a_stream_and_null_otherwise(client):
     assert all(r["ttft_ms"] is None for r in others)
 
 
+def test_ttft_ms_is_null_for_a_stream_without_content(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        data = (
+            b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{"content":""}}]}\n\n'
+            b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":0,"total_tokens":3}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=data)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://engine")
+    with TestClient(make_app(tmp_path, http=http)) as c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json={**HI, "stream": True}).status_code == 200
+        (row,) = audit_records(c, user="bob")
+    assert row["stream"] is True and row["status"] == 200
+    assert row["ttft_ms"] is None
+
+
 # Live load and the metrics history
 
 METRICS_TEXT = (
@@ -2504,3 +2523,33 @@ def test_the_app_builds_its_own_client_for_the_engine_metrics(tmp_path):
         wait_until(lambda: len(rounds) >= 3)
     assert "/metrics" not in proxy_paths
     assert rounds[0]["running"] is None
+
+
+def test_the_sampler_stops_before_the_engine_stops(tmp_path):
+    class SlowStop(FakeEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stopping = False
+
+        async def stop(self) -> None:
+            self.stopping = True
+            await asyncio.sleep(0.2)
+            await super().stop()
+
+    engine = SlowStop()
+    reads_during_stop = []
+    app = make_app(tmp_path, engine=engine, sample_interval=0.01)
+    with TestClient(app) as c:
+        wait_ready(c)
+        load = c.app.state.load
+        real = load.add_sample
+
+        def spy(numbers, gpu):
+            if engine.stopping and numbers:
+                reads_during_stop.append(numbers)
+            return real(numbers, gpu)
+
+        load.add_sample = spy
+        wait_until(lambda: load.live()["now"]["ts"] is not None)
+    assert engine.stopped == 1
+    assert reads_during_stop == []

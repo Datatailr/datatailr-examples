@@ -248,7 +248,7 @@ async def forward(
     chunk came before the disconnect. An error in `on_done` is logged and does not break the response.
 
     `on_first()` is optional. For a streamed answer it runs once, after the first chunk with content
-    went to the client. Content is a non-empty `delta.content` or `text`. It never runs for an answer
+    went to the client. Content is a non-empty `delta.content` or `text` of `choices[0]`. It never runs for an answer
     without a stream. An error in `on_first` is logged and does not break the stream.
     """
     prepared, usage_wanted = prepare_body(body)

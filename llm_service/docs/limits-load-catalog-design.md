@@ -236,7 +236,7 @@ A bad time, a `since` after `until` or a range that is too long gets 400 `invali
 
 - New routes that pass through: `GET /api/services/{name}/metrics/live` and `GET /api/services/{name}/metrics/history`.
 - New route `GET /api/load`: the `now` part of each service where the viewer is an admin, in parallel, with the same failure rules as the combined usage.
-- A Load tab, for an admin. With one service: tiles for the numbers of this moment and charts of the last hour. The tab reads the live endpoint each 5 seconds while it is open and the page is visible. A range picker loads the history and stops the refresh.
+- A Load tab, for an admin. With one service: tiles for the numbers of this moment and charts of the last hour. The tab reads the live endpoint each 5 seconds while it is open and the page is visible. Each read of the tab has a time limit of 30 seconds. A read over the limit counts as a failed read. A range picker loads the history and stops the refresh.
 - With "All services": one table row for each service with the numbers of this moment.
 
 ## Part 3: model catalog
@@ -333,7 +333,7 @@ A change of the catalog writes an audit event `catalog_change`.
 ## Known limits
 
 - The service checks the token budget before a request. So a user can pass it by the size of the requests in flight.
-- A restart clears the request window, the parallel counters and the points that are not in blob storage yet. This is at most 5 minutes of points.
+- A restart clears the request window, the parallel counters and the points that are not in blob storage yet. A clean stop loses only the point of the open minute. A crash loses up to the last 5 minutes of points and the open minute.
 - The limits are for each service. A user with access to two services has two budgets.
 - The percentiles of a merged history point are the maximum of the merged minutes, not a true percentile of the longer time.
 - The fit check does not know the context length or the engine arguments.

@@ -933,8 +933,8 @@ def test_load_tab_is_for_an_admin_and_shows_the_table_for_all_services():
 
 def test_page_calls_the_three_load_routes_and_drops_late_answers():
     text = (STATIC_DIR / "app.js").read_text()
-    assert "current('loadLive', call, service, api(servicePath('metrics/live', service)))" in text
-    assert "current('loadAll', call, null, api('api/load'))" in text
+    assert "current('loadLive', call, service, api(servicePath('metrics/live', service), loadRead()))" in text
+    assert "current('loadAll', call, null, api('api/load', loadRead()))" in text
     assert "current('loadHistory', call, service," in text
     assert "servicePath('metrics/history', service)" in text
 
@@ -1965,7 +1965,7 @@ def _run_load_harness(tmp_path, body, zone="UTC"):
         "const context = {URL, console, document: {addEventListener() {}},\n"
         "  location: {pathname: '/', origin: 'https://example.test'}};\n"
         "vm.createContext(context);\n"
-        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {timeTicks, createPoller};', context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {timeTicks, createPoller, readLimit, api, LOAD_READ_MS};', context);\n"
         "const h = context.h;\n"
         "(async () => {\n" + body + "\n})();\n"
     )
@@ -2084,3 +2084,37 @@ def test_load_timer_runs_one_read_of_a_kind_at_a_time(tmp_path):
     assert log["hidden"] == {"running": False, "reads": 7}
     assert log["again"] == {"running": True, "failures": 0, "reads": 8}
     assert log["otherKind"] == 9  # a running live read does not hold the read of all services
+
+
+READ_LIMIT_BODY = """
+const native = {timeout: ms => ({native: ms})};
+const scheduled = [];
+class Controller { constructor() { this.signal = {aborted: false}; } abort() { this.signal.aborted = true; } }
+const own = h.readLimit(h.LOAD_READ_MS, native);
+const fallback = h.readLimit(h.LOAD_READ_MS, {}, Controller, (fn, ms) => scheduled.push([fn, ms]));
+const before = fallback.aborted;
+scheduled[0][0]();
+const failure = async (signal, fetch) => {
+  context.fetch = fetch;
+  try { await h.api('x', {signal}); return null; } catch (error) { return error.message; }
+};
+const aborted = {aborted: true};
+const timeout = await failure(aborted, async () => { throw new Error('aborted'); });
+const body = await failure(aborted, async () => ({ok: true, status: 200, json: async () => { throw new Error('aborted'); }}));
+const down = await failure({aborted: false}, async () => { throw new Error('refused'); });
+console.log(JSON.stringify({own, before, after: fallback.aborted, ms: scheduled[0][1], timeout, body, down}));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_page_load_reads_have_a_time_limit(tmp_path):
+    result = _run_load_harness(tmp_path, READ_LIMIT_BODY)
+    assert result["own"] == {"native": 30000}
+    assert result["before"] is False and result["after"] is True and result["ms"] == 30000
+    # A read that ends by the time limit is a failed read with its own message.
+    assert result["timeout"] == result["body"] == "The admin app did not answer in 30 seconds."
+    assert result["down"] == "The admin app does not answer."
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "api(servicePath('metrics/live', service), loadRead())" in text
+    assert "api('api/load', loadRead())" in text
+    assert "query(range)}`, loadRead())" in text

@@ -506,3 +506,15 @@ def test_engine_reader_follows_a_redirect():
     (numbers,) = _run_reads(handler)
     assert seen == ["/metrics", "/metrics/"]
     assert numbers["running"] == 3.0
+
+
+def test_engine_reader_warning_without_vllm_names_counts_and_names_the_samples(caplog):
+    caplog.set_level(logging.DEBUG, logger=LOGGER_NAME)
+    lines = [f"other_metric_{i:02d}{{a=\"{j}\"}} 1" for i in range(12) for j in (1, 2)]
+    text = "# HELP x y\n" + "\n".join(lines) + "\n"
+    _run_reads(lambda request: httpx.Response(200, text=text))
+    (warning,) = _messages(caplog, logging.WARNING)
+    assert "24 sample lines" in warning
+    assert "other_metric_00" in warning and "other_metric_09" in warning
+    assert "other_metric_10" not in warning
+    assert "none" not in warning

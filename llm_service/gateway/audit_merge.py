@@ -421,9 +421,9 @@ async def run_maintenance(tick: Callable[[], None], interval: float = MAINTENANC
     """Call `tick` in a worker thread, then sleep `interval` seconds, until a cancel.
 
     `tick` runs the audit merge and the metrics retention. The merge has its own limit: at most
-    one time each minute. The retention checks run at most one time each hour. The loop awaits each call, so one call runs at a time. An
-    error in `tick` is logged and the loop goes on. A cancel returns at once. A call that runs
-    then ends in its thread by itself.
+    one time each minute. The retention checks run at most one time each hour. The loop awaits
+    each call, so one call runs at a time. An error in `tick` is logged and the loop goes on.
+    A cancel returns at once. A call that runs then ends in its thread by itself.
     """
     while True:
         try:

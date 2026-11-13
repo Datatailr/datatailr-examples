@@ -569,7 +569,7 @@ The admin app has the Load tab, after the Usage tab, for an admin. With one serv
 
 A range control has "Last hour", "6 hours", "24 hours", "7 days" and a custom range. With "Last hour", the tab reads the numbers again each 5 seconds. The other ranges read the history once. A history range shows the step of its points, for example 5 minutes. It also names the UTC days whose history the service did not read, from `missing_days`.
 
-If 5 reads in a row fail, the tab stops the 5 second read and shows a note with the last error. Use the Reload button of the page bar to read again.
+A read that gets no answer in 30 seconds counts as a failed read. If 5 reads in a row fail, the tab stops the 5 second read and shows a note with the last error. Use the Reload button of the page bar to read again.
 
 With "All services" picked, the tab shows a table that reads the numbers each 5 seconds. It has one row for each service where the viewer is an admin, with the numbers of this moment. A service that is not usable has a row with the reason. A service where the viewer is not an admin is absent. The app route `GET /api/load` gives these rows. The routes `GET /api/services/{name}/metrics/live` and `GET /api/services/{name}/metrics/history` pass the two service calls through.
 
@@ -678,7 +678,7 @@ The first start after the upgrade reads every old layout file of the days withou
 - The token budget passes by the size of the requests in flight. The service checks `tokens_per_day` before a request, and the service knows the tokens of a request only at its end. So a user can pass the budget with parallel requests. The next request is refused.
 - A restart of the service clears the request window and the parallel counter. The token budget stays, because it comes from the usage totals. A crash can lose the tokens of the last seconds, as it does for the usage numbers.
 - The limits are for each service. Each service has its own limits file, and the app shows the limits of the picked service.
-- A restart of the service loses at most 5 minutes of load points, the points that are not in blob storage yet.
+- A clean stop of the service loses only the load point of the open minute. A crash loses the points of up to the last 5 minutes and the open minute, the points that are not in blob storage yet.
 - The service has no load numbers for the minutes when it did not run.
 - A point of a merged history range holds the maximum of the merged percentiles. It is not the true percentile of the longer time.
 - The platform does not start GPU nodes. You must start one.

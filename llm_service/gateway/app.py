@@ -103,7 +103,10 @@ def _check_instant(name: str, value: str | None) -> datetime:
         return moment.astimezone(timezone.utc) if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
     except (ValueError, OverflowError):
         raise ApiError(
-            400, "invalid_request_error", "invalid_time", f"{name} is required and must be an ISO time like 2026-11-10T12:00:00Z"
+            400,
+            "invalid_request_error",
+            "invalid_time",
+            f"{name} is required and must be an ISO time like 2026-11-10T12:00:00Z",
         ) from None
 
 
@@ -189,11 +192,12 @@ def create_app(
     manager = ModelManager(weights, engine, store, config.blob_root, config.default_model, on_event)
 
     def on_flusher_tick() -> None:
-        """Run the usage steps, the new read of the limits and the metrics write after each flush, in the flusher thread.
+        """Run the usage steps, the new read of the limits and the metrics write after each flush.
 
-        Each step has its own guard, so one failure does not stop the others. The last cycle
-        at shutdown forces the checkpoint and the metrics write. The limits file is read again only after a failed read.
-        The merge and the retention run in the maintenance task, so a flush never waits for their deletes.
+        The steps run in the flusher thread. Each step has its own guard, so one failure does not
+        stop the others. The last cycle at shutdown forces the checkpoint and the metrics write.
+        The limits file is read again only after a failed read. The merge and the retention run
+        in the maintenance task, so a flush never waits for their deletes.
         """
         last_cycle = stopping.is_set()
         steps = [
@@ -267,6 +271,10 @@ def create_app(
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
+            # The sampler ends before the engine, so no metrics read fails during the stop.
+            sampler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sampler
             try:
                 await engine.stop()
             finally:
@@ -274,9 +282,6 @@ def create_app(
                 maintenance.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await maintenance
-                sampler.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await sampler
                 # One last round with no reads, so the points of the last minutes reach the store.
                 try:
                     metrics.add(load.add_sample({}, None))

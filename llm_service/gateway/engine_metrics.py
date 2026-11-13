@@ -87,6 +87,22 @@ def parse_metrics(text: str) -> tuple[dict[str, float | None], list[str]]:
     return numbers, sorted(seen)
 
 
+def answer_summary(text: str, limit: int = 10) -> tuple[int, list[str]]:
+    """Return the count of sample lines of the text and its first `limit` metric names, sorted."""
+    count = 0
+    names: set[str] = set()
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _SAMPLE.match(line)
+        if match is None:
+            continue
+        count += 1
+        names.add(match.group("name"))
+    return count, sorted(names)[:limit]
+
+
 def parse_gpu_memory(text: str) -> tuple[int, int] | None:
     """Return (used, total) in MiB, summed over the GPUs.
 
@@ -151,12 +167,22 @@ class EngineReader:
         missing = frozenset(key for key, value in numbers.items() if value is None)
         if missing != self._missing:
             self._missing = missing
-            if missing:
+            if missing and names:
                 logger.warning(
                     "No known metric name for: %s. The endpoint saw these %s names: %s",
                     ", ".join(sorted(missing)),
                     ENGINE_PREFIX,
-                    ", ".join(names) or "none",
+                    ", ".join(names),
+                )
+            elif missing:
+                count, some = answer_summary(text)
+                logger.warning(
+                    "No known metric name for: %s. The endpoint saw no %s name in %d sample lines. "
+                    "Some names of the answer: %s",
+                    ", ".join(sorted(missing)),
+                    ENGINE_PREFIX,
+                    count,
+                    ", ".join(some) or "no names",
                 )
         return numbers
 

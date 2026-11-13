@@ -98,15 +98,38 @@ function answerError(response, data) {
                                 retryAfter: retryWait(response.headers.get('Retry-After'))});
 }
 
-/** Call the app. Return the JSON answer, or throw an ApiError with the message of the service. */
+// The time limit of a read of the Load tab, in milliseconds.
+const LOAD_READ_MS = 30000;
+const TOO_SLOW = `The admin app did not answer in ${LOAD_READ_MS / 1000} seconds.`;
+
+/** An abort signal that ends a read after `ms` milliseconds.
+ *
+ * A browser without `AbortSignal.timeout` gets a controller and a timer. The tests pass fakes for
+ * the three dependencies. */
+function readLimit(ms, signals = globalThis.AbortSignal, Controller = globalThis.AbortController,
+                   schedule = globalThis.setTimeout) {
+  if (signals && typeof signals.timeout === 'function') return signals.timeout(ms);
+  const controller = new Controller();
+  schedule(() => controller.abort(), ms);
+  return controller.signal;
+}
+
+/** The fetch options of a read of the Load tab, with its time limit. */
+const loadRead = () => ({signal: readLimit(LOAD_READ_MS)});
+
+/** Call the app. Return the JSON answer, or throw an ApiError with the message of the service.
+ *
+ * A read that ends by the time limit of `options.signal` throws an ApiError too. */
 async function api(path, options = {}) {
+  const tooSlow = () => options.signal && options.signal.aborted;
   let response;
   try {
     response = await fetch(new URL(path, BASE), options);
   } catch {
-    throw new ApiError('The admin app does not answer.');
+    throw new ApiError(tooSlow() ? TOO_SLOW : 'The admin app does not answer.');
   }
   const data = await response.json().catch(() => null);
+  if (tooSlow()) throw new ApiError(TOO_SLOW);
   if (!response.ok) throw answerError(response, data);
   return data;
 }
@@ -809,8 +832,8 @@ function showLoadRange() {
   $('load-dates').hidden = state.loadRange !== 'custom';
 }
 
-/** True when the tab shows numbers of this moment: the tab is open with "All services", or with
- * one service that offers the endpoints and the range "Last hour". */
+/** True when the tab shows numbers of this moment. The tab is open with "All services". Or the tab
+ * is open with one service that offers the endpoints, and the range is "Last hour". */
 const loadLive = () => state.tab === 'load' && !$('main').hidden && $('load-missing').hidden
   && (!state.service || state.loadRange === 'hour');
 
@@ -865,13 +888,14 @@ function showAll(answer) {
 
 /** A timer that reads every `ms` milliseconds, with at most one read of a kind at a time.
  *
- * The dependencies come as arguments, so the node harness tests the unit with fakes:
- * `schedule(fn, ms)` and `cancel(id)` run the timer, `canRun()` says if the view reads now,
- * `viewOf()` names the view (one service, or "" for "All services"), `kindOf(view)` names the kind
- * of read, `read(view)` returns a promise of the answer, `show(view, answer)` shows it and
- * `failed(error, failures, stopped)` shows a failure. After `maxFailures` failures in a row the
- * timer stops. A stop drops the answer of a read that still runs. When that read ends and a timer
- * of the same kind runs, the new timer reads at once. */
+ * The dependencies come as arguments, so the node harness tests the unit with fakes.
+ * `schedule(fn, ms)` and `cancel(id)` run the timer. `canRun()` says if the view reads now.
+ * `viewOf()` names the view: one service, or "" for "All services". `kindOf(view)` names the kind
+ * of read. `read(view)` returns a promise of the answer, and `show(view, answer)` shows it.
+ * `failed(error, failures, stopped)` shows a failure.
+ *
+ * After `maxFailures` failures in a row the timer stops. A stop drops the answer of a read that
+ * still runs. When that read ends and a timer of the same kind runs, the new timer reads at once. */
 function createPoller({schedule, cancel, ms, maxFailures, canRun, viewOf, kindOf, read, show, failed}) {
   let timer = null;
   let run = 0;
@@ -933,10 +957,10 @@ function createPoller({schedule, cancel, ms, maxFailures, canRun, viewOf, kindOf
 async function readNow(service) {
   if (service) {
     const call = nextCall('loadLive');
-    return current('loadLive', call, service, api(servicePath('metrics/live', service)));
+    return current('loadLive', call, service, api(servicePath('metrics/live', service), loadRead()));
   }
   const call = nextCall('loadAll');
-  return current('loadAll', call, null, api('api/load'));
+  return current('loadAll', call, null, api('api/load', loadRead()));
 }
 
 function showNow(service, answer) {
@@ -1001,7 +1025,7 @@ async function readHistory() {
   let answer;
   try {
     answer = await current('loadHistory', call, service,
-      api(`${servicePath('metrics/history', service)}${query(range)}`));
+      api(`${servicePath('metrics/history', service)}${query(range)}`, loadRead()));
   } catch (error) {
     if (error instanceof StaleAnswer) return;
     if (loadMissing(error)) {

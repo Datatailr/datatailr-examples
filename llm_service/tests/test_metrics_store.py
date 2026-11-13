@@ -570,7 +570,7 @@ def test_clean_past_day_read_by_load_today_leaves_memory():
     assert len(got) == 1
 
 
-def test_point_added_during_put_of_past_day_stays(caplog):
+def test_point_added_during_put_of_past_day_stays():
     holder = {}
 
     class AddDuring(MemoryBlobStore):
