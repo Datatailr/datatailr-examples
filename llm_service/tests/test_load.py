@@ -441,3 +441,21 @@ def test_percentiles_are_null_for_a_minute_of_failed_requests(env):
     (point,) = env.sample()
     assert point["requests"] == 1 and point["failed_requests"] == 1
     assert point["ttft_ms_p50"] is None and point["duration_ms_p95"] is None
+
+
+def test_samples_of_one_minute_are_bounded_after_a_backward_clock_step(env):
+    env.sample()
+    env.now = START + timedelta(seconds=60)
+    env.sample()
+    # The clock steps back into the emitted minute 10:15, so each sample goes to the open minute 10:16.
+    env.now = START + timedelta(seconds=1)
+    env.sample(gpu=(9000, 10000))
+    for _ in range(40):
+        env.advance(1)
+        env.sample(gpu=(1, 10000))
+    (minute,) = env.monitor._minutes.values()
+    assert len(minute.samples) == load_module.SAMPLES_PER_MINUTE == 24
+    env.now = START + timedelta(seconds=120)
+    (point,) = env.sample()
+    assert point["ts"] == "2026-11-12T10:16:00Z"
+    assert point["gpu_memory_used_max"] == 1  # the oldest sample, with 9000, is dropped

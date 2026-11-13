@@ -604,7 +604,9 @@ const numeric = value => (typeof value === 'number' && Number.isFinite(value) ? 
 
 /** The series of each point field as `{x, y}` pairs, with `x` in milliseconds. A missing point, or a
  * missing value, is a null `y`. A step of more than 1.5 times `stepSeconds` between two points adds a
- * null pair, so the chart shows a gap. A point without a valid `ts` stays out. */
+ * null pair, so the chart shows a gap. A merged history point has the start of its time bucket as `ts`.
+ * So two neighbor buckets are one step apart, and an empty bucket is a gap. A point without a valid
+ * `ts` stays out. */
 function loadSeries(points, stepSeconds) {
   const step = (numeric(stepSeconds) || 60) * 1000;
   const timed = (Array.isArray(points) ? points : [])

@@ -127,23 +127,26 @@ def many(n):
     return [point((base + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")) for i in range(n)]
 
 
+S = datetime(2026, 11, 12, tzinfo=UTC)
+
+
 def test_merge_fewer_than_limit_keeps_points():
     pts = many(10)
-    out, step = merge_points(pts)
+    out, step = merge_points(pts, S, S + timedelta(minutes=9))
     assert out == pts
     assert step == 60
 
 
 def test_merge_exactly_limit_keeps_points():
     pts = many(MAX_POINTS)
-    out, step = merge_points(pts)
+    out, step = merge_points(pts, S, S + timedelta(minutes=MAX_POINTS - 1))
     assert len(out) == MAX_POINTS
     assert step == 60
 
 
 def test_merge_more_than_limit_groups_points():
     pts = many(MAX_POINTS + 1)
-    out, step = merge_points(pts)
+    out, step = merge_points(pts, S, S + timedelta(minutes=MAX_POINTS))
     assert step == 120
     assert len(out) <= MAX_POINTS
     assert out[0]["ts"] == pts[0]["ts"]
@@ -153,9 +156,36 @@ def test_merge_more_than_limit_groups_points():
 
 
 def test_merge_large_group_size():
-    out, step = merge_points(many(1440), limit=100)
+    out, step = merge_points(many(1440), S, S + timedelta(minutes=1439), limit=100)
     assert step == 60 * 15
     assert len(out) <= 100
+
+
+def test_merge_step_comes_from_the_range_not_from_the_points():
+    # Two points in a range of 1000 minutes: the step is 2 minutes, though no point merges.
+    pts = [point("2026-11-12T00:01:00Z"), point("2026-11-12T10:00:00Z")]
+    out, step = merge_points(pts, S, S + timedelta(minutes=999))
+    assert step == 120
+    assert [p["ts"] for p in out] == ["2026-11-12T00:00:00Z", "2026-11-12T10:00:00Z"]
+
+
+def test_merge_groups_by_time_across_a_gap():
+    pts = [point(f"2026-11-12T00:0{m}:00Z", requests=m + 1) for m in (0, 1, 7, 8)]
+    out, step = merge_points(pts, S, S + timedelta(minutes=9), limit=5)
+    assert step == 120
+    # The minutes 2 to 6 have no point, so their buckets give no point.
+    assert [(p["ts"], p["requests"]) for p in out] == [
+        ("2026-11-12T00:00:00Z", 3),
+        ("2026-11-12T00:06:00Z", 8),
+        ("2026-11-12T00:08:00Z", 9),
+    ]
+
+
+def test_merge_buckets_start_at_the_minute_of_since():
+    pts = [point("2026-11-12T00:01:00Z"), point("2026-11-12T00:02:00Z")]
+    out, step = merge_points(pts, S + timedelta(seconds=30), S + timedelta(minutes=3), limit=2)
+    assert step == 120
+    assert [p["ts"] for p in out] == ["2026-11-12T00:00:00Z", "2026-11-12T00:02:00Z"]
 
 
 def test_merge_field_rules():
@@ -169,7 +199,8 @@ def test_merge_field_rules():
         in_flight_max=2, waiting_max=4, ttft_ms_p50=250, ttft_ms_p95=200, duration_ms_p50=800,
         duration_ms_p95=2500, gpu_memory_used_max=600, gpu_memory_total=2000,
     )
-    out, step = merge_points([a, b], limit=1)
+    ten = S + timedelta(hours=10)
+    out, step = merge_points([a, b], ten, ten + timedelta(minutes=1), limit=1)
     assert step == 120
     assert out == [
         {
@@ -190,9 +221,10 @@ def test_merge_null_handling():
     b = point("2026-11-12T10:01:00Z", **nulls)
     c = point("2026-11-12T10:02:00Z", ttft_ms_p95=700, gpu_memory_total=1500)
     d = point("2026-11-12T10:03:00Z", **nulls)
-    out, _ = merge_points([a, b], limit=1)
+    ten = S + timedelta(hours=10)
+    out, _ = merge_points([a, b], ten, ten + timedelta(minutes=1), limit=1)
     assert all(out[0][name] is None for name in nulls)
-    out, _ = merge_points([a, c, d], limit=1)
+    out, _ = merge_points([a, c, d], ten, ten + timedelta(minutes=3), limit=1)
     assert out[0]["ttft_ms_p95"] == 700
     assert out[0]["ttft_ms_p50"] == 100
     assert out[0]["gpu_memory_total"] == 1500
@@ -200,7 +232,7 @@ def test_merge_null_handling():
 
 
 def test_merge_empty():
-    assert merge_points([]) == ([], 60)
+    assert merge_points([], S, S) == ([], 60)
 
 
 # load_today
@@ -209,7 +241,7 @@ def test_merge_empty():
 def test_load_today_missing_file_means_no_points():
     ms, store, _ = make()
     ms.load_today()
-    assert ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 13, tzinfo=UTC)) == ([], 60, [])
+    assert ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC)) == ([], 60, [])
 
 
 def test_load_today_reads_good_file():
@@ -218,7 +250,7 @@ def test_load_today_reads_good_file():
     store.put(path(DAY1), "\n".join(json.dumps(p) for p in pts) + "\n")
     ms, _, _ = make(store)
     ms.load_today()
-    got, _, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, tzinfo=UTC))
+    got, _, _ = ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC))
     assert got == pts
 
 
@@ -228,7 +260,7 @@ def test_load_today_skips_broken_lines():
     store.put(path(DAY1), json.dumps(good) + "\n{broken\n[1, 2]\n" + json.dumps({"ts": 5}) + "\n\n")
     ms, _, _ = make(store)
     ms.load_today()
-    got, _, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, tzinfo=UTC))
+    got, _, _ = ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC))
     assert got == [good]
 
 
@@ -373,7 +405,7 @@ def test_history_after_failed_load_today_reads_file_and_merges_memory():
     ms.load_today()
     ms.add([minute(DAY1, 9, 1)])
     store.fail = False
-    got, _, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, tzinfo=UTC))
+    got, _, _ = ms.history(datetime(2026, 11, 12, 9, tzinfo=UTC), datetime(2026, 11, 12, 10, tzinfo=UTC))
     assert [p["ts"] for p in got] == ["2026-11-12T09:00:00Z", "2026-11-12T09:01:00Z"]
 
 
@@ -420,7 +452,7 @@ def test_past_day_leaves_memory_after_good_write():
     clock.move(minutes=5)
     ms.write(force=True)
     before = store.gets
-    got, _, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 12, 23, 59, tzinfo=UTC))
+    got, _, _ = ms.history(datetime(2026, 11, 12, 23, tzinfo=UTC), datetime(2026, 11, 12, 23, 59, tzinfo=UTC))
     assert store.gets == before + 1  # read from the file, not from memory
     assert [p["ts"] for p in got] == ["2026-11-12T23:58:00Z"]
 
@@ -433,9 +465,13 @@ def test_history_over_two_days_with_memory_only_point():
     store.put(path(DAY1), json.dumps(minute(DAY1, 23, 0)) + "\n" + json.dumps(minute(DAY1, 23, 1)) + "\n")
     ms.load_today()
     ms.add([minute(DAY2, 0, 5)])
-    got, step, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 14, tzinfo=UTC))
+    got, step, _ = ms.history(datetime(2026, 11, 12, 22, tzinfo=UTC), datetime(2026, 11, 13, 2, tzinfo=UTC))
     assert [p["ts"] for p in got] == ["2026-11-12T23:00:00Z", "2026-11-12T23:01:00Z", "2026-11-13T00:05:00Z"]
     assert step == 60
+    # Two days have 2881 minutes, so the step is 6 minutes and the two points of 23:00 merge.
+    got, step, _ = ms.history(datetime(2026, 11, 12, tzinfo=UTC), datetime(2026, 11, 14, tzinfo=UTC))
+    assert [(p["ts"], p["requests"]) for p in got] == [("2026-11-12T23:00:00Z", 2), ("2026-11-13T00:00:00Z", 1)]
+    assert step == 360
 
 
 def test_history_bounds_are_inclusive():
@@ -452,7 +488,7 @@ def test_history_missing_day_file_is_empty():
     ms, _, _ = make()
     ms.load_today()
     got, step, _ = ms.history(datetime(2026, 11, 1, tzinfo=UTC), datetime(2026, 11, 5, tzinfo=UTC))
-    assert (got, step) == ([], 60)
+    assert (got, step) == ([], 60 * 12)
 
 
 def test_history_broken_line_skipped_in_past_day():
@@ -624,8 +660,43 @@ def test_write_never_raises_on_unexpected_error(caplog, monkeypatch):
     def boom(day):
         raise RuntimeError("surprise")
 
-    monkeypatch.setattr(ms, "_ensure_read", boom)
+    monkeypatch.setattr(ms, "_read_again", boom)
     with caplog.at_level(logging.ERROR):
         ms.write(force=True)
     assert "surprise" in caplog.text
     assert store.ls(f"{ROOT}/metrics") == []
+
+
+def test_write_keeps_a_point_that_another_writer_put_after_load_today():
+    ms, store, clock = make()
+    ms.load_today()
+    # An old container writes its last point after this one read the file.
+    store.put(path(DAY1), json.dumps(minute(DAY1, 9, 58, requests=4)) + "\n")
+    ms.add([minute(DAY1, 9, 59)])
+    ms.write(force=True)
+    lines = [json.loads(line) for line in store.get(path(DAY1)).decode().splitlines()]
+    assert [(p["ts"], p["requests"]) for p in lines] == [("2026-11-12T09:58:00Z", 4), ("2026-11-12T09:59:00Z", 1)]
+
+
+def test_write_memory_wins_over_the_file_for_the_same_ts():
+    ms, store, clock = make()
+    ms.load_today()
+    store.put(path(DAY1), json.dumps(minute(DAY1, 9, 59, requests=4)) + "\n")
+    ms.add([minute(DAY1, 9, 59, requests=7)])
+    ms.write(force=True)
+    lines = [json.loads(line) for line in store.get(path(DAY1)).decode().splitlines()]
+    assert [(p["ts"], p["requests"]) for p in lines] == [("2026-11-12T09:59:00Z", 7)]
+
+
+def test_write_skips_the_put_when_the_read_before_it_fails():
+    store = FailingGet()
+    store.fail = False
+    ms, _, _ = make(store)
+    ms.load_today()
+    ms.add([minute(DAY1, 9, 0)])
+    store.fail = True
+    ms.write(force=True)
+    assert path(DAY1) not in store.ls(f"{ROOT}/metrics")
+    store.fail = False
+    ms.write(force=True)
+    assert [json.loads(line)["ts"] for line in store.get(path(DAY1)).decode().splitlines()] == ["2026-11-12T09:00:00Z"]

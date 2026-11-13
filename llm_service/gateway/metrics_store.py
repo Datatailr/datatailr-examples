@@ -33,21 +33,31 @@ def _maximum(values: list) -> object:
     return max(values) if values else None
 
 
-def merge_points(points: list[dict], limit: int = MAX_POINTS) -> tuple[list[dict], int]:
-    """Return at most `limit` points and the step in seconds.
+def merge_points(
+    points: list[dict], since: datetime, until: datetime, limit: int = MAX_POINTS
+) -> tuple[list[dict], int]:
+    """Merge the points of the range from `since` to `until` into time buckets. Return them and the step in seconds.
 
-    Neighbor points merge in groups of the same size. The last group can be smaller. Counts and token numbers add up.
+    The buckets start at the minute of `since`. The step is `ceil(minutes / limit)` minutes, at
+    least 1, where `minutes` counts the minutes that the range touches. So at most `limit` buckets
+    exist. A point goes to the bucket `floor((ts - start) / step)`. An empty bucket gives no point.
+    The `ts` of a merged point is the start of its bucket. Counts and token numbers add up.
     Maximum values and percentiles take the maximum, or null if each value is null.
-    `gpu_memory_total` takes the last value that is not null. `ts` is the `ts` of
-    the first point of the group.
+    `gpu_memory_total` takes the last value that is not null.
     """
-    size = max(1, math.ceil(len(points) / limit))
-    if size == 1:
+    start = since.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    minutes = int((until - start).total_seconds() // 60) + 1
+    step = max(1, math.ceil(minutes / limit))
+    if step == 1:
         return [dict(p) for p in points], 60
+    buckets: dict[int, list[dict]] = {}
+    for p in points:
+        index = int((_parse_ts(p["ts"]) - start).total_seconds() // (60 * step))
+        buckets.setdefault(index, []).append(p)
     merged = []
-    for start in range(0, len(points), size):
-        group = points[start:start + size]
-        out = {"ts": group[0]["ts"]}
+    for index in sorted(buckets):
+        group = buckets[index]
+        out = {"ts": _iso(start + timedelta(minutes=step * index))}
         for name in _SUM_FIELDS:
             out[name] = sum(p.get(name) or 0 for p in group)
         for name in _MAX_FIELDS:
@@ -55,7 +65,11 @@ def merge_points(points: list[dict], limit: int = MAX_POINTS) -> tuple[list[dict
         totals = [p.get("gpu_memory_total") for p in group if p.get("gpu_memory_total") is not None]
         out["gpu_memory_total"] = totals[-1] if totals else None
         merged.append(out)
-    return merged, 60 * size
+    return merged, 60 * step
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _parse_ts(ts: str) -> datetime:
@@ -133,13 +147,21 @@ class MetricsStore:
         return _parse_lines(raw, day)
 
     def _ensure_read(self, day: str) -> bool:
-        """Merge the stored points of `day` under the points in memory. Return False on an error.
+        """Merge the stored points of `day` under the points in memory once. Return False on an error.
 
         Call it with the write lock held. The current day stays read. A past day leaves memory.
         """
         with self._lock:
             if day in self._read:
                 return True
+        return self._read_again(day)
+
+    def _read_again(self, day: str) -> bool:
+        """Read the file of `day` and keep each stored point whose `ts` memory lacks. Return False on an error.
+
+        Call it with the write lock held. The memory wins for a `ts` that both have. A write
+        calls it before each put, so a point of another writer stays in the file.
+        """
         stored = self._fetch(day)
         if stored is None:
             return False
@@ -215,7 +237,7 @@ class MetricsStore:
                     return
             self._last_write = now
         for day in days:
-            if not self._ensure_read(day):
+            if not self._read_again(day):
                 continue  # the points stay in memory, a later write reads again
             with self._lock:
                 version = self._version.get(day, 0)
@@ -238,7 +260,7 @@ class MetricsStore:
     def history(self, since: datetime, until: datetime) -> tuple[list[dict], int, list[str]]:
         """Return the points with `since <= ts <= until`, the step and the failed days.
 
-        The points merge to at most `MAX_POINTS`. The failed days are the sorted days
+        The points merge into at most `MAX_POINTS` time buckets, see `merge_points`. The failed days are the sorted days
         whose file read failed. A missing file is not a failure. A failed read logs one
         error for the call. Raise `ValueError` if `since` is after `until` or if the
         range is longer than `MAX_DAYS` days.
@@ -277,7 +299,7 @@ class MetricsStore:
                     continue
                 if since <= moment <= until:
                     chosen.append(merged[ts])
-        merged_points, step = merge_points(chosen)
+        merged_points, step = merge_points(chosen, since, until)
         return merged_points, step, sorted(failed)
 
     def _fetch_for_history(self, day: str) -> dict[str, dict] | None:

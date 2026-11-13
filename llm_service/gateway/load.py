@@ -12,6 +12,8 @@ from typing import Callable
 
 POINTS_KEPT = 60
 SAMPLES_KEPT = 12
+# A minute has 12 samples. After a backward step of the clock, more samples reach one minute.
+SAMPLES_PER_MINUTE = 24
 MINUTES_PENDING = 61
 VALUES_KEPT = 100_000
 
@@ -66,7 +68,7 @@ class _Minute:
         self.completion_tokens = 0
         self.ttft: list[int] = []
         self.duration: list[int] = []
-        self.samples: list[dict] = []
+        self.samples: deque[dict] = deque(maxlen=SAMPLES_PER_MINUTE)  # the oldest sample leaves first
 
     def point(self, start: datetime) -> dict:
         totals = [s["gpu_memory_total"] for s in self.samples if s["gpu_memory_total"] is not None]

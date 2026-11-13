@@ -2351,8 +2351,9 @@ def test_history_returns_the_points_the_store_wrote(tmp_path):
         c.app.state.metrics.write(force=True)
         assert f"{METRICS_DIR}/{DAY}.jsonl" in store.ls(METRICS_DIR)
         body = history(c, "2026-11-09T23:00:00Z", "2026-11-10T13:00:00+00:00").json()
-        assert body["step_seconds"] == 60 and body["missing_days"] == []
-        assert [p["ts"] for p in body["points"]] == ["2026-11-09T23:59:00Z", "2026-11-10T12:00:00Z"]
+        # The range touches 841 minutes, so a point covers 2 minutes and has the start of its bucket as ts.
+        assert body["step_seconds"] == 120 and body["missing_days"] == []
+        assert [p["ts"] for p in body["points"]] == ["2026-11-09T23:58:00Z", "2026-11-10T12:00:00Z"]
         assert body["points"][1]["requests"] == 1
         # A time without a zone counts as UTC.
         naive = history(c, "2026-11-10T12:00:00", "2026-11-10T12:30:00").json()

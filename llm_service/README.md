@@ -543,13 +543,13 @@ curl "http://llm-service/admin/metrics/history?since=2026-11-12T00:00:00Z&until=
 {"step_seconds": 60, "points": [ ... ], "missing_days": []}
 ```
 
-The range is at most 31 days as a duration. If the range has more than 500 points, the service merges neighbor points into at most 500. Counts and token sums add up. Maximum values stay maximum values. A percentile becomes the maximum of the merged percentiles. `step_seconds` is the time that one returned point covers. `missing_days` lists the UTC days whose file the service did not manage to read. A day with no file is not a failure.
+The range is at most 31 days as a duration. The range touches a count of minutes, counted from the minute of `since`. The step is that count divided by 500 and rounded up, at least 1 minute. The service puts each point into the time bucket of one step that holds it. The buckets start at the minute of `since`. Each bucket with points gives one point, with the start of the bucket as `ts`. A bucket without points gives no point, so a gap stays a gap. A range of up to 500 minutes keeps each point as it is. Counts and token sums add up. Maximum values stay maximum values. A percentile becomes the maximum of the merged percentiles. `step_seconds` is the time that one returned point covers. `missing_days` lists the UTC days whose file the service did not manage to read. A day with no file is not a failure.
 
 A time that is not valid, a `since` after `until` or a range over 31 days gets 400 `invalid_time`. A caller who is not an admin gets 403.
 
 ### The history files
 
-The service writes one file for each UTC day: `<root>/metrics/<day>.jsonl`. It has one JSON line for each point of the day, in time order. Each 5 minutes, and at a clean stop, the service writes the whole file of each day that has new points. A failed write keeps the points in memory for the next try. If a past day has no good write for one hour, the service drops its points and logs an error.
+The service writes one file for each UTC day: `<root>/metrics/<day>.jsonl`. It has one JSON line for each point of the day, in time order. Each 5 minutes, and at a clean stop, the service writes the whole file of each day that has new points. Before each write, the service reads the file again and keeps each stored point that its memory does not have. For a minute in both, the memory wins. So the last points of an old container that still runs for a moment stay in the file. A failed read or write keeps the points in memory for the next try. If a past day has no good write for one hour, the service drops its points and logs an error.
 
 At the start, the service reads the file of the current day and continues it.
 

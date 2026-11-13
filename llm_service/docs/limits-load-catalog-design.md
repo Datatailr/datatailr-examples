@@ -205,7 +205,7 @@ The service keeps the last 60 points and the last 12 samples in memory.
 
 The history has one file for each UTC day: `<blob root>/metrics/<day>.jsonl`. A file has one JSON line for each point of that day, in time order. A full day has 1440 lines.
 
-Each 5 minutes, and at shutdown, the task writes the file of each day that has new points. It writes the whole file again, with all points of the day so far. So a read of the history needs one file for each day.
+Each 5 minutes, and at shutdown, the task writes the file of each day that has new points. It writes the whole file again, with all points of the day so far. So a read of the history needs one file for each day. Before each write, the service reads the file again and keeps each stored point that its memory does not have. For a minute in both, the memory wins. So the last points of an old container that still runs for a moment stay in the file. A failed read skips the write of that day until a later try.
 
 At the start, the service reads the file of the current day and continues it. The points of the minutes when the service did not run are missing.
 
@@ -226,7 +226,7 @@ Both are for admins.
  "points": [ ... the last 60 points ... ]}
 ```
 
-`GET /admin/metrics/history?since=<time>&until=<time>` reads the files of the days in the range. `since` and `until` are ISO times. The range is at most 31 days as a duration. If the range has more than 500 points, the service merges neighbor points into at most 500. Sums stay sums and maximum values stay maximum values. A percentile becomes the maximum of the merged percentiles. The answer names the step in seconds.
+`GET /admin/metrics/history?since=<time>&until=<time>` reads the files of the days in the range. `since` and `until` are ISO times. The range is at most 31 days as a duration. The range touches a count of minutes, counted from the minute of `since`. The step is that count divided by 500 and rounded up, at least 1 minute. The service puts each point into the time bucket of one step that holds it. The buckets start at the minute of `since`. Each bucket with points gives one point, with the start of the bucket as `ts`. A bucket without points gives no point, so a gap stays a gap. A range of up to 500 minutes keeps each point as it is. Sums stay sums and maximum values stay maximum values. A percentile becomes the maximum of the merged percentiles. The answer names the step in seconds.
 
 The answer has `step_seconds`, `points` and `missing_days`. `missing_days` lists the UTC days whose file the service did not manage to read. A day with no file is not a failure. The list is empty when each read worked.
 
@@ -325,7 +325,7 @@ A change of the catalog writes an audit event `catalog_change`.
 ## Testing
 
 - Limits: unit tests for the lookup order, each limit with a fake clock and the `Retry-After` values. Other tests cover the parallel counter on each end of a request, the audit records, and each endpoint with its errors.
-- Load: unit tests for the metric parser with sample texts of two vLLM versions, and for the `nvidia-smi` parser. Other tests cover the point builder with percentiles and the merge to 500 points. They also cover the write to blob storage with a failed write, and the retention.
+- Load: unit tests for the metric parser with sample texts of two vLLM versions, and for the `nvidia-smi` parser. Other tests cover the point builder with percentiles and the merge into at most 500 time buckets. They also cover the write to blob storage with a failed write, and the retention.
 - Catalog: unit tests for the file checks, the download states, the 409 cases and the fit rules.
 - App: route tests with fake services, as for the existing routes. The page gets static checks and a check in a browser.
 - On a cluster: a load test with two users, one over each limit. The Load tab during that test. A download of a second model and a switch to it.
