@@ -168,7 +168,7 @@ Each change writes an audit event `limits_change` with the admin name, the targe
 | Requests in flight | A counter in the gateway. |
 | Requests that run and that wait in the engine | The metrics endpoint of vLLM, `GET /metrics` on the engine port. |
 | Generated tokens and prompt tokens | The token counters of the same endpoint. The rate is the change between two samples. |
-| GPU memory used and total | `nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits` |
+| GPU memory used and total | `nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits`. The task reads it at each third sample, so each 15 seconds. The samples between use the last value. |
 | Time to the first token, total time | The gateway measures each request. |
 
 The names of the vLLM metrics changed between versions. The gateway reads each number from a short list of known names and takes the first that exists. The first step of the work checks the names against the installed vLLM version.
@@ -226,9 +226,11 @@ Both are for admins.
  "points": [ ... the last 60 points ... ]}
 ```
 
-`GET /admin/metrics/history?since=<time>&until=<time>` reads the files of the days in the range. `since` and `until` are ISO times. The range is at most 31 days. If the range has more than 500 points, the service merges neighbor points into at most 500: sums stay sums, maximum values stay maximum values, and a percentile becomes the maximum of the merged percentiles. The answer names the step in seconds.
+`GET /admin/metrics/history?since=<time>&until=<time>` reads the files of the days in the range. `since` and `until` are ISO times. The range is at most 31 days as a duration. If the range has more than 500 points, the service merges neighbor points into at most 500. Sums stay sums and maximum values stay maximum values. A percentile becomes the maximum of the merged percentiles. The answer names the step in seconds.
 
-A bad time or a range that is too long gets 400 `invalid_time`.
+The answer has `step_seconds`, `points` and `missing_days`. `missing_days` lists the UTC days whose file the service did not manage to read. A day with no file is not a failure. The list is empty when each read worked.
+
+A bad time, a `since` after `until` or a range that is too long gets 400 `invalid_time`.
 
 ### The app
 

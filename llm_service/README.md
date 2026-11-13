@@ -100,6 +100,7 @@ The script reads these variables at deploy time:
 | `LLM_HF_TOKEN_KEY` | not set | Secret store key of the Hugging Face token. |
 | `LLM_VLLM_ARGS` | not set | Extra arguments for `vllm serve`. |
 | `LLM_PROMPT_RETENTION_DAYS` | not set | Days to keep prompts in the audit log. See [Prompt retention](#prompt-retention). |
+| `LLM_METRICS_RETENTION_DAYS` | `30` | Days to keep the load history files. See [Load and latency](#load-and-latency). |
 | `LLM_ENVIRONMENT` | `dev` | Platform environment: `dev`, `pre` or `prod`. |
 | `LLM_ADMIN_APP_NAME` | `LLM Service Admin` | Name of the admin app. |
 
@@ -315,7 +316,7 @@ After a failed delete, send the same delete again. The second delete removes the
 
 Only an admin can read the audit log. Each request to `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings` makes one record. Each model load also makes one record: a switch, the load at startup and an automatic reload. Other requests make no record.
 
-The list returns the metadata of each record: the time, request id, user, endpoint, model, status, token counts and duration. The list does not return the prompt.
+The list returns the metadata of each record: the time, request id, user, endpoint, model, status, token counts, duration and time to the first token. The list does not return the prompt.
 
 ```bash
 curl "$BASE/admin/audit?user=bob&limit=20" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
@@ -324,6 +325,8 @@ curl "$BASE/admin/audit?user=bob&limit=20" -H "Cookie: __datatailr_user_cookie__
 The filters are `user`, `model`, `since`, `until`, `limit` and `offset`. The values of `since` and `until` are a day like `2026-11-10` or an ISO 8601 time. The default `limit` is 100 and the largest is 1000. The newest records come first.
 
 A request that has an acting user has the extra field `via` with the name of the caller. A request without an acting user has no `via` field. When the acting user is the caller, the record has no `via` field either.
+
+The field `ttft_ms` is the time in milliseconds from the start of the request to the first content of a stream. It is `null` for a request without a stream and for a request without content. A record from before the load numbers has no `ttft_ms` field.
 
 A model load or delete record has the field `event` (`model_switch`, `engine_reload` or `model_delete`) and the field `detail` with the revision or the error. A request record has `event` and `detail` set to `null`.
 
@@ -472,11 +475,107 @@ Each change writes an audit event `limits_change` with the admin name, the targe
 
 The admin app has the Limits tab for an admin of the picked service. It has a card for the default limits and a table of the user entries with the current use. The table shows the limits that apply to each user, from `effective` in the answer of `GET /admin/limits`. A limit from the default is muted. An admin without an entry has "No limit". If the service did not read the limits file, the tab and the card "Your limits" show a note. An admin adds, changes and removes an entry there. An empty field in the default card means no limit. Each viewer sees their own limits in the card "Your limits" on the Connect tab.
 
+## Load and latency
+
+An admin sees how busy a service is now and how busy it was before. The numbers are requests in flight, requests that wait, tokens per second, latency and GPU memory.
+
+### Where the numbers come from
+
+| Number | Source |
+|---|---|
+| Requests in flight | A counter in the gateway. |
+| Requests that run and that wait in the engine | The vLLM metrics endpoint, `GET /metrics` on the engine port. |
+| Prompt and generated tokens per second | The token counters of the same endpoint. The rate is the change between two samples. |
+| GPU memory used and total | `nvidia-smi`. With more than one GPU, the numbers are sums. |
+| Time to the first token and total time | The gateway measures each request. |
+
+The service reads GPU memory at each third sample, so each 15 seconds. The samples between use the last value.
+
+The names of the vLLM metrics differ between versions. The service reads each number from a short list of known names. If the installed vLLM version uses another name, that number shows as empty. The service log then has a warning that names the metric names the service saw. A failure to read the metrics endpoint or `nvidia-smi` also gives an empty number. The service logs the first failure and the recovery. It does not stop, and no request fails.
+
+### The sample and the point
+
+A sample is a set of numbers that the service takes each 5 seconds. At the end of each minute, the service makes one point from the samples of that minute and the requests that ended in it. It keeps the last 60 points and the last 12 samples in memory.
+
+A point has these fields:
+
+| Field | Meaning |
+|---|---|
+| `ts` | The start of the minute, an ISO time in UTC with `Z`. |
+| `requests`, `failed_requests` | The requests that ended in the minute, and those with status 400 or higher. |
+| `in_flight_max`, `waiting_max` | The largest values of the samples of the minute. |
+| `prompt_tokens`, `completion_tokens` | The token sums of the requests that ended in the minute. |
+| `ttft_ms_p50`, `ttft_ms_p95` | The percentiles of the time to the first token, in milliseconds. |
+| `duration_ms_p50`, `duration_ms_p95` | The percentiles of the total time, in milliseconds. |
+| `gpu_memory_used_max`, `gpu_memory_total` | The largest used value and the total of the minute, in MiB. |
+
+A percentile is `null` for a minute without a matching request. A maximum or a GPU value is `null` when no sample of the minute had it.
+
+### Read the load
+
+Both calls are for admins. This call answers from memory. It has the last sample in `now` and the last 60 points.
+
+```bash
+curl http://llm-service/admin/metrics/live
+```
+
+```json
+{"now": {"ts": "2026-11-12T10:15:35Z", "in_flight": 3, "running": 3, "waiting": 0,
+         "prompt_tokens_per_s": 210.0, "completion_tokens_per_s": 96.5,
+         "gpu_memory_used": 14200, "gpu_memory_total": 15360},
+ "points": [{"ts": "2026-11-12T10:14:00Z", "requests": 42, "failed_requests": 1,
+             "in_flight_max": 6, "waiting_max": 2,
+             "prompt_tokens": 9100, "completion_tokens": 5200,
+             "ttft_ms_p50": 310, "ttft_ms_p95": 900,
+             "duration_ms_p50": 2100, "duration_ms_p95": 7400,
+             "gpu_memory_used_max": 14200, "gpu_memory_total": 15360}]}
+```
+
+Before the first sample, each field of `now` is `null`.
+
+The history call reads the points of a time range from blob storage. The values of `since` and `until` are ISO 8601 times.
+
+```bash
+curl "http://llm-service/admin/metrics/history?since=2026-11-12T00:00:00Z&until=2026-11-12T12:00:00Z"
+```
+
+```json
+{"step_seconds": 60, "points": [ ... ], "missing_days": []}
+```
+
+The range is at most 31 days as a duration. If the range has more than 500 points, the service merges neighbor points into at most 500. Counts and token sums add up. Maximum values stay maximum values. A percentile becomes the maximum of the merged percentiles. `step_seconds` is the time that one returned point covers. `missing_days` lists the UTC days whose file the service did not manage to read. A day with no file is not a failure.
+
+A time that is not valid, a `since` after `until` or a range over 31 days gets 400 `invalid_time`. A caller who is not an admin gets 403.
+
+### The history files
+
+The service writes one file for each UTC day: `<root>/metrics/<day>.jsonl`. It has one JSON line for each point of the day, in time order. Each 5 minutes, and at a clean stop, the service writes the whole file of each day that has new points. A failed write keeps the points in memory for the next try. If a past day has no good write for one hour, the service drops its points and logs an error.
+
+At the start, the service reads the file of the current day and continues it.
+
+`LLM_METRICS_RETENTION_DAYS` sets how many days the service keeps. The default is 30. The value is a whole number from 1 to 36500. A background task deletes the older files. Set the variable and deploy the service again:
+
+```bash
+LLM_METRICS_RETENTION_DAYS=90 python deploy.py service
+```
+
+### The Load tab
+
+The admin app has the Load tab, after the Usage tab, for an admin. With one service, the tab shows two rows of tiles and line charts.
+
+- The tiles for this moment: requests in flight, requests that wait, tokens per second and GPU memory.
+- The tiles for the last complete minute: requests and failed requests. Two more tiles show the time to the first token and the total time, each as p50 and p95.
+- Line charts of the points.
+
+A range control has "Last hour", "6 hours", "24 hours", "7 days" and a custom range. With "Last hour", the tab reads the numbers again each 5 seconds. The other ranges read the history once.
+
+With "All services" picked, the tab shows one table row for each service with the numbers of this moment. The app route `GET /api/load` gives these rows. The routes `GET /api/services/{name}/metrics/live` and `GET /api/services/{name}/metrics/history` pass the two service calls through.
+
 ## Admin app
 
 The admin app is a web page for the users of your LLM services. It is the second job that `deploy.py` deploys. It works with each LLM service in its environment, not with one fixed service. It keeps no data, except a list of service names that the owner of the app edits.
 
-The page has a bar at the top with a service picker and a reload button. The picker lists the services with their state. It also has the entry "All services" for the Usage tab. The page keeps the picked service in the address, after the `#`.
+The page has a bar at the top with a service picker and a reload button. The picker lists the services with their state. It also has the entry "All services" for the Usage and Load tabs. The page keeps the picked service in the address, after the `#`.
 
 ### How the app finds services
 
@@ -506,9 +605,9 @@ The platform signs each call of the app as the user who deployed the app. The se
 Each viewer needs access to a service to see anything from it. The service checks this for the viewer, with `LLM_ACCESS_GROUP`. If the service does not answer this check, the page shows "The service did not answer." for it. The Usage tab then names that service as a service without numbers.
 
 - Each user with access sees the Usage tab with their own numbers, and the Connect tab. The Connect tab has the card "Your limits".
-- An admin of a service also sees the numbers of all users of that service. An admin also sees the Audit, Models and Limits tabs. An admin switches the model and deletes cached weights in the Models tab. An admin sets limits in the Limits tab.
+- An admin of a service also sees the numbers of all users of that service. An admin also sees the Audit, Models, Limits and Load tabs. An admin switches the model and deletes cached weights in the Models tab. An admin sets limits in the Limits tab.
 - With "All services" picked, the Usage tab shows totals over all services, by user, by service and by day. A line names each service whose numbers are missing. Another line names each service where the viewer sees only their own numbers.
-- The Audit, Models and Limits tabs work with one service. With "All services" they ask the viewer to pick one.
+- The Audit, Models and Limits tabs work with one service. With "All services" they ask the viewer to pick one. The Load tab shows a table with one row for each service instead.
 
 The platform user names of the viewers must be ASCII. The app sends the name in an HTTP header. For a name that is not ASCII, the app answers 401 with the code `missing_user`.
 
@@ -542,6 +641,7 @@ All data is in blob storage, under the root directory in `LLM_BLOB_ROOT`:
 <root>/usage/<day>.json                              # totals of one finished day
 <root>/usage/<day>.partial.json                      # checkpoint of the current day
 <root>/limits.json                                   # the limits of the users, if an admin set any
+<root>/metrics/<day>.jsonl                           # load points of one UTC day
 ```
 
 The service writes `.complete` after the last weight file. The marker lists each file with its size. An upload that stops half way is not used. When the service downloads a model from blob storage, it downloads only the listed files and checks their sizes. If a file is missing or has the wrong size, the load fails with an error that names the file.
@@ -576,6 +676,9 @@ The first start after the upgrade reads every old layout file of the days withou
 - The token budget passes by the size of the requests in flight. The service checks `tokens_per_day` before a request, and the service knows the tokens of a request only at its end. So a user can pass the budget with parallel requests. The next request is refused.
 - A restart of the service clears the request window and the parallel counter. The token budget stays, because it comes from the usage totals. A crash can lose the tokens of the last seconds, as it does for the usage numbers.
 - The limits are for each service. Each service has its own limits file, and the app shows the limits of the picked service.
+- A restart of the service loses at most 5 minutes of load points, the points that are not in blob storage yet.
+- The service has no load numbers for the minutes when it did not run.
+- A point of a merged history range holds the maximum of the merged percentiles. It is not the true percentile of the longer time.
 - The platform does not start GPU nodes. You must start one.
 
 ## Run the tests
