@@ -2450,3 +2450,173 @@ def test_a_catalog_retry_after_passes_through_when_valid(client, fakes):
     assert client.get("/api/services/svc/catalog", headers=ALICE).headers["retry-after"] == "9"
     fakes.hosts["svc"].answer_headers[("GET", "/admin/catalog")] = {"Retry-After": "soon"}
     assert "retry-after" not in client.get("/api/services/svc/catalog", headers=ALICE).headers
+
+
+# ---- the page: catalog card, memory check and download state
+
+CATALOG_IDS = (
+    "catalog-card", "catalog-missing", "catalog-content", "catalog-note", "catalog-reload", "catalog-body",
+    "catalog-form", "catalog-model", "catalog-revision", "catalog-note-text", "catalog-memory", "catalog-save",
+    "catalog-status", "catalog-dialog", "catalog-remove-text", "catalog-remove-confirm", "serve-fit",
+    "st-download-row", "st-download-state", "st-download-model", "st-download-time", "st-download-error",
+)
+
+
+@pytest.mark.parametrize("element_id", CATALOG_IDS)
+def test_page_has_the_elements_of_the_catalog(element_id):
+    assert f'id="{element_id}"' in (STATIC_DIR / "index.html").read_text()
+
+
+def test_the_catalog_card_comes_before_the_cached_models():
+    page = (STATIC_DIR / "index.html").read_text()
+    panel = page[page.index('id="panel-models"'):page.index('id="panel-limits"')]
+    assert panel.index('id="catalog-card"') < panel.index('id="models-body"') < panel.index('id="serve-form"')
+    assert panel.index('id="serve-form"') < panel.index('id="serve-fit"')
+
+
+def test_the_catalog_form_fields_have_the_limits_of_an_entry():
+    page = (STATIC_DIR / "index.html").read_text()
+    memory = re.search(r'<input[^>]*id="catalog-memory"[^>]*>', page).group(0)
+    for attribute in ('type="number"', 'min="1"', 'max="10000000"', 'step="1"'):
+        assert attribute in memory, attribute
+    assert 'value="main"' in re.search(r'<input[^>]*id="catalog-revision"[^>]*>', page).group(0)
+    assert 'maxlength="500"' in re.search(r'<input[^>]*id="catalog-note-text"[^>]*>', page).group(0)
+
+
+def test_page_calls_the_five_catalog_routes():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "api(servicePath('catalog', service))" in text
+    assert "api(servicePath('catalog', service), {method: 'PUT'" in text
+    assert "api(`${servicePath('catalog', service)}${query({model, revision})}`, {method: 'DELETE'})" in text
+    assert "api(servicePath('models/download', service), {method: 'POST'" in text
+    assert "api(`${servicePath('models/fit', service)}${query({model, revision})}`)" in text
+
+
+def test_page_drops_late_answers_of_the_catalog_and_the_memory_check():
+    text = (STATIC_DIR / "app.js").read_text()
+    for name in ("catalog", "fit"):
+        assert f"current('{name}', call, service," in text, name
+    assert "const FIT_WAIT_MS = 500;" in text
+    # Each change of a field of the serve form makes an older memory check stale at once.
+    schedule = text[text.index("function scheduleFit("):text.index("async function checkFit(")]
+    assert "nextCall('fit')" in schedule and "setTimeout(checkFit, FIT_WAIT_MS)" in schedule
+
+
+def test_the_models_tab_loads_the_catalog_and_polls_for_a_download():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "models: loadModels" in text
+    status = text[text.index("async function loadStatus("):text.index("function startPoll(")]
+    assert "if (pollNeeded(status.engine))" in status
+    poll = text[text.index("async function poll("):text.index("function switchReport(")]
+    assert "if (pollNeeded(status.engine))" in poll
+    assert "loadCatalog(" in poll  # a finished download changes the cached badges of the catalog
+    # The catalog reload of a finished download runs only when the download ended with done.
+    assert "status.engine.download.state === 'done'" in poll
+
+
+def test_the_remove_of_a_catalog_entry_says_that_the_weights_stay():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("function askRemoveEntry("):text.index("async function confirmRemoveEntry(")]
+    assert "The cached weights of the model stay." in body
+    assert "$('catalog-dialog').showModal();" in body
+    clear = text[text.index("function clearServiceData("):text.index("async function refreshServices(")]
+    assert "'catalog-dialog'" in clear and "clearCatalog();" in clear
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_page_catalog_helpers(tmp_path):
+    from llm_service.gateway.weights import validate_model_name, validate_revision
+
+    names = ["org/a", "Qwen/Qwen2.5-1.5B-Instruct", "org", "org/a/b", "/a", "org/", "org/-a", "org/a-", "org/a--b",
+             "org/.a", "org/..", "org/a b", "org/a\n", "o_r.g/n-a_m.e", "org/ä", ""]
+    revisions = ["main", "v1.0", "a_b-c", "", ".", "..", "-x", "a/b", "a b", "abc\n", "ä"]
+    harness = tmp_path / "harness.js"
+    harness.write_text(
+        "const vm = require('vm');\n"
+        "const fs = require('fs');\n"
+        "const context = {URL, console, Intl, document: {addEventListener() {}},\n"
+        "  location: {pathname: '/', origin: 'https://example.test'}};\n"
+        "vm.createContext(context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {validModelName, validRevision,'\n"
+        "  + ' catalogEntry, fitText, fitBadge, needText, mibText, pollNeeded, downloadReport};', context);\n"
+        "const h = context.h;\n"
+        "const input = JSON.parse(process.argv[3]);\n"
+        "const fit = (fits, needed, available, basis, source) => h.fitText({fits, needed_mib: needed,\n"
+        "  available_mib: available, basis, available_source: source});\n"
+        "const entry = (model, revision, note, memory) => h.catalogEntry({model, revision, note, memory});\n"
+        "console.log(JSON.stringify({\n"
+        "  names: input.names.map(h.validModelName), revisions: input.revisions.map(h.validRevision),\n"
+        "  entries: [entry(' org/a ', ' ', ' Small. ', ''), entry('org/a', 'v1', '', '6000'),\n"
+        "            entry('org', 'main', '', ''), entry('org/a', 'a/b', '', ''), entry('org/a', 'main', 'x'.repeat(501), ''),\n"
+        "            entry('org/a', 'main', '\\u00e4'.repeat(500), ''), entry('org/a', 'main', '', '0'),\n"
+        "            entry('org/a', 'main', '', '10000001'), entry('org/a', 'main', '', '1.5'),\n"
+        "            entry('org/a', 'main', '', '10000000')],\n"
+        "  fits: [fit('yes', 6000, 15360, 'catalog', 'container'), fit('no', 20480, 15360, 'weights', 'nvidia-smi'),\n"
+        "         fit('unknown', null, 15360, 'unknown', 'container'), fit('unknown', 6000, null, 'catalog', null),\n"
+        "         fit('unknown', null, null, 'unknown', null)],\n"
+        "  badges: ['yes', 'no', 'unknown', undefined].map(fits => h.fitBadge({fits})),\n"
+        "  needs: [h.needText({needed_mib: 6000, basis: 'catalog'}), h.needText({needed_mib: null, basis: 'unknown'}),\n"
+        "          h.needText(undefined)],\n"
+        "  mib: [h.mibText(15360), h.mibText(6000), h.mibText(1), h.mibText(null)],\n"
+        "  polls: [h.pollNeeded({state: 'loading'}), h.pollNeeded({state: 'ready', rolling_back: {model: 'org/a'}}),\n"
+        "          h.pollNeeded({state: 'ready', download: {state: 'running'}}),\n"
+        "          h.pollNeeded({state: 'ready', download: {state: 'done'}}),\n"
+        "          h.pollNeeded({state: 'ready', download: null}), h.pollNeeded({state: 'ready'})],\n"
+        "  reports: [h.downloadReport({model: 'org/a', revision: 'main', state: 'done', error: null}),\n"
+        "            h.downloadReport({model: 'org/a', revision: 'main', state: 'failed', error: 'no space.'})],\n"
+        "}));\n"
+    )
+    argument = json.dumps({"names": names, "revisions": revisions})
+    out = subprocess.run(["node", str(harness), str(STATIC_DIR / "app.js"), argument],
+                         check=True, capture_output=True, text=True).stdout
+    result = json.loads(out)
+
+    def accepted(check, value):
+        try:
+            check(value)
+        except ValueError:
+            return False
+        return True
+
+    # The page uses the rule of the service.
+    assert result["names"] == [accepted(validate_model_name, name) for name in names]
+    assert result["revisions"] == [accepted(validate_revision, revision) for revision in revisions]
+    assert result["entries"][:2] == [
+        {"entry": {"model": "org/a", "revision": "main", "note": "Small.", "gpu_memory_mib": None}},
+        {"entry": {"model": "org/a", "revision": "v1", "note": "", "gpu_memory_mib": 6000}},
+    ]
+    name_error = "The model name needs the form org/name, with letters, digits, \".\", \"_\" and \"-\"."
+    revision_error = "The revision has letters, digits, \".\", \"_\" and \"-\" only."
+    note_error = "The note has at most 500 characters."
+    memory_error = "The needed GPU memory is a whole number of MiB from 1 to 10,000,000. Leave it empty if unknown."
+    assert result["entries"][2:] == [
+        {"error": name_error}, {"error": revision_error}, {"error": note_error},
+        {"entry": {"model": "org/a", "revision": "main", "note": "ä" * 500, "gpu_memory_mib": None}},
+        {"error": memory_error}, {"error": memory_error}, {"error": memory_error},
+        {"entry": {"model": "org/a", "revision": "main", "note": "", "gpu_memory_mib": 10000000}},
+    ]
+    assert result["fits"] == [
+        {"kind": "yes", "text": "The model fits. It needs 5.9 GiB, from the catalog. "
+                                "The GPU memory of the container is 15.0 GiB."},
+        {"kind": "no", "text": "The model does not fit. It needs 20.0 GiB, from the size of the cached weights, "
+                               "plus 20 percent. The GPU memory of the node is 15.0 GiB. "
+                               "A switch can still start, but the load can fail."},
+        {"kind": "unknown", "text": "The memory check has no result. The service does not know the GPU memory "
+                                    "that the model needs. Add the model to the catalog with its memory, "
+                                    "or download it first."},
+        {"kind": "unknown", "text": "The memory check has no result. "
+                                    "The service does not know the GPU memory of the container."},
+        {"kind": "unknown", "text": "The memory check has no result. The service does not know the GPU memory "
+                                    "that the model needs. Add the model to the catalog with its memory, "
+                                    "or download it first. The service does not know the GPU memory of the container."},
+    ]
+    assert result["badges"] == [{"label": "fits", "kind": "yes"}, {"label": "does not fit", "kind": "no"},
+                                {"label": "unknown", "kind": "unknown"}, {"label": "unknown", "kind": "unknown"}]
+    assert result["needs"] == [{"value": "5.9 GiB", "basis": "from the catalog"},
+                               {"value": "unknown", "basis": ""}, {"value": "unknown", "basis": ""}]
+    assert result["mib"] == ["15.0 GiB", "5.9 GiB", "0.0 GiB", "-"]
+    assert result["polls"] == [True, True, True, False, False, False]
+    assert result["reports"] == [
+        {"text": "The download of org/a @ main is complete. The model is in the cache now.", "ok": True},
+        {"text": "The download of org/a @ main failed: no space.", "ok": False},
+    ]

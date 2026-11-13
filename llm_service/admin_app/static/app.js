@@ -24,7 +24,8 @@ const number = new Intl.NumberFormat();
 // `service` is the picked service, or null for "All services". `services` is the answer of
 // `GET api/services`. A request of a tab keeps the service of its start and drops a late answer.
 const state = {tab: null, service: null, services: null, range: '30', loaded: {}, offset: 0,
-               polling: false, pollTimer: null, pollFailures: 0, pollService: null,
+               polling: false, pollTimer: null, pollFailures: 0, pollService: null, switching: false,
+               pollFollows: {switching: false, downloading: false}, fitTimer: null, pendingCatalogRemove: null,
                detailUser: null, chartsOff: false,
                loadRange: 'hour', loadCharts: {}, loadNow: null,
                charts: {}, pendingDelete: null, pendingRemove: null, auditUsersRead: false, calls: {},
@@ -212,7 +213,7 @@ async function guarded(work) {
 // ---- tabs
 
 const TABS = ['usage', 'load', 'connect', 'audit', 'models', 'limits'];
-const LOADERS = {usage: loadUsage, load: loadLoad, connect: loadConnect, audit: loadAudit, models: loadStatus,
+const LOADERS = {usage: loadUsage, load: loadLoad, connect: loadConnect, audit: loadAudit, models: loadModels,
                  limits: loadLimits};
 /** `one`: the tab works on one service. With "All services", the elements `<tab>-pick` (a note)
  * and `<tab>-content` swap. `admin`: the tab shows only for an admin of the picked service. An
@@ -387,8 +388,9 @@ function clearServiceData() {
   state.detailUser = null;
   state.pendingDelete = null;
   state.pendingRemove = null;
+  state.pendingCatalogRemove = null;
   $('detail').hidden = true;
-  for (const id of ['record-dialog', 'confirm-dialog', 'remove-dialog']) if ($(id).open) $(id).close();
+  for (const id of ['record-dialog', 'confirm-dialog', 'remove-dialog', 'catalog-dialog']) if ($(id).open) $(id).close();
   for (const id of ['tile-requests', 'tile-failed', 'tile-tokens', 'tile-users']) $(id).textContent = '-';
   for (const chart of Object.values(state.charts)) setChart(chart, [], []);
   $('usage-note').hidden = true;
@@ -406,6 +408,7 @@ function clearServiceData() {
   clearMyLimits();
   clearLimits();
   clearLoad();
+  clearCatalog();
 }
 
 /** Read the list of services again and show what depends on it. */
@@ -1625,6 +1628,10 @@ function pageAudit(step) {
 
 /** True while a switch runs or a failed switch loads the previous model again. */
 const busy = engine => engine.state === 'loading' || Boolean(engine.rolling_back);
+/** True while a download without a switch runs. An older service has no `download` field. */
+const downloading = engine => Boolean(engine && engine.download && engine.download.state === 'running');
+/** The poll rule: the page reads the state while a switch loads or a download runs. */
+const pollNeeded = engine => busy(engine) || downloading(engine);
 
 function showHeader(engine) {
   const loading = engine.state === 'loading';
@@ -1632,6 +1639,21 @@ function showHeader(engine) {
     : engine.rolling_back ? `Loading ${modelText(engine.rolling_back)} again`
     : engine.serving ? modelText(engine.serving) : 'The service serves no model.';
   $('serving-dot').className = `dot ${busy(engine) ? 'loading' : engine.state}`;
+}
+
+// The class of the badge of each state of a download.
+const DOWNLOAD_BADGES = {running: 'loading', done: 'ready', failed: 'failed'};
+
+/** The last download of the engine card: model, revision, state, start time and error. */
+function showDownload(download) {
+  $('st-download-row').hidden = !download;
+  if (!download) return;
+  $('st-download-state').textContent = download.state;
+  $('st-download-state').className = `badge ${ownValue(DOWNLOAD_BADGES, download.state) || ''}`;
+  $('st-download-model').textContent = modelText(download);
+  $('st-download-time').textContent = download.started_at ? `Started at ${localText(download.started_at, true)}.` : '';
+  $('st-download-error').textContent = download.error || '';
+  $('st-download-error').hidden = !download.error;
 }
 
 function showStatus({engine, models}) {
@@ -1645,8 +1667,10 @@ function showStatus({engine, models}) {
   $('st-rollback-row').hidden = !engine.rolling_back;
   $('st-rollback').textContent = engine.rolling_back
     ? `The service loads ${modelText(engine.rolling_back)} again after a failed switch.` : '-';
+  showDownload(engine.download || null);
   replaceRows($('models-body'), models.map(modelRow), 5, 'The service has no cached model.');
-  setBusy(state.polling);
+  state.switching = busy(engine);
+  setBusy(state.switching);
 }
 
 function modelRow(entry) {
@@ -1672,10 +1696,16 @@ function modelRow(entry) {
     el('td', {}, actions));
 }
 
+/** Turn the buttons of a switch off while a switch runs. A download alone keeps them on. */
 function setBusy(busy) {
   for (const button of document.querySelectorAll('[data-busy]')) button.disabled = busy;
   $('serve-submit').disabled = busy;
-  $('poll-text').hidden = !busy;
+}
+
+/** The loader of the tab: the catalog card reads on its own and shows its own errors. */
+async function loadModels() {
+  loadCatalog(state.service);
+  await loadStatus();
 }
 
 async function loadStatus() {
@@ -1684,18 +1714,23 @@ async function loadStatus() {
   const call = nextCall('status');
   const status = await current('status', call, service, api(servicePath('status', service)));
   showStatus(status);
-  if (busy(status.engine)) startPoll();
+  if (pollNeeded(status.engine)) startPoll({switching: busy(status.engine), downloading: downloading(status.engine)});
 }
 
-/** Poll the state of the picked service. A stop or a new poll makes the answers of the old poll stale. */
-function startPoll() {
-  if (state.polling) return;
-  state.polling = true;
-  state.pollFailures = 0;
-  state.pollService = state.service;
-  setBusy(true);
-  const run = nextCall('poll');
-  state.pollTimer = setTimeout(() => poll(run), POLL_MS);
+/** Poll the state of the picked service. A stop or a new poll makes the answers of the old poll stale.
+ * `follows` names what the poll reports at its end: a switch, a download or both. */
+function startPoll(follows = {}) {
+  if (!state.polling) {
+    state.polling = true;
+    state.pollFailures = 0;
+    state.pollService = state.service;
+    state.pollFollows = {switching: false, downloading: false};
+    $('poll-text').hidden = false;
+    const run = nextCall('poll');
+    state.pollTimer = setTimeout(() => poll(run), POLL_MS);
+  }
+  if (follows.switching) state.pollFollows.switching = true;
+  if (follows.downloading) state.pollFollows.downloading = true;
 }
 
 function stopPoll() {
@@ -1703,11 +1738,13 @@ function stopPoll() {
   nextCall('poll');
   state.pollTimer = null;
   state.polling = false;
+  state.switching = false;
+  $('poll-text').hidden = true;
   setBusy(false);
 }
 
-/** Read the state until the switch and a rollback after it end. Stop after MAX_POLL_FAILURES failed
- * reads in a row. */
+/** Read the state until the switch, a rollback after it and a download end. Stop after MAX_POLL_FAILURES
+ * failed reads in a row. */
 async function poll(run) {
   state.pollTimer = null;
   const stale = () => run !== state.calls.poll;
@@ -1728,26 +1765,41 @@ async function poll(run) {
   if (stale()) return;
   state.pollFailures = 0;
   showStatus(status);
-  if (busy(status.engine)) {
+  if (busy(status.engine)) state.pollFollows.switching = true;
+  if (downloading(status.engine)) state.pollFollows.downloading = true;
+  if (pollNeeded(status.engine)) {
     state.pollTimer = setTimeout(() => poll(run), POLL_MS);
     return;
   }
+  const follows = state.pollFollows;
+  const service = state.pollService;
   stopPoll();
-  reportSwitch(status.engine);
+  const reports = [];
+  if (follows.switching) reports.push(switchReport(status.engine));
+  if (follows.downloading && status.engine.download) reports.push(downloadReport(status.engine.download));
+  if (reports.length) showBanner(reports.map(({text}) => text).join(' '), reports.every(({ok}) => ok) ? 'ok' : 'error');
+  // The status read above has the new list of cached models. The catalog shows the new cached badge.
+  if (follows.downloading && status.engine.download && status.engine.download.state === 'done') loadCatalog(service);
 }
 
-/** Say how the switch ended. The poll ends only after a rollback, so no rollback runs now. A
- * successful load clears the error, so an error means a failed switch, also when the state is
- * `ready` again with the old model. */
-function reportSwitch(engine) {
+/** How the switch ended. The poll ends only after a rollback, so no rollback runs now. A successful
+ * load clears the error, so an error means a failed switch, also when the state is `ready` again
+ * with the old model. */
+function switchReport(engine) {
   if (engine.error) {
     const now = engine.serving ? `The service still serves ${modelText(engine.serving)}.` : 'The service serves no model.';
-    showBanner(`The switch failed: ${engine.error.replace(/[.\s]+$/, '')}. ${now}`);
-  } else if (engine.state === 'ready') {
-    showBanner(servingText(engine), 'ok');
-  } else {
-    showBanner(`The switch ended in the state ${engine.state}. ${servingText(engine)}`);
+    return {text: `The switch failed: ${engine.error.replace(/[.\s]+$/, '')}. ${now}`, ok: false};
   }
+  if (engine.state === 'ready') return {text: servingText(engine), ok: true};
+  return {text: `The switch ended in the state ${engine.state}. ${servingText(engine)}`, ok: false};
+}
+
+/** How the download `download` ended. */
+function downloadReport(download) {
+  const name = modelText(download);
+  if (download.state === 'done') return {text: `The download of ${name} is complete. The model is in the cache now.`, ok: true};
+  const error = download.error ? `: ${String(download.error).replace(/[.\s]+$/, '')}.` : '.';
+  return {text: `The download of ${name} failed${error}`, ok: false};
 }
 
 async function serve(model, revision) {
@@ -1758,10 +1810,11 @@ async function serve(model, revision) {
                                               body: JSON.stringify({model, revision})});
     showBanner(`The service ${service} loads ${model} @ ${revision}.`, 'ok');
     if (service !== state.service) return;
-    startPoll();  // first, so the poll runs even if the next read fails
+    state.switching = true;
+    startPoll({switching: true});  // first, so the poll runs even if the next read fails
     await loadStatus();
   });
-  if (!done) setBusy(state.polling);
+  if (!done) setBusy(state.switching);
 }
 
 function askDelete(model, revision) {
@@ -1781,8 +1834,258 @@ async function confirmDelete() {
     showBanner(`The service ${service} deleted ${model} @ ${revision}.`, 'ok');
   });
   if (service !== state.service) return;
-  setBusy(state.polling);
+  setBusy(state.switching);
   guarded(loadStatus);
+  loadCatalog(service);  // the cached badge of the catalog changes
+}
+
+// The catalog card and the memory check of the serve form.
+
+const FIT_WAIT_MS = 500;
+const MAX_NOTE = 500;
+const MAX_GPU_MEMORY_MIB = 10000000;
+// The check of a part of a model name or of a revision, as `_PART` and `_valid_part` in gateway/weights.py.
+const NAME_PART = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const validPart = part => NAME_PART.test(part) && part !== '.' && part !== '..';
+
+/** True for a model name `org/name`, by the rule of `validate_model_name` of the service. */
+function validModelName(model) {
+  const parts = typeof model === 'string' ? model.split('/') : [];
+  return parts.length === 2 && parts.every(part => validPart(part) && !part.includes('--') && !part.endsWith('-'));
+}
+
+/** True for a revision of letters, digits, ".", "_" and "-", by the rule of `validate_revision` of the service. */
+const validRevision = revision => typeof revision === 'string' && validPart(revision);
+
+/** The body of `PUT catalog` from the text of the form fields, or `{error}`. An empty revision is `main`.
+ * An empty memory field means unknown. */
+function catalogEntry({model, revision, note, memory}) {
+  const name = model.trim();
+  const rev = revision.trim() || 'main';
+  const text = note.trim();
+  if (!validModelName(name)) {
+    return {error: 'The model name needs the form org/name, with letters, digits, ".", "_" and "-".'};
+  }
+  if (!validRevision(rev)) return {error: 'The revision has letters, digits, ".", "_" and "-" only.'};
+  // The service counts characters, not the UTF-16 units of `length`.
+  if ([...text].length > MAX_NOTE) return {error: `The note has at most ${MAX_NOTE} characters.`};
+  const digits = memory.trim();
+  const mib = digits ? Number(digits) : null;
+  if (digits && !(/^\d+$/.test(digits) && mib >= 1 && mib <= MAX_GPU_MEMORY_MIB)) {
+    return {error: 'The needed GPU memory is a whole number of MiB from 1 to 10,000,000. Leave it empty if unknown.'};
+  }
+  return {entry: {model: name, revision: rev, note: text, gpu_memory_mib: mib}};
+}
+
+/** MiB as GiB with one decimal: "15.0 GiB". */
+const mibText = mib => (numeric(mib) === null ? '-' : `${(mib / 1024).toFixed(1)} GiB`);
+const BASIS_TEXTS = {catalog: 'from the catalog', weights: 'from the size of the cached weights, plus 20 percent'};
+const SOURCE_TEXTS = {'nvidia-smi': 'GPU memory of the node', container: 'GPU memory of the container'};
+const FIT_LABELS = {yes: 'fits', no: 'does not fit'};
+
+/** The label and the kind of the fit badge of a memory check. */
+function fitBadge(fit) {
+  const fits = ownValue(fit, 'fits');
+  const kind = fits === 'yes' || fits === 'no' ? fits : 'unknown';
+  return {label: ownValue(FIT_LABELS, kind) || 'unknown', kind};
+}
+
+/** The needed memory of a memory check and the text of its basis. */
+function needText(fit) {
+  const needed = numeric(ownValue(fit, 'needed_mib'));
+  if (needed === null) return {value: 'unknown', basis: ''};
+  return {value: mibText(needed), basis: ownValue(BASIS_TEXTS, ownValue(fit, 'basis')) || ''};
+}
+
+/** The text of a memory check and its kind: `yes`, `no` or `unknown`. */
+function fitText(fit) {
+  const {kind} = fitBadge(fit);
+  const need = needText(fit);
+  const available = numeric(ownValue(fit, 'available_mib'));
+  const source = ownValue(SOURCE_TEXTS, ownValue(fit, 'available_source')) || 'GPU memory';
+  const needs = `It needs ${need.value}${need.basis ? `, ${need.basis}` : ''}.`;
+  const has = `The ${source} is ${mibText(available)}.`;
+  if (kind === 'yes') return {kind, text: `The model fits. ${needs} ${has}`};
+  if (kind === 'no') {
+    return {kind, text: `The model does not fit. ${needs} ${has} A switch can still start, but the load can fail.`};
+  }
+  const parts = ['The memory check has no result.'];
+  if (need.value === 'unknown') {
+    parts.push('The service does not know the GPU memory that the model needs.',
+               'Add the model to the catalog with its memory, or download it first.');
+  }
+  if (available === null) parts.push('The service does not know the GPU memory of the container.');
+  return {kind, text: parts.join(' ')};
+}
+
+function showCatalogMissing(missing) {
+  $('catalog-missing').hidden = !missing;
+  $('catalog-content').hidden = missing;
+}
+
+function showCatalogNote(text) {
+  $('catalog-note').textContent = text;
+  $('catalog-note').hidden = !text;
+}
+
+/** Read the catalog of `service`. A failure shows a note in the card only, so the rest of the tab works. */
+async function loadCatalog(service) {
+  if (!service) return;
+  const call = nextCall('catalog');
+  let answer;
+  try {
+    answer = await current('catalog', call, service, api(servicePath('catalog', service)));
+  } catch (error) {
+    if (error instanceof StaleAnswer) return;
+    showCatalogMissing(limitsMissing(error));
+    showCatalogNote(`The page did not get the catalog: ${error instanceof ApiError ? error.message : String(error)}`);
+    return;
+  }
+  showCatalogMissing(false);
+  showCatalogNote(answer.loaded === false ? 'The service did not read the catalog file. The service tries again.' : '');
+  const models = Array.isArray(answer.models) ? answer.models : [];
+  replaceRows($('catalog-body'), models.map(catalogRow), 7, 'The catalog has no model.');
+  setBusy(state.switching);
+}
+
+/** A row of the catalog: the entry, its memory check and its buttons. */
+function catalogRow(entry) {
+  const fit = entry.fit || {};
+  const badge = fitBadge(fit);
+  const need = needText(fit);
+  const ref = `${entry.model} at ${entry.revision}`;
+  const actions = el('div', {className: 'pair'},
+    el('button', {type: 'button', className: 'small', 'data-busy': '', text: 'Serve', 'aria-label': `Serve ${ref}`,
+                  onclick: () => serveEntry(entry.model, entry.revision)}),
+    entry.cached ? null : el('button', {type: 'button', className: 'small ghost', text: 'Download',
+                                        'aria-label': `Download ${ref}`,
+                                        onclick: () => downloadModel(entry.model, entry.revision)}),
+    el('button', {type: 'button', className: 'small danger-ghost', text: 'Remove from the list',
+                  'aria-label': `Remove ${ref} from the catalog`,
+                  onclick: () => askRemoveEntry(entry.model, entry.revision)}));
+  return el('tr', {},
+    el('th', {scope: 'row', className: 'mono', text: entry.model}),
+    el('td', {className: 'mono', text: entry.revision}),
+    el('td', {className: entry.note ? 'text' : 'text muted', text: entry.note || '-'}),
+    el('td', {className: 'num'}, need.value, need.basis ? el('span', {className: 'caption basis', text: need.basis}) : null),
+    el('td', {}, el('span', {className: `badge fit-${badge.kind}`, text: badge.label, title: fitText(fit).text})),
+    el('td', {}, el('span', {className: entry.cached ? 'badge cached' : 'badge', text: entry.cached ? 'cached' : 'not cached'})),
+    el('td', {}, actions));
+}
+
+/** Fill the serve form with the entry and start the switch. */
+function serveEntry(model, revision) {
+  $('serve-model').value = model;
+  $('serve-revision').value = revision;
+  scheduleFit();
+  serve(model, revision);
+}
+
+/** Start a download without a switch. A 202 starts the poll. A model in the cache already starts nothing. */
+async function downloadModel(model, revision) {
+  const service = state.service;
+  await guarded(async () => {
+    const answer = await api(servicePath('models/download', service), {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model, revision})});
+    if (answer && answer.state === 'cached') {
+      showBanner(`The service ${service} has ${model} @ ${revision} in its cache already.`, 'ok');
+      if (service === state.service) loadCatalog(service);
+      return;
+    }
+    showBanner(`The service ${service} downloads ${model} @ ${revision}.`, 'ok');
+    if (service !== state.service) return;
+    startPoll({downloading: true});  // first, so the poll runs even if the next read fails
+    await loadStatus();
+  });
+}
+
+async function saveCatalogEntry(event) {
+  event.preventDefault();
+  const service = state.service;
+  if (!service) return;
+  const checked = catalogEntry({model: $('catalog-model').value, revision: $('catalog-revision').value,
+                                note: $('catalog-note-text').value, memory: $('catalog-memory').value});
+  $('catalog-status').textContent = checked.error || '';
+  if (checked.error) return;
+  const {model, revision} = checked.entry;
+  try {
+    await api(servicePath('catalog', service), {method: 'PUT', headers: {'Content-Type': 'application/json'},
+                                                body: JSON.stringify(checked.entry)});
+  } catch (error) {
+    if (service === state.service) {
+      $('catalog-status').textContent = error instanceof ApiError ? error.message : String(error);
+    }
+    return;
+  }
+  showBanner(`The service ${service} saved ${model} @ ${revision} in the catalog.`, 'ok');
+  if (service !== state.service) return;
+  $('catalog-form').reset();
+  loadCatalog(service);
+}
+
+function askRemoveEntry(model, revision) {
+  state.pendingCatalogRemove = {model, revision, service: state.service};
+  $('catalog-remove-text').textContent = `Remove ${model} at revision ${revision} from the catalog? ` +
+    'The cached weights of the model stay. To remove them, use Delete in the table of the cached models.';
+  $('catalog-dialog').showModal();
+}
+
+async function confirmRemoveEntry() {
+  const pending = state.pendingCatalogRemove;
+  state.pendingCatalogRemove = null;
+  $('catalog-dialog').close();
+  if (!pending) return;
+  const {model, revision, service} = pending;
+  await guarded(async () => {
+    await api(`${servicePath('catalog', service)}${query({model, revision})}`, {method: 'DELETE'});
+    showBanner(`The service ${service} removed ${model} @ ${revision} from the catalog. The cached weights stay.`, 'ok');
+  });
+  if (service === state.service) loadCatalog(service);
+}
+
+/** Show the result of the memory check under the serve form. A `no` result is a warning. Null hides the note. */
+function showFit(result) {
+  $('serve-fit').hidden = !result;
+  $('serve-fit').textContent = result ? result.text : '';
+  $('serve-fit').className = result && result.kind === 'no' ? 'note' : 'caption';
+}
+
+/** A change of the serve form: hide the old note, drop a running check, and check again after FIT_WAIT_MS. */
+function scheduleFit() {
+  clearTimeout(state.fitTimer);
+  nextCall('fit');
+  showFit(null);
+  state.fitTimer = setTimeout(checkFit, FIT_WAIT_MS);
+}
+
+/** Read the memory check of the model in the serve form. It never blocks the Serve button. */
+async function checkFit() {
+  const service = state.service;
+  const model = $('serve-model').value.trim();
+  const revision = $('serve-revision').value.trim() || 'main';
+  const call = nextCall('fit');
+  if (!service || !validModelName(model) || !validRevision(revision)) return;
+  try {
+    showFit(fitText(await current('fit', call, service,
+      api(`${servicePath('models/fit', service)}${query({model, revision})}`))));
+  } catch (error) {
+    if (error instanceof StaleAnswer || limitsMissing(error)) return;  // an older service has no check
+    showFit({kind: 'unknown',
+             text: `The page did not get the memory check: ${error instanceof ApiError ? error.message : String(error)}`});
+  }
+}
+
+function clearCatalog() {
+  nextCall('catalog');
+  nextCall('fit');
+  clearTimeout(state.fitTimer);
+  showFit(null);
+  showCatalogMissing(false);
+  showCatalogNote('');
+  $('catalog-body').replaceChildren();
+  $('catalog-form').reset();
+  $('catalog-status').textContent = '';
+  showDownload(null);
 }
 
 // ---- limits
@@ -2069,6 +2372,10 @@ function wire() {
     serve($('serve-model').value.trim(), $('serve-revision').value.trim() || 'main');
   });
   $('confirm-delete').addEventListener('click', confirmDelete);
+  for (const id of ['serve-model', 'serve-revision']) $(id).addEventListener('input', scheduleFit);
+  $('catalog-form').addEventListener('submit', saveCatalogEntry);
+  $('catalog-reload').addEventListener('click', () => loadCatalog(state.service));
+  $('catalog-remove-confirm').addEventListener('click', confirmRemoveEntry);
   $('limits-default-form').addEventListener('submit', saveDefaultLimits);
   $('limits-user-form').addEventListener('submit', saveUserLimits);
   $('limits-user-clear').addEventListener('click', clearUserForm);

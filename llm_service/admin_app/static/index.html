@@ -428,8 +428,45 @@ if (!location.pathname.endsWith('/')) {
         <div><dt>Target of the switch</dt><dd id="st-target">-</dd></div>
         <div class="wide"><dt>Last error</dt><dd id="st-error" class="mono">-</dd></div>
         <div class="wide" id="st-rollback-row" hidden><dt>Rollback</dt><dd id="st-rollback">-</dd></div>
+        <div class="wide" id="st-download-row" hidden><dt>Download</dt>
+          <dd><span class="badge" id="st-download-state">-</span> <span class="mono" id="st-download-model">-</span>
+            <span class="caption" id="st-download-time"></span></dd>
+          <dd class="mono bad" id="st-download-error" hidden></dd></div>
       </dl>
-      <p class="caption" id="poll-text" hidden>The model loads. The page reads the state every 3 seconds.</p>
+      <p class="caption" id="poll-text" hidden>A switch or a download runs. The page reads the state every 3 seconds.</p>
+    </div>
+
+    <div class="card" id="catalog-card">
+      <div class="card-head">
+        <h2>Catalog <span class="caption">The recommended models of this service.</span></h2>
+        <button type="button" class="ghost small" id="catalog-reload">Reload</button>
+      </div>
+      <p class="note" id="catalog-missing" role="status" hidden>This service does not offer a catalog. A newer version of the service has it.</p>
+      <div class="panel" id="catalog-content">
+      <p class="note" id="catalog-note" role="status" hidden></p>
+      <div class="scroll">
+        <table class="grid">
+          <thead><tr>
+            <th scope="col">Model</th><th scope="col">Revision</th><th scope="col">Note</th>
+            <th scope="col" class="num">Needed GPU memory</th><th scope="col">Fit</th><th scope="col">Cache</th>
+            <th scope="col">Actions</th>
+          </tr></thead>
+          <tbody id="catalog-body"></tbody>
+        </table>
+      </div>
+      <div>
+        <h3 class="sub">Add or replace an entry</h3>
+        <form class="toolbar catalog-form" id="catalog-form">
+          <label>Model <input type="text" id="catalog-model" placeholder="org/name" required autocomplete="off"></label>
+          <label>Revision <input type="text" id="catalog-revision" value="main" autocomplete="off"></label>
+          <label>Note <input type="text" id="catalog-note-text" maxlength="500" autocomplete="off"></label>
+          <label>Needed GPU memory (MiB) <input type="number" id="catalog-memory" min="1" max="10000000" step="1" placeholder="Unknown"></label>
+          <button type="submit" id="catalog-save">Save the entry</button>
+        </form>
+        <p class="caption" id="catalog-status" role="status"></p>
+        <p class="caption">An entry with the same model and revision replaces the old entry. An empty memory field means unknown.</p>
+      </div>
+      </div>
     </div>
 
     <div class="card">
@@ -452,6 +489,7 @@ if (!location.pathname.endsWith('/')) {
         <label>Revision <input type="text" id="serve-revision" value="main" required autocomplete="off"></label>
         <button type="submit" id="serve-submit">Serve</button>
       </form>
+      <p class="caption" id="serve-fit" role="status" hidden></p>
       <p class="caption">The service downloads the model if it has no copy, then loads it.</p>
     </div>
     </div>
@@ -539,6 +577,15 @@ if (!location.pathname.endsWith('/')) {
   <div class="actions">
     <button type="button" class="ghost" data-close>Cancel</button>
     <button type="button" class="danger" id="confirm-delete">Delete</button>
+  </div>
+</dialog>
+
+<dialog id="catalog-dialog" aria-labelledby="catalog-remove-title">
+  <h2 id="catalog-remove-title">Remove a model from the catalog</h2>
+  <p id="catalog-remove-text"></p>
+  <div class="actions">
+    <button type="button" class="ghost" data-close>Cancel</button>
+    <button type="button" class="danger" id="catalog-remove-confirm">Remove from the list</button>
   </div>
 </dialog>
 
