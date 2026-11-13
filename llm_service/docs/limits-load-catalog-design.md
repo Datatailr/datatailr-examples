@@ -282,13 +282,15 @@ A model that is not in the catalog still works with the switch and the download,
 `POST /admin/models/download` with `{"model", "revision"}` starts a download and answers 202. The service runs `WeightCache.ensure` in the background. That step downloads the files and stores them in blob storage. After the step, the service removes the local copy if the engine does not use it.
 
 - One download runs at a time. A second request gets 409 `download_in_progress`.
-- A download of a model that is in the cache already answers 200 with `"state": "cached"` and starts nothing.
+- A download of a model that is in the cache already answers 200 with `{"state": "cached", "model", "revision"}` and starts nothing.
+- A bad name or revision gets 400 `invalid_model`. A store error in the check of the cache gets 500 `cache_check_failed`.
 - A model switch during a download waits for the lock of the weight cache, as two switches do today.
-- A delete of the model that downloads gets 409 `model_in_use`.
+- A delete of the model that downloads gets 409 `model_in_use`. This holds also before the files reach blob storage, so the delete does not remove a half-written download.
+- A download of a pair that a delete removes now gets 409 `model_in_use`.
 
-`GET /admin/model` gets the new field `download`: null, or `{"model", "revision", "state", "error", "started_at"}`. `state` is `running`, `done` or `failed`. The last result stays until the next download starts.
+`GET /admin/model` gets the new field `download`: null, or `{"model", "revision", "state", "error", "started_at"}`. `state` is `running`, `done` or `failed`. The last result stays until the next download starts. A download that the service cancels at shutdown ends as `failed` with the error `cancelled`. The field `error` has at most 300 characters.
 
-The service writes an audit event `model_download` at the end, with the admin name and the result.
+The service writes an audit event `model_download` at the end, with the admin name and the result. The record has the status 200 for a good end and 500 for an error.
 
 ### GPU memory check
 
@@ -318,25 +320,26 @@ All are for admins.
 
 | Endpoint | Does |
 |---|---|
-| `GET /admin/catalog` | The entries. Each one gets `cached` (true or false) and the `fit` answer. |
-| `PUT /admin/catalog` | Adds or replaces one entry. Body: the entry. 400 `invalid_catalog_entry`, 409 `catalog_full`. |
-| `DELETE /admin/catalog?model=<name>&revision=<revision>` | Removes one entry. 404 `catalog_entry_not_found`. |
+| `GET /admin/catalog` | `{"models": [...], "loaded": true}`. Each entry gets `cached` (true or false) and the `fit` answer. `loaded` is false when the last read of `catalog.json` failed for a reason other than its content. The list is then empty. |
+| `PUT /admin/catalog` | Adds or replaces one entry. Body: the entry. The answer is the stored entry. 400 `invalid_catalog_entry`, 409 `catalog_full`, 502 `storage_unavailable`. |
+| `DELETE /admin/catalog?model=<name>&revision=<revision>` | Removes one entry. The answer is `{"removed": {"model", "revision"}}`. 400 `invalid_catalog_entry` for a bad name, 404 `catalog_entry_not_found`, 502 `storage_unavailable`. |
 | `POST /admin/models/download` | See above. |
 | `GET /admin/models/fit` | See above. |
 
-A change of the catalog writes an audit event `catalog_change`.
+A change of the catalog writes an audit event `catalog_change` with the target (`model@revision`) and the old and new entries.
 
 ### The app
 
 - New routes that pass through for each endpoint, under `/api/services/{name}/`.
 - The Models tab gets a Catalog card: a table with model, revision, note, needed memory, a fit badge and a cached badge. Each row has the buttons Serve, Download and Remove from the list. A form adds an entry.
 - The "Serve a model" form shows the fit result for the typed model before the switch, as a note. A `no` result shows as a warning and does not block the button.
-- During a download, the Models tab shows its state and reads it again each 3 seconds.
+- A running download shows in the engine card of the Models tab. The tab reads the state again each 3 seconds.
 
 ## Errors
 
 - A failure to read the metrics endpoint or `nvidia-smi` gives null numbers. The service logs the first failure and the recovery, not each try.
 - A failure to write `limits.json` or `catalog.json` answers 502 `storage_unavailable`, and the copy in memory does not change.
+- A failure to read `catalog.json` for a reason other than its content gives an empty catalog and `loaded` false. The flusher and the next write read the file again.
 - The app passes the status and the body of the service through, as its other routes do.
 
 ## Testing
@@ -354,6 +357,7 @@ A change of the catalog writes an audit event `catalog_change`.
 - The limits are for each service. A user with access to two services has two budgets.
 - The percentiles of a merged history point are the maximum of the merged minutes, not a true percentile of the longer time.
 - The fit check does not know the context length or the engine arguments.
+- A restart of the service forgets a running download. The next download of the pair starts again.
 
 ## Out of scope
 
