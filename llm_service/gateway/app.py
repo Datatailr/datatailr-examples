@@ -763,32 +763,46 @@ def create_app(
         app.state.last_admin = admin_user
         return manager.status()
 
-    async def fit_of(model: str, revision: str, cached: list[dict] | None = None) -> dict:
+    def available_memory() -> tuple[int | None, str | None]:
+        """Return the available GPU memory in MiB and its source.
+
+        The source is the total of `nvidia-smi` in the last load sample, else the memory of the
+        container, else None.
+        """
+        available = load.live()["now"]["gpu_memory_total"]
+        if available is not None:
+            return available, "nvidia-smi"
+        if config.gpu_memory_mib is not None:
+            return config.gpu_memory_mib, "container"
+        return None, None
+
+    async def fit_of(
+        model: str,
+        revision: str,
+        cached: list[dict] | None = None,
+        memory: tuple[int | None, str | None] | None = None,
+    ) -> dict:
         """Return the GPU memory check of one pair.
 
         The needed memory comes from the catalog entry, else from the size of the cached pair.
         `cached` is an already read list of `weights.cached()`. Without it, the function reads
-        the list in a thread. A store error then leaves the size unknown. The available memory is
-        the total of `nvidia-smi` in the last load sample, else the memory of the container.
+        the one marker of the pair in a thread. A store error then leaves the size unknown.
+        `memory` is an already read answer of `available_memory()`. Without it, the function
+        reads it.
         """
         entry = catalog.get(model, revision)
         size_bytes = None
         if cached is None:
             try:
-                cached = await asyncio.to_thread(weights.cached)
+                size_bytes = await asyncio.to_thread(weights.size_of, model, revision)
             except Exception as error:
-                logger.warning("the cache list for the fit of %s %s failed: %s", model, revision, error)
-                cached = []
-        for item in cached:
-            if item["model"] == model and item["revision"] == revision:
-                size_bytes = item["size_bytes"]
+                logger.warning("the size read for the fit of %s %s failed: %s", model, revision, error)
+        else:
+            for item in cached:
+                if item["model"] == model and item["revision"] == revision:
+                    size_bytes = item["size_bytes"]
         needed, basis = needed_from(entry, size_bytes)
-        available = load.live()["now"]["gpu_memory_total"]
-        source = "nvidia-smi"
-        if available is None:
-            available, source = config.gpu_memory_mib, "container"
-        if available is None:
-            source = None
+        available, source = memory if memory is not None else available_memory()
         return fit(needed, basis, available, source)
 
     app.state.fit_of = fit_of
@@ -810,13 +824,16 @@ def create_app(
             logger.warning("the cache list for the catalog failed: %s", error)
             cached = None
         have = {(item["model"], item["revision"]) for item in cached or []}
+        memory = available_memory()
         models = []
         for entry in catalog.entries():
             models.append(
                 {
                     **entry,
                     "cached": (entry["model"], entry["revision"]) in have,
-                    "fit": await fit_of(entry["model"], entry["revision"], cached if cached is not None else []),
+                    "fit": await fit_of(
+                        entry["model"], entry["revision"], cached if cached is not None else [], memory
+                    ),
                 }
             )
         return {"models": models, "loaded": catalog.loaded()}
@@ -902,11 +919,14 @@ def create_app(
             validate_revision(revision)
         except ValueError as error:
             raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
-        # A delete removes the marker first. Until then the pair looks cached.
-        if (model, revision) in manager.removing:
-            raise ApiError(
-                409, "invalid_request_error", "model_in_use", f"a delete removes {model} {revision} now"
-            )
+        def check_removing() -> None:
+            # A delete removes the marker first. Until then the pair looks cached.
+            if (model, revision) in manager.removing:
+                raise ApiError(
+                    409, "invalid_request_error", "model_in_use", f"a delete removes {model} {revision} now"
+                )
+
+        check_removing()
         try:
             cached = await asyncio.to_thread(weights.is_cached, model, revision)
         except Exception as error:
@@ -915,6 +935,8 @@ def create_app(
                 500, "server_error", "cache_check_failed",
                 f"the cache check of the model {model!r} failed ({type(error).__name__})",
             ) from None
+        # A delete can start during the cache check.
+        check_removing()
         if cached:
             return JSONResponse({"state": "cached", "model": model, "revision": revision})
         try:

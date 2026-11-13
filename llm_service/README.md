@@ -494,7 +494,7 @@ The available memory has two sources:
 
 The deploy script always passes `LLM_VRAM` to the service. The default is `16g`. The service reads the units `m`, `g` and `t` as binary units, so `16g` is 16,384 MiB.
 
-The field `fits` is `yes` when the needed memory is at most the available memory. It is `no` when the needed memory is larger. It is `unknown` when a number is missing. If the service cannot read the cache list, the answer uses the catalog only, and the call does not fail. A bad name gets 400 `invalid_model`.
+The field `fits` is `yes` when the needed memory is at most the available memory. It is `no` when the needed memory is larger. It is `unknown` when a number is missing. If the service cannot read blob storage, the answer uses the catalog only, and the call does not fail. A bad name gets 400 `invalid_model`.
 
 ### The catalog endpoints
 

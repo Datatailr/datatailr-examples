@@ -309,10 +309,10 @@ The service writes an audit event `model_download` at the end, with the admin na
 - `needed_mib` and `basis`:
   - `catalog`: the `gpu_memory_mib` of the catalog entry.
   - `weights`: the size of the cached weights, times 1.2, rounded up to a whole MiB. The margin covers the working memory of the engine for a short context.
-  - `unknown`: the entry has no `gpu_memory_mib` and the pair is not in the cache, or the cache list is not readable now. `needed_mib` is null.
+  - `unknown`: the entry has no `gpu_memory_mib` and the pair is not in the cache, or blob storage is not readable now. `needed_mib` is null.
 - `fits` is `yes` when the needed memory is at most the available memory, `no` when it is more, and `unknown` when a number is missing.
 
-A read error of the cache list never fails the endpoint. The answer then uses the catalog only.
+A read error of blob storage never fails the endpoint. The answer then uses the catalog only. One fit request reads only the `.complete` marker of its pair. `GET /admin/catalog` lists the cache once and reads the available memory once for all entries.
 
 The check is an estimate. A model that fits can still fail with a long context. The switch does not use the check: an admin can start a switch with each result.
 

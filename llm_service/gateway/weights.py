@@ -299,6 +299,16 @@ class WeightCache:
                 self._sizes[marker] = size
         return size
 
+    def size_of(self, model: str, revision: str) -> int | None:
+        """Return the total size of the files of one pair in blob storage, or None.
+
+        It reads the one marker of the pair through the size memo and lists
+        nothing. None means no usable marker, or a store error with a warning.
+        """
+        validate_model_name(model)
+        validate_revision(revision)
+        return self._size(f"{self._blob_dir(model, revision)}/{COMPLETE}")
+
     def cached(self) -> list[dict]:
         """List the models in blob storage that have a `.complete` marker.
 

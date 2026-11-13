@@ -534,3 +534,30 @@ def test_local_copy_does_not_take_the_cache_lock(fx):
 def test_local_copy_validates_the_names(fx, model, revision):
     with pytest.raises(ValueError):
         fx.cache.local_copy(model, revision)
+
+
+def test_size_of_reads_one_marker_once_and_lists_nothing(tmp_path):
+    fx = Fixture(tmp_path, GetCountingStore())
+    fx.cache.ensure("org/m", "main")
+    fx.store.gets.clear()
+    assert fx.cache.size_of("org/m", "main") == 3
+    assert fx.cache.size_of("org/m", "main") == 3
+    assert fx.store.gets == [MARKER]
+    assert fx.cache.size_of("org/m", "v2") is None
+    # `cached` uses the same memo.
+    fx.store.gets.clear()
+    assert fx.cache.cached()[0]["size_bytes"] == 3
+    assert fx.store.gets == []
+
+
+def test_size_of_lists_nothing(fx):
+    fx.cache.ensure("org/m", "main")
+    fx.store.listings = 0
+    assert fx.cache.size_of("org/m", "main") == 3
+    assert fx.store.listings == 0
+
+
+@pytest.mark.parametrize("model,revision", [("nonsense", "main"), ("org/m", "a/b")])
+def test_size_of_validates_the_names(fx, model, revision):
+    with pytest.raises(ValueError):
+        fx.cache.size_of(model, revision)

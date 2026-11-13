@@ -2728,6 +2728,30 @@ def test_download_of_a_pair_under_removal_is_409(tmp_path):
         store.gate.set()
 
 
+class MarkingExistsStore(MemoryBlobStore):
+    """A store whose check of the org/other marker starts a delete mark of that pair while `manager` is set."""
+
+    manager = None
+
+    def exists(self, path: str) -> bool:
+        if self.manager is not None and path.endswith("org--other/main/.complete"):
+            self.manager.begin_remove("org/other", ["main"])
+        return super().exists(path)
+
+
+def test_download_rechecks_a_delete_that_starts_during_the_cache_check(tmp_path):
+    store = MarkingExistsStore()
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        switch_and_wait(c, "org/other")
+        switch_and_wait(c, "org/a")
+        store.manager = c.app.state.manager
+        r = c.post(DOWNLOAD, headers=ALICE, json={"model": "org/other"})
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "model_in_use"
+        assert c.app.state.manager.download is None
+
+
 def test_shutdown_cancels_a_running_download(tmp_path):
     download = GatedDownload("org/b")
     try:
@@ -2854,19 +2878,19 @@ def test_fit_bad_name_is_400(client):
         assert r.json()["error"]["code"] == "invalid_model"
 
 
-class FailingLsStore(MemoryBlobStore):
-    """A memory store whose listing of the models raises after the start."""
+class FailingMarkerStore(MemoryBlobStore):
+    """A memory store whose read of a model marker raises while `broken` is true."""
 
     broken = False
 
-    def ls(self, prefix: str) -> list[str]:
-        if self.broken and "/models/" in prefix:
+    def get(self, path: str) -> bytes:
+        if self.broken and "/models/" in path and path.endswith("/.complete"):
             raise OSError("store down")
-        return super().ls(prefix)
+        return super().get(path)
 
 
-def test_fit_survives_a_store_error_of_the_cache_list(tmp_path):
-    store = FailingLsStore()
+def test_fit_survives_a_store_error_of_the_marker_read(tmp_path):
+    store = FailingMarkerStore()
     put_catalog(store, {"model": "org/b", "revision": "main", "gpu_memory_mib": 6000})
     with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
         wait_ready(c)
@@ -2874,6 +2898,9 @@ def test_fit_survives_a_store_error_of_the_cache_list(tmp_path):
         assert fit_answer(c, model="org/b")["basis"] == "catalog"
         answer = fit_answer(c, model="org/a")
         assert answer["basis"] == "unknown" and answer["fits"] == "unknown"
+        # A failed read is not kept: the next request reads the marker again.
+        store.broken = False
+        assert fit_answer(c, model="org/a")["basis"] == "weights"
 
 
 def test_fit_of_takes_a_list_of_cached_entries(tmp_path):
@@ -2882,6 +2909,52 @@ def test_fit_of_takes_a_list_of_cached_entries(tmp_path):
         cached = [{"model": "org/q", "revision": "main", "size_bytes": 10 * 2**20}]
         answer = c.portal.call(c.app.state.fit_of, "org/q", "main", cached)
         assert answer["basis"] == "weights" and answer["needed_mib"] == 12
+
+
+class MarkerCountingStore(MemoryBlobStore):
+    """A store that counts the listings of the models folder and the reads of markers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.listings = 0
+        self.marker_reads: list[str] = []
+
+    def ls(self, prefix):
+        if prefix.endswith("/models/"):
+            self.listings += 1
+        return super().ls(prefix)
+
+    def get(self, path):
+        if path.endswith("/.complete"):
+            self.marker_reads.append(path)
+        return super().get(path)
+
+
+def test_one_fit_request_reads_one_marker_and_no_listing(tmp_path):
+    store = MarkerCountingStore()
+    with TestClient(make_app(tmp_path, store=store, download=big_download, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+        wait_download(c, "done")
+        store.listings, store.marker_reads = 0, []
+        answer = fit_answer(c, model="org/b")
+        assert answer["basis"] == "weights" and answer["needed_mib"] == 12
+        assert store.listings == 0
+        assert store.marker_reads == ["llm-service/models/org--b/main/.complete"]
+
+
+def test_get_catalog_reads_the_live_numbers_once(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, ENTRY_B, ENTRY_C, {"model": "org/d", "revision": "main"})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        load = c.app.state.load
+        real, reads = load.live, []
+        load.live = lambda: reads.append(1) or real()
+        models = c.get(CATALOG, headers=ALICE).json()["models"]
+        assert len(models) == 3
+        assert all(m["fit"]["available_mib"] == 15360 for m in models)
+        assert len(reads) == 1
 
 
 def test_catalog_is_loaded_at_start_and_read_again_by_the_flusher(tmp_path):
