@@ -1313,6 +1313,8 @@ async function loadChatScript() {
     const response = await fetch(new URL('api/chat-script', BASE));
     if (!response.ok) throw new Error(String(response.status));
     target.textContent = await response.text();
+    // The Copy button works only with the real file, not with the note of a load or a failure.
+    $('chat-script-copy').disabled = false;
   } catch {
     target.textContent = 'The app did not give the file. Use the Download link, or take chat.py from the example folder.';
   }

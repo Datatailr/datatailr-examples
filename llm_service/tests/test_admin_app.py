@@ -739,6 +739,13 @@ def test_page_shows_the_chat_script_with_copy_and_download():
     assert 'href="api/chat-script?download=1" download="chat.py"' in page
     assert "new URL('api/chat-script', BASE)" in script
     assert "target.textContent = await response.text();" in script
+    # The Copy button starts disabled, and only a good load of the file enables it.
+    button = re.search(r'<button[^>]*id="chat-script-copy"[^>]*>', page).group(0)
+    assert "disabled" in button
+    load = script[script.index("async function loadChatScript"):script.index("async function copyExample")]
+    good, bad = load.split("} catch {")
+    assert "$('chat-script-copy').disabled = false;" in good
+    assert "disabled = false" not in bad
 
 
 def test_page_streams_the_answer_with_stop():

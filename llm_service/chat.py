@@ -125,7 +125,10 @@ NOT_LOGGED_IN = (
 def main(env=os.environ) -> None:
     try:
         client = make_client(env)
-        model = env.get("LLM_MODEL", "").strip() or served_model(client)
+        # Ask the service first, also with LLM_MODEL set. This call finds a login that the
+        # platform does not accept, and gives the clear message for it.
+        served = served_model(client)
+        model = env.get("LLM_MODEL", "").strip() or served
     except RuntimeError as error:
         raise SystemExit(str(error)) from None
     system = {"role": "system", "content": env.get("LLM_SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT}

@@ -55,3 +55,17 @@ def test_a_login_page_as_the_answer_gives_a_clear_error():
 
     with pytest.raises(RuntimeError, match="did not accept the login"):
         chat.served_model(Client())
+
+
+def test_main_asks_the_service_also_with_a_model_set(monkeypatch, capsys):
+    asked = []
+
+    def served(client):
+        asked.append(client)
+        raise RuntimeError(chat.NOT_LOGGED_IN)
+
+    monkeypatch.setattr(chat, "served_model", served)
+    with pytest.raises(SystemExit) as stop:
+        chat.main({"LLM_MODEL": "org/a"})
+    assert len(asked) == 1
+    assert "did not accept the login" in str(stop.value)
