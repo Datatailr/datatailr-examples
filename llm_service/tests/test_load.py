@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from llm_service.gateway import load as load_module
 from llm_service.gateway.load import POINTS_KEPT, SAMPLES_KEPT, LoadMonitor, percentile
 
 START = datetime(2026, 11, 12, 10, 15, 0, tzinfo=timezone.utc)
@@ -261,8 +262,12 @@ def test_bad_records_do_not_raise(env):
     env.monitor.observe(None)
     env.monitor.observe("text")
     env.now = START + timedelta(seconds=60)
-    points = env.sample()
-    assert len(points) <= 1
+    (point,) = env.sample()
+    assert point["requests"] == 1
+    assert point["failed_requests"] == 0
+    assert point["prompt_tokens"] == 0
+    assert point["ttft_ms_p50"] is None
+    assert point["duration_ms_p50"] is None
 
 
 def test_missing_ttft_key_and_null_values(env):
@@ -369,3 +374,48 @@ def test_live_after_several_minutes(env):
     assert live["now"]["ts"] == "2026-11-12T10:17:00Z"
     assert live["now"]["running"] == 2.0
     assert [p["ts"] for p in live["points"]] == ["2026-11-12T10:15:00Z", "2026-11-12T10:16:00Z"]
+
+
+def test_late_record_for_emitted_minute_counts_for_open_minute(env):
+    env.sample()
+    env.now = START + timedelta(seconds=60)
+    env.sample()
+    # The clock goes back into the emitted minute 10:15 while 10:16 is open.
+    env.now = START + timedelta(seconds=59)
+    env.record()
+    env.now = START + timedelta(seconds=120)
+    points = env.sample()
+    assert [(p["ts"], p["requests"]) for p in points] == [("2026-11-12T10:16:00Z", 1)]
+    stamps = [p["ts"] for p in env.monitor.live()["points"]]
+    assert len(stamps) == len(set(stamps))
+
+
+def test_clock_error_in_observe_does_not_raise():
+    def broken():
+        raise RuntimeError("clock")
+
+    LoadMonitor(broken).observe({"endpoint": "/v1/x", "status": 200})
+
+
+def test_pending_minutes_are_bounded(env):
+    for minute in range(200):
+        env.now = START + timedelta(minutes=minute)
+        env.record()
+    assert len(env.monitor._minutes) == load_module.MINUTES_PENDING == 61
+    assert min(env.monitor._minutes) == START + timedelta(minutes=139)
+
+
+def test_values_of_one_minute_are_bounded(env, monkeypatch):
+    monkeypatch.setattr(load_module, "VALUES_KEPT", 3)
+    for i in range(5):
+        env.record(ttft_ms=i, duration_ms=i)
+    env.now = START + timedelta(seconds=60)
+    (point,) = env.sample()
+    assert point["requests"] == 5
+    assert point["prompt_tokens"] == 50
+    assert point["ttft_ms_p95"] == 2
+    assert point["duration_ms_p50"] == 1
+
+
+def test_values_limit_is_one_hundred_thousand():
+    assert load_module.VALUES_KEPT == 100_000

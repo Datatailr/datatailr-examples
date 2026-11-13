@@ -7,11 +7,13 @@ The methods run on the event loop and in threads.
 import math
 import threading
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 POINTS_KEPT = 60
 SAMPLES_KEPT = 12
+MINUTES_PENDING = 61
+VALUES_KEPT = 100_000
 
 _NO_SAMPLE = {
     "ts": None,
@@ -96,6 +98,7 @@ class LoadMonitor:
         self._samples: deque[dict] = deque(maxlen=SAMPLES_KEPT)
         self._points: deque[dict] = deque(maxlen=POINTS_KEPT)
         self._last_time: datetime | None = None
+        self._emitted: datetime | None = None
         self._last_counters: tuple[float | None, float | None] = (None, None)
 
     def begin(self) -> None:
@@ -123,20 +126,35 @@ class LoadMonitor:
             completion = _whole(record.get("completion_tokens"))
             ttft = _whole(record.get("ttft_ms"))
             duration = _whole(record.get("duration_ms"))
-            start = _minute_start(self._now())
             with self._lock:
-                minute = self._minutes.setdefault(start, _Minute())
+                minute = self._open_minute(self._now())
                 minute.requests += 1
                 if status >= 400:
                     minute.failed += 1
                 minute.prompt_tokens += prompt or 0
                 minute.completion_tokens += completion or 0
-                if ttft is not None:
+                if ttft is not None and len(minute.ttft) < VALUES_KEPT:
                     minute.ttft.append(ttft)
-                if duration is not None:
+                if duration is not None and len(minute.duration) < VALUES_KEPT:
                     minute.duration.append(duration)
         except Exception:
             return
+
+    def _open_minute(self, moment: datetime) -> _Minute:
+        """The pending minute for a moment. Call it with the lock held.
+
+        A moment in a minute that was emitted already counts for the current open minute.
+        The number of pending minutes stays at MINUTES_PENDING or below.
+        """
+        start = _minute_start(moment)
+        if self._emitted is not None and start <= self._emitted:
+            start = _minute_start(self._last_time) if self._last_time else self._emitted + timedelta(minutes=1)
+            start = max(start, self._emitted + timedelta(minutes=1))
+        if start not in self._minutes:
+            self._minutes[start] = _Minute()
+            while len(self._minutes) > MINUTES_PENDING:
+                del self._minutes[min(self._minutes)]
+        return self._minutes[start]
 
     @staticmethod
     def _rate(previous: float | None, current: float | None, seconds: float) -> float | None:
@@ -146,9 +164,9 @@ class LoadMonitor:
 
     def add_sample(self, engine: dict[str, float | None], gpu: tuple[int, int] | None) -> list[dict]:
         """Take a sample. Return the points of the minutes that ended since the last call."""
-        moment = self._now()
         counters = (engine.get("prompt_tokens_total"), engine.get("completion_tokens_total"))
         with self._lock:
+            moment = self._now()
             if self._last_time is None:
                 rates: tuple[float | None, float | None] = (None, None)
             else:
@@ -171,10 +189,11 @@ class LoadMonitor:
             }
             self._samples.append(sample)
             current = _minute_start(moment)
-            self._minutes.setdefault(current, _Minute()).samples.append(sample)
+            self._open_minute(moment).samples.append(sample)
             finished = []
             for start in sorted(s for s in self._minutes if s < current):
                 point = self._minutes.pop(start).point(start)
+                self._emitted = start
                 self._points.append(point)
                 finished.append(point)
             return finished
