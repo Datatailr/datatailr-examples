@@ -106,6 +106,8 @@ class UsageTotals:
         self._written: dict[str, int] = {}  # day -> the version of the last checkpoint write
         self._stale_partials: set[str] = set()  # days whose partial file must be deleted
         self._last_checkpoint: datetime | None = None  # clock time of the last checkpoint write
+        self._tokens_day: str | None = None  # the day of `_day_tokens`
+        self._day_tokens: dict[str, int] = {}  # user -> total tokens on `_tokens_day`
 
     def _path(self, day: str) -> str:
         return f"{self._prefix}/{day}.json"
@@ -180,8 +182,22 @@ class UsageTotals:
             entry = _empty_row()
             _add(entry, row)
             self._totals[(day, row["user"], row["model"])] = entry
+        if day == self._tokens_day:
+            self._rebuild_day_tokens()
         if self._newest is None or day > self._newest:
             self._newest = day
+
+    def _rebuild_day_tokens(self) -> None:
+        """Build the running totals of `_tokens_day` from the entries of `_totals`. Hold the lock."""
+        self._day_tokens = {}
+        for (day, name, _), entry in self._totals.items():
+            if day == self._tokens_day:
+                self._count_tokens(name, entry["total_tokens"])
+
+    def _count_tokens(self, user: str, tokens: int) -> None:
+        """Add `tokens` to the running total of `user` on `_tokens_day`. Hold the lock."""
+        if tokens:
+            self._day_tokens[user] = self._day_tokens.get(user, 0) + tokens
 
     def _forget_flushed(self, day: str) -> None:
         """Drop the flushed totals of `day`. Hold the lock."""
@@ -275,6 +291,8 @@ class UsageTotals:
                     self._newest = day
                 entry = self._totals.setdefault((day, user, model), _empty_row())
                 _add(entry, row)
+                if day == self._tokens_day:
+                    self._count_tokens(user, row["total_tokens"])
                 self._saved.discard(day)  # a late record makes the daily file stale
         except Exception as error:
             logger.warning("the count of an audit record failed: %s", error)
@@ -375,6 +393,27 @@ class UsageTotals:
                 continue
             with self._lock:
                 self._stale_partials.discard(day)
+
+    def tokens_today(self, user: str) -> int:
+        """Return the total tokens of `user` for the current UTC day. Reads memory only.
+
+        It reads a running total for each user. The first call of a new day builds it from the totals.
+        """
+        today = self._today()
+        with self._lock:
+            if today != self._tokens_day:
+                self._tokens_day = today
+                self._rebuild_day_tokens()
+            return self._day_tokens.get(user, 0)
+
+    def users_today(self) -> list[str]:
+        """Return the users with tokens in the current UTC day, sorted. Reads memory only."""
+        today = self._today()
+        with self._lock:
+            if today != self._tokens_day:
+                self._tokens_day = today
+                self._rebuild_day_tokens()
+            return sorted(user for user, tokens in self._day_tokens.items() if tokens > 0)
 
     def summary(
         self,

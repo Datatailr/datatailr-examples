@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Callable, Mapping
 
@@ -33,6 +34,21 @@ ACTING_USER_HEADER = "X-LLM-Acting-User"
 MAX_ACTING_USER_LENGTH = 256
 
 
+def check_user_name(name: str, label: str = "the user name") -> str:
+    """Return the stripped user name. Raise `ValueError` if it is empty, too long or has a control character.
+
+    `label` names the name in the message of the error.
+    """
+    name = name.strip()
+    if not name:
+        raise ValueError(f"{label} is empty")
+    if len(name) > MAX_ACTING_USER_LENGTH:
+        raise ValueError(f"{label} is longer than {MAX_ACTING_USER_LENGTH} characters")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
+        raise ValueError(f"{label} has a control character")
+    return name
+
+
 def acting_user_from_headers(headers: Mapping[str, str]) -> str | None:
     """Return the acting user name from the request headers.
 
@@ -42,11 +58,7 @@ def acting_user_from_headers(headers: Mapping[str, str]) -> str | None:
     name = (headers.get(ACTING_USER_HEADER) or "").strip()
     if not name:
         return None
-    if len(name) > MAX_ACTING_USER_LENGTH:
-        raise ValueError(f"the acting user name is longer than {MAX_ACTING_USER_LENGTH} characters")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in name):
-        raise ValueError("the acting user name has a control character")
-    return name
+    return check_user_name(name, "the acting user name")
 
 
 class AdminCheck:
@@ -55,6 +67,8 @@ class AdminCheck:
     The owner is always an admin. Members of the admin group are admins too.
     The group members are cached for `ttl` seconds. A failed lookup gives no
     members, and the next lookup comes 10 seconds later at the earliest.
+    One thread at a time refreshes the group. The other callers use the last members meanwhile.
+    Before the first lookup ends, they wait for its result.
     """
 
     def __init__(
@@ -73,6 +87,8 @@ class AdminCheck:
         self._cached: set[str] = set()
         self._fetched_at: float | None = None
         self._failed_at: float | None = None
+        self._lock = threading.Condition()  # guards the cache fields, never held for a lookup
+        self._refreshing = False
 
     def is_admin(self, user: str) -> bool:
         """Return True when the user is the owner or an admin group member."""
@@ -86,22 +102,38 @@ class AdminCheck:
 
     def _group_members(self) -> set[str]:
         now = self._clock()
-        if self._fetched_at is not None and now - self._fetched_at < self._ttl:
-            return self._cached
-        # After a failed lookup the group has no members, and the next lookup waits
-        # 10 seconds. So a removed member never keeps a right during an outage.
-        if self._failed_at is not None and now - self._failed_at < FAILED_LOOKUP_SECONDS:
-            return set()
+        with self._lock:
+            if self._fetched_at is not None and now - self._fetched_at < self._ttl:
+                return self._cached
+            # After a failed lookup the group has no members, and the next lookup waits
+            # 10 seconds. So a removed member never keeps a right during an outage.
+            if self._failed_at is not None and now - self._failed_at < FAILED_LOOKUP_SECONDS:
+                return set()
+            if self._refreshing:  # another thread looks the group up now
+                # Without an earlier lookup there are no last members, so wait for this one.
+                if self._fetched_at is None and self._failed_at is None:
+                    while self._refreshing:
+                        self._lock.wait()
+                return self._cached
+            self._refreshing = True
+        members: set[str] | None = None
         try:
-            self._cached = set(self._members(self._group))
+            members = set(self._members(self._group))
         except Exception:
-            self._cached = set()
-            self._fetched_at = None
-            self._failed_at = now
-            return set()
-        self._fetched_at = now
-        self._failed_at = None
-        return self._cached
+            members = None
+        finally:
+            with self._lock:
+                self._refreshing = False
+                if members is None:
+                    self._cached = set()
+                    self._fetched_at = None
+                    self._failed_at = now
+                else:
+                    self._cached = members
+                    self._fetched_at = now
+                    self._failed_at = None
+                self._lock.notify_all()
+        return members if members is not None else set()
 
 
 class AccessCheck:

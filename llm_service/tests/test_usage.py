@@ -773,3 +773,110 @@ def test_load_lists_usage_once_and_reads_each_daily_file_without_exists():
     by_day = {row["day"]: row for row in usage.summary(None, None, None, None, "day")}
     assert {day: by_day[day]["requests"] for day in days} == {day: n + 1 for n, day in enumerate(days)}
     assert usage.summary(None, None, None, None)[0]["requests"] == sum(range(1, 41))
+
+
+def test_tokens_today_counts_only_the_current_day_of_the_user():
+    _, audit, usage, _ = make(today=D2)
+    seed(audit)
+    audit.add(rec("alice", T2, model="m2", prompt=1, completion=1))
+    assert usage.tokens_today("alice") == 15 + 25 + 2
+    assert usage.tokens_today("bob") == 0  # bob has use on the day before only
+    assert usage.tokens_today("nobody") == 0
+
+
+def test_tokens_today_follows_the_day_of_the_clock():
+    _, audit, usage, state = make(today=D2)
+    seed(audit)
+    state["today"] = D1
+    assert usage.tokens_today("bob") == 2
+    assert usage.tokens_today("alice") == 0
+
+
+def _scan(usage, user):
+    """The old full scan: the total tokens of `user` on the current day."""
+    today = usage._today()
+    rows = usage.summary(today, today, user, None)
+    return rows[0]["total_tokens"] if rows else 0
+
+
+class ScanSpy(dict):
+    """A totals dict that counts the full scans."""
+
+    scans = 0
+
+    def items(self):
+        ScanSpy.scans += 1
+        return super().items()
+
+    def __iter__(self):
+        ScanSpy.scans += 1
+        return super().__iter__()
+
+
+def test_tokens_today_reads_no_full_scan_after_the_first_call():
+    _, audit, usage, _ = make(today=D2)
+    seed(audit)
+    usage.tokens_today("alice")
+    usage._totals = ScanSpy(usage._totals)
+    ScanSpy.scans = 0
+    audit.add(rec("alice", T3, prompt=3, completion=4))
+    assert usage.tokens_today("alice") == 15 + 25 + 7
+    assert ScanSpy.scans == 0
+
+
+def test_tokens_today_matches_the_full_scan_after_records():
+    _, audit, usage, _ = make(today=D2)
+    assert usage.tokens_today("alice") == 0
+    seed(audit)
+    audit.add(rec("carol", T2, prompt=None, completion=None))
+    audit.add(rec("alice", T2, endpoint="/admin/model"))
+    for user in ("alice", "bob", "carol", "nobody"):
+        assert usage.tokens_today(user) == _scan(usage, user), user
+    assert usage.tokens_today("alice") == 40
+
+
+def test_tokens_today_matches_the_full_scan_after_a_load():
+    store, audit, usage, _ = make(today=D2)
+    seed(audit)
+    audit.flush()
+    _, audit2, usage2, _ = make(today=D2, store=store)
+    usage2.tokens_today("alice")  # the cache of the day exists before the load
+    usage2.load()
+    for user in ("alice", "bob", "nobody"):
+        assert usage2.tokens_today(user) == _scan(usage2, user), user
+    assert usage2.tokens_today("alice") == 40
+
+
+def test_tokens_today_matches_the_full_scan_after_the_day_changes():
+    _, audit, usage, state = make(today=D1)
+    seed(audit)
+    assert usage.tokens_today("bob") == 2
+    assert usage.tokens_today("alice") == 0
+    state["today"] = D2
+    for user in ("alice", "bob"):
+        assert usage.tokens_today(user) == _scan(usage, user), user
+    assert usage.tokens_today("alice") == 40
+    audit.add(rec("alice", T3, prompt=1, completion=1))
+    assert usage.tokens_today("alice") == 42 == _scan(usage, "alice")
+
+
+def test_tokens_today_matches_the_totals_with_two_file_rows_of_one_user_and_model():
+    store, audit, _, _ = make(today=D2)
+    audit.add(rec("alice", T2))
+    audit.flush()
+    row = {"user": "alice", "model": "m1", "requests": 1, "failed_requests": 0, "prompt_tokens": 10,
+           "completion_tokens": 5, "last_request": T2}
+    rows = [{**row, "total_tokens": 15}, {**row, "total_tokens": 7}]
+    store.put(f"{ROOT}/usage/{D2}.json", json.dumps({"day": D2, "rows": rows}))
+    _, _, usage, _ = make(today=D2, store=store)
+    usage.tokens_today("alice")  # the running total of the day exists before the load
+    usage.load()
+    assert usage.tokens_today("alice") == _scan(usage, "alice") == 7
+
+
+def test_users_today_lists_the_users_with_tokens_in_the_current_day():
+    _, audit, usage, state = make(today=D2)
+    seed(audit)
+    assert usage.users_today() == ["alice"]  # bob has use on the day before only
+    state["today"] = D1
+    assert "bob" in usage.users_today()

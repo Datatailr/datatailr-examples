@@ -28,6 +28,7 @@ class FakeService:
         self.admins = set(admins)
         self.users = set(users)  # users with access who are not admins
         self.answers: dict[tuple[str, str], tuple[int, object]] = {}
+        self.answer_headers: dict[tuple[str, str], dict[str, str]] = {}
         self.error: Exception | None = None
         self.raw: bytes | None = None
         self.caller_admin = True
@@ -61,7 +62,7 @@ class FakeService:
             return httpx.Response(200, content=self.raw)
         if (request.method, path) in self.answers:
             status, body = self.answers[(request.method, path)]
-            return httpx.Response(status, json=body)
+            return httpx.Response(status, json=body, headers=self.answer_headers.get((request.method, path)))
         if path == "/v1/service":
             return httpx.Response(200, json=self.descriptor(request.headers.get("X-LLM-Acting-User")))
         return httpx.Response(200, json={})
@@ -654,7 +655,7 @@ def test_page_offers_the_names_of_the_next_task():
 def test_page_drops_late_answers_and_errors_of_a_load():
     text = (STATIC_DIR / "app.js").read_text()
     assert "if (error instanceof StaleAnswer) return false;" in text
-    for name in ("usage", "detail", "audit", "status"):
+    for name in ("usage", "detail", "audit", "status", "limits", "limitsMe"):
         assert f"current('{name}', call, service," in text, name
 
 
@@ -681,8 +682,8 @@ def test_page_has_the_elements_of_the_connect_tab(element_id):
 def test_connect_tab_comes_after_usage():
     page = (STATIC_DIR / "index.html").read_text()
     tabs = re.findall(r'role="tab" id="tab-(\w+)"', page)
-    assert tabs == ["usage", "connect", "audit", "models"]
-    assert "const TABS = ['usage', 'connect', 'audit', 'models'];" in (STATIC_DIR / "app.js").read_text()
+    assert tabs == ["usage", "connect", "audit", "models", "limits"]
+    assert "const TABS = ['usage', 'connect', 'audit', 'models', 'limits'];" in (STATIC_DIR / "app.js").read_text()
 
 
 @pytest.mark.parametrize(
@@ -718,7 +719,7 @@ def test_page_cancels_the_reader_and_reports_a_stop_before_an_error_body():
     body = text[text.index("async function streamChat("):text.index("function chatTurn(")]
     assert re.search(r"finally \{\s*(//[^\n]*\s*)?reader\.cancel\(\)", body)
     assert "if (signal.aborted)" in body
-    assert body.index("if (signal.aborted)") < body.index("data.error.message")
+    assert body.index("if (signal.aborted)") < body.index("throw answerError(response, data);")
     assert "The page knows this URL only on the platform." in text
     assert "Known only on the platform" not in text
 
@@ -758,6 +759,140 @@ def test_page_reads_split_events_and_builds_the_outside_url(tmp_path):
     for other in ("/", "/job/dev/", "/job/dev/llm-service-admin/extra/", "/apps/dev/llm-service-admin/",
                   "/x/job/dev/llm-service-admin/", "/job//llm-service-admin/"):
         assert run(other)["url"] is None, other
+
+
+LIMITS_IDS = (
+    "tab-limits", "panel-limits", "limits-pick", "limits-content", "limits-missing", "limits-cards", "limits-unloaded",
+    "limits-default-form", "limits-default-requests_per_minute", "limits-default-tokens_per_day",
+    "limits-default-parallel_requests", "limits-reload", "limits-body", "limits-user-form", "limits-user",
+    "limits-user-requests_per_minute-mode", "limits-user-requests_per_minute",
+    "limits-user-tokens_per_day-mode", "limits-user-tokens_per_day",
+    "limits-user-parallel_requests-mode", "limits-user-parallel_requests", "limits-user-status",
+    "remove-dialog", "remove-text", "remove-confirm",
+    "my-limits", "my-limits-note", "my-limits-list", "my-requests_per_minute", "my-tokens_per_day",
+    "my-parallel_requests", "my-limits-source",
+)
+
+
+@pytest.mark.parametrize("element_id", LIMITS_IDS)
+def test_page_has_the_elements_of_the_limits(element_id):
+    assert f'id="{element_id}"' in (STATIC_DIR / "index.html").read_text()
+
+
+def test_limits_tab_is_for_an_admin_of_one_service():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "limits: {one: true, admin: true}" in text
+    assert "limits: loadLimits" in text
+    # The tab reads the limits only on a load or a click, never on a timer.
+    body = text[text.index("// ---- limits"):text.index("// ---- start")]
+    assert "setTimeout" not in body and "setInterval" not in body
+
+
+@pytest.mark.parametrize("number_id", [f"limits-{form}-{name}" for form in ("default", "user")
+                                       for name in ("requests_per_minute", "tokens_per_day", "parallel_requests")])
+def test_limit_fields_take_whole_numbers_of_the_range(number_id):
+    page = (STATIC_DIR / "index.html").read_text()
+    tag = re.search(rf'<input[^>]*id="{number_id}"[^>]*>', page).group(0)
+    for attribute in ('type="number"', 'min="1"', 'max="1000000000"', 'step="1"'):
+        assert attribute in tag, attribute
+
+
+def test_page_calls_the_five_limits_routes():
+    text = (STATIC_DIR / "app.js").read_text()
+    assert "servicePath('limits', service)" in text
+    assert "servicePath('limits/me', service)" in text
+    assert "servicePath('limits/default', service), {method: 'PUT'" in text
+    assert "const userPath = servicePath(`limits/users/${encodeURIComponent(user)}`, service);" in text
+    assert "api(userPath, {method: 'PUT'" in text
+    assert "api(userPath, {method: 'DELETE'})" in text
+
+
+def test_page_shows_the_effective_limits_of_the_service():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("function showLimits("):text.index("function setChoice(")]
+    assert "ownValue(effective, user)" in body
+    assert "effectiveLimit" not in text  # the page no longer repeats the lookup order
+    assert "$('limits-unloaded').hidden = answer.loaded !== false;" in body
+
+
+def test_a_blank_user_name_in_the_limits_form_shows_a_message():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("async function saveUserLimits("):text.index("function askRemove(")]
+    assert "$('limits-user-status').textContent = 'Type a user name.';" in body
+    assert "if (!service || !user) return;" not in body
+
+
+def test_the_limits_texts_name_the_utc_day_and_the_selects_have_no_data_limit():
+    page = (STATIC_DIR / "index.html").read_text()
+    assert "Tokens per UTC day" not in page and "data-limit" not in page
+    assert '<dt>Tokens per day (UTC)</dt>' in page
+    assert '<th scope="col" class="num">Tokens per day (UTC)</th>' in page
+
+
+def test_page_passes_retry_after_of_a_chat_error():
+    text = (STATIC_DIR / "app.js").read_text()
+    body = text[text.index("async function streamChat("):text.index("function chatTurn(")]
+    assert "throw answerError(response, data);" in body
+    assert "response.headers.get('Retry-After')" in text
+    send = text[text.index("async function sendChat("):text.index("function stopChat(")]
+    assert "waitText(error.retryAfter)" in send
+    assert "loadMyLimits(service)" in send
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_page_limit_helpers(tmp_path):
+    harness = tmp_path / "harness.js"
+    harness.write_text(
+        "const vm = require('vm');\n"
+        "const fs = require('fs');\n"
+        "const context = {URL, console, Intl, document: {addEventListener() {}},\n"
+        "  location: {pathname: '/', origin: 'https://example.test'}};\n"
+        "vm.createContext(context);\n"
+        "vm.runInContext(fs.readFileSync(process.argv[2], 'utf8') + '\\nthis.h = {userLimitBody, defaultLimitBody,'\n"
+        "  + ' limitCell, myLimitsNote, retryWait, waitText, limitsMissing, ApiError};', context);\n"
+        "const h = context.h;\n"
+        "const choice = (mode, value = '') => ({mode, value});\n"
+        "const missing = (status, code) => h.limitsMissing(new h.ApiError('x', {status, code}));\n"
+        "console.log(JSON.stringify({\n"
+        "  allDefault: h.userLimitBody({requests_per_minute: choice('default'), tokens_per_day: choice('default'),\n"
+        "                               parallel_requests: choice('default')}),\n"
+        "  mixed: h.userLimitBody({requests_per_minute: choice('number', '60'), tokens_per_day: choice('none'),\n"
+        "                          parallel_requests: choice('default', '9')}),\n"
+        "  defaults: h.defaultLimitBody({requests_per_minute: '5', tokens_per_day: '', parallel_requests: ' 2 '}),\n"
+        "  own: h.limitCell({limits: {tokens_per_day: null}, source: 'user'}, {tokens_per_day: null}, 'tokens_per_day'),\n"
+        "  leftOut: h.limitCell({limits: {requests_per_minute: 7}, source: 'user'}, {tokens_per_day: 3},\n"
+        "                       'requests_per_minute'),\n"
+        "  fromDefault: h.limitCell({limits: {tokens_per_day: 9}, source: 'default'}, undefined, 'tokens_per_day'),\n"
+        "  admin: h.limitCell({limits: {parallel_requests: null}, source: 'admin'}, undefined, 'parallel_requests'),\n"
+        "  none: h.limitCell({limits: {parallel_requests: null}, source: 'none'}, undefined, 'parallel_requests'),\n"
+        "  unknown: h.limitCell(undefined, undefined, 'parallel_requests'),\n"
+        "  notes: [h.myLimitsNote({limits: {tokens_per_day: 5}, loaded: false}),\n"
+        "          h.myLimitsNote({limits: {tokens_per_day: null}, loaded: true}),\n"
+        "          h.myLimitsNote({limits: {tokens_per_day: 5}, loaded: true}),\n"
+        "          h.myLimitsNote({limits: {tokens_per_day: 5}})],\n"
+        "  waits: ['17', '0', '', null, 'soon', '1.5', '123456'].map(h.retryWait),\n"
+        "  texts: [h.waitText(1), h.waitText(17), h.waitText(null), h.waitText(0)],\n"
+        "  missing: [missing(404, 'not_found'), missing(404, null), missing(404, 'unknown_service'),\n"
+        "            missing(502, 'service_unreachable'), h.limitsMissing(new Error('x'))],\n"
+        "}));\n"
+    )
+    out = subprocess.run(["node", str(harness), str(STATIC_DIR / "app.js")],
+                         check=True, capture_output=True, text=True).stdout
+    result = json.loads(out)
+    assert result["allDefault"] is None
+    assert result["mixed"] == {"requests_per_minute": 60, "tokens_per_day": None}
+    assert result["defaults"] == {"requests_per_minute": 5, "tokens_per_day": None, "parallel_requests": 2}
+    assert result["own"] == {"value": None, "muted": False, "title": None}
+    assert result["leftOut"] == {"value": 7, "muted": True, "title": "From the default"}
+    assert result["fromDefault"] == {"value": 9, "muted": True, "title": "From the default"}
+    assert result["admin"] == {"value": None, "muted": False, "title": "Admin of the service"}
+    assert result["none"] == {"value": None, "muted": False, "title": None}
+    assert result["unknown"] == {"muted": False, "title": None}  # no value: the row shows "-"
+    unloaded = "The service did not read the limits file. No limit applies now. The service tries again."
+    assert result["notes"] == [unloaded, "You have no limit on this service.", "", ""]
+    assert result["waits"] == [17, 0, None, None, None, None, None]
+    assert result["texts"] == ["Try again in 1 second.", "Try again in 17 seconds.", "", ""]
+    assert result["missing"] == [True, True, False, False, False]
 
 
 def _timeout(request: httpx.Request) -> float:
@@ -1336,3 +1471,118 @@ def test_page_shows_no_stale_model_after_a_fresh_answer():
     script = (STATIC_DIR / "app.js").read_text()
     assert "showConnect(service, activeModel(answer), entry.engine)" in script
     assert "activeModel(answer) || entry.model" not in script
+
+
+LIMITS_BODY = {"default": {"requests_per_minute": 5}, "users": {"bob": {"tokens_per_day": 9}}}
+ERROR_429 = {"error": {"message": "slow down", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}
+
+LIMIT_ROUTES = [
+    ("GET", "/api/services/svc-two/limits", None, "GET", "/admin/limits"),
+    ("PUT", "/api/services/svc-two/limits/default", {"requests_per_minute": 3}, "PUT", "/admin/limits/default"),
+    ("PUT", "/api/services/svc-two/limits/users/carol", {"tokens_per_day": 7}, "PUT", "/admin/limits/users/carol"),
+    ("DELETE", "/api/services/svc-two/limits/users/carol", None, "DELETE", "/admin/limits/users/carol"),
+    ("GET", "/api/services/svc-two/limits/me", None, "GET", "/v1/limits/me"),
+]
+
+
+@pytest.mark.parametrize("method,route,body,service_method,service_path", LIMIT_ROUTES)
+def test_each_limits_route_reaches_its_service_endpoint(client, fakes, method, route, body, service_method, service_path):
+    fakes.hosts["svc-two"].answers[(service_method, service_path)] = (200, LIMITS_BODY)
+    response = client.request(method, route, json=body, headers=ALICE)
+    assert response.status_code == 200
+    assert response.json() == LIMITS_BODY
+    sent = fakes.calls()
+    assert len(sent) == 1
+    assert (sent[0].url.host, sent[0].method, sent[0].url.path) == ("svc-two", service_method, service_path)
+    assert sent[0].headers["X-LLM-Acting-User"] == "alice"
+    assert sent[0].headers["Connection"] == "close"
+    if body is not None:
+        assert json.loads(sent[0].content) == body
+
+
+@pytest.mark.parametrize("route", ["/limits/default", "/limits/users/carol"])
+def test_the_limits_put_routes_need_json(client, fakes, route):
+    response = client.put("/api/services/svc/" + route.lstrip("/"), content=b"{}", headers={**ALICE, "Content-Type": "text/plain"})
+    assert response.status_code == 415
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize("route", ["/limits/default", "/limits/users/carol"])
+def test_the_limits_put_routes_need_valid_json(client, fakes, route):
+    response = client.put(
+        "/api/services/svc/" + route.lstrip("/"), content=b"{oops", headers={**ALICE, "Content-Type": "application/json"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_json"
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize("user", ["a%2Fb", "%2E", "%2E%2E", "%2Fx", "x%2F"])
+def test_a_bad_user_name_in_the_limits_routes_makes_no_call(client, fakes, user):
+    for method in ("PUT", "DELETE"):
+        response = client.request(method, f"/api/services/svc/limits/users/{user}", json={}, headers=ALICE)
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_user"
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize("user, status", [(".", 400), ("..", 405)])
+def test_a_literal_dot_user_segment_in_the_limits_routes_makes_no_call(client, fakes, user, status):
+    # The test client removes a literal dot segment: "users/." becomes "users/", and "users/.." becomes
+    # "limits". So the route gets an empty user name, or the path of the limits list.
+    for method in ("PUT", "DELETE"):
+        response = client.request(method, f"/api/services/svc/limits/users/{user}", json={}, headers=ALICE)
+        assert response.status_code == status, method
+        if status == 400:
+            assert response.json()["error"]["code"] == "invalid_user"
+    assert fakes.calls() == []
+
+
+def test_the_limits_routes_of_an_unknown_service_are_404(client, fakes):
+    for method, route, body, *_ in LIMIT_ROUTES:
+        response = client.request(method, route.replace("svc-two", "nope"), json=body, headers=ALICE)
+        assert response.status_code == 404
+    assert fakes.calls() == []
+
+
+@pytest.mark.parametrize("status,error", [(403, ERROR_403), (429, ERROR_429)])
+def test_a_limits_error_of_the_service_passes_through(client, fakes, status, error):
+    fakes.hosts["svc-two"].answers[("GET", "/admin/limits")] = (status, error)
+    response = client.get("/api/services/svc-two/limits", headers=ALICE)
+    assert response.status_code == status
+    assert response.json() == error
+
+
+def test_retry_after_of_a_service_429_reaches_the_client(client, fakes):
+    fakes.hosts["svc-two"].answers[("GET", "/v1/limits/me")] = (429, ERROR_429)
+    fakes.hosts["svc-two"].answer_headers[("GET", "/v1/limits/me")] = {"Retry-After": "17", "X-Other": "yes"}
+    response = client.get("/api/services/svc-two/limits/me", headers=ALICE)
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "17"
+    assert "x-other" not in response.headers
+
+
+@pytest.mark.parametrize("value", ["soon", "123456", "-1", "1.5", "", "1 2", "Wed, 21 Oct 2026 07:28:00 GMT"])
+def test_a_retry_after_that_is_not_1_to_5_digits_is_dropped(client, fakes, value):
+    fakes.hosts["svc-two"].answers[("GET", "/v1/limits/me")] = (429, ERROR_429)
+    fakes.hosts["svc-two"].answer_headers[("GET", "/v1/limits/me")] = {"Retry-After": value}
+    response = client.get("/api/services/svc-two/limits/me", headers=ALICE)
+    assert response.status_code == 429
+    assert "retry-after" not in response.headers
+
+
+def test_a_response_without_retry_after_has_none(client, fakes):
+    fakes.hosts["svc-two"].answers[("GET", "/v1/limits/me")] = (429, ERROR_429)
+    assert "retry-after" not in client.get("/api/services/svc-two/limits/me", headers=ALICE).headers
+
+
+@pytest.mark.parametrize("route", ["/limits/default", "/limits/users/carol"])
+def test_the_limits_put_routes_refuse_deeply_nested_json(client, fakes, route):
+    response = client.put(
+        "/api/services/svc/" + route.lstrip("/"),
+        content=b"[" * 100_000,
+        headers={**ALICE, "Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_json"
+    assert fakes.calls() == []

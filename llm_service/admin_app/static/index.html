@@ -85,6 +85,7 @@ if (!location.pathname.endsWith('/')) {
     <button type="button" role="tab" id="tab-connect" aria-controls="panel-connect" data-tab="connect">Connect</button>
     <button type="button" role="tab" id="tab-audit" aria-controls="panel-audit" data-tab="audit">Audit</button>
     <button type="button" role="tab" id="tab-models" aria-controls="panel-models" data-tab="models">Models</button>
+    <button type="button" role="tab" id="tab-limits" aria-controls="panel-limits" data-tab="limits">Limits</button>
   </div>
 
   <!-- Usage -->
@@ -228,6 +229,17 @@ if (!location.pathname.endsWith('/')) {
       </div>
     </div>
 
+    <div class="card" id="my-limits">
+      <h2>Your limits</h2>
+      <p class="caption" id="my-limits-note" role="status" hidden></p>
+      <dl class="status" id="my-limits-list">
+        <div><dt>Requests per minute</dt><dd id="my-requests_per_minute">-</dd></div>
+        <div><dt>Tokens per day (UTC)</dt><dd id="my-tokens_per_day">-</dd></div>
+        <div><dt>Parallel requests</dt><dd id="my-parallel_requests">-</dd></div>
+        <div class="wide"><dt>Source</dt><dd id="my-limits-source">-</dd></div>
+      </dl>
+    </div>
+
     <div class="card">
       <h2>Testing area</h2>
       <p class="note">The requests of this area count as your requests. They show in the usage and in the audit records of the service.</p>
@@ -334,6 +346,72 @@ if (!location.pathname.endsWith('/')) {
     </div>
     </div>
   </section>
+
+  <!-- Limits -->
+  <section class="panel" role="tabpanel" id="panel-limits" aria-labelledby="tab-limits" hidden>
+    <p class="card pick" id="limits-pick" hidden>Pick one service in the bar to see its limits.</p>
+    <div class="panel" id="limits-content">
+    <p class="note" id="limits-missing" role="status" hidden>This service does not offer limits. A newer version of the service has them.</p>
+    <div class="panel" id="limits-cards">
+    <p class="note" id="limits-unloaded" role="status" hidden></p>
+    <div class="card">
+      <h2>Default limits</h2>
+      <form class="toolbar" id="limits-default-form">
+        <label>Requests per minute <input type="number" id="limits-default-requests_per_minute" min="1" max="1000000000" step="1" placeholder="No limit"></label>
+        <label>Tokens per day (UTC) <input type="number" id="limits-default-tokens_per_day" min="1" max="1000000000" step="1" placeholder="No limit"></label>
+        <label>Parallel requests <input type="number" id="limits-default-parallel_requests" min="1" max="1000000000" step="1" placeholder="No limit"></label>
+        <button type="submit" id="limits-default-save">Save</button>
+      </form>
+      <p class="caption">An empty field means no limit. The default applies to each user without an own entry.
+        An admin of the service without an own entry has no limit.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Users <span class="caption">A muted limit comes from the default.</span></h2>
+        <button type="button" class="ghost small" id="limits-reload">Reload</button>
+      </div>
+      <div class="scroll">
+        <table class="grid">
+          <thead><tr>
+            <th scope="col">User</th><th scope="col" class="num">Requests per minute</th>
+            <th scope="col" class="num">Tokens per day (UTC)</th><th scope="col" class="num">Parallel requests</th>
+            <th scope="col" class="num">Requests in the last minute</th><th scope="col" class="num">Tokens today</th>
+            <th scope="col" class="num">Parallel requests now</th><th scope="col">Actions</th>
+          </tr></thead>
+          <tbody id="limits-body"></tbody>
+        </table>
+      </div>
+      <h3 class="sub">Add or change an entry</h3>
+      <form class="toolbar limit-form" id="limits-user-form">
+        <label>User <input type="text" id="limits-user" required maxlength="256" autocomplete="off" placeholder="user name"></label>
+        <fieldset class="choice">
+          <legend>Requests per minute</legend>
+          <select id="limits-user-requests_per_minute-mode" aria-label="Requests per minute: kind of value">
+            <option value="default">Default</option><option value="none">No limit</option><option value="number">Number</option>
+          </select>
+          <input type="number" id="limits-user-requests_per_minute" min="1" max="1000000000" step="1" required disabled aria-label="Requests per minute: number"></fieldset>
+        <fieldset class="choice">
+          <legend>Tokens per day (UTC)</legend>
+          <select id="limits-user-tokens_per_day-mode" aria-label="Tokens per day (UTC): kind of value">
+            <option value="default">Default</option><option value="none">No limit</option><option value="number">Number</option>
+          </select>
+          <input type="number" id="limits-user-tokens_per_day" min="1" max="1000000000" step="1" required disabled aria-label="Tokens per day (UTC): number"></fieldset>
+        <fieldset class="choice">
+          <legend>Parallel requests</legend>
+          <select id="limits-user-parallel_requests-mode" aria-label="Parallel requests: kind of value">
+            <option value="default">Default</option><option value="none">No limit</option><option value="number">Number</option>
+          </select>
+          <input type="number" id="limits-user-parallel_requests" min="1" max="1000000000" step="1" required disabled aria-label="Parallel requests: number"></fieldset>
+        <button type="submit" id="limits-user-save">Save the entry</button>
+        <button type="button" class="ghost" id="limits-user-clear">Clear</button>
+      </form>
+      <p class="caption" id="limits-user-status" role="status"></p>
+      <p class="caption">"Default" leaves the field out of the entry, so the field takes the default. "No limit" sets no limit for this field.</p>
+    </div>
+    </div>
+    </div>
+  </section>
 </main>
 
 <dialog id="record-dialog" aria-labelledby="record-title">
@@ -351,6 +429,15 @@ if (!location.pathname.endsWith('/')) {
   <div class="actions">
     <button type="button" class="ghost" data-close>Cancel</button>
     <button type="button" class="danger" id="confirm-delete">Delete</button>
+  </div>
+</dialog>
+
+<dialog id="remove-dialog" aria-labelledby="remove-title">
+  <h2 id="remove-title">Remove the limits of a user</h2>
+  <p id="remove-text"></p>
+  <div class="actions">
+    <button type="button" class="ghost" data-close>Cancel</button>
+    <button type="button" class="danger" id="remove-confirm">Remove</button>
   </div>
 </dialog>
 

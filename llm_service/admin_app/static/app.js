@@ -1,5 +1,5 @@
-/* LLM Service Admin: the page. A service picker and four tabs (usage, connect, audit, models)
- * over the JSON API of the app.
+/* LLM Service Admin: the page. A service picker and five tabs (usage, connect, audit, models,
+ * limits) over the JSON API of the app.
  *
  * The platform serves the app under a path prefix, so every URL is relative to BASE, the
  * location of the page. Text from the service goes into the page with textContent or as an
@@ -25,7 +25,7 @@ const number = new Intl.NumberFormat();
 const state = {tab: null, service: null, services: null, range: '30', loaded: {}, offset: 0,
                polling: false, pollTimer: null, pollFailures: 0, pollService: null,
                detailUser: null, chartsOff: false,
-               charts: {}, pendingDelete: null, auditUsersRead: false, calls: {},
+               charts: {}, pendingDelete: null, pendingRemove: null, auditUsersRead: false, calls: {},
                chat: {messages: [], controller: null, defaultModel: ''}};
 
 /** A number for a new call of `name`. A call that is no longer the newest drops its answer. */
@@ -76,7 +76,25 @@ function replaceRows(body, rows, columns, empty) {
 
 // ---- API
 
-class ApiError extends Error {}
+/** An error of the app or of a service. `status` and `code` come from an error answer. `retryAfter`
+ * is the wait in whole seconds from the `Retry-After` header of that answer, or null. */
+class ApiError extends Error {
+  constructor(message, {status = null, code = null, retryAfter = null} = {}) {
+    super(message);
+    Object.assign(this, {status, code, retryAfter});
+  }
+}
+
+/** The whole seconds of a `Retry-After` value, or null for a value that is not 1 to 5 digits. */
+const retryWait = value => (typeof value === 'string' && /^\d{1,5}$/.test(value) ? Number(value) : null);
+
+/** The ApiError of an error answer with the JSON body `data`, with the message of the service. */
+function answerError(response, data) {
+  const error = data && typeof data.error === 'object' ? data.error : null;
+  const message = error && typeof error.message === 'string' ? error.message : `The admin app answered ${response.status}.`;
+  return new ApiError(message, {status: response.status, code: error && typeof error.code === 'string' ? error.code : null,
+                                retryAfter: retryWait(response.headers.get('Retry-After'))});
+}
 
 /** Call the app. Return the JSON answer, or throw an ApiError with the message of the service. */
 async function api(path, options = {}) {
@@ -87,10 +105,7 @@ async function api(path, options = {}) {
     throw new ApiError('The admin app does not answer.');
   }
   const data = await response.json().catch(() => null);
-  if (!response.ok) {
-    const message = data && data.error && data.error.message;
-    throw new ApiError(typeof message === 'string' ? message : `The admin app answered ${response.status}.`);
-  }
+  if (!response.ok) throw answerError(response, data);
   return data;
 }
 
@@ -156,12 +171,12 @@ async function guarded(work) {
 
 // ---- tabs
 
-const TABS = ['usage', 'connect', 'audit', 'models'];
-const LOADERS = {usage: loadUsage, connect: loadConnect, audit: loadAudit, models: loadStatus};
+const TABS = ['usage', 'connect', 'audit', 'models', 'limits'];
+const LOADERS = {usage: loadUsage, connect: loadConnect, audit: loadAudit, models: loadStatus, limits: loadLimits};
 /** `one`: the tab works on one service. With "All services", the elements `<tab>-pick` (a note)
  * and `<tab>-content` swap. `admin`: the tab shows only for an admin of the picked service. */
 const TAB_RULES = {usage: {}, connect: {one: true}, audit: {one: true, admin: true},
-                   models: {one: true, admin: true}};
+                   models: {one: true, admin: true}, limits: {one: true, admin: true}};
 
 /** An admin tab shows for an admin of the picked service. With "All services", it shows for an
  * admin of at least one service. */
@@ -326,8 +341,9 @@ function clearServiceData() {
   state.auditUsersRead = false;
   state.detailUser = null;
   state.pendingDelete = null;
+  state.pendingRemove = null;
   $('detail').hidden = true;
-  for (const id of ['record-dialog', 'confirm-dialog']) if ($(id).open) $(id).close();
+  for (const id of ['record-dialog', 'confirm-dialog', 'remove-dialog']) if ($(id).open) $(id).close();
   for (const id of ['tile-requests', 'tile-failed', 'tile-tokens', 'tile-users']) $(id).textContent = '-';
   for (const chart of Object.values(state.charts)) setChart(chart, [], []);
   $('usage-note').hidden = true;
@@ -342,6 +358,8 @@ function clearServiceData() {
   $('st-rollback-row').hidden = true;
   clearChat();
   clearConnect();
+  clearMyLimits();
+  clearLimits();
 }
 
 /** Read the list of services again and show what depends on it. */
@@ -646,6 +664,7 @@ function activeModel(answer) {
 async function loadConnect() {
   const service = state.service;
   if (!service) return;
+  loadMyLimits(service);  // the card shows its own errors, so the rest of the tab still loads
   const call = nextCall('connect');
   const entry = entryOf(service) || {};
   showConnect(service, entry.model, entry.engine);
@@ -726,8 +745,8 @@ async function streamChat(service, body, signal, onText) {
     const data = await response.json().catch(() => null);
     // A stop during the read of the error body is a stop, not an error of the service.
     if (signal.aborted) throw new DOMException('You stopped the answer.', 'AbortError');
-    const message = data && data.error && data.error.message;
-    throw new ApiError(typeof message === 'string' ? message : `The admin app answered ${response.status}.`);
+    // The error keeps the wait of a 429 answer from its Retry-After header.
+    throw answerError(response, data);
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -844,7 +863,11 @@ async function sendChat(event) {
     if (!$('chat-prompt').value) $('chat-prompt').value = prompt;
     const reason = error.name === 'AbortError' ? 'You stopped the answer.'
       : `The answer failed: ${error instanceof ApiError ? error.message : String(error)}`;
-    $('chat-status').textContent = `${reason} The conversation does not keep this prompt.`;
+    const limited = error instanceof ApiError && error.status === 429;
+    const wait = limited ? waitText(error.retryAfter) : '';
+    $('chat-status').textContent = [reason, wait, 'The conversation does not keep this prompt.'].filter(Boolean).join(' ');
+    // The card of the limits then shows the use that made the service refuse the request.
+    if (limited) loadMyLimits(service);
   } finally {
     if (controller === state.chat.controller) {
       state.chat.controller = null;
@@ -1124,6 +1147,257 @@ async function confirmDelete() {
   guarded(loadStatus);
 }
 
+// ---- limits
+
+/** The three limits, the field of the current use of each, and the time of that use. */
+const LIMITS = [
+  {name: 'requests_per_minute', use: 'requests_last_minute', when: 'in the last minute'},
+  {name: 'tokens_per_day', use: 'tokens_today', when: 'today'},
+  {name: 'parallel_requests', use: 'parallel_requests', when: 'now'},
+];
+const LIMIT_SOURCES = {
+  user: 'An own entry for you sets these limits. Each field that the entry leaves out takes the default.',
+  default: 'The default limits of the service apply to you.',
+  admin: 'You are an admin of the service and have no own entry, so you have no limit.',
+  none: 'The service sets no limit for you.',
+};
+const NOT_OFFERED = 'This service does not offer limits.';
+const UNLOADED = 'The service did not read the limits file. No limit applies now. The service tries again.';
+
+/** The value of the own property `key` of `object`, or undefined. */
+const ownValue = (object, key) => (object && Object.hasOwn(object, key) ? object[key] : undefined);
+const noLimit = value => value === null || value === undefined;
+const limitText = value => (noLimit(value) ? 'No limit' : fmt(value));
+
+/** "Try again in N seconds." for a wait of N seconds, or an empty text without a wait or for a wait of 0. */
+const waitText = wait => (wait === null || wait === undefined || wait === 0 ? ''
+  : `Try again in ${fmt(wait)} ${wait === 1 ? 'second' : 'seconds'}.`);
+
+/** True for the 404 of a service without the limit endpoints. The 404 of an unknown service is another error. */
+const limitsMissing = error => error instanceof ApiError && error.status === 404 && error.code !== 'unknown_service';
+
+/** The cell of the limit `name` from the effective limits `effective` of the service and the entry `entry` (or
+ * none). The limit is muted when it comes from the default. The value is undefined without effective limits. */
+function limitCell(effective, entry, name) {
+  const source = ownValue(effective, 'source');
+  const muted = source === 'default' || (source === 'user' && !(entry && Object.hasOwn(entry, name)));
+  const title = muted ? 'From the default' : source === 'admin' ? 'Admin of the service' : null;
+  return {value: ownValue(ownValue(effective, 'limits'), name), muted, title};
+}
+
+/** The note of the card "Your limits" for the answer of `limits/me`. */
+function myLimitsNote({limits, loaded}) {
+  if (loaded === false) return UNLOADED;
+  return LIMITS.every(({name}) => noLimit(ownValue(limits, name))) ? 'You have no limit on this service.' : '';
+}
+
+/** The body of `PUT limits/default` from the text of each field. An empty field means no limit. */
+function defaultLimitBody(values) {
+  return Object.fromEntries(Object.entries(values).map(([name, value]) => [name, value.trim() ? Number(value) : null]));
+}
+
+/** The body of `PUT limits/users/{user}` from the choice of each field: `default`, `none` or `number` with its
+ * value. A field with the choice `default` stays out of the body. Null when each field has the choice `default`. */
+function userLimitBody(choices) {
+  const body = {};
+  for (const [name, {mode, value}] of Object.entries(choices)) {
+    if (mode === 'none') body[name] = null;
+    else if (mode === 'number') body[name] = Number(value);
+  }
+  return Object.keys(body).length ? body : null;
+}
+
+// The card "Your limits" of the Connect tab.
+
+function showMyLimitsNote(text) {
+  $('my-limits-note').textContent = text;
+  $('my-limits-note').hidden = !text;
+}
+
+function showMyLimits(answer) {
+  const {limits, use, source} = answer;
+  for (const {name, use: key, when} of LIMITS) {
+    const limit = ownValue(limits, name);
+    const used = fmt(ownValue(use, key) ?? 0);
+    $(`my-${name}`).textContent = noLimit(limit) ? `No limit, ${used} ${when}` : `${used} of ${fmt(limit)} ${when}`;
+  }
+  $('my-limits-source').textContent = ownValue(LIMIT_SOURCES, source) || String(source ?? '-');
+  $('my-limits-list').hidden = false;
+  showMyLimitsNote(myLimitsNote(answer));
+}
+
+/** Read the limits and the use of the viewer on `service`. A failure shows a note in the card only. */
+async function loadMyLimits(service) {
+  const call = nextCall('limitsMe');
+  try {
+    showMyLimits(await current('limitsMe', call, service, api(servicePath('limits/me', service))));
+  } catch (error) {
+    if (error instanceof StaleAnswer) return;
+    $('my-limits-list').hidden = true;
+    showMyLimitsNote(limitsMissing(error) ? NOT_OFFERED
+      : `The page did not get your limits: ${error instanceof ApiError ? error.message : String(error)}`);
+  }
+}
+
+function clearMyLimits() {
+  nextCall('limitsMe');
+  showMyLimitsNote('');
+  $('my-limits-list').hidden = false;
+  for (const id of [...LIMITS.map(({name}) => `my-${name}`), 'my-limits-source']) $(id).textContent = '-';
+}
+
+// The Limits tab.
+
+function showLimitsMissing(missing) {
+  $('limits-missing').hidden = !missing;
+  $('limits-cards').hidden = missing;
+}
+
+async function loadLimits() {
+  const service = state.service;
+  if (!service) return;
+  const call = nextCall('limits');
+  let answer;
+  try {
+    answer = await current('limits', call, service, api(servicePath('limits', service)));
+  } catch (error) {
+    if (!limitsMissing(error)) throw error;
+    showLimitsMissing(true);
+    return;
+  }
+  showLimitsMissing(false);
+  showLimits(answer);
+}
+
+function showLimits(answer) {
+  const defaults = answer.default || null;
+  const users = answer.users || {};
+  const use = answer.use || {};
+  const effective = answer.effective || {};
+  $('limits-unloaded').textContent = UNLOADED;
+  $('limits-unloaded').hidden = answer.loaded !== false;
+  for (const {name} of LIMITS) {
+    const value = ownValue(defaults, name);
+    $(`limits-default-${name}`).value = noLimit(value) ? '' : String(value);
+  }
+  const names = [...new Set([...Object.keys(users), ...Object.keys(use)])].sort();
+  replaceRows($('limits-body'),
+              names.map(user => limitRow(user, ownValue(users, user), ownValue(effective, user), ownValue(use, user))),
+              8, 'No user has an entry or a current use.');
+}
+
+/** A row of a user with the effective limits of the service. A limit from the default is muted. A row with an
+ * entry has Edit and Remove. */
+function limitRow(user, entry, effective, use) {
+  const limits = LIMITS.map(({name}) => {
+    const {value, muted, title} = limitCell(effective, entry, name);
+    return el('td', {className: muted ? 'num muted' : 'num', title},
+              value === undefined ? '-' : limitText(value),
+              title ? el('span', {className: 'sr-only', text: `, ${title.toLowerCase()}`}) : null);
+  });
+  const used = LIMITS.map(({use: key}) => el('td', {className: 'num', text: fmt(ownValue(use, key) ?? 0)}));
+  const actions = entry ? el('div', {className: 'pair'},
+    el('button', {type: 'button', className: 'small ghost', text: 'Edit', 'aria-label': `Edit the limits of ${user}`,
+                  onclick: () => editLimits(user, entry)}),
+    el('button', {type: 'button', className: 'small danger-ghost', text: 'Remove',
+                  'aria-label': `Remove the limits of ${user}`, onclick: () => askRemove(user)})) : null;
+  return el('tr', {}, el('th', {scope: 'row', text: user}), ...limits, ...used, el('td', {}, actions));
+}
+
+/** Set the choice of the field `name` of the user form. Only the choice `number` takes a value. */
+function setChoice(name, mode, value = '') {
+  $(`limits-user-${name}-mode`).value = mode;
+  $(`limits-user-${name}`).value = mode === 'number' ? String(value) : '';
+  $(`limits-user-${name}`).disabled = mode !== 'number';
+}
+
+function editLimits(user, entry) {
+  $('limits-user').value = user;
+  for (const {name} of LIMITS) {
+    const value = ownValue(entry, name);
+    setChoice(name, value === undefined ? 'default' : value === null ? 'none' : 'number', value);
+  }
+  $('limits-user-status').textContent = `The form shows the entry of ${user}.`;
+  $('limits-user').focus();
+}
+
+function clearUserForm() {
+  $('limits-user-form').reset();
+  for (const {name} of LIMITS) setChoice(name, 'default');
+  $('limits-user-status').textContent = '';
+}
+
+function clearLimits() {
+  nextCall('limits');
+  showLimitsMissing(false);
+  $('limits-unloaded').hidden = true;
+  $('limits-default-form').reset();
+  $('limits-body').replaceChildren();
+  clearUserForm();
+}
+
+async function saveDefaultLimits(event) {
+  event.preventDefault();
+  const service = state.service;
+  if (!service) return;
+  const body = defaultLimitBody(Object.fromEntries(LIMITS.map(({name}) => [name, $(`limits-default-${name}`).value])));
+  await guarded(async () => {
+    await api(servicePath('limits/default', service), {method: 'PUT', headers: {'Content-Type': 'application/json'},
+                                                       body: JSON.stringify(body)});
+    showBanner(`The service ${service} saved the default limits.`, 'ok');
+    if (service === state.service) await loadLimits();
+  });
+}
+
+async function saveUserLimits(event) {
+  event.preventDefault();
+  const service = state.service;
+  const user = $('limits-user').value.trim();
+  if (!service) return;
+  if (!user) {
+    $('limits-user-status').textContent = 'Type a user name.';
+    $('limits-user').focus();
+    return;
+  }
+  const body = userLimitBody(Object.fromEntries(LIMITS.map(({name}) => [name, {
+    mode: $(`limits-user-${name}-mode`).value, value: $(`limits-user-${name}`).value}])));
+  if (!body) {
+    $('limits-user-status').textContent =
+      'Each field is "Default", so the entry sets nothing. To give the user the default limits, remove the entry of the user.';
+    return;
+  }
+  $('limits-user-status').textContent = '';
+  await guarded(async () => {
+    const userPath = servicePath(`limits/users/${encodeURIComponent(user)}`, service);
+    await api(userPath, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    showBanner(`The service ${service} saved the limits of ${user}.`, 'ok');
+    if (service !== state.service) return;
+    clearUserForm();
+    await loadLimits();
+  });
+}
+
+function askRemove(user) {
+  state.pendingRemove = {user, service: state.service};
+  $('remove-text').textContent = `Remove the entry of ${user}? The user then gets the default limits. ` +
+    'An admin of the service then has no limit.';
+  $('remove-dialog').showModal();
+}
+
+async function confirmRemove() {
+  const pending = state.pendingRemove;
+  state.pendingRemove = null;
+  $('remove-dialog').close();
+  if (!pending) return;
+  const {user, service} = pending;
+  await guarded(async () => {
+    const userPath = servicePath(`limits/users/${encodeURIComponent(user)}`, service);
+    await api(userPath, {method: 'DELETE'});
+    showBanner(`The service ${service} removed the limits of ${user}.`, 'ok');
+  });
+  if (service === state.service) guarded(loadLimits);
+}
+
 // ---- start
 
 function wire() {
@@ -1157,6 +1431,17 @@ function wire() {
     serve($('serve-model').value.trim(), $('serve-revision').value.trim() || 'main');
   });
   $('confirm-delete').addEventListener('click', confirmDelete);
+  $('limits-default-form').addEventListener('submit', saveDefaultLimits);
+  $('limits-user-form').addEventListener('submit', saveUserLimits);
+  $('limits-user-clear').addEventListener('click', clearUserForm);
+  $('limits-reload').addEventListener('click', () => guarded(loadLimits));
+  $('remove-confirm').addEventListener('click', confirmRemove);
+  for (const {name} of LIMITS) {
+    $(`limits-user-${name}-mode`).addEventListener('change', event => {
+      setChoice(name, event.target.value, $(`limits-user-${name}`).value);
+      if (event.target.value === 'number') $(`limits-user-${name}`).focus();
+    });
+  }
   for (const button of document.querySelectorAll('[data-copy]')) {
     button.addEventListener('click', () => copyExample(button));
   }

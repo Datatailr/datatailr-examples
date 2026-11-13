@@ -1409,3 +1409,691 @@ def test_descriptor_needs_a_platform_user(client):
     r = client.get(SERVICE)
     assert r.status_code == 401
     assert r.json()["error"]["code"] == "missing_user"
+
+
+# Limits
+
+LIMITS_PATH = "llm-service/limits.json"
+
+
+class HeldEngine:
+    """The engine side of the app. A request waits for `gate` while `hold` is true."""
+
+    def __init__(self) -> None:
+        self.hold = False
+        self.gate = threading.Event()
+        self.entered = threading.Event()
+        self.fail = False
+        self.crash = False
+        self.hold_stream = False  # a stream waits for `gate` after its first chunk
+
+    def transport(self) -> httpx.MockTransport:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if self.fail:
+                raise httpx.ConnectError("engine is gone")
+            if self.crash:
+                raise RuntimeError("the transport broke")
+            if self.hold:
+                self.entered.set()
+                await asyncio.to_thread(self.gate.wait, 10)
+            body = json.loads(request.content)
+            if body.get("stream") and self.hold_stream:
+                gate = self.gate
+
+                class Held(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        yield b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+                        await asyncio.to_thread(gate.wait, 10)
+                        yield b"data: [DONE]\n\n"
+
+                return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Held())
+            if body.get("stream"):
+                data = (
+                    b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+                    b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=data)
+            return httpx.Response(
+                200, json={"id": "x", "choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}
+            )
+
+        return httpx.MockTransport(handler)
+
+
+def limited_client(tmp_path, limits, engine=None, now=None):
+    """Return a started TestClient whose store holds the limits file `limits` (a dict, bytes or None)."""
+    store = MemoryBlobStore()
+    if limits is not None:
+        store.put(LIMITS_PATH, limits if isinstance(limits, bytes) else json.dumps(limits))
+    engine = engine or HeldEngine()
+    http = httpx.AsyncClient(transport=engine.transport(), base_url="http://engine")
+    return TestClient(make_app(tmp_path, store=store, http=http, now=now)), engine
+
+
+FULL_LIMITS = {"requests_per_minute": 5, "tokens_per_day": 1000, "parallel_requests": 2}
+
+
+def user_limits(**fields):
+    return {"users": {"bob": fields}}
+
+
+def parallel_of(client, user="bob"):
+    return client.app.state.limiter.use(user)["parallel_requests"]
+
+
+def test_requests_per_minute_limit_gives_429(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=1))
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 429
+        assert r.json()["error"] == {
+            "message": "You reached the limit of 1 request in one minute.",
+            "type": "rate_limit_error",
+            "code": "requests_per_minute",
+        }
+        assert 1 <= int(r.headers["Retry-After"]) <= 60
+        assert r.headers["x-request-id"]
+
+
+def test_refused_request_has_an_audit_record_and_counts_as_failed(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=1))
+    with c:
+        wait_ready(c)
+        c.post(CHAT, headers=BOB, json=HI)
+        r = c.post(CHAT, headers=BOB, json=HI)
+        rec = audit_records(c, user="bob")[0]
+        assert rec["status"] == 429 and rec["request_id"] == r.headers["x-request-id"]
+        assert rec["total_tokens"] is None
+        total = c.app.state.usage.summary(None, None, "bob", None)[0]
+        assert total["requests"] == 2 and total["failed_requests"] == 1 and total["total_tokens"] == 5
+
+
+def test_tokens_per_day_limit_gives_429_after_use(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(tokens_per_day=5))
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 429
+        error = r.json()["error"]
+        assert error["code"] == "tokens_per_day" and error["type"] == "rate_limit_error"
+        assert error["message"] == "You reached the limit of 5 tokens in one day."
+        assert int(r.headers["Retry-After"]) >= 1
+
+
+def test_tokens_per_day_retry_after_is_the_time_to_utc_midnight(tmp_path):
+    clock = lambda: datetime(2026, 11, 12, 23, 0, 0, tzinfo=timezone.utc)  # noqa: E731
+    c, _ = limited_client(tmp_path, user_limits(tokens_per_day=5), now=clock)
+    with c:
+        wait_ready(c)
+        c.post(CHAT, headers=BOB, json=HI)
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 429 and r.headers["Retry-After"] == "3600"
+
+
+def test_parallel_requests_limit_gives_429_while_a_request_is_held(tmp_path):
+    c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        engine.hold = True
+        first = []
+        worker = threading.Thread(target=lambda: first.append(c.post(CHAT, headers=BOB, json=HI)))
+        worker.start()
+        assert engine.entered.wait(10)
+        r = c.post(CHAT, headers=BOB, json=HI)
+        assert r.status_code == 429 and r.json()["error"]["code"] == "parallel_requests"
+        assert r.headers["Retry-After"] == "1"
+        assert parallel_of(c) == 1
+        engine.gate.set()
+        worker.join(10)
+        assert not worker.is_alive()
+        assert first[0].status_code == 200
+        assert parallel_of(c) == 0
+        engine.hold = False
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+
+
+def test_parallel_counter_is_zero_after_complete_and_streamed_answers(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert parallel_of(c) == 0
+        assert c.post(CHAT, headers=BOB, json={**HI, "stream": True}).status_code == 200
+        assert parallel_of(c) == 0
+
+
+def test_parallel_counter_is_zero_after_an_engine_failure(tmp_path):
+    c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        engine.fail = True
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 502
+        assert parallel_of(c) == 0
+
+
+def test_parallel_counter_is_zero_after_forward_raises(tmp_path):
+    c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        engine.crash = True
+        with pytest.raises(RuntimeError):
+            c.post(CHAT, headers=BOB, json=HI)
+        assert parallel_of(c) == 0
+
+
+def test_parallel_counter_is_zero_after_a_client_leaves_a_stream(tmp_path):
+    c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        engine.hold_stream = True
+        sent = []
+
+        async def drop():
+            proceed = asyncio.Event()
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": CHAT,
+                "raw_path": CHAT.encode(),
+                "query_string": b"",
+                "headers": [(b"x-datatailr-user", b"bob"), (b"content-type", b"application/json")],
+                "client": ("127.0.0.1", 1),
+                "server": ("test", 80),
+            }
+            payload = json.dumps({**HI, "stream": True}).encode()
+            given = False
+
+            async def receive():
+                nonlocal given
+                if not given:
+                    given = True
+                    return {"type": "http.request", "body": payload, "more_body": False}
+                await proceed.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                sent.append(message)
+                if message["type"] == "http.response.body" and message.get("body"):
+                    proceed.set()
+                    await asyncio.sleep(0.05)
+
+            await c.app(scope, receive, send)
+
+        c.portal.call(drop)
+        engine.gate.set()
+        assert any(m.get("body") for m in sent)
+        assert parallel_of(c) == 0
+        assert audit_records(c, user="bob")[0]["status"] == 499
+
+
+def test_refused_model_never_takes_or_releases_a_slot(tmp_path):
+    c, engine = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        r = c.post(CHAT, headers=BOB, json={**HI, "model": "org/other"})
+        assert r.status_code == 404 and parallel_of(c) == 0
+        engine.hold = True
+        worker = threading.Thread(target=lambda: c.post(CHAT, headers=BOB, json=HI))
+        worker.start()
+        assert engine.entered.wait(10)
+        assert c.post(CHAT, headers=BOB, json={**HI, "model": "org/other"}).status_code == 404
+        assert parallel_of(c) == 1  # the refused request did not release the slot of the held one
+        engine.gate.set()
+        worker.join(10)
+        assert not worker.is_alive()
+        assert parallel_of(c) == 0
+
+
+def test_admin_without_an_entry_has_no_limit_even_with_a_default(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": {"requests_per_minute": 1, "tokens_per_day": None, "parallel_requests": None}})
+    with c:
+        wait_ready(c)
+        for _ in range(3):
+            assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 429
+
+
+def test_acting_user_counts_for_the_acting_user(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=1))
+    with c:
+        wait_ready(c)
+        acting = {**ALICE, ACTING: "bob"}
+        assert c.post(CHAT, headers=acting, json=HI).status_code == 200
+        assert c.post(CHAT, headers=acting, json=HI).status_code == 429
+        assert c.app.state.limiter.use("alice")["requests_last_minute"] == 0  # the two requests count for bob
+        assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200  # alice has no limit
+
+
+class CountedAdmin:
+    """Count the admin lookups of each user by `AdminCheck.is_admin`."""
+
+    def __init__(self, monkeypatch):
+        self.users = []
+        real = AdminCheck.is_admin
+
+        def is_admin(check, user):
+            self.users.append(user)
+            return real(check, user)
+
+        monkeypatch.setattr(AdminCheck, "is_admin", is_admin)
+
+
+@pytest.mark.parametrize(
+    "limits, lookups",
+    [
+        (None, 0),
+        (user_limits(requests_per_minute=5), 0),
+        ({"default": FULL_LIMITS, "users": {"bob": {"tokens_per_day": 9}}}, 0),
+        ({"default": FULL_LIMITS}, 1),
+    ],
+)
+def test_a_request_looks_up_the_admin_right_only_when_it_changes_the_limits(tmp_path, monkeypatch, limits, lookups):
+    counted = CountedAdmin(monkeypatch)
+    c, _ = limited_client(tmp_path, limits)
+    with c:
+        wait_ready(c)
+        counted.users.clear()
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert counted.users == ["bob"] * lookups
+
+
+def test_without_a_limits_file_each_request_passes(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        for _ in range(5):
+            assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+
+
+def test_a_broken_limits_file_lets_the_service_start(tmp_path):
+    c, _ = limited_client(tmp_path, b"{not json")
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.app.state.limits.limits_for("bob", False)[1] == "none"
+
+
+# Limit endpoints
+
+ALL_NONE = {"requests_per_minute": None, "tokens_per_day": None, "parallel_requests": None}
+FULL = {"requests_per_minute": 5, "tokens_per_day": 1000, "parallel_requests": 2}
+
+
+def limit_events(client):
+    return [r for r in audit_records(client, limit=1000) if r["event"] == "limits_change"]
+
+
+def test_limits_me_for_a_user_with_an_entry_and_the_use_after_a_request(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=10, tokens_per_day=100))
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        body = c.get("/v1/limits/me", headers=BOB).json()
+        assert body == {
+            "user": "bob",
+            "limits": {"requests_per_minute": 10, "tokens_per_day": 100, "parallel_requests": None},
+            "use": {"requests_last_minute": 1, "tokens_today": 5, "parallel_requests": 0},
+            "source": "user",
+            "loaded": True,
+        }
+
+
+def test_limits_me_for_a_user_on_the_default(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": FULL})
+    with c:
+        wait_ready(c)
+        body = c.get("/v1/limits/me", headers=BOB).json()
+        assert body["limits"] == FULL and body["source"] == "default"
+
+
+def test_limits_me_for_an_admin_and_without_a_file(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": FULL})
+    with c:
+        wait_ready(c)
+        body = c.get("/v1/limits/me", headers=ALICE).json()
+        assert body["user"] == "alice" and body["limits"] == ALL_NONE and body["source"] == "admin"
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        body = c.get("/v1/limits/me", headers=BOB).json()
+        assert body["limits"] == ALL_NONE and body["source"] == "none"
+
+
+def test_limits_me_follows_the_acting_user(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=3))
+    with c:
+        wait_ready(c)
+        body = c.get("/v1/limits/me", headers={**ALICE, ACTING: "bob"}).json()
+        assert body["user"] == "bob" and body["limits"]["requests_per_minute"] == 3
+        assert c.get("/v1/limits/me", headers={**BOB, ACTING: "alice"}).status_code == 403
+        assert c.get("/v1/limits/me").status_code == 401
+
+
+LIMIT_ROUTES = [
+    ("GET", "/admin/limits", {}),
+    ("PUT", "/admin/limits/default", {"json": FULL}),
+    ("PUT", "/admin/limits/users/bob", {"json": {"parallel_requests": 1}}),
+    ("DELETE", "/admin/limits/users/bob", {}),
+]
+
+
+@pytest.mark.parametrize("method,path,kwargs", LIMIT_ROUTES)
+def test_limit_admin_endpoints_need_an_admin(tmp_path, method, path, kwargs):
+    c, _ = limited_client(tmp_path, user_limits(parallel_requests=1))
+    with c:
+        wait_ready(c)
+        r = c.request(method, path, headers=BOB, **kwargs)
+        assert r.status_code == 403
+        assert r.json()["error"]["code"] == "admin_required"
+        assert c.request(method, path, **kwargs).status_code == 401
+        assert c.app.state.limits.users() == {"bob": {"parallel_requests": 1}}
+
+
+def test_get_limits_shows_default_entries_and_use(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": FULL, "users": {"carol": {"tokens_per_day": 9}}})
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        body = c.get("/admin/limits", headers=ALICE).json()
+        assert body["default"] == FULL
+        assert body["users"] == {"carol": {"tokens_per_day": 9}}
+        assert body["use"]["bob"] == {"requests_last_minute": 1, "tokens_today": 5, "parallel_requests": 0}
+        assert body["use"]["carol"] == {"requests_last_minute": 0, "tokens_today": 0, "parallel_requests": 0}
+
+
+def test_get_limits_shows_the_effective_limits_and_their_source(tmp_path, monkeypatch):
+    threads = []
+    real = AdminCheck.is_admin
+
+    def is_admin(check, user):
+        threads.append(threading.get_ident())
+        return real(check, user)
+
+    entries = {"bob": {"tokens_per_day": 9}, "carol": {"parallel_requests": None}}
+    c, _ = limited_client(tmp_path, {"default": FULL, "users": entries})
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200
+        c.app.state.limiter.acquire("dave", {})
+        c.app.state.limiter.release("dave")
+        monkeypatch.setattr(AdminCheck, "is_admin", is_admin)
+        body = c.get("/admin/limits", headers=ALICE).json()
+        assert body["effective"] == {
+            "alice": {"limits": ALL_NONE, "source": "admin"},
+            "bob": {"limits": {**FULL, "tokens_per_day": 9}, "source": "user"},
+            "carol": {"limits": {**FULL, "parallel_requests": None}, "source": "user"},
+            "dave": {"limits": FULL, "source": "default"},
+        }
+        lookups = threads[1:]  # the first lookup is the admin check of the caller
+        assert len(lookups) == 4 and len(set(lookups)) == 1  # one thread hop for all users
+
+
+def test_get_limits_effective_source_is_none_without_a_default(tmp_path):
+    c, _ = limited_client(tmp_path, user_limits(requests_per_minute=3))
+    with c:
+        wait_ready(c)
+        c.app.state.limiter.acquire("dave", {})
+        effective = c.get("/admin/limits", headers=ALICE).json()["effective"]
+        assert effective["dave"] == {"limits": ALL_NONE, "source": "none"}
+        assert effective["bob"] == {"limits": {**ALL_NONE, "requests_per_minute": 3}, "source": "user"}
+
+
+def test_get_limits_without_a_file(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        body = c.get("/admin/limits", headers=ALICE).json()
+        assert body == {"default": None, "users": {}, "use": {}, "effective": {}, "loaded": True}
+
+
+def test_put_default_changes_the_answer_and_the_enforcement_at_once(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        r = c.put("/admin/limits/default", headers=ALICE, json={**ALL_NONE, "requests_per_minute": 2})
+        assert r.status_code == 200 and r.json() == {**ALL_NONE, "requests_per_minute": 2}
+        assert c.get("/admin/limits", headers=ALICE).json()["default"]["requests_per_minute"] == 2
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 429
+        assert c.get("/v1/limits/me", headers=BOB).json()["source"] == "default"
+
+
+def test_put_user_and_delete_user_change_the_enforcement_at_once(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        r = c.put("/admin/limits/users/bob", headers=ALICE, json={"requests_per_minute": 1})
+        assert r.status_code == 200 and r.json() == {"requests_per_minute": 1}
+        assert c.get("/admin/limits", headers=ALICE).json()["users"] == {"bob": {"requests_per_minute": 1}}
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 429
+        r = c.delete("/admin/limits/users/bob", headers=ALICE)
+        assert r.status_code == 200 and r.json() == {"removed": "bob"}
+        assert c.get("/admin/limits", headers=ALICE).json()["users"] == {}
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+
+
+def test_the_changes_reach_the_limits_file(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        c.put("/admin/limits/default", headers=ALICE, json=FULL)
+        c.put("/admin/limits/users/bob", headers=ALICE, json={"tokens_per_day": None})
+        stored = json.loads(c.app.state.limits._store.get(LIMITS_PATH))
+        assert stored == {"default": FULL, "users": {"bob": {"tokens_per_day": None}}}
+
+
+def test_delete_of_a_missing_entry_is_404(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        r = c.delete("/admin/limits/users/bob", headers=ALICE)
+        assert r.status_code == 404
+        assert r.json()["error"] == {
+            "message": r.json()["error"]["message"],
+            "type": "invalid_request_error",
+            "code": "limit_not_found",
+        }
+        assert limit_events(c) == []
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        ("/admin/limits/default", {"requests_per_minute": 1}),
+        ("/admin/limits/default", {**FULL, "extra": 1}),
+        ("/admin/limits/default", {**FULL, "requests_per_minute": 0}),
+        ("/admin/limits/default", {**FULL, "requests_per_minute": True}),
+        ("/admin/limits/default", {**FULL, "tokens_per_day": "5"}),
+        ("/admin/limits/users/bob", {}),
+        ("/admin/limits/users/bob", {"nope": 1}),
+        ("/admin/limits/users/bob", {"parallel_requests": 1_000_000_001}),
+    ],
+)
+def test_a_bad_limits_body_is_400_invalid_limit(tmp_path, path, body):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        r = c.put(path, headers=ALICE, json=body)
+        assert r.status_code == 400
+        error = r.json()["error"]
+        assert error["code"] == "invalid_limit" and error["type"] == "invalid_request_error"
+        assert error["message"]
+        assert c.app.state.limits.default() is None and c.app.state.limits.users() == {}
+        assert limit_events(c) == []
+
+
+@pytest.mark.parametrize("path", ["/admin/limits/default", "/admin/limits/users/bob"])
+@pytest.mark.parametrize("content", [b"hello", b"[1]", b"", b"5", b"[" * 100000])
+def test_a_body_that_is_not_a_json_object_is_400_invalid_limit(tmp_path, path, content):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        r = c.put(path, headers=ALICE, content=content)
+        assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_limit"
+
+
+@pytest.mark.parametrize("name", ["x" * 257, "a%09b", "a%7Fb", "%20%20"])
+@pytest.mark.parametrize("method", ["PUT", "DELETE"])
+def test_a_bad_user_name_is_400_invalid_user(tmp_path, name, method):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        kwargs = {"json": {"parallel_requests": 1}} if method == "PUT" else {}
+        r = c.request(method, f"/admin/limits/users/{name}", headers=ALICE, **kwargs)
+        assert r.status_code == 400
+        error = r.json()["error"]
+        assert error["code"] == "invalid_user" and error["type"] == "invalid_request_error"
+        assert c.app.state.limits.users() == {}
+
+
+def test_a_user_name_is_stripped_and_a_long_name_at_the_limit_is_fine(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        assert c.put("/admin/limits/users/%20bob%20", headers=ALICE, json={"parallel_requests": 1}).status_code == 200
+        assert c.put(f"/admin/limits/users/{'x' * 256}", headers=ALICE, json={"parallel_requests": 1}).status_code == 200
+        assert sorted(c.app.state.limits.users()) == sorted(["bob", "x" * 256])
+
+
+def test_a_bad_user_name_is_refused_before_the_body_is_read(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        r = c.put("/admin/limits/users/a%09b", headers=ALICE, json={"nope": 1})
+        assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_user"
+
+
+class FailingLimitsStore(MemoryBlobStore):
+    """A store that refuses each write of the limits file while `fail` is true."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+
+    def put(self, path, data):
+        if self.fail and path == LIMITS_PATH:
+            raise OSError("the store is down")
+        super().put(path, data)
+
+
+@pytest.mark.parametrize("method,path,kwargs", LIMIT_ROUTES[1:])
+def test_a_failed_write_is_502_and_changes_nothing(tmp_path, method, path, kwargs):
+    store = FailingLimitsStore()
+    store.put(LIMITS_PATH, json.dumps({"default": FULL, "users": {"bob": {"parallel_requests": 1}}}))
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    with TestClient(make_app(tmp_path, store=store, http=http)) as c:
+        wait_ready(c)
+        store.fail = True
+        r = c.request(method, path, headers=ALICE, **kwargs)
+        assert r.status_code == 502
+        error = r.json()["error"]
+        assert error["code"] == "storage_unavailable" and error["type"] == "server_error"
+        assert c.app.state.limits.default() == FULL
+        assert c.app.state.limits.users() == {"bob": {"parallel_requests": 1}}
+        assert limit_events(c) == []
+
+
+def test_a_limits_file_that_could_not_be_read_gives_502(tmp_path):
+    class UnreadableStore(MemoryBlobStore):
+        def get(self, path):
+            if path == LIMITS_PATH:
+                raise OSError("the store is down")
+            return super().get(path)
+
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    with TestClient(make_app(tmp_path, store=UnreadableStore(), http=http)) as c:
+        wait_ready(c)
+        r = c.put("/admin/limits/default", headers=ALICE, json=FULL)
+        assert r.status_code == 502 and r.json()["error"]["code"] == "storage_unavailable"
+
+
+class SwitchedLimitsStore(MemoryBlobStore):
+    """A store whose reads of the limits file fail while `fail` is true."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = True
+
+    def get(self, path):
+        if self.fail and path == LIMITS_PATH:
+            raise OSError("the store is down")
+        return super().get(path)
+
+
+def test_a_failed_read_shows_loaded_false_and_the_flusher_reads_the_file_again(tmp_path):
+    store = SwitchedLimitsStore()
+    store.put(LIMITS_PATH, json.dumps(user_limits(requests_per_minute=1)))
+    http = httpx.AsyncClient(transport=HeldEngine().transport(), base_url="http://engine")
+    with TestClient(make_app(tmp_path, store=store, http=http, flush_interval=0.05)) as c:
+        wait_ready(c)
+        assert c.get("/admin/limits", headers=ALICE).json()["loaded"] is False
+        assert c.get("/v1/limits/me", headers=BOB).json()["loaded"] is False
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200  # no limit applies now
+        store.fail = False
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not c.app.state.limits.loaded():
+            time.sleep(0.05)
+        assert c.get("/admin/limits", headers=ALICE).json()["loaded"] is True
+        assert c.get("/v1/limits/me", headers=BOB).json()["loaded"] is True
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 429
+
+
+def test_each_change_is_audited_with_old_and_new(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+        c.put("/admin/limits/default", headers=ALICE, json=FULL)
+        c.put("/admin/limits/default", headers={**ALICE, ACTING: "carol"}, json=ALL_NONE)
+        c.put("/admin/limits/users/bob", headers=ALICE, json={"tokens_per_day": 7})
+        c.put("/admin/limits/users/bob", headers=ALICE, json={"tokens_per_day": 8})
+        c.delete("/admin/limits/users/bob", headers=ALICE)
+        events = sorted(limit_events(c), key=lambda e: e["ts"])
+        assert len(events) == 5
+        assert all(e["endpoint"] == "/admin/limits" and e["status"] == 200 for e in events)
+        details = [(e["user"], e["detail"]) for e in events]
+        assert sorted(details, key=json.dumps) == sorted(
+            [
+                ("alice", {"target": "default", "old": None, "new": FULL}),
+                ("carol", {"target": "default", "old": FULL, "new": ALL_NONE}),
+                ("alice", {"target": "bob", "old": None, "new": {"tokens_per_day": 7}}),
+                ("alice", {"target": "bob", "old": {"tokens_per_day": 7}, "new": {"tokens_per_day": 8}}),
+                ("alice", {"target": "bob", "old": {"tokens_per_day": 8}, "new": None}),
+            ],
+            key=json.dumps,
+        )
+        prompt = full_record(c, events[0])["prompt"]
+        assert prompt["event"] == "limits_change" and set(prompt) == {"event", "target", "old", "new"}
+
+
+def test_get_limits_keeps_a_user_with_tokens_today_after_the_window_ends(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": FULL})
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=BOB, json=HI).status_code == 200
+        # The request window of bob ends, as it does after 60 seconds and after a restart.
+        c.app.state.limiter._users.clear()
+        body = c.get("/admin/limits", headers=ALICE).json()
+        assert body["use"]["bob"] == {"requests_last_minute": 0, "tokens_today": 5, "parallel_requests": 0}
+        assert body["effective"]["bob"]["source"] == "default"
+
+
+def test_an_admin_whose_entry_goes_away_gets_no_limit_from_the_default(tmp_path):
+    c, _ = limited_client(tmp_path, {"default": FULL, "users": {"alice": {"requests_per_minute": 1}}})
+    with c:
+        wait_ready(c)
+        assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200
+        assert c.post(CHAT, headers=ALICE, json=HI).status_code == 429
+        assert c.delete("/admin/limits/users/alice", headers=ALICE).status_code == 200
+        for _ in range(FULL["requests_per_minute"] + 2):
+            assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200

@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Callable
 
 import httpx
@@ -23,7 +23,15 @@ from llm_service.gateway.audit import AuditLog, PromptUnreadable, iso, parse_tim
 from llm_service.gateway.audit_merge import MAINTENANCE_INTERVAL, AuditMerger, run_maintenance
 from llm_service.gateway.config import Config
 from llm_service.gateway.engine import Engine
-from llm_service.gateway.identity import AccessCheck, AdminCheck, acting_user_from_headers, user_from_headers
+from llm_service.gateway.identity import (
+    AccessCheck,
+    AdminCheck,
+    acting_user_from_headers,
+    check_user_name,
+    user_from_headers,
+)
+from llm_service.gateway.limiter import LimitExceeded, Limiter
+from llm_service.gateway.limits import InvalidLimit, LimitStore, StorageUnavailable
 from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.proxy import forward, prompt_of
 from llm_service.gateway.storage import BlobStore
@@ -101,6 +109,14 @@ def create_app(
     client = http or httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
     audit = AuditLog(store, config.blob_root, config.flush_size, now=now)
     usage = UsageTotals(store, config.blob_root, audit, lambda: iso(now())[:10], now=now)
+    limits = LimitStore(store, config.blob_root)
+
+    def seconds_to_midnight() -> float:
+        current = now()
+        midnight = current.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        return (midnight - current).total_seconds()
+
+    limiter = Limiter(usage.tokens_today, seconds_to_midnight)
     merger = AuditMerger(store, config.blob_root, audit, now, config.prompt_retention_days)
     stopping = threading.Event()  # set before the last flusher cycle, which forces the checkpoint
     weights = WeightCache(store, config.blob_root, config.local_dir, download)
@@ -140,16 +156,17 @@ def create_app(
     manager = ModelManager(weights, engine, store, config.blob_root, config.default_model, on_event)
 
     def on_flusher_tick() -> None:
-        """Run the usage steps after each flush, in the flusher thread.
+        """Run the usage steps and the new read of the limits after each flush, in the flusher thread.
 
-        Each step has its own guard, so one failure does not stop the other. The last cycle
-        at shutdown forces the checkpoint. The merge and the retention run in the
-        maintenance task, so a flush never waits for their deletes.
+        Each step has its own guard, so one failure does not stop the others. The last cycle
+        at shutdown forces the checkpoint. The limits file is read again only after a failed read.
+        The merge and the retention run in the maintenance task, so a flush never waits for their deletes.
         """
         last_cycle = stopping.is_set()
         steps = [
             ("close_days", usage.close_days),
             ("checkpoint", lambda: usage.checkpoint(force=last_cycle)),
+            ("limits", limits.retry_load),
         ]
         for name, step in steps:
             try:
@@ -162,6 +179,7 @@ def create_app(
         # Load the totals first. Register the listeners after that, with no await
         # in between, so that no record is counted twice and no flush runs against
         # a half-loaded day.
+        await asyncio.to_thread(limits.load)
         started = time.monotonic()
         days = await asyncio.to_thread(usage.load)
         logger.info("usage totals loaded in %.1f s for %d days", time.monotonic() - started, days)
@@ -206,6 +224,8 @@ def create_app(
     app.state.manager = manager
     app.state.audit = audit
     app.state.usage = usage
+    app.state.limits = limits
+    app.state.limiter = limiter
 
     # Error bodies
 
@@ -317,7 +337,16 @@ def create_app(
             body: dict | None = None
             model: str | None = None
 
+            slot = False  # True while the limiter holds a slot of this request
+
+            def release_slot() -> None:
+                nonlocal slot
+                if slot:
+                    slot = False
+                    limiter.release(user)
+
             def record(status: int, usage_counts: dict | None = None) -> None:
+                release_slot()
                 counts = usage_counts or {}
                 entry = {
                     "request_id": request_id,
@@ -384,7 +413,29 @@ def create_app(
                     )
                 )
 
-            response = await forward(client, engine.base_url, path, body, record)
+            # One read decides whether the admin right matters: only the default depends on it.
+            # A second read after the lookup takes the limits as they are at that moment.
+            user_limits, source = limits.limits_for(user, False)
+            if source == "default" and await asyncio.to_thread(admin.is_admin, user):
+                user_limits, _ = limits.limits_for(user, True)
+            try:
+                limiter.acquire(user, user_limits)
+            except LimitExceeded as exceeded:
+                return refuse(
+                    ApiError(
+                        429,
+                        "rate_limit_error",
+                        exceeded.code,
+                        exceeded.message,
+                        {"Retry-After": str(exceeded.retry_after)},
+                    )
+                )
+            slot = True
+            try:
+                response = await forward(client, engine.base_url, path, body, record)
+            except BaseException:
+                release_slot()
+                raise
             response.headers["x-request-id"] = request_id
             return response
 
@@ -450,7 +501,115 @@ def create_app(
         _check_day("until", until)
         return await asyncio.to_thread(usage.user_detail, user, since, until)
 
+    @app.get("/v1/limits/me")
+    async def limits_me(user: str = Depends(effective_user)) -> dict:
+        user_admin = await asyncio.to_thread(admin.is_admin, user)
+        user_limits, source = limits.limits_for(user, user_admin)
+        return {
+            "user": user,
+            "limits": user_limits,
+            "use": limiter.use(user),
+            "source": source,
+            "loaded": limits.loaded(),
+        }
+
     # Admin API
+
+    def entry_user(name: str) -> str:
+        """Return the stripped user name of a limits entry. Raise `ApiError` with `invalid_user` if it is bad."""
+        try:
+            return check_user_name(name)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_user", str(error)) from None
+
+    async def limits_body(request: Request) -> object:
+        """Return the parsed JSON body. A body that is not JSON gives None, which `check_limits` refuses."""
+        try:
+            return json.loads(await request.body())
+        except (ValueError, RecursionError):
+            return None
+
+    async def change_limits(
+        target: str, admin_user: str, change: Callable[[], tuple[dict | None, dict | None]]
+    ) -> dict | None:
+        """Run a store change in a thread and audit it. The change returns the old and the new value."""
+        try:
+            old, new = await asyncio.to_thread(change)
+        except InvalidLimit as error:
+            raise ApiError(400, "invalid_request_error", "invalid_limit", str(error)) from None
+        except StorageUnavailable as error:
+            raise ApiError(502, "server_error", "storage_unavailable", str(error)) from None
+        write_audit(
+            {
+                "user": admin_user,
+                "endpoint": "/admin/limits",
+                "model": None,
+                "stream": False,
+                "prompt": {"event": "limits_change", "target": target, "old": old, "new": new},
+                "status": 200,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "duration_ms": None,
+            }
+        )
+        return new
+
+    @app.get("/admin/limits")
+    async def get_limits(admin_user: str = Depends(require_admin)) -> dict:
+        entries = limits.users()
+        # A user with tokens today stays in the list after the request window ends and after a restart.
+        names = sorted(set(limiter.active_users()) | set(entries) | set(usage.users_today()))
+
+        def effective() -> dict:
+            """The limits of each listed user and their source, with one admin lookup for each."""
+            found = {}
+            for name in names:
+                values, source = limits.limits_for(name, admin.is_admin(name))
+                found[name] = {"limits": values, "source": source}
+            return found
+
+        return {
+            "default": limits.default(),
+            "users": entries,
+            "use": {name: limiter.use(name) for name in names},
+            "effective": await asyncio.to_thread(effective),
+            "loaded": limits.loaded(),
+        }
+
+    @app.put("/admin/limits/default")
+    async def put_default_limits(request: Request, admin_user: str = Depends(require_admin)) -> dict:
+        body = await limits_body(request)
+
+        def change():
+            return limits.set_default(body), body
+
+        return await change_limits("default", admin_user, change)
+
+    @app.put("/admin/limits/users/{name}")
+    async def put_user_limits(name: str, request: Request, admin_user: str = Depends(require_admin)) -> dict:
+        name = entry_user(name)
+        body = await limits_body(request)
+
+        def change():
+            return limits.set_user(name, body), body
+
+        return await change_limits(name, admin_user, change)
+
+    @app.delete("/admin/limits/users/{name}")
+    async def delete_user_limits(name: str, admin_user: str = Depends(require_admin)) -> dict:
+        name = entry_user(name)
+
+        def change():
+            try:
+                return limits.remove_user(name), None
+            except KeyError:
+                raise ApiError(
+                    404, "invalid_request_error", "limit_not_found", f"the user {name!r} has no limits entry"
+                ) from None
+
+        await change_limits(name, admin_user, change)
+        return {"removed": name}
 
     @app.get("/admin/model")
     async def get_model(admin_user: str = Depends(require_admin)) -> dict:

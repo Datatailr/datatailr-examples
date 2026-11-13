@@ -225,6 +225,20 @@ textarea:focus { border-color: var(--blue); outline: none; box-shadow: 0 0 0 3px
 .stats dt { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
 .stats dd { margin-top: 2px; font-variant-numeric: tabular-nums; }
 
+/* ---- limits */
+
+#limits-content input[type="number"] { width: 150px; }
+.card h3.sub { font-size: 13px; font-weight: 600; margin: 18px 0 10px; }
+fieldset.choice {
+  display: inline-flex; align-items: center; gap: 6px; border: 0; min-width: 0;
+}
+fieldset.choice legend { float: left; margin-right: 8px; color: var(--muted); font-size: 13px; }
+.limit-form + .caption { margin-top: 10px; }
+#limits-user { width: 200px; }
+#limits-body td.muted { font-style: italic; }
+/* The column titles of the users table wrap, so the table fits a wide window without a scroll. */
+#limits-cards .grid thead th { white-space: normal; vertical-align: bottom; }
+
 /* ---- dialogs */
 
 dialog {
@@ -233,9 +247,9 @@ dialog {
   border-radius: 12px; padding: 18px 20px; box-shadow: 0 20px 60px rgba(0, 0, 0, .55);
 }
 dialog::backdrop { background: rgba(5, 8, 12, .7); }
-#confirm-dialog { width: min(460px, calc(100vw - 32px)); }
-#confirm-dialog h2 { font-size: 16px; margin-bottom: 10px; }
-#confirm-dialog p { color: var(--muted); overflow-wrap: anywhere; }
+#confirm-dialog, #remove-dialog { width: min(460px, calc(100vw - 32px)); }
+#confirm-dialog h2, #remove-dialog h2 { font-size: 16px; margin-bottom: 10px; }
+#confirm-dialog p, #remove-dialog p { color: var(--muted); overflow-wrap: anywhere; }
 .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 pre.json {
   font-family: var(--mono); font-size: 12.5px; line-height: 1.55; background: var(--bg);
@@ -262,4 +276,6 @@ pre.json {
   .filters label { flex: 1 1 100%; justify-content: space-between; }
   .filters input, .filters select { flex: 1; }
   #chat-model { width: 100%; }
+  .limit-form label, fieldset.choice { flex: 1 1 100%; }
+  #limits-user { flex: 1; }
 }

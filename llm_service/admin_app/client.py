@@ -11,6 +11,20 @@ from llm_service.admin_app.registry import service_url, valid_name
 from llm_service.gateway.identity import ACTING_USER_HEADER
 
 
+RETRY_AFTER = "Retry-After"
+
+
+def retry_after_headers(headers: httpx.Headers) -> dict[str, str]:
+    """Return the `Retry-After` header of a service answer when it is a whole number of 1 to 5 digits.
+
+    Return an empty dict for each other value. The app passes no other header.
+    """
+    value = headers.get(RETRY_AFTER, "")
+    if 1 <= len(value) <= 5 and value.isascii() and value.isdigit():
+        return {RETRY_AFTER: value}
+    return {}
+
+
 class ServiceUnreachable(Exception):
     """The service did not answer, or it answered with a body that is not JSON.
 
@@ -40,9 +54,27 @@ class ServiceClient:
         json: object | None = None,
         timeout: float,
     ) -> tuple[int, object]:
+        """Send one request and return the status and the JSON body. See `request_with_headers`."""
+        status, body, _ = await self.request_with_headers(
+            service, method, path, viewer, params=params, json=json, timeout=timeout
+        )
+        return status, body
+
+    async def request_with_headers(
+        self,
+        service: str,
+        method: str,
+        path: str,
+        viewer: str | None,
+        *,
+        params: dict | None = None,
+        json: object | None = None,
+        timeout: float,
+    ) -> tuple[int, object, dict[str, str]]:
         """Send one request to the service `service`.
 
-        `viewer` goes into the acting user header. With None, the request has no
+        Return the status, the JSON body and the headers that the app passes on.
+        Today that is only a valid `Retry-After`. `viewer` goes into the acting user header. With None, the request has no
         acting user. Params with the value None are dropped. `timeout` is in
         seconds. Raise `ValueError` for a bad service name. Raise
         `ServiceUnreachable` for a transport error and for a body that is not JSON.
@@ -64,7 +96,7 @@ class ServiceClient:
                 json=json,
                 timeout=timeout,
             )
-            return response.status_code, response.json()
+            return response.status_code, response.json(), retry_after_headers(response.headers)
         except (httpx.ReadTimeout, httpx.WriteTimeout) as error:
             raise ServiceUnreachable(str(error), sent=True) from error
         except (httpx.HTTPError, ValueError) as error:
