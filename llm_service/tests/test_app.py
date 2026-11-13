@@ -2097,3 +2097,16 @@ def test_an_admin_whose_entry_goes_away_gets_no_limit_from_the_default(tmp_path)
         assert c.delete("/admin/limits/users/alice", headers=ALICE).status_code == 200
         for _ in range(FULL["requests_per_minute"] + 2):
             assert c.post(CHAT, headers=ALICE, json=HI).status_code == 200
+
+
+def test_ttft_ms_is_set_for_a_stream_and_null_otherwise(client):
+    assert client.post(CHAT, headers=BOB, json={**HI, "stream": True}).status_code == 200
+    assert client.post(CHAT, headers=BOB, json=HI).status_code == 200
+    assert client.post(CHAT, headers=BOB, json={**HI, "model": "other"}).status_code == 404
+    rows = audit_records(client, user="bob")
+    streamed = [r for r in rows if r["stream"] is True]
+    others = [r for r in rows if r["stream"] is not True]
+    assert len(streamed) == 1 and len(others) == 2
+    assert isinstance(streamed[0]["ttft_ms"], int)
+    assert 0 <= streamed[0]["ttft_ms"] <= streamed[0]["duration_ms"]
+    assert all(r["ttft_ms"] is None for r in others)

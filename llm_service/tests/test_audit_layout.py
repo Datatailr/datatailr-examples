@@ -281,3 +281,19 @@ def test_split_record_keeps_via_in_the_row_and_out_of_the_prompt_line():
     assert "via" not in prompt_line
     assert layout.public_row(row)["via"] == "alice"
     assert layout.join_record(row, prompt_line["prompt"])["via"] == "alice"
+
+
+def test_ttft_ms_survives_split_and_join():
+    record = request_record(ttft_ms=40)
+    row, prompt = layout.split_record(record, "seg", 0)
+    assert row["ttft_ms"] == 40
+    assert layout.join_record(row, prompt)["ttft_ms"] == 40
+    assert layout.public_row(row)["ttft_ms"] == 40
+
+
+def test_old_row_without_ttft_ms_reads_as_null():
+    row, prompt = layout.split_record(request_record(), "seg", 0)
+    assert row.get("ttft_ms") is None
+    assert layout.public_row(row).get("ttft_ms") is None
+    assert layout.join_record(row, prompt).get("ttft_ms") is None
+    assert layout.join_record(row, prompt)["duration_ms"] == 12

@@ -337,6 +337,12 @@ def create_app(
             body: dict | None = None
             model: str | None = None
 
+            first_ms: int | None = None  # time to the first content of a stream
+
+            def note_first() -> None:
+                nonlocal first_ms
+                first_ms = int((time.monotonic() - started) * 1000)
+
             slot = False  # True while the limiter holds a slot of this request
 
             def release_slot() -> None:
@@ -360,6 +366,7 @@ def create_app(
                     "completion_tokens": counts.get("completion_tokens"),
                     "total_tokens": counts.get("total_tokens"),
                     "duration_ms": int((time.monotonic() - started) * 1000),
+                    "ttft_ms": first_ms,
                 }
                 if user != caller:
                     entry["via"] = caller
@@ -432,7 +439,7 @@ def create_app(
                 )
             slot = True
             try:
-                response = await forward(client, engine.base_url, path, body, record)
+                response = await forward(client, engine.base_url, path, body, record, note_first)
             except BaseException:
                 release_slot()
                 raise
