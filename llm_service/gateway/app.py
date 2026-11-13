@@ -34,7 +34,7 @@ from llm_service.gateway.identity import (
 from llm_service.gateway.limiter import LimitExceeded, Limiter
 from llm_service.gateway.limits import InvalidLimit, LimitStore, StorageUnavailable
 from llm_service.gateway.load import LoadMonitor
-from llm_service.gateway.metrics_store import MetricsStore
+from llm_service.gateway.metrics_store import MAX_DAYS, MetricsStore
 from llm_service.gateway.models import ModelInUse, ModelManager, SwitchInProgress
 from llm_service.gateway.proxy import forward, prompt_of
 from llm_service.gateway.storage import BlobStore
@@ -97,12 +97,14 @@ def _check_instant(name: str, value: str | None) -> datetime:
     try:
         if value is None:
             raise ValueError(name)
-        moment = datetime.fromisoformat(value.strip().replace("z", "Z"))
-    except ValueError:
+        text = value.strip()
+        # Python 3.13 accepts a capital `Z` only.
+        moment = datetime.fromisoformat(text[:-1] + "Z" if text.endswith("z") else text)
+        return moment.astimezone(timezone.utc) if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError):
         raise ApiError(
             400, "invalid_request_error", "invalid_time", f"{name} is required and must be an ISO time like 2026-11-10T12:00:00Z"
         ) from None
-    return moment.astimezone(timezone.utc) if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
 def create_app(
@@ -140,7 +142,7 @@ def create_app(
 
     limiter = Limiter(usage.tokens_today, seconds_to_midnight)
     merger = AuditMerger(store, config.blob_root, audit, now, config.prompt_retention_days)
-    stopping = threading.Event()  # set before the last flusher cycle, which forces the checkpoint
+    stopping = threading.Event()  # set before the last flusher cycle, which forces the checkpoint and the metrics write
     load = LoadMonitor(now)
     metrics = MetricsStore(store, config.blob_root, now, config.metrics_retention_days)
     gpu = gpu or GpuReader()
@@ -182,10 +184,10 @@ def create_app(
     manager = ModelManager(weights, engine, store, config.blob_root, config.default_model, on_event)
 
     def on_flusher_tick() -> None:
-        """Run the usage steps and the new read of the limits after each flush, in the flusher thread.
+        """Run the usage steps, the new read of the limits and the metrics write after each flush, in the flusher thread.
 
         Each step has its own guard, so one failure does not stop the others. The last cycle
-        at shutdown forces the checkpoint. The limits file is read again only after a failed read.
+        at shutdown forces the checkpoint and the metrics write. The limits file is read again only after a failed read.
         The merge and the retention run in the maintenance task, so a flush never waits for their deletes.
         """
         last_cycle = stopping.is_set()
@@ -210,10 +212,10 @@ def create_app(
                 logger.warning("the maintenance step %s failed: %s", name, error)
 
     async def sample_loop() -> None:
-        """Take a load sample each `sample_interval` seconds until cancelled.
+        """Take a load sample each `sample_interval` seconds until a cancel.
 
         Each round reads the engine numbers, and at each third round the GPU memory in a thread.
-        A failed round is logged and the loop goes on.
+        The loop logs a failed round and goes on.
         """
         gpu_memory = None
         rounds = 0
@@ -418,8 +420,10 @@ def create_app(
                 nonlocal slot
                 if slot:
                     slot = False
-                    limiter.release(user)
-                    load.end()
+                    try:
+                        limiter.release(user)
+                    finally:
+                        load.end()
 
             def record(status: int, usage_counts: dict | None = None) -> None:
                 release_slot()
@@ -778,10 +782,11 @@ def create_app(
     ) -> dict:
         start = _check_instant("since", since)
         end = _check_instant("until", until)
-        try:
-            points, step, missing = await asyncio.to_thread(metrics.history, start, end)
-        except ValueError as error:
-            raise ApiError(400, "invalid_request_error", "invalid_time", str(error)) from None
+        if start > end:
+            raise ApiError(400, "invalid_request_error", "invalid_time", "since is after until")
+        if end - start > timedelta(days=MAX_DAYS):
+            raise ApiError(400, "invalid_request_error", "invalid_time", f"the range is over {MAX_DAYS} days")
+        points, step, missing = await asyncio.to_thread(metrics.history, start, end)
         return {"step_seconds": step, "points": points, "missing_days": missing}
 
     @app.get("/admin/audit")

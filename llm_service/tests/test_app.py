@@ -2240,7 +2240,7 @@ def test_live_needs_an_admin(client):
 
 
 def test_live_shows_the_gpu_and_the_engine_numbers_after_a_round(tmp_path):
-    c, engine = limited_client(tmp_path, None, gpu=FakeGpu((1000, 2000)), sample_interval=0.02)
+    c, engine = limited_client(tmp_path, None, now=Clock(), gpu=FakeGpu((1000, 2000)), sample_interval=0.02)
     engine.metrics = METRICS_TEXT
     with c:
         wait_ready(c)
@@ -2265,15 +2265,29 @@ def test_live_has_null_numbers_without_a_metrics_endpoint(tmp_path):
 
 
 def test_the_gpu_is_read_at_each_third_round(tmp_path):
-    gpu = FakeGpu((1, 2))
-    c, _ = limited_client(tmp_path, None, gpu=gpu, sample_interval=0.01)
+    class CountingGpu:
+        """Each read gives a new value: (1, 1), then (2, 2), and so on."""
+
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read(self):
+            self.reads += 1
+            return (self.reads, self.reads)
+
+    c, _ = limited_client(tmp_path, None, gpu=CountingGpu(), sample_interval=0.01)
+    load = c.app.state.load
+    real, given = load.add_sample, []
+
+    def spy(engine_numbers, gpu):
+        given.append(gpu)
+        return real(engine_numbers, gpu)
+
+    load.add_sample = spy
     with c:
         wait_ready(c)
-        wait_until(lambda: len(c.app.state.load._samples) == 12)
-        time.sleep(0.1)
-        reads = gpu.reads
-        assert reads >= 4
-        assert c.app.state.load.live()["now"]["gpu_memory_used"] == 1
+        wait_until(lambda: len(given) >= 9)
+        assert given[:9] == [(1, 1)] * 3 + [(2, 2)] * 3 + [(3, 3)] * 3
 
 
 def test_a_minute_with_a_request_becomes_a_point(tmp_path):
@@ -2368,6 +2382,42 @@ def test_history_refuses_a_bad_range(client, params):
     assert r.status_code == 400
     error = r.json()["error"]
     assert error["code"] == "invalid_time" and error["type"] == "invalid_request_error" and error["message"]
+
+
+@pytest.mark.parametrize(
+    "since,until",
+    [
+        ("0001-01-01T00:00:00+05:00", "2026-11-10T12:00:00Z"),
+        ("2026-11-10T12:00:00Z", "9999-12-31T23:59:59-05:00"),
+    ],
+)
+def test_history_answers_400_for_a_time_at_the_edge_of_the_range(client, since, until):
+    r = history(client, since, until)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_time"
+
+
+def test_history_range_of_31_days_passes_and_one_second_more_is_refused(client):
+    assert history(client, "2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z").status_code == 200
+    r = history(client, "2026-10-01T00:00:00Z", "2026-11-01T00:00:01Z")
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_time"
+
+
+def test_history_takes_a_lower_case_z(client):
+    r = history(client, "2026-11-10T12:00:00z", "2026-11-10T13:00:00z")
+    assert r.status_code == 200
+
+
+def test_a_failed_limiter_release_still_ends_the_in_flight_count(tmp_path):
+    c, _ = limited_client(tmp_path, None)
+    with c:
+        wait_ready(c)
+
+        def broken(user):
+            raise RuntimeError("release failed")
+
+        c.app.state.limiter.release = broken
+        c.post(CHAT, headers=BOB, json=HI)  # the proxy logs the failed callback
+        assert c.app.state.load.in_flight() == 0
 
 
 def test_the_points_reach_blob_storage_at_shutdown(tmp_path):

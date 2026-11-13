@@ -17,8 +17,8 @@ Environment variables read at deploy time (all are optional):
     LLM_BLOB_ROOT       root directory in blob storage (default llm-service)
     LLM_HF_TOKEN_KEY    secret store key of the Hugging Face token, for gated models
     LLM_VLLM_ARGS       extra arguments for `vllm serve`
-    LLM_PROMPT_RETENTION_DAYS  days to keep audit prompts (default: keep them)
-    LLM_METRICS_RETENTION_DAYS days to keep the load history (default 30)
+    LLM_PROMPT_RETENTION_DAYS   days to keep audit prompts (default: keep them)
+    LLM_METRICS_RETENTION_DAYS  days to keep the load history (default 30)
     LLM_ENVIRONMENT     platform environment: dev (default), pre or prod
     LLM_ADMIN_APP_NAME  name of the admin app (default "LLM Service Admin")
 
