@@ -32,7 +32,7 @@ from llm_service.gateway.identity import (
     user_from_headers,
 )
 from llm_service.gateway.limiter import LimitExceeded, Limiter
-from llm_service.gateway.catalog import CatalogStore
+from llm_service.gateway.catalog import CatalogFull, CatalogStore, InvalidEntry, check_entry
 from llm_service.gateway.fit import fit, needed_from
 from llm_service.gateway.limits import InvalidLimit, LimitStore, StorageUnavailable
 from llm_service.gateway.load import LoadMonitor
@@ -801,6 +801,90 @@ def create_app(
         except ValueError as error:
             raise ApiError(400, "invalid_request_error", "invalid_model", str(error)) from None
         return await fit_of(model, revision)
+
+    @app.get("/admin/catalog")
+    async def get_catalog(admin_user: str = Depends(require_admin)) -> dict:
+        try:
+            cached = await asyncio.to_thread(weights.cached)
+        except Exception as error:
+            logger.warning("the cache list for the catalog failed: %s", error)
+            cached = None
+        have = {(item["model"], item["revision"]) for item in cached or []}
+        models = []
+        for entry in catalog.entries():
+            models.append(
+                {
+                    **entry,
+                    "cached": (entry["model"], entry["revision"]) in have,
+                    "fit": await fit_of(entry["model"], entry["revision"], cached if cached is not None else []),
+                }
+            )
+        return {"models": models, "loaded": catalog.loaded()}
+
+    async def change_catalog(
+        target: str, admin_user: str, change: Callable[[], tuple[dict | None, dict | None]]
+    ) -> None:
+        """Run a catalog change in a thread and audit it. The change returns the old and the new entry."""
+        try:
+            old, new = await asyncio.to_thread(change)
+        except InvalidEntry as error:
+            raise ApiError(400, "invalid_request_error", "invalid_catalog_entry", str(error)[:300]) from None
+        except CatalogFull as error:
+            raise ApiError(409, "invalid_request_error", "catalog_full", str(error)) from None
+        except StorageUnavailable as error:
+            raise ApiError(502, "server_error", "storage_unavailable", str(error)) from None
+        write_audit(
+            {
+                "user": admin_user,
+                "endpoint": "/admin/catalog",
+                "model": None,
+                "stream": False,
+                "prompt": {"event": "catalog_change", "target": target, "old": old, "new": new},
+                "status": 200,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "duration_ms": None,
+            }
+        )
+
+    @app.put("/admin/catalog")
+    async def put_catalog(request: Request, admin_user: str = Depends(require_admin)) -> dict:
+        try:
+            body = json.loads(await request.body())
+        except (ValueError, RecursionError):
+            body = None
+        try:
+            new = check_entry(body)
+        except InvalidEntry as error:
+            raise ApiError(400, "invalid_request_error", "invalid_catalog_entry", str(error)[:300]) from None
+
+        def change():
+            return catalog.put(new), new
+
+        await change_catalog(f"{new['model']}@{new['revision']}", admin_user, change)
+        return new
+
+    @app.delete("/admin/catalog")
+    async def delete_catalog(
+        model: str = "", revision: str = "main", admin_user: str = Depends(require_admin)
+    ) -> dict:
+        try:
+            validate_model_name(model)
+            validate_revision(revision)
+        except ValueError as error:
+            raise ApiError(400, "invalid_request_error", "invalid_catalog_entry", str(error)[:300]) from None
+
+        def change():
+            try:
+                return catalog.remove(model, revision), None
+            except KeyError:
+                raise ApiError(
+                    404, "invalid_request_error", "catalog_entry_not_found", f"the catalog has no entry {model}@{revision}"
+                ) from None
+
+        await change_catalog(f"{model}@{revision}", admin_user, change)
+        return {"removed": {"model": model, "revision": revision}}
 
     @app.post("/admin/models/download", status_code=202)
     async def download_model(request: Request, admin_user: str = Depends(require_admin)):

@@ -2870,3 +2870,270 @@ def test_catalog_is_loaded_at_start_and_read_again_by_the_flusher(tmp_path):
         store.broken = False
         wait_until(lambda: c.app.state.catalog.loaded())
         assert fit_answer(c, model="org/b")["basis"] == "catalog"
+
+
+# Catalog endpoints
+
+CATALOG = "/admin/catalog"
+CATALOG_PATH = "llm-service/catalog.json"
+ENTRY_B = {"model": "org/b", "revision": "main", "note": "small", "gpu_memory_mib": 6000}
+ENTRY_C = {"model": "org/c", "revision": "dev", "note": "", "gpu_memory_mib": None}
+
+
+def catalog_events(client):
+    return [r for r in audit_records(client, limit=1000) if r["event"] == "catalog_change"]
+
+
+CATALOG_ROUTES = [
+    ("GET", CATALOG, {}),
+    ("PUT", CATALOG, {"json": ENTRY_B}),
+    ("DELETE", CATALOG, {"params": {"model": "org/b"}}),
+]
+
+
+@pytest.mark.parametrize("method,path,kwargs", CATALOG_ROUTES)
+def test_catalog_endpoints_need_an_admin(tmp_path, method, path, kwargs):
+    store = MemoryBlobStore()
+    put_catalog(store, ENTRY_B)
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        r = c.request(method, path, headers=BOB, **kwargs)
+        assert r.status_code == 403 and r.json()["error"]["code"] == "admin_required"
+        assert c.request(method, path, **kwargs).status_code == 401
+        assert c.app.state.catalog.entries() == [ENTRY_B]
+
+
+def test_get_catalog_lists_entries_with_cached_and_fit(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, ENTRY_B, ENTRY_C)
+    with TestClient(make_app(tmp_path, store=store, download=big_download, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        assert c.get(CATALOG, headers=ALICE).json()["models"][0]["cached"] is False
+        assert c.post(DOWNLOAD, headers=ALICE, json={"model": "org/b"}).status_code == 202
+        wait_download(c, "done")
+        body = c.get(CATALOG, headers=ALICE).json()
+        assert body["loaded"] is True
+        assert [m["model"] for m in body["models"]] == ["org/b", "org/c"]
+        first, second = body["models"]
+        assert first["cached"] is True and first["fit"]["fits"] == "yes" and first["fit"]["basis"] == "catalog"
+        assert first["note"] == "small" and first["gpu_memory_mib"] == 6000
+        assert second["cached"] is False and second["fit"]["fits"] == "unknown"
+
+
+class ListingStore(MemoryBlobStore):
+    """A store that counts the listings of the models folder and fails them while `fail` is true."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.listings = 0
+        self.fail = False
+
+    def ls(self, prefix):
+        if prefix.endswith("/models/"):
+            self.listings += 1
+            if self.fail:
+                raise OSError("store down")
+        return super().ls(prefix)
+
+
+def test_get_catalog_reads_the_blob_listing_once(tmp_path):
+    store = ListingStore()
+    put_catalog(store, ENTRY_B, ENTRY_C, {"model": "org/d", "revision": "main"})
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        store.listings = 0
+        assert len(c.get(CATALOG, headers=ALICE).json()["models"]) == 3
+        assert store.listings == 1
+
+
+def test_get_catalog_survives_a_failed_listing(tmp_path):
+    store = ListingStore()
+    put_catalog(store, ENTRY_B, ENTRY_C)
+    with TestClient(make_app(tmp_path, store=store, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        store.fail = True
+        r = c.get(CATALOG, headers=ALICE)
+        assert r.status_code == 200
+        models = r.json()["models"]
+        assert [m["cached"] for m in models] == [False, False]
+        assert models[0]["fit"]["basis"] == "catalog" and models[1]["fit"]["fits"] == "unknown"
+
+
+def test_get_catalog_of_an_empty_catalog(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        assert c.get(CATALOG, headers=ALICE).json() == {"models": [], "loaded": True}
+
+
+def test_put_catalog_adds_and_replaces_and_the_change_shows_at_once(tmp_path):
+    with TestClient(make_app(tmp_path, gpu_memory_mib=15360)) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, json={"model": "org/b", "revision": "main"})
+        assert r.status_code == 200
+        assert r.json() == {"model": "org/b", "revision": "main", "note": "", "gpu_memory_mib": None}
+        assert [m["gpu_memory_mib"] for m in c.get(CATALOG, headers=ALICE).json()["models"]] == [None]
+        r = c.put(CATALOG, headers=ALICE, json=ENTRY_B)
+        assert r.status_code == 200 and r.json() == ENTRY_B
+        models = c.get(CATALOG, headers=ALICE).json()["models"]
+        assert len(models) == 1 and models[0]["gpu_memory_mib"] == 6000
+        assert fit_answer(c, model="org/b")["basis"] == "catalog"
+        assert json.loads(c.app.state.catalog._store.get(CATALOG_PATH))["models"] == [ENTRY_B]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"model": "org/b"},
+        {**ENTRY_B, "extra": 1},
+        {**ENTRY_B, "model": "../x"},
+        {**ENTRY_B, "note": "x" * 501},
+        {**ENTRY_B, "gpu_memory_mib": True},
+        {**ENTRY_B, "gpu_memory_mib": 0},
+    ],
+)
+def test_put_catalog_with_a_bad_entry_is_400(tmp_path, body):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, json=body)
+        assert r.status_code == 400
+        error = r.json()["error"]
+        assert error["code"] == "invalid_catalog_entry" and error["type"] == "invalid_request_error"
+        assert error["message"] and len(error["message"]) <= 300
+        assert c.app.state.catalog.entries() == [] and catalog_events(c) == []
+
+
+@pytest.mark.parametrize("content", [b"hello", b"[1]", b"", b"5", b"[" * 100000])
+def test_put_catalog_with_a_body_that_is_not_an_object_is_400(tmp_path, content):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, content=content)
+        assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_catalog_entry"
+
+
+def test_a_400_message_is_cut_to_300_characters(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, json={**ENTRY_B, "k" * 1000: 1})
+        assert r.status_code == 400
+        assert 0 < len(r.json()["error"]["message"]) <= 300
+
+
+def test_put_catalog_over_the_limit_is_409_catalog_full(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, *({"model": f"org/m{i}", "revision": "main"} for i in range(200)))
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, json={"model": "org/new", "revision": "main"})
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "catalog_full"
+        assert set(r.json()["error"]) == {"message", "type", "code"}
+        assert len(c.app.state.catalog.entries()) == 200 and catalog_events(c) == []
+        assert c.put(CATALOG, headers=ALICE, json={"model": "org/m1", "revision": "main", "note": "n"}).status_code == 200
+
+
+class FailingCatalogStore(MemoryBlobStore):
+    """A store that refuses each write of the catalog file while `fail` is true."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+
+    def put(self, path, data):
+        if self.fail and path == CATALOG_PATH:
+            raise OSError("the store is down")
+        super().put(path, data)
+
+
+@pytest.mark.parametrize(
+    "method,kwargs",
+    [
+        ("PUT", {"json": {**ENTRY_B, "note": "changed"}}),
+        ("PUT", {"json": ENTRY_C}),
+        ("DELETE", {"params": {"model": "org/b"}}),
+    ],
+)
+def test_a_failed_catalog_write_is_502_and_changes_nothing(tmp_path, method, kwargs):
+    store = FailingCatalogStore()
+    put_catalog(store, ENTRY_B)
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        store.fail = True
+        r = c.request(method, CATALOG, headers=ALICE, **kwargs)
+        assert r.status_code == 502
+        error = r.json()["error"]
+        assert error["code"] == "storage_unavailable" and error["type"] == "server_error"
+        assert c.app.state.catalog.entries() == [ENTRY_B]
+        assert catalog_events(c) == []
+
+
+def test_a_catalog_file_that_could_not_be_read_gives_502(tmp_path):
+    class UnreadableStore(MemoryBlobStore):
+        def get(self, path):
+            if path == CATALOG_PATH:
+                raise OSError("the store is down")
+            return super().get(path)
+
+    with TestClient(make_app(tmp_path, store=UnreadableStore())) as c:
+        wait_ready(c)
+        r = c.put(CATALOG, headers=ALICE, json=ENTRY_B)
+        assert r.status_code == 502 and r.json()["error"]["code"] == "storage_unavailable"
+        assert c.get(CATALOG, headers=ALICE).json() == {"models": [], "loaded": False}
+
+
+def test_delete_catalog_removes_the_entry(tmp_path):
+    store = MemoryBlobStore()
+    put_catalog(store, ENTRY_B, {"model": "org/b", "revision": "dev"})
+    with TestClient(make_app(tmp_path, store=store)) as c:
+        wait_ready(c)
+        r = c.delete(CATALOG, headers=ALICE, params={"model": "org/b", "revision": "dev"})
+        assert r.status_code == 200 and r.json() == {"removed": {"model": "org/b", "revision": "dev"}}
+        assert [m["revision"] for m in c.get(CATALOG, headers=ALICE).json()["models"]] == ["main"]
+        r = c.delete(CATALOG, headers=ALICE, params={"model": "org/b"})
+        assert r.status_code == 200 and r.json() == {"removed": {"model": "org/b", "revision": "main"}}
+        assert c.get(CATALOG, headers=ALICE).json()["models"] == []
+        assert json.loads(c.app.state.catalog._store.get(CATALOG_PATH))["models"] == []
+
+
+def test_delete_of_a_missing_entry_is_404(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        r = c.delete(CATALOG, headers=ALICE, params={"model": "org/b"})
+        assert r.status_code == 404
+        error = r.json()["error"]
+        assert error["code"] == "catalog_entry_not_found" and error["type"] == "invalid_request_error"
+        assert catalog_events(c) == []
+
+
+@pytest.mark.parametrize(
+    "params", [{}, {"model": ""}, {"model": "../x"}, {"model": "org/b", "revision": "a b"}, {"model": "org/b", "revision": ""}]
+)
+def test_delete_with_a_bad_name_is_400(tmp_path, params):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        r = c.delete(CATALOG, headers=ALICE, params=params)
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "invalid_catalog_entry"
+        assert len(r.json()["error"]["message"]) <= 300
+
+
+def test_each_catalog_change_is_audited_with_old_and_new(tmp_path):
+    with TestClient(make_app(tmp_path)) as c:
+        wait_ready(c)
+        changed = {**ENTRY_B, "note": "bigger"}
+        c.put(CATALOG, headers=ALICE, json=ENTRY_B)
+        c.put(CATALOG, headers={**ALICE, ACTING: "carol"}, json=changed)
+        c.delete(CATALOG, headers=ALICE, params={"model": "org/b"})
+        events = sorted(catalog_events(c), key=lambda e: e["ts"])
+        assert len(events) == 3
+        assert all(e["endpoint"] == "/admin/catalog" and e["status"] == 200 for e in events)
+        details = [(e["user"], e["detail"]) for e in events]
+        assert sorted(details, key=json.dumps) == sorted(
+            [
+                ("alice", {"target": "org/b@main", "old": None, "new": ENTRY_B}),
+                ("carol", {"target": "org/b@main", "old": ENTRY_B, "new": changed}),
+                ("alice", {"target": "org/b@main", "old": changed, "new": None}),
+            ],
+            key=json.dumps,
+        )
+        prompt = full_record(c, events[0])["prompt"]
+        assert prompt["event"] == "catalog_change" and set(prompt) == {"event", "target", "old", "new"}
