@@ -29,6 +29,8 @@ from llm_service.gateway.identity import user_from_headers
 log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+# The terminal client lives next to the app package. The Connect tab shows it.
+CHAT_SCRIPT = Path(__file__).resolve().parents[1] / "chat.py"
 TIMEOUT_SECONDS = 30.0
 # The total limit of the usage call of one service. A slow service must not hold the merged answer.
 USAGE_TIMEOUT_SECONDS = 10.0
@@ -762,6 +764,16 @@ def create_app(
                 "name": name, "ok": False, "error": error
             }
         return JSONResponse({"services": [rows[e.name] for e in all_entries if e.name in rows]})
+
+    @app.get("/api/chat-script")
+    async def chat_script(download: str | None = None):
+        """Return the text of `chat.py`, the terminal client of the service. `download=1` saves it as a file."""
+        if not CHAT_SCRIPT.is_file():
+            return _error(404, "no_chat_script", "This app has no chat.py file.", "invalid_request_error")
+        headers = {"Cache-Control": "no-cache"}
+        if download:
+            headers["Content-Disposition"] = 'attachment; filename="chat.py"'
+        return FileResponse(CHAT_SCRIPT, media_type="text/x-python; charset=utf-8", headers=headers)
 
     @app.get("/")
     async def index() -> FileResponse:

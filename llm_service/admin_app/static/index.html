@@ -290,9 +290,13 @@ if (!location.pathname.endsWith('/')) {
     <div class="card">
       <h2>Examples</h2>
       <p class="caption intro">The platform adds your user name to each request. The service does not check the API key,
-        but the <span class="mono">openai</span> client needs a value. A client outside the platform sends an API token of
-        your user. You create the token in the Datatailr interface. Put it in the variable
-        <span class="mono">LLM_TOKEN</span> before you run the outside example.</p>
+        but the <span class="mono">openai</span> client needs a value. A client outside the platform must prove who you
+        are. The outside example sends the login of the Datatailr CLI: install the
+        <span class="mono">datatailr</span> package and run <span class="mono">datatailr login</span> once.</p>
+      <p class="caption intro">An API token of your user works too. The platform reads it only from the query argument
+        <span class="mono">__datatailr_user_cookie__</span> of the URL, not from a cookie and not from the
+        <span class="mono">Authorization</span> header. The script <span class="mono">chat.py</span> sends it that way
+        when you set <span class="mono">LLM_TOKEN</span>.</p>
       <span class="sr-only" id="copy-status" role="status"></span>
       <div class="examples">
         <div class="example">
@@ -320,6 +324,19 @@ if (!location.pathname.endsWith('/')) {
           <pre class="code"><code id="example-chat"></code></pre>
         </div>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>chat.py</h2>
+        <span class="actions">
+          <button type="button" class="ghost small" data-copy="chat-script"
+                  aria-label="Copy the chat.py file">Copy</button>
+          <a class="ghost small button" href="api/chat-script?download=1" download="chat.py">Download</a>
+        </span></div>
+      <p class="caption intro">This script keeps a conversation with the service in the terminal. Save it as
+        <span class="mono">chat.py</span> and run it as the example above shows. The top of the file lists its
+        environment variables.</p>
+      <pre class="code script"><code id="chat-script">The file loads.</code></pre>
     </div>
 
     <div class="card" id="my-limits">

@@ -702,12 +702,43 @@ def test_chat_fields_have_the_limits_of_the_app(element_id, attributes):
 
 def test_page_examples_have_no_token_value():
     text = (STATIC_DIR / "app.js").read_text() + (STATIC_DIR / "index.html").read_text()
-    assert 'os.environ["LLM_TOKEN"]' in text
+    assert "datatailr.get_remote_oidc_cookie_line()" in text
     assert 'api_key="unused"' in text
-    # The cookie name is always followed by the end of a string, never by a value.
-    after = re.findall(r"__datatailr_user_cookie__=(.?)", text)
-    assert after and all(char in "\"'" for char in after)
+    # No example sends the API token as a cookie: the platform edge does not read it there.
+    assert "__datatailr_user_cookie__=" not in text
+    assert 'os.environ["LLM_TOKEN"]' not in text
     assert not re.search(r"LLM_TOKEN=\S", text)
+
+
+def test_the_app_serves_the_chat_script(client):
+    response = client.get("/api/chat-script")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/x-python")
+    assert response.headers["cache-control"] == "no-cache"
+    assert "content-disposition" not in response.headers
+    assert response.text == (STATIC_DIR.parents[1] / "chat.py").read_text()
+    saved = client.get("/api/chat-script?download=1")
+    assert saved.headers["content-disposition"] == 'attachment; filename="chat.py"'
+    assert saved.text == response.text
+
+
+def test_the_chat_script_route_says_when_the_file_is_missing(client, monkeypatch, tmp_path):
+    import llm_service.admin_app.app as app_module
+
+    monkeypatch.setattr(app_module, "CHAT_SCRIPT", tmp_path / "chat.py")
+    response = client.get("/api/chat-script")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "no_chat_script"
+
+
+def test_page_shows_the_chat_script_with_copy_and_download():
+    page = (STATIC_DIR / "index.html").read_text()
+    script = (STATIC_DIR / "app.js").read_text()
+    assert 'id="chat-script"' in page
+    assert 'data-copy="chat-script"' in page
+    assert 'href="api/chat-script?download=1" download="chat.py"' in page
+    assert "new URL('api/chat-script', BASE)" in script
+    assert "target.textContent = await response.text();" in script
 
 
 def test_page_streams_the_answer_with_stop():

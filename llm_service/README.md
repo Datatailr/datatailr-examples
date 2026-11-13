@@ -156,28 +156,61 @@ Type a prompt and press Enter. The command `/reset` starts a new conversation. T
 
 ## Use from outside Datatailr
 
-A client outside the platform must send an API token of a platform user. The platform edge reads the token from the `__datatailr_user_cookie__` cookie. It does not read the `Authorization: Bearer` header.
+A client outside the platform must prove who the user is. The platform edge accepts two things on the URL of a job.
+
+The first is the login of the Datatailr CLI. Install the `datatailr` package and run `datatailr login` once. The package then gives the login as a cookie line:
 
 ```python
+import datatailr
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://<your-domain>/<service path>/v1",
+    base_url="https://<your-domain>/job/<environment>/<service name>/v1",
     api_key="unused",
-    default_headers={"Cookie": "__datatailr_user_cookie__=<token>"},
+    default_headers={"Cookie": datatailr.get_remote_oidc_cookie_line()},
 )
 ```
 
-The service page in the Datatailr interface shows the URL. Use that URL in place of `https://<your-domain>/<service path>`.
+The login ends after some time. Run `datatailr login` again then.
+
+The second is an API token of a platform user. The edge reads it only from the query argument `__datatailr_user_cookie__` of the URL. It does not read a cookie with that name on a job URL, and it does not read the `Authorization: Bearer` header.
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://<your-domain>/job/<environment>/<service name>/v1",
+    api_key="unused",
+    default_query={"__datatailr_user_cookie__": os.environ["LLM_TOKEN"]},
+)
+```
+
+A token in a URL can show in the logs of a proxy. Use the login of the CLI where you can.
+
+If the answer is the login page of the platform, the edge did not accept the request. Log in again, or check the token.
+
+The Connect tab of the admin app shows the URL of each service. For the service `LLM Service` in the environment `dev`, the path is `/job/dev/llm-service/v1`.
+
+The script `chat.py` uses both ways. It sends the token of `LLM_TOKEN` if you set one, and the login of the CLI otherwise.
 
 A tool that accepts only a base URL and an API key does not work yet. The platform edge must first accept a Bearer token. That change belongs to the platform and is not part of this example.
+
+The curl examples in this document use two shell variables for a call from outside the platform:
+
+```bash
+BASE=https://<your-domain>/job/<environment>/<service name>
+COOKIE=$(python -c 'import datatailr; print(datatailr.get_remote_oidc_cookie_line())')
+```
+
+From a job on the platform, use `BASE=http://llm-service` and leave the `Cookie` header out.
 
 ## Check that a job is an LLM service
 
 `GET /v1/service` describes the service. Each user with access can call it. The admin app uses it to find LLM services.
 
 ```bash
-curl "$BASE/v1/service" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+curl "$BASE/v1/service" -H "Cookie: $COOKIE"
 ```
 
 ```json
@@ -219,7 +252,7 @@ Only an admin can switch the model. Send the name of the Hugging Face repository
 
 ```bash
 curl -X POST "$BASE/admin/model" \
-  -H "Cookie: __datatailr_user_cookie__=$TOKEN" \
+  -H "Cookie: $COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"model": "Qwen/Qwen2.5-7B-Instruct", "revision": "main"}'
 ```
@@ -231,7 +264,7 @@ The old model keeps serving requests while the service downloads the new weights
 To check the switch, read the state:
 
 ```bash
-curl "$BASE/admin/model" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+curl "$BASE/admin/model" -H "Cookie: $COOKIE"
 ```
 
 The answer shows the active model, the switch state and the last switch error. The field `serving` shows the model that vLLM serves now. It is `null` while vLLM restarts. If the new model fails to load, the service starts the previous model again and keeps the error. During this rollback, the field `rolling_back` names the previous model. It is `null` at other times.
@@ -265,7 +298,7 @@ If the service cannot read the secret, it logs an error with the key name and th
 Any user with access can list the models:
 
 ```bash
-curl "$BASE/v1/models" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+curl "$BASE/v1/models" -H "Cookie: $COOKIE"
 ```
 
 The list has one entry for each model: the active model, the model that loads, and each model in the blob storage cache. Each entry has the OpenAI fields `id`, `object`, `created` and `owned_by`. It also has four extra fields:
@@ -278,7 +311,7 @@ The list has one entry for each model: the active model, the model that loads, a
 To read one entry, add the model name to the path:
 
 ```bash
-curl "$BASE/v1/models/Qwen/Qwen2.5-1.5B-Instruct" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+curl "$BASE/v1/models/Qwen/Qwen2.5-1.5B-Instruct" -H "Cookie: $COOKIE"
 ```
 
 The OpenAI SDK call `client.models.retrieve("Qwen/Qwen2.5-1.5B-Instruct")` uses this path. If the service does not know the model, it returns the error `model_not_found` with status 404.
@@ -289,7 +322,7 @@ Only an admin can remove the cached weights of a model from blob storage. The qu
 
 ```bash
 curl -X DELETE "$BASE/admin/models/Qwen/Qwen2.5-7B-Instruct?revision=main" \
-  -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+  -H "Cookie: $COOKIE"
 ```
 
 The call returns status 200 and the list of the removed revisions: `{"deleted": [...]}`. The service removes each matching revision that has files in blob storage, also a revision without a complete copy.
@@ -319,7 +352,7 @@ Only an admin can read the audit log. Each request to `/v1/chat/completions`, `/
 The list returns the metadata of each record: the time, request id, user, endpoint, model, status, token counts, duration and time to the first token. The list does not return the prompt.
 
 ```bash
-curl "$BASE/admin/audit?user=bob&limit=20" -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+curl "$BASE/admin/audit?user=bob&limit=20" -H "Cookie: $COOKIE"
 ```
 
 The filters are `user`, `model`, `since`, `until`, `limit` and `offset`. The values of `since` and `until` are a day like `2026-11-10` or an ISO 8601 time. The default `limit` is 100 and the largest is 1000. The newest records come first.
@@ -334,7 +367,7 @@ To read the prompt, open one record. Give the request id from the list and the U
 
 ```bash
 curl "$BASE/admin/audit/records/<request_id>?day=2026-11-10" \
-  -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+  -H "Cookie: $COOKIE"
 ```
 
 The answer has the fields of the list row and the field `prompt`. If prompt retention removed the prompt, `prompt` is `null` and `prompt_deleted` is `true`. The errors are:
@@ -366,7 +399,7 @@ An admin can read the usage of all users:
 
 ```bash
 curl "$BASE/admin/usage?group_by=model&since=2026-11-01" \
-  -H "Cookie: __datatailr_user_cookie__=$TOKEN"
+  -H "Cookie: $COOKIE"
 ```
 
 The filters are `since`, `until`, `user` and `model`. The values of `since` and `until` are days in the form `YYYY-MM-DD`, and both days are included. The value of `group_by` is `user` (the default), `model` or `day`.
@@ -621,9 +654,10 @@ The platform user names of the viewers must be ASCII. The app sends the name in 
 
 ### The Connect tab
 
-The Connect tab shows how to call the picked service. It has two parts.
+The Connect tab shows how to call the picked service. It has these parts.
 
-- Addresses and examples. The tab shows the internal base URL `http://<name>/v1` and the outside base URL, with the served model. It has examples for curl, for the `openai` package from a job, for the `openai` package from outside the platform, and for `chat.py`. Each example has a copy button. No example holds a token. The outside example reads it from the variable `LLM_TOKEN`.
+- Addresses and examples. The tab shows the internal base URL `http://<name>/v1` and the outside base URL, with the served model. It has examples for curl, for the `openai` package from a job, for the `openai` package from outside the platform, and for `chat.py`. Each example has a copy button. No example holds a token. The outside example sends the login of the Datatailr CLI.
+- The script `chat.py`. A card shows the file, with a Copy button and a Download link.
 - The testing area. A viewer types a system prompt and a prompt, sets the model, the temperature and the maximum tokens, and presses Send. The answer streams into the page. After it, the area shows the token counts and the time to the first token. The area keeps the conversation, and Clear starts again. If the service answers 429, the area shows the message of the answer and the wait time.
 - The card "Your limits". The card shows the three limits of the viewer, the current use and the source of the limits. The source is the entry of the user, the default, admin (no limit) or none. A limit with no value shows as no limit.
 
