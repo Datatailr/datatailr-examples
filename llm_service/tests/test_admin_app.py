@@ -1586,3 +1586,193 @@ def test_the_limits_put_routes_refuse_deeply_nested_json(client, fakes, route):
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_json"
     assert fakes.calls() == []
+
+
+LIVE_NOW = {
+    "ts": "2026-11-13T10:00:00Z",
+    "in_flight": 3,
+    "running": 3,
+    "waiting": 0,
+    "prompt_tokens_per_s": 210.0,
+    "completion_tokens_per_s": None,
+    "gpu_memory_used": 14200,
+    "gpu_memory_total": 15360,
+}
+
+
+def _live_answer(now=None):
+    return 200, {"now": now if now is not None else LIVE_NOW, "points": []}
+
+
+def test_metrics_live_passes_through_with_the_acting_user(client, fakes):
+    answer = _live_answer()
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = answer
+    response = client.get("/api/services/svc/metrics/live", headers=ALICE)
+    assert response.status_code == 200
+    assert response.json() == answer[1]
+    (sent,) = fakes.calls("/admin/metrics")
+    assert sent.url.host == "svc" and sent.url.path == "/admin/metrics/live"
+    assert sent.headers["X-LLM-Acting-User"] == "alice"
+    assert sent.headers["Connection"] == "close"
+
+
+def test_metrics_live_passes_an_error_status_through(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = (403, ERROR_403)
+    response = client.get("/api/services/svc/metrics/live", headers=ALICE)
+    assert response.status_code == 403
+    assert response.json() == ERROR_403
+
+
+def test_metrics_history_passes_the_times_through(client, fakes):
+    answer = (200, {"step_seconds": 60, "points": [], "missing_days": ["2026-11-01"]})
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/history")] = answer
+    query = "since=2026-11-13T09:00:00Z&until=2026-11-13T10:00:00Z"
+    response = client.get(f"/api/services/svc/metrics/history?{query}", headers=ALICE)
+    assert response.status_code == 200
+    assert response.json() == answer[1]
+    (sent,) = fakes.calls("/admin/metrics")
+    assert sent.url.path == "/admin/metrics/history"
+    assert dict(sent.url.params) == {"since": "2026-11-13T09:00:00Z", "until": "2026-11-13T10:00:00Z"}
+    assert sent.headers["X-LLM-Acting-User"] == "alice"
+    assert sent.headers["Connection"] == "close"
+
+
+def test_metrics_history_passes_a_400_through(client, fakes):
+    bad = {"error": {"message": "bad time", "type": "invalid_request_error", "code": "invalid_time"}}
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/history")] = (400, bad)
+    response = client.get("/api/services/svc/metrics/history?since=nope", headers=ALICE)
+    assert response.status_code == 400
+    assert response.json() == bad
+
+
+def test_metrics_routes_need_a_user_and_a_known_service(client, fakes):
+    assert client.get("/api/services/svc/metrics/live").status_code == 401
+    assert client.get("/api/services/svc/metrics/history").status_code == 401
+    assert client.get("/api/services/unknown/metrics/live", headers=ALICE).status_code == 404
+    assert fakes.calls() == []
+
+
+def _load_calls(fakes):
+    return fakes.calls("/admin/metrics/live")
+
+
+def test_load_lists_two_admin_services_in_registry_order(client, fakes):
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    fakes.hosts["svc-two"].answers[("GET", "/admin/metrics/live")] = _live_answer({**LIVE_NOW, "in_flight": 9})
+    response = client.get("/api/load", headers=ALICE)
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "services": [
+            {"name": "svc", "ok": True, "now": LIVE_NOW},
+            {"name": "svc-two", "ok": True, "now": {**LIVE_NOW, "in_flight": 9}},
+        ]
+    }
+    sent = _load_calls(fakes)
+    assert {r.url.host for r in sent} == {"svc", "svc-two"}
+    assert all(r.headers["X-LLM-Acting-User"] == "alice" for r in sent)
+    assert all(r.headers["Connection"] == "close" for r in sent)
+
+
+def test_load_leaves_out_a_service_where_the_viewer_is_not_admin(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    body = client.get("/api/load", headers=ALICE).json()
+    assert [s["name"] for s in body["services"]] == ["svc"]
+    assert [r.url.host for r in _load_calls(fakes)] == ["svc"]
+
+
+def test_load_leaves_out_a_service_that_answers_403(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc-two"].answers[("GET", "/admin/metrics/live")] = (403, ERROR_403)
+    body = client.get("/api/load", headers=ALICE).json()
+    assert [s["name"] for s in body["services"]] == ["svc"]
+
+
+def test_load_lists_a_service_whose_role_call_failed(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    fakes.hosts["svc-two"].answers[("GET", "/v1/service")] = (500, {})
+    body = client.get("/api/load", headers=ALICE).json()
+    assert body["services"][0]["ok"] is True
+    assert body["services"][1] == {"name": "svc-two", "ok": False, "error": "The service did not answer."}
+
+
+def test_load_a_404_service_does_not_offer_load_numbers(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = (404, {})
+    response = client.get("/api/load", headers=ALICE)
+    assert response.status_code == 200
+    assert response.json()["services"] == [
+        {"name": "svc", "ok": False, "error": "The service does not offer load numbers."}
+    ]
+
+
+def test_load_answers_200_when_each_service_fails(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = (500, {})
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc-two"].error = httpx.ConnectError("down")
+    response = client.get("/api/load", headers=ALICE)
+    assert response.status_code == 200
+    assert [s["ok"] for s in response.json()["services"]] == [False, False]
+
+
+@pytest.mark.parametrize("now", ["x", [], 5, None])
+def test_load_a_now_that_is_not_an_object_fails_that_service_only(client, fakes, now):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = (200, {"now": now, "points": []})
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc-two"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    body = client.get("/api/load", headers=ALICE).json()
+    assert body["services"][0] == {
+        "name": "svc", "ok": False, "error": "The LLM service did not give a valid answer.",
+    }
+    assert body["services"][1]["ok"] is True
+
+
+def test_load_a_body_that_is_not_an_object_fails_that_service(client, fakes):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = (200, [1])
+    body = client.get("/api/load", headers=ALICE).json()
+    assert body["services"][0]["ok"] is False
+
+
+def test_load_an_unexpected_error_fails_one_service_only(client, fakes, monkeypatch):
+    fakes.hosts["svc"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    fakes.hosts["svc-two"].admins.add("alice")
+    original = app_module.ServiceClient.request
+
+    async def broken(self, service, method, path, viewer, **options):
+        if service == "svc-two" and path == "/admin/metrics/live":
+            raise RuntimeError("boom")
+        return await original(self, service, method, path, viewer, **options)
+
+    monkeypatch.setattr(app_module.ServiceClient, "request", broken)
+    body = client.get("/api/load", headers=ALICE).json()
+    assert [s["ok"] for s in body["services"]] == [True, False]
+
+
+def test_load_a_hanging_service_times_out_and_the_others_answer(client, fakes, monkeypatch):
+    assert app_module.LOAD_TIMEOUT_SECONDS == 5.0
+    monkeypatch.setattr(app_module, "LOAD_TIMEOUT_SECONDS", 0.05)
+    fakes.hosts["svc-two"].admins.add("alice")
+    fakes.hosts["svc-two"].answers[("GET", "/admin/metrics/live")] = _live_answer()
+    original = fakes.hosts["svc"]
+
+    async def hang(request):
+        if request.url.path == "/admin/metrics/live":
+            await asyncio.sleep(5)
+        return original(request)
+
+    fakes.hosts["svc"] = hang
+    started = time.monotonic()
+    response = client.get("/api/load", headers=ALICE)
+    assert time.monotonic() - started < 2
+    assert response.status_code == 200
+    body = response.json()
+    assert body["services"][0] == {
+        "name": "svc", "ok": False, "error": "The LLM service did not answer in time.",
+    }
+    assert body["services"][1]["ok"] is True
+
+
+def test_load_needs_a_user(client, fakes):
+    assert client.get("/api/load").status_code == 401
+    assert fakes.requests == []
