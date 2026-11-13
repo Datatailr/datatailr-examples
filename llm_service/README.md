@@ -439,7 +439,7 @@ curl -X POST "$BASE/admin/models/download" \
   -d '{"model": "Qwen/Qwen2.5-0.5B-Instruct", "revision": "main"}'
 ```
 
-The field `revision` is optional. The call returns status 202 and the download runs in the background. The service downloads the files from Hugging Face and stores them in blob storage. Then it removes the local copy, unless the engine uses the model.
+The field `revision` is optional. The call returns status 202 and the download runs in the background. The service downloads the files from Hugging Face and stores them in blob storage. Then it removes the local copy, unless the service needs the model.
 
 Read the state in the field `download` of `GET /admin/model`. The field is null before the first download. It has these keys:
 
@@ -531,11 +531,11 @@ The admin app has a route for each endpoint under `/api/services/{name}/`: `cata
 
 ### The Catalog card
 
-The Models tab of the admin app has the card "Catalog". It has one row for each entry, with the model, the revision, the note, the needed memory, a fit badge and a cached badge. Each row has three buttons: Serve, Download and Remove from the list. A form under the table adds an entry or replaces the entry with the same pair.
+The Models tab of the admin app has the card "Catalog". It has one row for each entry, with the model, the revision, the note, the needed memory, a fit badge and a cached badge. The badges read `fits`, `does not fit` or `unknown`, and `cached` or `not cached`. Each row has the buttons Serve and Remove from the list. A row that is not cached also has the button Download. Serve fills the serve form and starts the switch. Remove asks for a confirmation and keeps the cached weights. A form under the table adds an entry or replaces the entry with the same pair. A Reload button reads the catalog again. A service without the catalog endpoints shows a note instead of the table.
 
-Under the form "Serve a model", a note shows the fit result for the typed model. A result `does not fit` is a warning. It does not block the Serve button.
+Under the form "Serve a model", a note shows the fit result for the typed model. A result `does not fit` is a warning. The note says that a switch can still start. It does not block the Serve button.
 
-A running download shows in the engine card. The tab reads the state of the service each 3 seconds while a download runs.
+A running download shows in the engine card with its state, its model and its start time. The tab reads the state of the service each 3 seconds while a switch or a download runs.
 
 ### Limits of the model catalog
 

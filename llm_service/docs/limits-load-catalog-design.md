@@ -279,7 +279,7 @@ A model that is not in the catalog still works with the switch and the download,
 
 ### Download without a switch
 
-`POST /admin/models/download` with `{"model", "revision"}` starts a download and answers 202. The service runs `WeightCache.ensure` in the background. That step downloads the files and stores them in blob storage. After the step, the service removes the local copy if the engine does not use it.
+`POST /admin/models/download` with `{"model", "revision"}` starts a download and answers 202. The service runs `WeightCache.ensure` in the background. That step downloads the files and stores them in blob storage. After the step, the service removes the local copy unless the service needs the model. It keeps the copy of the served, target and rollback model, and removes nothing while the service starts.
 
 - One download runs at a time. A second request gets 409 `download_in_progress`.
 - A download of a model that is in the cache already answers 200 with `{"state": "cached", "model", "revision"}` and starts nothing.
@@ -331,7 +331,7 @@ A change of the catalog writes an audit event `catalog_change` with the target (
 ### The app
 
 - New routes that pass through for each endpoint, under `/api/services/{name}/`.
-- The Models tab gets a Catalog card: a table with model, revision, note, needed memory, a fit badge and a cached badge. Each row has the buttons Serve, Download and Remove from the list. A form adds an entry.
+- The Models tab gets a Catalog card: a table with model, revision, note, needed memory, a fit badge and a cached badge. Each row has the buttons Serve and Remove from the list. A row that is not cached also has Download. A form adds an entry.
 - The "Serve a model" form shows the fit result for the typed model before the switch, as a note. A `no` result shows as a warning and does not block the button.
 - A running download shows in the engine card of the Models tab. The tab reads the state again each 3 seconds.
 
