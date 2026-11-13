@@ -533,7 +533,7 @@ curl http://llm-service/admin/metrics/live
 
 Before the first sample, each field of `now` is `null`.
 
-The history call reads the points of a time range from blob storage. The values of `since` and `until` are ISO 8601 times.
+The history call reads the points of a time range from blob storage. It adds the points that are still in memory. The values of `since` and `until` are ISO 8601 times.
 
 ```bash
 curl "http://llm-service/admin/metrics/history?since=2026-11-12T00:00:00Z&until=2026-11-12T12:00:00Z"
@@ -563,13 +563,15 @@ LLM_METRICS_RETENTION_DAYS=90 python deploy.py service
 
 The admin app has the Load tab, after the Usage tab, for an admin. With one service, the tab shows two rows of tiles and line charts.
 
-- The tiles for this moment: requests in flight, requests that wait, tokens per second and GPU memory.
-- The tiles for the last complete minute: requests and failed requests. Two more tiles show the time to the first token and the total time, each as p50 and p95.
+- Five tiles for this moment: requests in flight, requests that wait, completion tokens per second, prompt tokens per second and GPU memory used.
+- Six tiles for the last complete minute. They show requests and failed requests. They show the time to the first token as p50 and p95. They show the total time as p50 and p95.
 - Line charts of the points.
 
-A range control has "Last hour", "6 hours", "24 hours", "7 days" and a custom range. With "Last hour", the tab reads the numbers again each 5 seconds. The other ranges read the history once.
+A range control has "Last hour", "6 hours", "24 hours", "7 days" and a custom range. With "Last hour", the tab reads the numbers again each 5 seconds. The other ranges read the history once. A history range shows the step of its points, for example 5 minutes. It also names the UTC days whose history the service did not read, from `missing_days`.
 
-With "All services" picked, the tab shows one table row for each service with the numbers of this moment. The app route `GET /api/load` gives these rows. The routes `GET /api/services/{name}/metrics/live` and `GET /api/services/{name}/metrics/history` pass the two service calls through.
+If 5 reads in a row fail, the tab stops the 5 second read and shows a note with the last error. Use the Reload button of the page bar to read again.
+
+With "All services" picked, the tab shows a table that reads the numbers each 5 seconds. It has one row for each service where the viewer is an admin, with the numbers of this moment. A service that is not usable has a row with the reason. A service where the viewer is not an admin is absent. The app route `GET /api/load` gives these rows. The routes `GET /api/services/{name}/metrics/live` and `GET /api/services/{name}/metrics/history` pass the two service calls through.
 
 ## Admin app
 
@@ -607,7 +609,7 @@ Each viewer needs access to a service to see anything from it. The service check
 - Each user with access sees the Usage tab with their own numbers, and the Connect tab. The Connect tab has the card "Your limits".
 - An admin of a service also sees the numbers of all users of that service. An admin also sees the Audit, Models, Limits and Load tabs. An admin switches the model and deletes cached weights in the Models tab. An admin sets limits in the Limits tab.
 - With "All services" picked, the Usage tab shows totals over all services, by user, by service and by day. A line names each service whose numbers are missing. Another line names each service where the viewer sees only their own numbers.
-- The Audit, Models and Limits tabs work with one service. With "All services" they ask the viewer to pick one. The Load tab shows a table with one row for each service instead.
+- The Audit, Models and Limits tabs work with one service. With "All services" they ask the viewer to pick one. The Load tab shows a table of the services where the viewer is an admin instead.
 
 The platform user names of the viewers must be ASCII. The app sends the name in an HTTP header. For a name that is not ASCII, the app answers 401 with the code `missing_user`.
 
