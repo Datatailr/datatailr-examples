@@ -3,4 +3,5 @@ starlette
 uvicorn
 httpx
 huggingface_hub
-vllm
+# vLLM pins torch, which brings the CUDA libraries. All install in one image layer.
+vllm==0.33.0
