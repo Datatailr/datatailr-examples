@@ -116,7 +116,7 @@ The first deploy on a GPU node confirms that vLLM finds the GPU. Read the servic
 
 The deploy script installs `build-essential` in the image, because vLLM compiles a small C module when it starts. A first start takes a few minutes: the node pulls the image, the service gets the weights, and vLLM loads the model.
 
-The image has one large layer of several GB with vLLM, PyTorch and the CUDA libraries. If the image build fails when it pushes that layer to the platform registry, ask an admin of the platform to check the registry.
+The platform installs every package of `requirements.txt` in one image layer of several GB, with vLLM, PyTorch and the CUDA libraries. The file pins vLLM to 0.33.0, the version that runs on a T4 GPU node on the platform. If the image build fails when it pushes that layer to the platform registry, ask an admin of the platform to check the registry.
 
 To pass extra arguments to vLLM, set `LLM_VLLM_ARGS`. Two common arguments are `--max-model-len` and `--gpu-memory-utilization`:
 

@@ -53,6 +53,7 @@ from llm_service.deploy_config import (  # noqa: E402
 )
 from llm_service.gateway.app import main  # noqa: E402
 
+# The platform installs every package of this file in one image layer, vLLM and PyTorch included.
 REQUIREMENTS = str(current_dir / "requirements.txt")
 ADMIN_APP_REQUIREMENTS = str(current_dir / "admin_app" / "requirements.txt")
 SERVICE_NAME = os.environ.get("LLM_SERVICE_NAME", "").strip() or "LLM Service"
