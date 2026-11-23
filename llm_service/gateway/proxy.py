@@ -57,14 +57,19 @@ def prompt_of(body: dict) -> dict:
 
 
 def _has_content(obj: dict) -> bool:
-    """Say whether a stream chunk carries text: a delta content or a completion text."""
+    """Say whether a stream chunk carries text: a delta content or thinking, or a completion text.
+
+    vLLM 0.33 and later send the thinking as `reasoning`, older versions as `reasoning_content`.
+    """
     choices = obj.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         return False
     choice = choices[0]
     delta = choice.get("delta")
-    if isinstance(delta, dict) and isinstance(delta.get("content"), str) and delta["content"]:
-        return True
+    if isinstance(delta, dict):
+        for key in ("content", "reasoning", "reasoning_content"):
+            if isinstance(delta.get(key), str) and delta[key]:
+                return True
     return isinstance(choice.get("text"), str) and bool(choice["text"])
 
 
@@ -248,7 +253,8 @@ async def forward(
     chunk came before the disconnect. An error in `on_done` is logged and does not break the response.
 
     `on_first()` is optional. For a streamed answer it runs once, after the first chunk with content
-    went to the client. Content is a non-empty `delta.content` or `text` of `choices[0]`. It never runs for an answer
+    went to the client. Content is a non-empty `delta.content`, `delta.reasoning` or `delta.reasoning_content`
+    (the thinking of a reasoning model) or `text` of `choices[0]`. It never runs for an answer
     without a stream. An error in `on_first` is logged and does not break the stream.
     """
     prepared, usage_wanted = prepare_body(body)

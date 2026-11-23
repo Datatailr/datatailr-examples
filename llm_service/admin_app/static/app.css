@@ -224,6 +224,7 @@ pre.code {
 .turn.user { border-color: rgba(76, 141, 255, .4); background: var(--blue-dim); }
 .turn.dropped { opacity: .5; }
 .turn-text { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 2px; }
+.turn-thinking { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 2px; margin-bottom: 8px; color: var(--muted); font-size: .92em; border-left: 2px solid var(--border); padding-left: 8px; }
 .chat-form { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
 label.field { display: flex; flex-direction: column; align-items: stretch; gap: 4px; }
 textarea {

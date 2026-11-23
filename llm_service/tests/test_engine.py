@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 import sys
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_service.gateway.engine import EngineError, VllmEngine
+from llm_service.gateway.engine import EngineError, VllmEngine, reasoning_parser
 
 
 def test_vllm_command():
@@ -21,6 +22,45 @@ def test_vllm_command():
         "127.0.0.1", "--port", "8001", "--max-model-len", "4096",
     ]
     assert engine.base_url == "http://127.0.0.1:8001"
+
+
+def _tokenizer_config(model_dir: Path, tokens: list[str]) -> None:
+    decoder = {str(i): {"content": token, "special": True} for i, token in enumerate(tokens)}
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "tokenizer_config.json").write_text(json.dumps({"added_tokens_decoder": decoder}))
+
+
+def test_a_thinking_model_gets_the_reasoning_parser(tmp_path):
+    _tokenizer_config(tmp_path, ["<|im_end|>", "<think>", "</think>"])
+    assert reasoning_parser(tmp_path) == "qwen3"
+    command = VllmEngine(8001, ["--max-model-len", "4096"]).command(tmp_path, "org/m")
+    assert command[-4:] == ["--reasoning-parser", "qwen3", "--max-model-len", "4096"]
+
+
+def test_a_model_without_a_think_token_gets_no_parser(tmp_path):
+    _tokenizer_config(tmp_path, ["<|im_end|>", "<|endoftext|>"])
+    assert reasoning_parser(tmp_path) is None
+    assert "--reasoning-parser" not in VllmEngine(8001, []).command(tmp_path, "org/m")
+
+
+def test_the_think_token_is_also_found_in_tokenizer_json(tmp_path):
+    (tmp_path / "tokenizer.json").write_text(json.dumps({"added_tokens": [{"content": "<think>"}]}))
+    assert reasoning_parser(tmp_path) == "qwen3"
+
+
+def test_a_missing_or_broken_tokenizer_file_gives_no_parser(tmp_path):
+    assert reasoning_parser(tmp_path / "absent") is None
+    (tmp_path / "tokenizer_config.json").write_text("{not json")
+    assert reasoning_parser(tmp_path) is None
+
+
+def test_an_own_reasoning_parser_argument_wins(tmp_path):
+    _tokenizer_config(tmp_path, ["<think>", "</think>"])
+    command = VllmEngine(8001, ["--reasoning-parser", "deepseek_r1"]).command(tmp_path, "org/m")
+    assert command.count("--reasoning-parser") == 1
+    assert command[-2:] == ["--reasoning-parser", "deepseek_r1"]
+    joined = VllmEngine(8001, ["--reasoning-parser=deepseek_r1"]).command(tmp_path, "org/m")
+    assert [arg for arg in joined if arg.startswith("--reasoning-parser")] == ["--reasoning-parser=deepseek_r1"]
 
 
 def _free_port() -> int:
