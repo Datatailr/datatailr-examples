@@ -1369,10 +1369,11 @@ function splitLines(text) {
   return {lines: lines.map(line => line.replace(/\r$/, '')), rest};
 }
 
-/** Post the chat request and call `onText` with each piece of the answer. Return the usage of the
- * last chunk. Throw an ApiError when the answer fails or ends without `[DONE]`. A stop throws the
- * AbortError of the browser. */
-async function streamChat(service, body, signal, onText) {
+/** Post the chat request and call `onText` with each piece of the answer and `onThinking` with
+ * each piece of the thinking of a reasoning model. Return the usage of the last chunk. Throw an
+ * ApiError when the answer fails or ends without `[DONE]`. A stop throws the AbortError of the
+ * browser. */
+async function streamChat(service, body, signal, onText, onThinking) {
   let response;
   try {
     response = await fetch(new URL(servicePath('chat', service), BASE),
@@ -1420,7 +1421,11 @@ async function streamChat(service, body, signal, onText) {
           throw new ApiError(typeof message === 'string' ? message : 'The service reported an error.');
         }
         if (chunk && chunk.usage) usage = chunk.usage;
-        const content = chunk?.choices?.[0]?.delta?.content;
+        const delta = chunk?.choices?.[0]?.delta;
+        // vLLM 0.33 and later send `reasoning`, older versions `reasoning_content`.
+        const thinking = delta?.reasoning ?? delta?.reasoning_content;
+        if (typeof thinking === 'string' && thinking && onThinking) onThinking(thinking);
+        const content = delta?.content;
         if (typeof content === 'string' && content) onText(content);
       }
       if (part.done) throw new ApiError('The stream ended before the service finished the answer.');
@@ -1431,13 +1436,34 @@ async function streamChat(service, body, signal, onText) {
   }
 }
 
-/** Add a turn to the conversation. The text goes in with textContent only. */
+/** The conversation follows its end while an answer streams, so the viewer sees the newest text
+ * without scrolling. A scroll up to read an earlier part stops the following; a scroll back to
+ * the end, or a new prompt, starts it again. */
+const chatFollow = {atEnd: true};
+const CHAT_END_SLACK = 24;  // pixels from the end that still count as the end
+
+function chatLogAtEnd() {
+  const log = $('chat-log');
+  return log.scrollHeight - log.scrollTop - log.clientHeight <= CHAT_END_SLACK;
+}
+
+/** Scroll the conversation to its end when the viewer has not scrolled away from it. */
+function followChat() {
+  if (!chatFollow.atEnd) return;
+  const log = $('chat-log');
+  log.scrollTop = log.scrollHeight;
+}
+
+/** Add a turn to the conversation. The text goes in with textContent only. A model turn has a
+ * hidden `thinking` element in front of the text. It shows when the model thinks before it answers. */
 function chatTurn(role, text) {
   const body = el('div', {className: 'turn-text', text});
+  const thinking = el('div', {className: 'turn-thinking', hidden: true});
   const turn = el('div', {className: `turn ${role}`},
-                  el('div', {className: 'label', text: role === 'user' ? 'You' : 'Model'}), body);
+                  el('div', {className: 'label', text: role === 'user' ? 'You' : 'Model'}), thinking, body);
   $('chat-log').append(turn);
-  return {turn, body};
+  followChat();
+  return {turn, body, thinking};
 }
 
 function setChatBusy(running) {
@@ -1476,6 +1502,7 @@ async function sendChat(event) {
   const asked = messages[messages.length - 1];
   state.chat.messages.push(asked);
   $('chat-prompt').value = '';
+  chatFollow.atEnd = true;  // a new prompt: the viewer wants to see the answer
   const question = chatTurn('user', prompt);
   const answer = chatTurn('assistant', '');
   const controller = new AbortController();
@@ -1490,6 +1517,13 @@ async function sendChat(event) {
       if (controller !== state.chat.controller) return;
       if (firstMs === null) firstMs = performance.now() - started;
       answer.body.textContent += piece;
+      followChat();
+    }, piece => {
+      if (controller !== state.chat.controller) return;
+      if (firstMs === null) firstMs = performance.now() - started;
+      answer.thinking.hidden = false;
+      answer.thinking.textContent += piece;
+      followChat();
     });
     if (controller !== state.chat.controller) return;
     state.chat.messages.push({role: 'assistant', content: answer.body.textContent});
@@ -2436,6 +2470,8 @@ function wire() {
   $('chat-form').addEventListener('submit', sendChat);
   $('chat-stop').addEventListener('click', stopChat);
   $('chat-clear').addEventListener('click', clearChat);
+  // The viewer's own scroll decides whether the conversation follows its end.
+  $('chat-log').addEventListener('scroll', () => { chatFollow.atEnd = chatLogAtEnd(); }, {passive: true});
   for (const button of document.querySelectorAll('dialog [data-close]')) {
     button.addEventListener('click', () => button.closest('dialog').close());
   }

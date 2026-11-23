@@ -2,6 +2,7 @@ import asyncio
 import json
 
 import httpx
+import pytest
 
 from llm_service.gateway.proxy import StreamUsageFilter, forward, prepare_body, prompt_of
 from llm_service.tests.fakes import fake_vllm_app
@@ -534,6 +535,14 @@ def test_on_first_ignores_role_and_empty_chunks():
 
 def test_on_first_runs_for_completion_text():
     assert _first_calls(TEXT + DONE)[0] == [1]
+
+
+@pytest.mark.parametrize("field", ["reasoning", "reasoning_content"])
+def test_on_first_runs_for_the_first_reasoning_chunk(field):
+    thinking = _chunk({"id": "x", "choices": [{"index": 0, "delta": {"content": None, field: "Hm"}}], "usage": None})
+    calls, seen, _ = _first_calls(ROLE + thinking + SSE)
+    assert calls == [1]
+    assert seen == [1]
 
 
 def test_on_first_runs_when_a_content_event_is_split_over_chunks():

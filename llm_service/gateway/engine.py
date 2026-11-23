@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import json
 import logging
 import os
 import signal
@@ -18,6 +19,28 @@ log = logging.getLogger("llm_service.engine")
 TAIL_LINES = 40
 READER_TIMEOUT = 5.0
 CHUNK = 65536
+THINK_TOKEN = "<think>"
+REASONING_PARSER = "qwen3"
+
+
+def reasoning_parser(model_dir: Path) -> str | None:
+    """Return the vLLM reasoning parser for the model in `model_dir`, or None.
+
+    A model that thinks before it answers, such as Qwen3, has the token `<think>`
+    in its tokenizer. With the parser, vLLM sends the thinking as the field
+    `reasoning` (`reasoning_content` before vLLM 0.33) and the answer as `content`. A model without the token
+    gets no parser: the parser takes every answer for thinking until it sees
+    `</think>`, so a model that never writes it would return an empty `content`.
+    """
+    for name, key in (("tokenizer_config.json", "added_tokens_decoder"), ("tokenizer.json", "added_tokens")):
+        try:
+            tokens = json.loads((model_dir / name).read_text()).get(key)
+        except (OSError, ValueError, AttributeError):
+            continue
+        entries = tokens.values() if isinstance(tokens, dict) else tokens if isinstance(tokens, list) else ()
+        if any(isinstance(entry, dict) and entry.get("content") == THINK_TOKEN for entry in entries):
+            return REASONING_PARSER
+    return None
 
 
 class EngineError(Exception):
@@ -61,12 +84,21 @@ class VllmEngine:
         self.base_url = f"http://127.0.0.1:{port}"
 
     def command(self, model_dir: Path, served_name: str) -> list[str]:
-        """Return the command line that starts vLLM."""
+        """Return the command line that starts vLLM.
+
+        The reasoning parser follows the model, not the service: see
+        `reasoning_parser`. An own `--reasoning-parser` in the extra arguments
+        wins.
+        """
+        own = any(arg.startswith("--reasoning-parser") for arg in self._extra_args)
+        parser = None if own else reasoning_parser(model_dir)
+        log.info("reasoning parser for %s: %s", served_name, parser or ("own argument" if own else "none"))
         return [
             "vllm", "serve", str(model_dir),
             "--served-model-name", served_name,
             "--host", "127.0.0.1",
             "--port", str(self._port),
+            *(["--reasoning-parser", parser] if parser else []),
             *self._extra_args,
         ]
 

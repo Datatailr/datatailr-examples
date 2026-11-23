@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 pytest.importorskip("openai")
@@ -69,3 +71,31 @@ def test_main_asks_the_service_also_with_a_model_set(monkeypatch, capsys):
         chat.main({"LLM_MODEL": "org/a"})
     assert len(asked) == 1
     assert "did not accept the login" in str(stop.value)
+
+
+def _stream(*deltas):
+    chunks = [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(**delta))]) for delta in deltas]
+    chunks.append(SimpleNamespace(choices=[]))  # the usage chunk has no choice
+    create = lambda **kwargs: iter(chunks)  # noqa: E731
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+@pytest.mark.parametrize("field", ["reasoning", "reasoning_content"])
+def test_answer_shows_the_thinking_and_returns_only_the_reply(capsys, field):
+    client = _stream(
+        {"content": None, field: "Let me "},
+        {"content": None, field: "see."},
+        {"content": "Hello", field: None},
+        {"content": "!", field: None},
+    )
+    reply = chat.answer(client, "org/m", [{"role": "user", "content": "hi"}])
+    out = capsys.readouterr().out
+    assert reply == "Hello!"
+    assert out.index("Let me see.") < out.index("Hello!")
+    assert chat.THINKING_END in out
+
+
+def test_answer_works_without_a_reasoning_field(capsys):
+    client = _stream({"content": "Hi"}, {"content": " there"})
+    assert chat.answer(client, "org/m", []) == "Hi there"
+    assert capsys.readouterr().out == "Hi there\n"

@@ -98,7 +98,7 @@ The script reads these variables at deploy time:
 | `LLM_ACCESS_GROUP` | not set | Platform group that gets read and access permission. The service container gets it too. |
 | `LLM_BLOB_ROOT` | `llm-service` | Root directory in blob storage. |
 | `LLM_HF_TOKEN_KEY` | not set | Secret store key of the Hugging Face token. |
-| `LLM_VLLM_ARGS` | not set | Extra arguments for `vllm serve`. |
+| `LLM_VLLM_ARGS` | not set | Extra arguments for `vllm serve`. The service adds `--reasoning-parser` by itself, see [Thinking models](#thinking-models). |
 | `LLM_PROMPT_RETENTION_DAYS` | not set | Days to keep prompts in the audit log. See [Prompt retention](#prompt-retention). |
 | `LLM_METRICS_RETENTION_DAYS` | `30` | Days to keep the load history files. See [Load and latency](#load-and-latency). |
 | `LLM_ENVIRONMENT` | `dev` | Platform environment: `dev`, `pre` or `prod`. |
@@ -126,6 +126,14 @@ LLM_VLLM_ARGS="--max-model-len 8192 --gpu-memory-utilization 0.85" python deploy
 
 At the first start, the service downloads the default model from Hugging Face. It uploads the files to blob storage. Later starts load the model from blob storage.
 
+### Thinking models
+
+A thinking model, such as Qwen3, writes its reasoning between `<think>` and `</think>` before it answers. The service starts vLLM with `--reasoning-parser qwen3` for such a model. vLLM then sends the reasoning as the field `reasoning` and the answer as `content`, in a complete answer and in each chunk of a stream. vLLM before 0.33 named the field `reasoning_content`. The clients of this example read both names. A client that reads only `content` sees nothing until the reasoning ends, so a long wait before the first token is the model thinking.
+
+The service decides per model, at each start and at each switch. It looks for the token `<think>` in the `tokenizer_config.json` or `tokenizer.json` of the model. The flag must follow the model: with the flag, a model that never writes `</think>` returns its whole answer in `reasoning` and an empty `content`. Do not put `--reasoning-parser` in `LLM_VLLM_ARGS` unless you serve only one model family. If you do, the service keeps your value and adds nothing.
+
+To get an answer without reasoning from a Qwen3 model, send `chat_template_kwargs` with `enable_thinking` set to false in the request. The `openai` package takes it in `extra_body`.
+
 ## Use from a job inside Datatailr
 
 A job, workstation or notebook on the platform calls the service by its host name. The platform adds the user name. The API key is not checked, but the OpenAI client needs a value.
@@ -141,6 +149,8 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
+For a thinking model, `reply.choices[0].message.reasoning` holds the reasoning. See [Thinking models](#thinking-models).
+
 If you omit `model`, the service uses the model that it serves now. If you name another model, the service returns the error `model_not_found` with status 404.
 
 ### A conversation in the terminal
@@ -152,7 +162,7 @@ pip install openai
 python chat.py
 ```
 
-Type a prompt and press Enter. The command `/reset` starts a new conversation. The top of the file lists the environment variables, for example `LLM_MODEL` and `LLM_SYSTEM_PROMPT`.
+Type a prompt and press Enter. The command `/reset` starts a new conversation. The top of the file lists the environment variables, for example `LLM_MODEL` and `LLM_SYSTEM_PROMPT`. With a thinking model, the script shows the reasoning in dim text before the answer. The reasoning is not part of the conversation that the script keeps.
 
 ## Use from outside Datatailr
 
@@ -361,7 +371,7 @@ The filters are `user`, `model`, `since`, `until`, `limit` and `offset`. The val
 
 A request that has an acting user has the extra field `via` with the name of the caller. A request without an acting user has no `via` field. When the acting user is the caller, the record has no `via` field either.
 
-The field `ttft_ms` is the time in milliseconds from the start of the request to the first content of a stream. It is `null` for a request without a stream and for a request without content. A record from before the load numbers has no `ttft_ms` field.
+The field `ttft_ms` is the time in milliseconds from the start of the request to the first content of a stream. The reasoning of a thinking model counts as content. It is `null` for a request without a stream and for a request without content. A record from before the load numbers has no `ttft_ms` field.
 
 A record of a model event has the field `event`. Its value is `model_switch`, `engine_reload`, `model_delete`, `model_download` or `catalog_change`. The field `detail` holds the revision, the error or the catalog change. A request record has `event` and `detail` set to `null`.
 
@@ -799,7 +809,7 @@ The Connect tab shows how to call the picked service. It has these parts.
 
 - Addresses and examples. The tab shows the internal base URL `http://<name>/v1` and the outside base URL, with the served model. It has examples for curl, for the `openai` package from a job, for the `openai` package from outside the platform, and for `chat.py`. Each example has a copy button. No example holds a token. The outside example sends the login of the Datatailr CLI.
 - The script `chat.py`. A card shows the file, with a Copy button and a Download link.
-- The testing area. A viewer types a system prompt and a prompt, sets the model, the temperature and the maximum tokens, and presses Send. The answer streams into the page. After it, the area shows the token counts and the time to the first token. The area keeps the conversation, and Clear starts again. If the service answers 429, the area shows the message of the answer and the wait time.
+- The testing area. A viewer types a system prompt and a prompt, sets the model, the temperature and the maximum tokens, and presses Send. The answer streams into the page. With a thinking model, the reasoning streams in muted text above the answer. The conversation scrolls to its end while the answer streams. Scroll up to read an earlier part; the conversation stays there until you scroll back to the end or send a new prompt. After it, the area shows the token counts and the time to the first token. The area keeps the conversation, and Clear starts again. If the service answers 429, the area shows the message of the answer and the wait time.
 - The card "Your limits". The card shows the three limits of the viewer, the current use and the source of the limits. The source is the entry of the user, the default, admin (no limit) or none. A limit with no value shows as no limit.
 
 A request from the testing area counts for the viewer. It shows in the usage numbers and in the audit log under the name of the viewer. The `via` field of the record names the owner of the app. When the viewer is the owner of the app, the record has no `via` field.

@@ -13,7 +13,9 @@ Usage, from a machine outside the platform:
     datatailr login
     LLM_BASE_URL=https://<your-domain>/job/<environment>/<service name>/v1 python chat.py
 
-Type a prompt and press Enter. The answer streams to the terminal.
+Type a prompt and press Enter. The answer streams to the terminal. A model that thinks before
+it answers, such as Qwen3, shows the thinking first, in dim text. The thinking is not part of
+the conversation that the script keeps.
     /reset    starts a new conversation
     Ctrl+C    during an answer stops that answer
     Ctrl+C    at the prompt ends the script
@@ -103,15 +105,38 @@ def window(history: list[dict], max_messages: int) -> list[dict]:
     return recent
 
 
+THINKING_START = "\033[2m"  # dim text
+THINKING_END = "\033[0m\n\n"
+
+
 def answer(client: OpenAI, model: str, messages: list[dict]) -> str:
-    """Send the messages, print the answer while it streams, and return it."""
+    """Send the messages, print the answer while it streams, and return it.
+
+    A thinking model sends its thinking before the answer, as the field `reasoning`
+    (vLLM 0.33 and later) or `reasoning_content` (older vLLM). The script prints it in
+    dim text and returns only the answer.
+    """
     stream = client.chat.completions.create(model=model, messages=messages, stream=True)
     reply = ""
+    thinking = False
     for chunk in stream:
-        if chunk.choices:
-            text = chunk.choices[0].delta.content or ""
-            reply += text
-            print(text, end="", flush=True)
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        thought = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
+        if thought:
+            if not thinking:
+                thinking = True
+                print(THINKING_START, end="")
+            print(thought, end="", flush=True)
+        text = delta.content or ""
+        if text and thinking:
+            thinking = False
+            print(THINKING_END, end="")
+        reply += text
+        print(text, end="", flush=True)
+    if thinking:
+        print(THINKING_END, end="")
     print()
     return reply
 
